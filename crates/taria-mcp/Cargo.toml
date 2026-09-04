@@ -1,0 +1,19 @@
+[package]
+name = "taria-mcp"
+description = "MCP bridge for taria. Exposes any taria-enabled TUI app to AI agent harnesses (Claude Code, OpenCode, Cursor) as MCP tools."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+taria.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "taria-mcp"
+path = "src/main.rs"

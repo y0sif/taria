@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/taria",
+    "crates/taria-ratatui",
+    "crates/taria-mcp",
+    "examples/demo-app",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+authors = ["y0sif <yosif@outbond.io>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/y0sif/taria"
+homepage = "https://github.com/y0sif/taria"
+keywords = ["tui", "accessibility", "ai", "agents", "mcp"]
+categories = ["accessibility", "command-line-interface"]
+
+[workspace.dependencies]
+taria = { path = "crates/taria", version = "0.0.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

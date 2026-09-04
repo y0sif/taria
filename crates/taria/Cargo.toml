@@ -1,0 +1,16 @@
+[package]
+name = "taria"
+description = "Agent accessibility layer for terminal user interfaces. Lets TUI apps expose their widget tree, focus state, and available actions to AI agents, like ARIA does for the web."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

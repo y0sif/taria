@@ -1,0 +1,11 @@
+[package]
+name = "taria-demo"
+description = "Demo ratatui app used to show an agent driving a TUI through taria vs. fumbling through screen-scraping."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+taria.workspace = true
