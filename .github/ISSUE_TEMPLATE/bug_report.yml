@@ -1,0 +1,38 @@
+name: Bug report
+description: Something broken in taria, taria-ratatui, or taria-mcp
+labels: [bug]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - taria (core protocol)
+        - taria-ratatui (adapter)
+        - taria-mcp (bridge)
+        - demo app
+        - docs
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        OS:
+        Rust version (rustc --version):
+        Agent harness (Claude Code / OpenCode / other + version):
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / snapshot JSON
+      render: shell

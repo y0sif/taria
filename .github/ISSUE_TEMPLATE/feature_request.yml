@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose a protocol change, adapter, or bridge capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What can't an agent (or app author) do today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including "solve it with tmux/ht/screen-scraping instead".
