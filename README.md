@@ -1,10 +1,10 @@
 # taria
 
 **ARIA for terminals.** taria is an agent accessibility layer for terminal
-user interfaces: a small protocol plus framework integrations that let a TUI
-app expose its live widget tree, focus state, and available actions directly
-to AI agents, with an MCP bridge so any harness (Claude Code, OpenCode,
-Cursor) can drive the app without modification.
+user interfaces. A TUI app declares its live widget tree, focus state, and
+available actions through a small protocol. An MCP bridge exposes that tree
+to any agent harness (Claude Code, OpenCode, Cursor), which can then drive
+the app without modification.
 
 Agents today reach TUIs by scraping rendered screens through tmux or headless
 terminals and guessing at structure. taria works on the other side of the
@@ -18,7 +18,8 @@ accessibility trees transformed GUI automation.
 
 ## Quick start
 
-Three steps, two terminals.
+Prerequisites: a Rust toolchain (1.88 or newer) and, for step 2, the
+`claude` CLI. Three steps, two terminals.
 
 1. Run the demo app in one terminal. It prints its taria socket path on
    startup and then behaves like a normal task-manager TUI:
@@ -32,7 +33,7 @@ Three steps, two terminals.
 
    ```bash
    cargo build -p taria-mcp
-   claude mcp add taria -- <repo>/target/debug/taria-mcp --app taria-demo
+   claude mcp add taria -- $(pwd)/target/debug/taria-mcp --app taria-demo
    ```
 
    Working inside this repo, you can skip `claude mcp add`: the committed
@@ -96,7 +97,7 @@ app-side adapter does when binding:
 
 ## Workspace layout
 
-```
+```text
 crates/taria          Core protocol types (widget tree, actions, snapshots)
 crates/taria-ratatui  Ratatui adapter: publish semantics alongside rendering
 crates/taria-mcp      MCP bridge binary for agent harnesses

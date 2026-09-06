@@ -44,7 +44,7 @@ Details: docs/architecture.md.
 - Dual MIT/Apache-2.0. Adoption is the project's oxygen: keep the protocol
   minimal, keep `taria` (core) dependency-light.
 - Add dependencies with `cargo add` (picks current versions); justify heavy
-  ones in docs/tech-stack.md.
+  ones in docs/architecture.md.
 - Never panic in library crates; return errors.
 - Conventional commits: feat:, fix:, docs:, chore:, refactor:.
 - The `Key` raw-input fallback exists so partial semantic coverage is still

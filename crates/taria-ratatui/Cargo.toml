@@ -3,6 +3,7 @@ name = "taria-ratatui"
 description = "Ratatui adapter for taria. Publishes your app's widget tree, focus, and actions to AI agents alongside normal rendering."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

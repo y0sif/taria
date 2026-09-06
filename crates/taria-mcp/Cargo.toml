@@ -3,6 +3,7 @@ name = "taria-mcp"
 description = "MCP bridge for taria. Exposes any taria-enabled TUI app to AI agent harnesses (Claude Code, OpenCode, Cursor) as MCP tools."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
