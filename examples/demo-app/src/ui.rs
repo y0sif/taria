@@ -66,16 +66,14 @@ fn render_tabs(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_tasks(app: &App, frame: &mut Frame, area: Rect) {
-    let visible = app.visible_indices();
     let list_focused = app.focus == Focus::List && app.dialog.is_none();
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
-    if visible.is_empty() {
+    if app.visible_len() == 0 {
         lines.push(Line::from(Span::styled("    (no tasks here)", dim())));
     }
-    for (pos, &idx) in visible.iter().enumerate() {
-        let task = &app.tasks[idx];
+    for (pos, task) in app.visible_tasks().enumerate() {
         let is_selected = list_focused && pos == app.selection;
         let marker = if is_selected { "> " } else { "  " };
         let check = if task.done { "[x] " } else { "[ ] " };
@@ -124,12 +122,8 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_dialog(app: &App, frame: &mut Frame, area: Rect) {
-    let Some(idx) = app.dialog else { return };
-    let title = app
-        .tasks
-        .get(idx)
-        .map(|task| task.title.as_str())
-        .unwrap_or("?");
+    let Some(id) = app.dialog else { return };
+    let title = app.task(id).map(|task| task.title.as_str()).unwrap_or("?");
 
     let popup = centered_rect(60, 30, area);
     frame.render_widget(Clear, popup);
