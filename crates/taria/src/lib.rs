@@ -8,6 +8,7 @@
 mod action;
 mod node;
 mod snapshot;
+pub mod wire;
 
 pub use action::{Action, AgentInput};
 pub use node::{Node, NodeId, Role};
