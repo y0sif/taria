@@ -6,17 +6,23 @@
 //! `BridgeToApp::Input` lines. On disconnect the watch flips to
 //! [`BridgeState::Disconnected`] so tool calls fail fast (instead of acting
 //! on a stale tree) with an error that says which app went away.
+//!
+//! Every outgoing input carries an [`InputId`] and the app answers it with an
+//! `AppToBridge::Ack`. Acks are republished on a [`broadcast`] channel rather
+//! than kept here, because only the tool call that sent an input knows which
+//! id it is waiting for; the manager stays free of per-input bookkeeping.
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use taria::wire::{AppToBridge, BridgeToApp};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{AgentInput, PROTOCOL_VERSION, Snapshot};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedReadHalf;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// First reconnect delay after a failed connect attempt.
 const RETRY_MIN: Duration = Duration::from_millis(250);
@@ -30,6 +36,11 @@ const RETRY_MAX: Duration = Duration::from_secs(2);
 const HEALTHY_CONNECTION_MIN: Duration = Duration::from_secs(2);
 /// Queued agent inputs awaiting the socket writer.
 const INPUT_QUEUE: usize = 32;
+/// Acks buffered per subscriber. A waiter only needs the acks published while
+/// its own input is in flight, and one input draws at most two of them, so
+/// this leaves room for a burst of concurrent tool calls without ever making
+/// a slow subscriber miss the answer it is waiting for.
+const ACK_QUEUE: usize = 64;
 /// Longest accepted ndjson line from the app. A peer that streams more than
 /// this without a newline is treated as a broken connection (disconnect and
 /// reconnect) so the bridge never buffers a line unboundedly.
@@ -56,22 +67,63 @@ pub enum BridgeState {
     },
 }
 
+/// Source of the [`InputId`]s the tool layer stamps on outgoing inputs.
+///
+/// Process-wide and monotonic. The protocol only asks for ids that are unique
+/// within one connection, and monotonic ids give that for free; they also make
+/// an ack left over from a previous connection trivially non-matching, since
+/// no waiter is ever looking for an id that low again.
+static NEXT_INPUT_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Handles the MCP tool layer uses to talk to the socket-manager task.
 #[derive(Clone)]
 pub struct BridgeHandle {
     /// Latest connection state; holds the current [`Snapshot`] while an app
     /// is connected.
     pub state_rx: watch::Receiver<BridgeState>,
-    /// Queue of agent inputs to forward to the app.
-    pub input_tx: mpsc::Sender<AgentInput>,
+    /// Queue of identified agent inputs to forward to the app.
+    pub input_tx: mpsc::Sender<(InputId, AgentInput)>,
+    /// Every ack the app sends, republished for whoever is waiting on one.
+    pub ack_tx: broadcast::Sender<(InputId, InputStatus)>,
+}
+
+impl BridgeHandle {
+    /// Claim the id for the next input to send.
+    ///
+    /// Takes `&self` so the id source stays an implementation detail of the
+    /// handle: callers ask the bridge for an id rather than reaching for a
+    /// counter of their own, and two tool calls racing still get different
+    /// ids.
+    pub fn next_input_id(&self) -> InputId {
+        NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Start receiving acks from now on.
+    ///
+    /// A broadcast receiver only sees what is published after it subscribes,
+    /// so a caller that waits on an input must subscribe *before* sending it:
+    /// the app can ack before the sending task is scheduled again.
+    pub fn subscribe_acks(&self) -> broadcast::Receiver<(InputId, InputStatus)> {
+        self.ack_tx.subscribe()
+    }
 }
 
 /// Spawn the socket-manager task for `socket_path` on the current runtime.
 pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
     let (state_tx, state_rx) = watch::channel(BridgeState::Never);
     let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
-    tokio::spawn(manager_loop(socket_path, state_tx, input_rx));
-    BridgeHandle { state_rx, input_tx }
+    let (ack_tx, _) = broadcast::channel(ACK_QUEUE);
+    tokio::spawn(manager_loop(
+        socket_path,
+        state_tx,
+        input_rx,
+        ack_tx.clone(),
+    ));
+    BridgeHandle {
+        state_rx,
+        input_tx,
+        ack_tx,
+    }
 }
 
 /// Why one served connection ended.
@@ -87,7 +139,8 @@ enum ConnectionEnd {
 async fn manager_loop(
     path: PathBuf,
     state_tx: watch::Sender<BridgeState>,
-    mut input_rx: mpsc::Receiver<AgentInput>,
+    mut input_rx: mpsc::Receiver<(InputId, AgentInput)>,
+    ack_tx: broadcast::Sender<(InputId, InputStatus)>,
 ) {
     let mut backoff = RETRY_MIN;
     loop {
@@ -97,7 +150,9 @@ async fn manager_loop(
                 drain_stale_inputs(&mut input_rx);
                 let connected_at = Instant::now();
                 let mut conn_label = None;
-                let end = run_connection(stream, &state_tx, &mut input_rx, &mut conn_label).await;
+                let end =
+                    run_connection(stream, &state_tx, &mut input_rx, &ack_tx, &mut conn_label)
+                        .await;
                 // The watch only ever holds `Connected` while this connection
                 // was being served (it is demoted below after every
                 // connection), so `Connected` here means this connection
@@ -163,7 +218,7 @@ async fn manager_loop(
 /// direct [`BridgeHandle::input_tx`] sender). Replaying them into a freshly
 /// connected app instance would deliver keystrokes ("q", "y", ...) the agent
 /// aimed at a UI that no longer exists, so they are discarded instead.
-fn drain_stale_inputs(input_rx: &mut mpsc::Receiver<AgentInput>) {
+fn drain_stale_inputs(input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>) {
     let mut drained = 0usize;
     while input_rx.try_recv().is_ok() {
         drained += 1;
@@ -219,7 +274,8 @@ async fn read_line_capped(
 async fn run_connection(
     stream: UnixStream,
     state_tx: &watch::Sender<BridgeState>,
-    input_rx: &mut mpsc::Receiver<AgentInput>,
+    input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>,
+    ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
     conn_label: &mut Option<String>,
 ) -> ConnectionEnd {
     let (read_half, mut write_half) = stream.into_split();
@@ -229,7 +285,7 @@ async fn run_connection(
         tokio::select! {
             read = read_line_capped(&mut reader, &mut line_buf) => match read {
                 Ok(LineRead::Line) => {
-                    handle_app_line(&line_buf, state_tx, conn_label);
+                    handle_app_line(&line_buf, state_tx, ack_tx, conn_label);
                     line_buf.clear();
                 }
                 Ok(LineRead::Eof) => return ConnectionEnd::AppClosed,
@@ -246,10 +302,10 @@ async fn run_connection(
                 }
             },
             input = input_rx.recv() => {
-                let Some(input) = input else {
+                let Some((id, input)) = input else {
                     return ConnectionEnd::SessionClosed;
                 };
-                let msg = BridgeToApp::Input(input);
+                let msg = BridgeToApp::Input { id, input };
                 let mut line = match serde_json::to_string(&msg) {
                     Ok(line) => line,
                     Err(err) => {
@@ -272,6 +328,7 @@ async fn run_connection(
 fn handle_app_line(
     line: &[u8],
     state_tx: &watch::Sender<BridgeState>,
+    ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
     conn_label: &mut Option<String>,
 ) {
     match serde_json::from_slice::<AppToBridge>(line) {
@@ -294,6 +351,13 @@ fn handle_app_line(
         Ok(AppToBridge::Snapshot(snapshot)) => {
             tracing::debug!(seq = snapshot.seq, "snapshot received");
             state_tx.send_replace(BridgeState::Connected(snapshot));
+        }
+        Ok(AppToBridge::Ack { id, status }) => {
+            tracing::debug!(id, ?status, "input ack received");
+            // An ack nobody is waiting for is the normal case (the tool call
+            // that sent the input has already returned), so a send with no
+            // subscribers is not an error worth reporting.
+            let _ = ack_tx.send((id, status));
         }
         Err(err) => {
             tracing::warn!(%err, "ignoring malformed line from app");

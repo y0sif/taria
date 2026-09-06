@@ -5,17 +5,16 @@
 //! the app-side adapter (`taria-ratatui`) binds to.
 
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Help text printed for `--help` and appended to argument errors.
 pub const HELP: &str = "\
 taria-mcp - MCP bridge for taria-enabled TUI apps
 
 Speaks MCP over stdio to an agent harness and connects to a running TUI
-app's taria Unix socket, exposing read_tree / act / key tools.
+app's taria Unix socket, exposing read_tree / act / type_text / key tools.
 
 Usage:
   taria-mcp --socket <path>   Connect to an explicit Unix socket path
@@ -69,54 +68,33 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
-    match (socket, app) {
-        (Some(_), Some(_)) => Err("pass either --socket or --app, not both".to_string()),
-        (Some(path), None) => Ok(Cli::Run {
-            socket: PathBuf::from(path),
-        }),
-        (None, Some(label)) => Ok(Cli::Run {
-            socket: resolve_socket_path(&label),
-        }),
-        (None, None) => Err("one of --socket <path> or --app <label> is required".to_string()),
-    }
+    let socket = match (socket, app) {
+        (Some(_), Some(_)) => return Err("pass either --socket or --app, not both".to_string()),
+        (Some(path), None) => PathBuf::from(path),
+        (None, Some(label)) => resolve_socket_path(&label),
+        (None, None) => {
+            return Err("one of --socket <path> or --app <label> is required".to_string());
+        }
+    };
+    // Check the length here rather than at connect time: the kernel's own
+    // refusal names neither the path nor the limit, and it would surface from
+    // inside the reconnect loop, where it reads as "the app is not running".
+    taria::socket::check_path_len(&socket).map_err(|err| err.to_string())?;
+    Ok(Cli::Run { socket })
 }
 
-/// Resolve the default socket path for `app_label` from the environment,
-/// mirroring the resolution in `taria-ratatui`'s `TariaLayer::bind`.
+/// Resolve the default socket path for `app_label` from the environment.
+///
+/// The derivation itself lives in [`taria::socket::resolve_path`], shared with
+/// the app-side adapter: the two have to agree on the path or they never meet.
 pub fn resolve_socket_path(app_label: &str) -> PathBuf {
-    resolve_socket_path_from(
+    taria::socket::resolve_path(
         env::var_os("TARIA_SOCK"),
         env::var_os("XDG_RUNTIME_DIR"),
         &env::temp_dir(),
         &user_identity(),
         app_label,
     )
-}
-
-/// Pure resolution logic, split out so it can be tested without touching the
-/// process environment. Must stay in lockstep with the adapter's resolution.
-fn resolve_socket_path_from(
-    taria_sock: Option<OsString>,
-    xdg_runtime_dir: Option<OsString>,
-    temp_dir: &Path,
-    user: &str,
-    app_label: &str,
-) -> PathBuf {
-    if let Some(path) = taria_sock
-        && !path.is_empty()
-    {
-        return PathBuf::from(path);
-    }
-    if let Some(dir) = xdg_runtime_dir
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir)
-            .join("taria")
-            .join(format!("{app_label}.sock"));
-    }
-    temp_dir
-        .join(format!("taria-{user}"))
-        .join(format!("{app_label}.sock"))
 }
 
 /// Uid where available (via `/proc/self` on Linux), else `$USER`/`$LOGNAME`,
@@ -197,52 +175,23 @@ mod tests {
         assert!(err.contains("--frobnicate"), "err: {err}");
     }
 
+    /// A path the kernel would refuse must be caught while the user is still
+    /// looking at argument errors, not later as a failed connect.
     #[test]
-    fn taria_sock_env_wins() {
-        let path = resolve_socket_path_from(
-            Some("/custom/app.sock".into()),
-            Some("/run/user/1000".into()),
-            Path::new("/tmp"),
-            "1000",
-            "demo",
+    fn over_long_socket_paths_are_rejected_with_the_limit() {
+        let long = format!(
+            "/tmp/{}.sock",
+            "x".repeat(taria::socket::MAX_SOCKET_PATH_BYTES)
         );
-        assert_eq!(path, PathBuf::from("/custom/app.sock"));
-    }
-
-    #[test]
-    fn empty_taria_sock_is_ignored() {
-        let path = resolve_socket_path_from(
-            Some("".into()),
-            Some("/run/user/1000".into()),
-            Path::new("/tmp"),
-            "1000",
-            "demo",
+        let err = parse_strs(&["--socket", &long]).unwrap_err();
+        assert!(err.contains("over the"), "err: {err}");
+        assert!(
+            err.contains(&taria::socket::MAX_SOCKET_PATH_BYTES.to_string()),
+            "error should name the limit: {err}"
         );
-        assert_eq!(path, PathBuf::from("/run/user/1000/taria/demo.sock"));
-    }
-
-    #[test]
-    fn xdg_runtime_dir_is_second_choice() {
-        let path = resolve_socket_path_from(
-            None,
-            Some("/run/user/1000".into()),
-            Path::new("/tmp"),
-            "1000",
-            "demo",
+        assert!(
+            err.contains("TARIA_SOCK"),
+            "error should say how out: {err}"
         );
-        assert_eq!(path, PathBuf::from("/run/user/1000/taria/demo.sock"));
-    }
-
-    #[test]
-    fn temp_dir_is_last_resort() {
-        let path = resolve_socket_path_from(None, None, Path::new("/tmp"), "1000", "demo");
-        assert_eq!(path, PathBuf::from("/tmp/taria-1000/demo.sock"));
-    }
-
-    #[test]
-    fn empty_xdg_falls_through_to_temp_dir() {
-        let path =
-            resolve_socket_path_from(None, Some("".into()), Path::new("/tmp"), "alice", "demo");
-        assert_eq!(path, PathBuf::from("/tmp/taria-alice/demo.sock"));
     }
 }
