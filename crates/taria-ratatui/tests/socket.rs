@@ -382,12 +382,21 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
     let messages = collector.join().expect("collector thread");
 
     // Only the queue capacity was retained; the overflow was dropped instead
-    // of buffered.
+    // of buffered. None of it reaches the app either: the connection that
+    // sent it is gone, so every queued input is stale by now.
     let mut received = 0;
     while layer.try_recv().is_some() {
         received += 1;
     }
-    assert_eq!(received, QUEUE, "input queue should be bounded at {QUEUE}");
+    assert_eq!(
+        received, 0,
+        "inputs queued on a dead connection must never be handed to the app"
+    );
+    assert_eq!(
+        layer.stale_inputs(),
+        QUEUE,
+        "the queue held {QUEUE} inputs, and each discard must be counted once"
+    );
     assert_eq!(
         layer.dropped_inputs(),
         FLOOD - QUEUE,
@@ -449,8 +458,63 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
     // over with each client.
     assert_eq!(second.read_message(), ack(0, InputStatus::Delivered));
 
-    // Accepted inputs never bump the drop counter.
+    // Accepted inputs never bump either counter.
     assert_eq!(layer.dropped_inputs(), FLOOD - QUEUE);
+    assert_eq!(layer.stale_inputs(), QUEUE);
+}
+
+/// The mirror image of the bridge dropping inputs it queued while no app was
+/// connected: an input that arrived on a connection which then died targets a
+/// bridge session that no longer exists. Applying it would let, say, a `key q`
+/// sent just before the bridge restarted quit the app on the next frame, with
+/// nobody left to be told.
+#[test]
+fn inputs_from_a_dead_connection_are_discarded_and_the_next_ones_are_not() {
+    let layer = bind_layer("staleinput");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    client.send_input(1, key("q"));
+    // Half-close: the reader consumes the input, then sees EOF and tears the
+    // connection down. Reading our side to EOF is the barrier proving the
+    // layer is done with this connection, input included.
+    client.writer.shutdown(Shutdown::Write).unwrap();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match client.reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) => panic!("client read failed: {err}"),
+        }
+    }
+
+    // Discarding must not cut a wait short: an app pacing its event loop on
+    // `recv_timeout` would otherwise spin through the rest of its budget the
+    // moment a bridge disconnects.
+    const WAIT: Duration = Duration::from_millis(150);
+    let started = Instant::now();
+    assert_eq!(
+        layer.recv_timeout(WAIT),
+        None,
+        "an input from a dead connection must never reach the app"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= WAIT,
+        "recv_timeout returned after {waited:?}, short of its {WAIT:?} timeout"
+    );
+    assert_eq!(layer.stale_inputs(), 1, "the discard must be counted");
+
+    // Nothing was acked for it either: the peer that would read the ack is
+    // the one that is gone. A fresh session then works normally, and its
+    // inputs are live.
+    let mut second = Client::connect(&layer);
+    assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
+    second.send_input(1, key("j"));
+    assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("j")));
+    assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
+    assert_eq!(layer.stale_inputs(), 1, "a live input is not a stale one");
 }
 
 #[test]

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
@@ -47,7 +47,10 @@ const INPUT_QUEUE: usize = 256;
 /// messages to the app via [`try_recv`](Self::try_recv) /
 /// [`recv_timeout`](Self::recv_timeout). Every forwarded input is answered
 /// with an [`AppToBridge::Ack`], so an agent can tell an input the app acted
-/// on from one it never saw.
+/// on from one it never saw. An input belongs to the connection it arrived
+/// on: one whose bridge disconnected before the app dequeued it is discarded
+/// rather than applied, because it was aimed at a session that is gone (see
+/// [`stale_inputs`](Self::stale_inputs)).
 ///
 /// A layer may also be *disabled*: [`bind_or_disabled`](Self::bind_or_disabled)
 /// hands back an inert layer rather than an error, so taria failing to bind
@@ -69,10 +72,21 @@ pub struct TariaLayer {
 /// The parts of a layer that exist only while its socket is bound.
 struct Inner {
     shared: Arc<Shared>,
-    input_rx: Receiver<(InputId, AgentInput)>,
+    input_rx: Receiver<QueuedInput>,
     listener: Option<JoinHandle<()>>,
     seq: u64,
     last_root: Option<Node>,
+}
+
+/// One agent input on its way from a connection's reader thread to the app.
+///
+/// The generation tags the connection it arrived on, so an input queued by a
+/// bridge that has since disconnected can be told apart from one the live
+/// bridge is waiting on.
+struct QueuedInput {
+    generation: u64,
+    id: InputId,
+    input: AgentInput,
 }
 
 impl TariaLayer {
@@ -132,6 +146,7 @@ impl TariaLayer {
             state: Mutex::new(State::default()),
             cv: Condvar::new(),
             dropped_inputs: AtomicU64::new(0),
+            stale_inputs: AtomicU64::new(0),
         });
         let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
 
@@ -243,6 +258,10 @@ impl TariaLayer {
     /// [`ack`](Self::ack), whose id comes from
     /// [`try_recv_with_id`](Self::try_recv_with_id).
     ///
+    /// Inputs left over from a bridge connection that has since ended are
+    /// discarded here rather than handed over; see
+    /// [`stale_inputs`](Self::stale_inputs).
+    ///
     /// Always `None` on a disabled layer.
     pub fn try_recv(&self) -> Option<AgentInput> {
         self.try_recv_with_id().map(|(_, input)| input)
@@ -250,10 +269,12 @@ impl TariaLayer {
 
     /// Wait up to `timeout` for the next agent input.
     ///
-    /// Acks [`Delivered`](InputStatus::Delivered) exactly like
-    /// [`try_recv`](Self::try_recv). A disabled layer has nothing to wait for
-    /// but still waits out the timeout, so an app that paces its loop on this
-    /// call keeps its timing whether or not taria bound.
+    /// Acks [`Delivered`](InputStatus::Delivered) and discards stale inputs
+    /// exactly like [`try_recv`](Self::try_recv); a discard consumes none of
+    /// the budget, the wait resumes for what is left of `timeout`. A disabled
+    /// layer has nothing to wait for but still waits out the timeout, so an
+    /// app that paces its loop on this call keeps its timing whether or not
+    /// taria bound.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<AgentInput> {
         self.recv_timeout_with_id(timeout).map(|(_, input)| input)
     }
@@ -265,9 +286,12 @@ impl TariaLayer {
     /// unacknowledged by forgetting to call something.
     pub fn try_recv_with_id(&self) -> Option<(InputId, AgentInput)> {
         let inner = self.inner.as_ref()?;
-        let (id, input) = inner.input_rx.try_recv().ok()?;
-        inner.shared.queue_ack(id, InputStatus::Delivered);
-        Some((id, input))
+        loop {
+            let queued = inner.input_rx.try_recv().ok()?;
+            if inner.shared.deliver(queued.generation, queued.id) {
+                return Some((queued.id, queued.input));
+            }
+        }
     }
 
     /// [`recv_timeout`](Self::recv_timeout), keeping the [`InputId`] so the
@@ -280,9 +304,17 @@ impl TariaLayer {
             thread::sleep(timeout);
             return None;
         };
-        let (id, input) = inner.input_rx.recv_timeout(timeout).ok()?;
-        inner.shared.queue_ack(id, InputStatus::Delivered);
-        Some((id, input))
+        // Discarding a stale input must not cut the wait short: an app that
+        // paces its event loop on this call would otherwise spin through the
+        // rest of its budget the moment a bridge disconnects.
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let queued = inner.input_rx.recv_timeout(remaining).ok()?;
+            if inner.shared.deliver(queued.generation, queued.id) {
+                return Some((queued.id, queued.input));
+            }
+        }
     }
 
     /// Hand every queued agent input to `f`, in arrival order.
@@ -338,6 +370,27 @@ impl TariaLayer {
         self.inner.as_ref().map_or(0, |inner| {
             inner.shared.dropped_inputs.load(Ordering::Relaxed)
         })
+    }
+
+    /// How many agent inputs have been discarded so far because the bridge
+    /// connection they arrived on ended before the app dequeued them. Always
+    /// 0 on a disabled layer.
+    ///
+    /// Such an input was aimed at a bridge session that no longer exists:
+    /// applying it would act on an agent's intent minutes or milliseconds
+    /// after the agent that formed it is gone, with nobody left to receive
+    /// the result. A `key q` that arrives just before the bridge restarts
+    /// would otherwise quit the app on the next frame. The bridge drops its
+    /// own queue on reconnect for the mirror-image reason, so both sides
+    /// agree that an input belongs to one connection.
+    ///
+    /// Monotonic across reconnects, and read like
+    /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
+    /// restored, never while the app owns the alternate screen.
+    pub fn stale_inputs(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.shared.stale_inputs.load(Ordering::Relaxed))
     }
 
     /// Publish `nodes` as a snapshot, without going through a
@@ -404,8 +457,15 @@ impl Drop for TariaLayer {
         // Wake the listener thread if it is blocked in accept(); the dummy
         // connection is never served because the shutdown flag is checked
         // right after accept returns.
-        let _ = UnixStream::connect(&self.socket_path);
-        if let Some(handle) = inner.listener.take() {
+        let woke_listener = UnixStream::connect(&self.socket_path).is_ok();
+        let listener = inner.listener.take();
+        // Join only when the wake-up actually landed. If the connect failed,
+        // say because the socket file is already gone, nothing will ever
+        // return the listener from accept() and join() would block forever,
+        // hanging the app at exit. Dropping the handle detaches the thread
+        // instead: a leaked thread in a process that is on its way out is
+        // strictly better than an app that will not close.
+        if woke_listener && let Some(handle) = listener {
             let _ = handle.join();
         }
         let _ = fs::remove_file(&self.socket_path);
@@ -420,6 +480,10 @@ struct Shared {
     /// Agent inputs dropped because the input queue was full. Written by
     /// reader threads, read via [`TariaLayer::dropped_inputs`].
     dropped_inputs: AtomicU64,
+    /// Agent inputs discarded at dequeue because the connection they arrived
+    /// on had ended. Written by the app thread, read via
+    /// [`TariaLayer::stale_inputs`].
+    stale_inputs: AtomicU64,
 }
 
 #[derive(Default)]
@@ -433,6 +497,12 @@ struct State {
     /// than written where they are produced, so that one thread owns the
     /// stream and an ack can never overtake the snapshot published after it.
     acks: VecDeque<(InputId, InputStatus)>,
+    /// Which bridge connection is live. Bumped when a connection starts and
+    /// again when it ends, so the value between connections matches nothing.
+    /// Every queued input carries the generation it arrived on, which is what
+    /// lets the app tell an input the live bridge is waiting on from one that
+    /// outlived its sender.
+    generation: u64,
     shutdown: bool,
 }
 
@@ -461,6 +531,28 @@ impl Shared {
     fn clear_acks(&self) {
         self.lock_state().acks.clear();
     }
+
+    /// Answer an input the app just dequeued, or refuse it as stale.
+    ///
+    /// Returns true after queueing the [`Delivered`](InputStatus::Delivered)
+    /// ack for an input whose connection is still live. Returns false for an
+    /// input from a retired generation: the caller must discard it instead of
+    /// acting on it, because it was aimed at a bridge session that no longer
+    /// exists. A discard is counted (see [`TariaLayer::stale_inputs`]) and
+    /// deliberately not acked, since the peer that would read the ack is the
+    /// one that is gone.
+    fn deliver(&self, generation: u64, id: InputId) -> bool {
+        let mut state = self.lock_state();
+        if state.generation != generation {
+            drop(state);
+            self.stale_inputs.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        state.acks.push_back((id, InputStatus::Delivered));
+        drop(state);
+        self.cv.notify_all();
+        true
+    }
 }
 
 /// Does `node` or any of its descendants have focus?
@@ -469,11 +561,7 @@ fn subtree_has_focus(node: &Node) -> bool {
 }
 
 /// Accept loop: serves one bridge client at a time until shutdown.
-fn accept_loop(
-    listener: UnixListener,
-    shared: Arc<Shared>,
-    input_tx: SyncSender<(InputId, AgentInput)>,
-) {
+fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender<QueuedInput>) {
     loop {
         if shared.is_shutdown() {
             return;
@@ -502,7 +590,7 @@ fn accept_loop(
 fn serve_client(
     stream: UnixStream,
     shared: &Arc<Shared>,
-    input_tx: &SyncSender<(InputId, AgentInput)>,
+    input_tx: &SyncSender<QueuedInput>,
 ) -> io::Result<()> {
     // SO_SNDTIMEO is shared across the duplicated fds; only writes block long
     // enough to need it.
@@ -512,13 +600,14 @@ fn serve_client(
     // Capture the snapshot and epoch atomically so the writer loop neither
     // misses nor duplicates a publish that races the handshake. Acks left
     // over from the previous connection go here: they name ids this client
-    // never used. An input queued before that connection dropped can still be
-    // dequeued (and so acked) after this one starts, so a bridge must ignore
-    // acks for ids it has no input pending for.
-    let (initial_snapshot, initial_epoch) = {
+    // never used. The generation taken here tags every input this connection
+    // queues, so an input that outlives it is discarded rather than applied
+    // to the app on behalf of a bridge that is gone.
+    let (initial_snapshot, initial_epoch, generation) = {
         let mut state = shared.lock_state();
         state.acks.clear();
-        (state.latest.clone(), state.epoch)
+        state.generation += 1;
+        (state.latest.clone(), state.epoch, state.generation)
     };
     write_line(
         &mut write_stream,
@@ -536,7 +625,7 @@ fn serve_client(
         let alive = Arc::clone(&alive);
         let shared = Arc::clone(shared);
         let input_tx = input_tx.clone();
-        move || reader_loop(stream, input_tx, alive, shared)
+        move || reader_loop(stream, input_tx, alive, shared, generation)
     })?;
 
     writer_loop(&mut write_stream, shared, &alive, initial_epoch);
@@ -546,7 +635,8 @@ fn serve_client(
     let _ = write_stream.shutdown(Shutdown::Both);
     let _ = reader.join();
     // Whatever is still queued can no longer be delivered, and means nothing
-    // to the next client.
+    // to the next client. Queued inputs need no sweep here: the reader
+    // retired their generation, so the app discards them as it dequeues.
     shared.clear_acks();
     Ok(())
 }
@@ -559,11 +649,16 @@ fn serve_client(
 /// so the agent learns of it, and counted for the app (see
 /// [`TariaLayer::dropped_inputs`]); a flood of inputs can never block this
 /// thread.
+///
+/// Every forwarded input carries `generation`, which this loop retires when
+/// the connection ends so anything still queued from it is discarded instead
+/// of delivered.
 fn reader_loop(
     stream: UnixStream,
-    input_tx: SyncSender<(InputId, AgentInput)>,
+    input_tx: SyncSender<QueuedInput>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
+    generation: u64,
 ) {
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
@@ -590,7 +685,12 @@ fn reader_loop(
             continue;
         };
         let BridgeToApp::Input { id, input } = msg;
-        match input_tx.try_send((id, input)) {
+        let queued = QueuedInput {
+            generation,
+            id,
+            input,
+        };
+        match input_tx.try_send(queued) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 shared.dropped_inputs.fetch_add(1, Ordering::Relaxed);
@@ -599,12 +699,19 @@ fn reader_loop(
             Err(TrySendError::Disconnected(_)) => break,
         }
     }
+    let mut state = shared.lock_state();
+    // Retire this connection's generation before anyone can observe the
+    // disconnect: an input still queued from it must already be stale by the
+    // time the peer is gone, because no ack could reach that peer any more.
+    // Only one connection is served at a time and `serve_client` joins this
+    // thread before accepting the next, so this always retires the generation
+    // that just ended.
+    state.generation += 1;
     alive.store(false, Ordering::SeqCst);
     // Notify while holding the lock so the writer cannot miss the wakeup
     // between checking `alive` and parking on the condvar.
-    let guard = shared.lock_state();
     shared.cv.notify_all();
-    drop(guard);
+    drop(state);
 }
 
 /// Writer half of a connection: send queued acks, then each newly published
@@ -953,6 +1060,93 @@ mod tests {
         assert!(!root.focused, "a focused node unfocuses the auto root");
         let ids: Vec<&str> = root.children.iter().map(|c| c.id.0.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
+    }
+
+    /// The ordering [`writer_loop`] promises, exercised where it actually
+    /// bites: an ack and a newer snapshot pending in the *same* pass. Driving
+    /// the loop directly over a socket pair is the only way to make that
+    /// overlap certain; through a live connection the writer wakes on the
+    /// first of the two and usually drains it before the second exists, so
+    /// the socket tests only ever see the two in separate passes.
+    #[test]
+    fn writer_sends_pending_acks_before_a_pending_snapshot() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+
+        let shared = Arc::new(Shared {
+            app_label: "ackorder".into(),
+            state: Mutex::new(State::default()),
+            cv: Condvar::new(),
+            dropped_inputs: AtomicU64::new(0),
+            stale_inputs: AtomicU64::new(0),
+        });
+        {
+            // Both are waiting before the loop runs, so it has to choose an
+            // order: the app acked an input and published a new tree in
+            // response to it.
+            let mut state = shared.lock_state();
+            state.acks.push_back((7, InputStatus::Delivered));
+            state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
+            state.epoch = 1;
+        }
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let writer = thread::spawn({
+            let shared = Arc::clone(&shared);
+            let alive = Arc::clone(&alive);
+            move || {
+                let mut server = server;
+                writer_loop(&mut server, &shared, &alive, 0);
+            }
+        });
+
+        let mut reader = BufReader::new(client);
+        let mut read_message = || {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("read a message");
+            assert!(n > 0, "writer closed the stream");
+            serde_json::from_str::<AppToBridge>(&line).expect("parse a message")
+        };
+        assert_eq!(
+            read_message(),
+            AppToBridge::Ack {
+                id: 7,
+                status: InputStatus::Delivered
+            },
+            "an agent that saw the snapshot first could not tell whether it \
+             already reflects its input"
+        );
+        let AppToBridge::Snapshot(snapshot) = read_message() else {
+            panic!("expected the snapshot after the ack");
+        };
+        assert_eq!(snapshot.seq, 1);
+
+        shared.lock_state().shutdown = true;
+        shared.cv.notify_all();
+        writer.join().expect("writer thread");
+    }
+
+    /// Exit must not depend on the wake-up connection succeeding: with the
+    /// socket file gone, nothing can return the listener from `accept()`, and
+    /// a join would hang the app forever.
+    #[test]
+    fn drop_returns_even_when_the_listener_cannot_be_woken() {
+        let layer = bind_test_layer("taria-drophang-", "unwakeable");
+        fs::remove_file(layer.socket_path()).expect("remove the socket file");
+
+        // Drop off-thread so a regression fails this test instead of hanging
+        // the whole suite.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(layer);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "drop must not join a listener that can no longer be woken"
+        );
     }
 
     #[test]
