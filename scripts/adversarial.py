@@ -89,11 +89,12 @@ def partial_drop_error(dropped, sent):
 # A burst the bridge could not finish handing over. The counts are whatever
 # the kernel's socket buffer happened to hold, so they are captured rather
 # than spelled out; every other word is verbatim, and the bracketed drop
-# clause must be absent when the app acked nothing.
+# clause must be absent when the app acked nothing. The verbs agree with the
+# counts they follow, so a burst of one is not reported as "1 ... were sent".
 PARTIAL_SEND_RE = re.compile(
     r"^the app stopped accepting input partway through this call: (?P<sent>\d+) of the "
-    r"(?P<wanted>\d+) inputs were sent and may already have taken effect, and the "
-    r"remaining (?P<unsent>\d+) were not sent, so the effect is partial\."
+    r"(?P<wanted>\d+) inputs (?:was|were) sent and may already have taken effect, and "
+    r"the remaining (?P<unsent>\d+) (?:was|were) not sent, so the effect is partial\."
     r"(?P<dropped> Of the (?P=sent) sent, the app dropped (?P<n>\d+) because its input "
     r"queue was full\.)? Call read_tree to see what landed, then retry the rest once "
     r"the app is responsive\.$"
@@ -101,14 +102,17 @@ PARTIAL_SEND_RE = re.compile(
 
 # The bridge's ack channel fell behind while a call was in flight. `lost` is a
 # function of how fast the reader outran the observer, so it is captured; the
-# `{known}` clause has exactly two shapes and both are spelled out.
+# `{known}` clause has exactly two shapes and both are spelled out. The noun
+# and the verb agree with the counts they follow, so a one-input call reads
+# "the 1 input it sent" rather than "the 1 inputs it sent".
 LOST_ACKS_RE = re.compile(
     r"^the bridge lost (?P<lost>\d+) of the app's acknowledgements while this call was "
-    r"in flight, so what became of the (?P<sent>\d+) inputs it sent cannot be reported "
+    r"in flight, so what became of the (?P<sent>\d+) inputs? it sent cannot be reported "
     r"in full: (?P<known>they may or may not have been applied|at least (?P<dropped>\d+)"
-    r" of them were dropped because the app's input queue was full, and the rest may or "
-    r"may not have been applied)\. Call read_tree to see what actually landed, and send "
-    r"fewer inputs per call so the answers can be read as fast as they arrive\.$"
+    r" of them (?:was|were) dropped because the app's input queue was full, and the "
+    r"rest may or may not have been applied)\. Call read_tree to see what actually "
+    r"landed, and send fewer inputs per call so the answers can be read as fast as "
+    r"they arrive\.$"
 )
 
 

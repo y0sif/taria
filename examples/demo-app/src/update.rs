@@ -172,9 +172,27 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Whether this press carries ctrl or alt, which makes it a chord rather than
+/// the plain key the demo's single-key bindings name.
+///
+/// Shift is not a chord: it is how an uppercase character arrives, and the
+/// character already says which one it is.
+fn is_chord(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 // --- List focus ---
 
 fn handle_list_key(app: &mut App, key: KeyEvent) {
+    // A chord is not the plain key it is built from: `ctrl+q` must not quit
+    // and `ctrl+j` must not move the cursor, or an agent reaching for a
+    // control chord some other part of a UI wants closes this app by
+    // accident. Falling through here leaves it unhandled the way any unbound
+    // press is, which the caller still reports as received.
+    if is_chord(key) {
+        return;
+    }
     match key.code {
         KeyCode::Char('q') => app.running = false,
         KeyCode::Tab => switch_tab(app, app.tab.other()),
@@ -236,11 +254,11 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => {
             app.input.pop();
         }
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
+        // The guard sits on this arm rather than at the top of the handler
+        // because this is the arm that would otherwise swallow the chord:
+        // `ctrl+c` is not the letter `c`, and typing it into the draft is
+        // the one thing an agent sending it cannot have meant.
+        KeyCode::Char(c) if !is_chord(key) => {
             app.input.push(c);
         }
         _ => {}
@@ -269,6 +287,11 @@ fn submit_input(app: &mut App) -> Applied {
 // --- Dialog ---
 
 fn handle_dialog_key(app: &mut App, key: KeyEvent) {
+    // The same rule as the list, and it matters more here: `ctrl+y` is not
+    // the `y` that deletes a task.
+    if is_chord(key) {
+        return;
+    }
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => confirm_delete(app),
         KeyCode::Char('n') | KeyCode::Esc => app.dialog = None,
@@ -683,6 +706,57 @@ mod tests {
         assert!(app.input.is_empty(), "esc discards the draft");
         apply_agent_input(&mut app, key("q"));
         assert!(!app.running);
+    }
+
+    /// A control chord is not the letter it is built from. An agent that
+    /// sends `ctrl+q` (or has a chord bound elsewhere in its own habits) must
+    /// not close the app or move the cursor by accident, and the demo answers
+    /// the way it answers any unbound press: received, nothing done.
+    #[test]
+    fn control_chords_are_not_the_plain_bindings() {
+        let mut app = App::new();
+
+        assert_eq!(apply_agent_input(&mut app, key("ctrl+q")), Applied::Handled);
+        assert!(app.running, "ctrl+q must not quit");
+
+        let selection = app.selection;
+        apply_agent_input(&mut app, key("ctrl+j"));
+        apply_agent_input(&mut app, key("ctrl+k"));
+        apply_agent_input(&mut app, key("alt+down"));
+        assert_eq!(app.selection, selection, "chords must not move the cursor");
+
+        apply_agent_input(&mut app, key("ctrl+i"));
+        assert_eq!(app.focus, Focus::List, "ctrl+i must not focus the input");
+
+        apply_agent_input(&mut app, key("ctrl+d"));
+        assert_eq!(app.dialog, None, "ctrl+d must not open the delete dialog");
+
+        // The plain keys still work, so the guard blocks chords and nothing
+        // else.
+        apply_agent_input(&mut app, key("j"));
+        assert_eq!(app.selection, selection + 1);
+        apply_agent_input(&mut app, key("q"));
+        assert!(!app.running, "q still quits");
+    }
+
+    /// The dialog is modal and its `y` deletes, so a chord reaching it is the
+    /// same accident with a worse ending.
+    #[test]
+    fn control_chords_do_not_answer_the_delete_dialog() {
+        let mut app = App::new();
+        let before = app.tasks.len();
+        apply_agent_input(&mut app, key("d"));
+        assert!(app.dialog.is_some());
+
+        apply_agent_input(&mut app, key("ctrl+y"));
+        assert!(app.dialog.is_some(), "ctrl+y must not confirm the delete");
+        assert_eq!(app.tasks.len(), before, "nothing was deleted");
+
+        apply_agent_input(&mut app, key("ctrl+n"));
+        assert!(app.dialog.is_some(), "ctrl+n must not cancel either");
+
+        apply_agent_input(&mut app, key("y"));
+        assert_eq!(app.tasks.len(), before - 1, "plain y still confirms");
     }
 
     #[test]

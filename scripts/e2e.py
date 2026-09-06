@@ -1062,7 +1062,19 @@ def step_p_ack_without_change(client, ctx):
 
 
 def step_q_shutdown(client, ctx, app):
-    client.call_raw("key", {"key": "q"})  # quit; tree may or may not update
+    # `q` quits, so the app is gone before this call can answer. The answer
+    # has to say that: an input that ended the app reported as "the tree did
+    # not change" tells the agent the app is idle while it is in fact gone.
+    try:
+        text = client.call_raw("key", {"key": "q"})
+        raise StepFailure(
+            f"the key that quit the app answered as if it were still there: {text[:200]}"
+        )
+    except ToolError as err:
+        require(
+            "disconnected" in err.message and "may have exited" in err.message,
+            f"unexpected report from the quitting key: {err.message[:200]}",
+        )
 
     # The bridge must notice the disconnect and fail read_tree cleanly.
     deadline = time.monotonic() + READ_TIMEOUT

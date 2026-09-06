@@ -484,6 +484,13 @@ struct Observed {
     lost: u64,
     /// Newest snapshot differing from the one the input was aimed at.
     changed: Option<Snapshot>,
+    /// The state the bridge was left in when the app went away and had not
+    /// come back by the end of the window.
+    ///
+    /// An input can be the reason the app is gone (a quit key, a crash it
+    /// triggered), and every other verdict here describes an app that is
+    /// still there, so this one has to outrank them.
+    gone: Option<BridgeState>,
 }
 
 /// Watch the app's acks and snapshots for up to [`UPDATE_WAIT`], and report
@@ -515,6 +522,11 @@ struct Observed {
 /// the state pass through a non-`Connected` value (the bridge's disconnect
 /// marker) also counts as a change, because the next snapshot then comes from
 /// a fresh app instance.
+///
+/// A departure the window ends on is kept in [`Observed::gone`] instead: the
+/// app that received this input is not there any more, and no ack or tree
+/// answers that. An app that comes back inside the window clears it, because
+/// its tree is a real answer and the better one.
 async fn observe(
     mut acks: broadcast::Receiver<(InputId, InputStatus)>,
     mut rx: watch::Receiver<BridgeState>,
@@ -581,8 +593,12 @@ async fn observe(
                     continue;
                 }
                 match rx.borrow_and_update().clone() {
-                    BridgeState::Never | BridgeState::Disconnected { .. } => reconnected = true,
+                    state @ (BridgeState::Never | BridgeState::Disconnected { .. }) => {
+                        reconnected = true;
+                        seen.gone = Some(state);
+                    }
                     BridgeState::Connected(snapshot) => {
+                        seen.gone = None;
                         if reconnected || snapshot != *pre {
                             seen.changed = Some(snapshot);
                             if seen.status.is_some() {
@@ -609,9 +625,10 @@ fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolRes
     if seen.lost > 0 {
         let known = if seen.dropped > 0 {
             format!(
-                "at least {} of them were dropped because the app's input queue was full, and the \
+                "at least {} of them {} dropped because the app's input queue was full, and the \
                  rest may or may not have been applied",
-                seen.dropped
+                seen.dropped,
+                was_were(seen.dropped)
             )
         } else {
             "they may or may not have been applied".to_string()
@@ -619,10 +636,11 @@ fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolRes
         return Err(McpError::internal_error(
             format!(
                 "the bridge lost {} of the app's acknowledgements while this call was in flight, \
-                 so what became of the {sent} inputs it sent cannot be reported in full: {known}. \
-                 Call read_tree to see what actually landed, and send fewer inputs per call so \
-                 the answers can be read as fast as they arrive.",
-                seen.lost
+                 so what became of the {} it sent cannot be reported in full: {known}. Call \
+                 read_tree to see what actually landed, and send fewer inputs per call so the \
+                 answers can be read as fast as they arrive.",
+                seen.lost,
+                inputs(sent)
             ),
             None,
         ));
@@ -639,6 +657,32 @@ fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolRes
                  inputs, or wait for each call to return before sending the next; slower input \
                  gets through.",
                 seen.dropped
+            ),
+            None,
+        ));
+    }
+    // The app this call was talking to is gone, and none of the verdicts
+    // below can say so: a tree would describe a UI that no longer exists, and
+    // the two no-answer notes would put it down to an app that has not
+    // reacted yet. A drop still outranks this, here and in the burst report
+    // above: "the app never applied this input" is a fact about the input
+    // that the app's exit does not change, and it would contradict the
+    // "possibly because of this input" below.
+    if let Some(state) = seen.gone
+        && seen.status != Some(InputStatus::Dropped)
+    {
+        // Said the way `read_tree` says it about the same condition, so an
+        // agent meets one vocabulary for a missing app, not two.
+        let lead = if seen.status.is_some() {
+            "the app received this input and then disconnected"
+        } else {
+            "the app disconnected before acknowledging this input"
+        };
+        return Err(McpError::internal_error(
+            format!(
+                "{lead}: {} and may have exited, possibly because of this input. The bridge \
+                 reconnects automatically; retry once the app is back.",
+                gone_app(&state)
             ),
             None,
         ));
@@ -697,12 +741,49 @@ fn partial_send_error(seen: &Observed, sent: usize, wanted: usize) -> McpError {
     McpError::internal_error(
         format!(
             "the app stopped accepting input partway through this call: {sent} of the {wanted} \
-             inputs were sent and may already have taken effect, and the remaining {unsent} were \
-             not sent, so the effect is partial.{dropped} Call read_tree to see what landed, then \
-             retry the rest once the app is responsive."
+             inputs {} sent and may already have taken effect, and the remaining {unsent} {} not \
+             sent, so the effect is partial.{dropped} Call read_tree to see what landed, then \
+             retry the rest once the app is responsive.",
+            was_were(sent),
+            was_were(unsent)
         ),
         None,
     )
+}
+
+/// "1 input" or "4 inputs", so a single-input call is not reported with a
+/// count and a noun that disagree.
+fn inputs(count: usize) -> String {
+    if count == 1 {
+        format!("{count} input")
+    } else {
+        format!("{count} inputs")
+    }
+}
+
+/// The verb agreeing with a subject of `count`, for the same reason.
+fn was_were(count: usize) -> &'static str {
+    if count == 1 { "was" } else { "were" }
+}
+
+/// Name the app the bridge no longer has, in the words
+/// [`available_snapshot`] uses for the same state.
+fn gone_app(state: &BridgeState) -> String {
+    match state {
+        BridgeState::Disconnected {
+            app_label,
+            last_seq,
+        } => format!(
+            "app '{}' (last snapshot seq {last_seq}) is gone",
+            app_label.as_deref().unwrap_or("unknown")
+        ),
+        // The bridge only ever demotes a connected app to `Disconnected`, and
+        // an input tool refuses to send before the first connection, so
+        // neither of these can be the state a call was left in. Described
+        // without the details rather than asserted away, because a report is
+        // no place to panic.
+        BridgeState::Never | BridgeState::Connected(_) => "the app is gone".to_string(),
+    }
 }
 
 /// Depth-first search for a node by id.
@@ -842,12 +923,122 @@ mod tests {
             dropped: 2,
             lost: 1,
             changed: None,
+            gone: None,
         };
         let err = report(seen, snapshot("after"), 5).expect_err("lost acks are not a success");
         assert!(
             err.message.contains("at least 2 of them were dropped"),
             "a drop count that cannot be complete must not read as exact: {}",
             err.message
+        );
+    }
+
+    /// Counts and the words around them have to agree: "the 1 inputs it sent"
+    /// reads as a bug in the bridge, in a message whose whole job is to be
+    /// trusted about what became of a call.
+    #[test]
+    fn a_one_input_call_is_reported_in_the_singular() {
+        let seen = Observed {
+            status: Some(InputStatus::Delivered),
+            dropped: 1,
+            lost: 1,
+            changed: None,
+            gone: None,
+        };
+        let err = report(seen, snapshot("after"), 1).expect_err("lost acks are not a success");
+        assert!(
+            err.message.contains("the 1 input it sent"),
+            "a single input is one input: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("at least 1 of them was dropped"),
+            "a single drop is not a plural: {}",
+            err.message
+        );
+
+        // The same agreement in the other message that counts a burst.
+        let cut_short = partial_send_error(&Observed::default(), 1, 2);
+        assert!(
+            cut_short.message.contains("1 of the 2 inputs was sent"),
+            "one input sent is singular: {}",
+            cut_short.message
+        );
+        assert!(
+            cut_short.message.contains("the remaining 1 was not sent"),
+            "one input unsent is singular: {}",
+            cut_short.message
+        );
+    }
+
+    /// An input the app does not survive must not read as "nothing happened".
+    /// The app is gone, `read_tree` would say so on the next call, and the
+    /// tool that sent the input is the first place the agent can hear it.
+    #[tokio::test]
+    async fn an_app_that_stays_gone_is_reported_gone_rather_than_unreactive() {
+        let (ack_tx, acks) = broadcast::channel(4);
+        let pre = snapshot("before");
+        let (state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
+        let _ = ack_tx.send((1, InputStatus::Delivered));
+        state_tx.send_replace(BridgeState::Disconnected {
+            app_label: Some("demo".to_string()),
+            last_seq: 7,
+        });
+
+        let seen = observe(acks, rx, &pre, &[1]).await;
+        assert!(
+            seen.gone.is_some(),
+            "a departure must be recorded: {seen:?}"
+        );
+
+        let err = report(seen, pre, 1).expect_err("an app that went away is not a success");
+        assert!(
+            err.message
+                .contains("received this input and then disconnected")
+                && err
+                    .message
+                    .contains("app 'demo' (last snapshot seq 7) is gone"),
+            "the report must name the app and its departure: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("did not change"),
+            "an app that exited must not be reported as one that ignored the input: {}",
+            err.message
+        );
+    }
+
+    /// The other half of the same window: an app that comes back is a real
+    /// answer, and the fresh instance's tree is what the agent needs.
+    #[tokio::test]
+    async fn an_app_that_comes_back_inside_the_window_answers_with_its_tree() {
+        let (ack_tx, acks) = broadcast::channel(4);
+        let pre = snapshot("before");
+        let (state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
+        let _ = ack_tx.send((1, InputStatus::Delivered));
+        state_tx.send_replace(BridgeState::Disconnected {
+            app_label: Some("demo".to_string()),
+            last_seq: 7,
+        });
+        // The restarted app draws the same tree it drew before, so the gap
+        // itself is the only evidence a new instance answered.
+        let after = pre.clone();
+        tokio::spawn(async move {
+            // Long enough for the observer to read the disconnect first, and
+            // far short of the window it has to answer in.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            state_tx.send_replace(BridgeState::Connected(after));
+        });
+
+        let seen = observe(acks, rx, &pre, &[1]).await;
+        assert!(
+            seen.gone.is_none(),
+            "an app that came back is not gone: {seen:?}"
+        );
+        assert_eq!(
+            seen.changed.as_ref(),
+            Some(&pre),
+            "the fresh instance's tree is the answer: {seen:?}"
         );
     }
 

@@ -318,6 +318,57 @@ async fn act_reports_delivered_without_a_tree_change() {
     echo.await.expect("fake app task");
 }
 
+/// The same shape from the outside - an ack and no new tree - but the app
+/// took the input and exited. "Its tree did not change" would tell the agent
+/// the app is sitting there having done nothing, when it is gone; the answer
+/// has to be the disconnect, in the words `read_tree` uses for it.
+#[tokio::test]
+async fn act_reports_an_app_that_went_away_after_taking_the_input() {
+    let (_dir, path) = test_socket_path("act-then-exit");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+
+    let app = FakeApp::accept(&listener, Snapshot::new(4, demo_root("about-to-exit"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 4).await;
+
+    // Acks, then exits without drawing again, taking its socket with it.
+    let exit = tokio::spawn(async move {
+        let mut app = app;
+        app.recv_input().await;
+        drop(app);
+        drop(listener);
+    });
+
+    let err = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect_err("an app that exited is not a tool call that went fine");
+    assert!(
+        err.message
+            .contains("the app received this input and then disconnected"),
+        "the report must tie the departure to the input: {}",
+        err.message
+    );
+    assert!(
+        err.message
+            .contains("app 'fake-app' (last snapshot seq 4) is gone"),
+        "the report must name which app went away, and when: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("did not change"),
+        "an app that exited must not read as one that ignored the input: {}",
+        err.message
+    );
+
+    exit.await.expect("fake app task");
+}
+
 /// An app that never reads its socket: no ack, no snapshot. The result must
 /// not claim the app received anything.
 #[tokio::test]
