@@ -326,6 +326,116 @@ async fn key_rejects_empty_key() {
 }
 
 #[tokio::test]
+async fn newline_free_flood_disconnects_the_app_connection() {
+    let (listener, mut handle, _server) = setup("line-flood").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("pre-flood"))).await;
+    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+
+    // Stream a few MiB with no newline; the bridge must treat the connection
+    // as broken (watch clears to None) instead of buffering it all.
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..48 {
+        // 48 * 64 KiB = 3 MiB
+        if app.write.write_all(&chunk).await.is_err() {
+            break; // the bridge already dropped the connection
+        }
+    }
+    wait_for_clear(&mut handle.snapshot_rx).await;
+}
+
+/// Simulate an app restart mid-`act`: the fake app receives the input, then
+/// its process "dies" and a fresh instance (seq starting over) comes up. The
+/// listener is rebound before the old connection drops so the bridge's
+/// reconnect succeeds immediately.
+async fn restart_app_on_input(
+    listener: UnixListener,
+    path: PathBuf,
+    mut app: FakeApp,
+    fresh: Snapshot,
+) -> FakeApp {
+    let input = app.recv_input().await;
+    assert!(matches!(input, AgentInput::Act { .. }));
+    drop(listener);
+    std::fs::remove_file(&path).expect("remove old socket file");
+    let listener = UnixListener::bind(&path).expect("rebind fake app socket");
+    drop(app); // the bridge sees the disconnect and reconnects
+    FakeApp::accept(&listener, fresh).await
+}
+
+#[tokio::test]
+async fn act_returns_fresh_tree_after_app_restart() {
+    let path = test_socket_path("restart-act");
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+
+    // The old instance is at seq 5; the restarted one starts over at seq 1.
+    let app = FakeApp::accept(&listener, Snapshot::new(5, demo_root("before-restart"))).await;
+    wait_for_snapshot(&mut handle.snapshot_rx, 5).await;
+    let restart = tokio::spawn(restart_app_on_input(
+        listener,
+        path,
+        app,
+        Snapshot::new(1, demo_root("after-restart")),
+    ));
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("act across an app restart");
+    let text = result_text(&result);
+    assert!(
+        !text.contains("did not change"),
+        "restart must not be misreported as no change: {text}"
+    );
+    assert!(text.contains("after-restart"), "tree json: {text}");
+    assert!(text.contains("\"seq\":1"), "tree json: {text}");
+
+    restart.await.expect("fake app restart task");
+}
+
+#[tokio::test]
+async fn act_detects_restart_even_when_seq_matches() {
+    let path = test_socket_path("restart-act-same-seq");
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+
+    // Both instances publish seq 1, but the trees differ.
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("generation-one"))).await;
+    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    let restart = tokio::spawn(restart_app_on_input(
+        listener,
+        path,
+        app,
+        Snapshot::new(1, demo_root("generation-two")),
+    ));
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("act across a same-seq app restart");
+    let text = result_text(&result);
+    assert!(
+        !text.contains("did not change"),
+        "same-seq restart must not be misreported as no change: {text}"
+    );
+    assert!(text.contains("generation-two"), "tree json: {text}");
+
+    restart.await.expect("fake app restart task");
+}
+
+#[tokio::test]
 async fn disconnect_clears_watch_and_read_tree_errors_again() {
     let (listener, mut handle, server) = setup("disconnect").await;
     let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("alive"))).await;

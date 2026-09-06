@@ -6,13 +6,15 @@
 //! `BridgeToApp::Input` lines. On disconnect the watch is cleared to `None`
 //! so tool calls fail fast instead of acting on a stale tree.
 
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use taria::wire::{AppToBridge, BridgeToApp};
 use taria::{AgentInput, PROTOCOL_VERSION, Snapshot};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::net::unix::OwnedReadHalf;
 use tokio::sync::{mpsc, watch};
 
 /// First reconnect delay after a failed connect attempt.
@@ -21,6 +23,10 @@ const RETRY_MIN: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(2);
 /// Queued agent inputs awaiting the socket writer.
 const INPUT_QUEUE: usize = 32;
+/// Longest accepted ndjson line from the app. A peer that streams more than
+/// this without a newline is treated as a broken connection (disconnect and
+/// reconnect) so the bridge never buffers a line unboundedly.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Handles the MCP tool layer uses to talk to the socket-manager task.
 #[derive(Clone)]
@@ -90,6 +96,42 @@ async fn manager_loop(
     }
 }
 
+/// Outcome of reading one line from the app socket.
+enum LineRead {
+    /// A complete line is in the buffer (newline stripped).
+    Line,
+    /// The app closed the connection (possibly mid-line).
+    Eof,
+    /// The line exceeded [`MAX_LINE_BYTES`]; the connection is broken.
+    Overflow,
+}
+
+/// Read one `\n`-terminated line into `buf` (newline stripped), reading at
+/// most [`MAX_LINE_BYTES`] plus the newline.
+///
+/// Cancel-safe: `read_until` appends partially read bytes to `buf`, and the
+/// cap is recomputed from `buf.len()`, so being cancelled by `select!` and
+/// re-called continues the same line without loosening the limit.
+async fn read_line_capped(
+    reader: &mut BufReader<OwnedReadHalf>,
+    buf: &mut Vec<u8>,
+) -> io::Result<LineRead> {
+    loop {
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            return Ok(LineRead::Line);
+        }
+        if buf.len() > MAX_LINE_BYTES {
+            return Ok(LineRead::Overflow);
+        }
+        let limit = (MAX_LINE_BYTES + 1 - buf.len()) as u64;
+        let n = (&mut *reader).take(limit).read_until(b'\n', buf).await?;
+        if n == 0 {
+            return Ok(LineRead::Eof);
+        }
+    }
+}
+
 /// Serve one connection: pump app lines into the watch and agent inputs onto
 /// the socket until either side goes away.
 async fn run_connection(
@@ -98,12 +140,23 @@ async fn run_connection(
     input_rx: &mut mpsc::Receiver<AgentInput>,
 ) -> ConnectionEnd {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
+    let mut line_buf: Vec<u8> = Vec::new();
     loop {
         tokio::select! {
-            line = lines.next_line() => match line {
-                Ok(Some(line)) => handle_app_line(&line, snapshot_tx),
-                Ok(None) => return ConnectionEnd::AppClosed,
+            read = read_line_capped(&mut reader, &mut line_buf) => match read {
+                Ok(LineRead::Line) => {
+                    handle_app_line(&line_buf, snapshot_tx);
+                    line_buf.clear();
+                }
+                Ok(LineRead::Eof) => return ConnectionEnd::AppClosed,
+                Ok(LineRead::Overflow) => {
+                    tracing::warn!(
+                        cap_bytes = MAX_LINE_BYTES,
+                        "app sent an oversized line; treating the connection as broken"
+                    );
+                    return ConnectionEnd::AppClosed;
+                }
                 Err(err) => {
                     tracing::warn!(%err, "read error on app socket");
                     return ConnectionEnd::AppClosed;
@@ -133,8 +186,8 @@ async fn run_connection(
 
 /// Handle one ndjson line from the app. Malformed lines are logged and
 /// skipped so a buggy app cannot kill the bridge.
-fn handle_app_line(line: &str, snapshot_tx: &watch::Sender<Option<Snapshot>>) {
-    match serde_json::from_str::<AppToBridge>(line) {
+fn handle_app_line(line: &[u8], snapshot_tx: &watch::Sender<Option<Snapshot>>) {
+    match serde_json::from_slice::<AppToBridge>(line) {
         Ok(AppToBridge::Hello {
             app_label,
             protocol_version,

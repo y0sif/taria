@@ -61,11 +61,12 @@ impl TariaMcpServer {
     }
 
     /// Forward `input` to the app, then wait up to [`UPDATE_WAIT`] for a
-    /// snapshot newer than `pre_seq` and render the tool result.
+    /// snapshot that differs from the `pre` snapshot and render the tool
+    /// result.
     async fn send_and_report(
         &self,
         rx: watch::Receiver<Option<Snapshot>>,
-        pre_seq: Option<u64>,
+        pre: Option<Snapshot>,
         input: AgentInput,
     ) -> Result<CallToolResult, McpError> {
         self.input_tx.send(input).await.map_err(|_| {
@@ -74,7 +75,7 @@ impl TariaMcpServer {
                 None,
             )
         })?;
-        match wait_for_change(rx, pre_seq).await {
+        match wait_for_change(rx, pre).await {
             Some(snapshot) => tree_result(&snapshot),
             None => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Input sent, but the tree did not change within {}ms. The app may not have \
@@ -161,13 +162,12 @@ impl TariaMcpServer {
             ));
         }
 
-        let pre_seq = snapshot.seq;
         let input = AgentInput::Act {
             node: NodeId(node),
             action: parsed,
             value,
         };
-        self.send_and_report(rx, Some(pre_seq), input).await
+        self.send_and_report(rx, Some(snapshot), input).await
     }
 
     /// The `key` tool: raw key fallback.
@@ -185,9 +185,8 @@ impl TariaMcpServer {
             return Err(McpError::invalid_params("key must be non-empty", None));
         }
         let mut rx = self.snapshot_rx.clone();
-        let pre_seq = rx.borrow_and_update().as_ref().map(|s| s.seq);
-        self.send_and_report(rx, pre_seq, AgentInput::Key { key })
-            .await
+        let pre = rx.borrow_and_update().clone();
+        self.send_and_report(rx, pre, AgentInput::Key { key }).await
     }
 }
 
@@ -250,24 +249,33 @@ fn tree_result(snapshot: &Snapshot) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
 }
 
-/// Wait up to [`UPDATE_WAIT`] for a snapshot with `seq` beyond `pre_seq`
-/// (any snapshot at all when `pre_seq` is `None`).
+/// Wait up to [`UPDATE_WAIT`] for a snapshot that differs from `pre` (any
+/// snapshot at all when `pre` is `None`).
+///
+/// "Differs" is a full comparison against the `pre` snapshot rather than a
+/// `seq > pre.seq` check: after an app restart the fresh instance's `seq`
+/// starts over at 1, so a lower (or equal) `seq` with different content is
+/// still a change. Observing the watch pass through `None` (the bridge's
+/// disconnect marker) also counts as a change, because the next snapshot then
+/// comes from a fresh app instance and should be reported as the new tree.
 async fn wait_for_change(
     mut rx: watch::Receiver<Option<Snapshot>>,
-    pre_seq: Option<u64>,
+    pre: Option<Snapshot>,
 ) -> Option<Snapshot> {
     tokio::time::timeout(UPDATE_WAIT, async move {
+        let mut reconnected = false;
         loop {
             if rx.changed().await.is_err() {
                 return None;
             }
-            let newer = rx
-                .borrow_and_update()
-                .as_ref()
-                .filter(|s| pre_seq.is_none_or(|pre| s.seq > pre))
-                .cloned();
-            if newer.is_some() {
-                return newer;
+            let current = rx.borrow_and_update().clone();
+            match current {
+                None => reconnected = true,
+                Some(snapshot) => {
+                    if reconnected || pre.as_ref() != Some(&snapshot) {
+                        return Some(snapshot);
+                    }
+                }
             }
         }
     })

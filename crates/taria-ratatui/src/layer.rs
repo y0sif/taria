@@ -4,17 +4,18 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use taria::wire::{AppToBridge, BridgeToApp};
 use taria::{AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
@@ -24,6 +25,20 @@ use crate::FrameRecorder;
 /// How long a snapshot write may stall on a slow or stuck bridge before the
 /// connection is dropped. Protects the app from a peer that stops reading.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest accepted ndjson line from a connected client. A peer that streams
+/// more than this without a newline is treated as broken and disconnected,
+/// so a hostile or buggy bridge cannot make the app buffer unboundedly.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Capacity of the agent-input queue between the socket thread and the app.
+/// When the app is not draining inputs, the newest input is dropped (with a
+/// rate-limited warning) instead of blocking the socket thread or queueing
+/// without bound.
+const INPUT_QUEUE: usize = 256;
+
+/// Minimum interval between "input queue full" warnings on stderr.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The embeddable taria endpoint for a ratatui app.
 ///
@@ -54,25 +69,27 @@ impl TariaLayer {
     /// 2. `$XDG_RUNTIME_DIR/taria/<app_label>.sock`;
     /// 3. `<temp_dir>/taria-<uid or user>/<app_label>.sock`.
     ///
-    /// The parent directory is created (mode `0700`, best-effort) and a stale
-    /// socket file at the path is removed before binding.
+    /// The parent directory is created with mode `0700` and then verified to
+    /// be a private directory (a real directory, owned by the current user,
+    /// with no group/other permission bits); binding is refused otherwise,
+    /// because a directory another user controls would let them replace or
+    /// redirect the socket. A stale socket file at the path is removed before
+    /// binding.
     pub fn bind(app_label: &str) -> io::Result<Self> {
         Self::bind_at(app_label, resolve_socket_path(app_label))
     }
 
     /// Like [`bind`](Self::bind), but at an explicit socket path, skipping
     /// resolution. Useful for tests and apps that manage their own runtime
-    /// directories.
+    /// directories. The same parent-directory creation and privacy checks as
+    /// [`bind`](Self::bind) apply.
     pub fn bind_at(app_label: &str, socket_path: impl Into<PathBuf>) -> io::Result<Self> {
         let socket_path = socket_path.into();
 
-        if let Some(parent) = socket_path.parent() {
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true);
-            builder.mode(0o700);
-            // Best-effort: an existing directory keeps its mode, and a real
-            // failure surfaces as a bind error below.
-            let _ = builder.create(parent);
+        if let Some(parent) = socket_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            ensure_private_dir(parent)?;
         }
         // Remove a stale socket left by a previous run; if this fails for any
         // reason other than the file being absent, bind reports the real error.
@@ -84,7 +101,7 @@ impl TariaLayer {
             state: Mutex::new(State::default()),
             cv: Condvar::new(),
         });
-        let (input_tx, input_rx) = mpsc::channel();
+        let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
 
         let thread_shared = Arc::clone(&shared);
         let handle = thread::Builder::new()
@@ -223,7 +240,7 @@ fn subtree_has_focus(node: &Node) -> bool {
 }
 
 /// Accept loop: serves one bridge client at a time until shutdown.
-fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: Sender<AgentInput>) {
+fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender<AgentInput>) {
     loop {
         if shared.is_shutdown() {
             return;
@@ -252,7 +269,7 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: Sender<Age
 fn serve_client(
     stream: UnixStream,
     shared: &Arc<Shared>,
-    input_tx: &Sender<AgentInput>,
+    input_tx: &SyncSender<AgentInput>,
 ) -> io::Result<()> {
     // SO_SNDTIMEO is shared across the duplicated fds; only writes block long
     // enough to need it.
@@ -294,22 +311,55 @@ fn serve_client(
 }
 
 /// Reader half of a connection: parse `BridgeToApp` lines and forward agent
-/// inputs to the app. Malformed lines are ignored.
+/// inputs to the app. Malformed lines are ignored. A line longer than
+/// [`MAX_LINE_BYTES`] marks the connection broken (the loop exits and the
+/// client is disconnected) instead of buffering it. When the input queue is
+/// full the newest input is dropped with a rate-limited warning, so a flood
+/// of inputs can never block this thread.
 fn reader_loop(
     stream: UnixStream,
-    input_tx: Sender<AgentInput>,
+    input_tx: SyncSender<AgentInput>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
 ) {
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        let Ok(msg) = serde_json::from_str::<BridgeToApp>(&line) else {
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    let mut last_drop_warn: Option<Instant> = None;
+    loop {
+        buf.clear();
+        // Read at most one byte past the cap: a line that fits ends in `\n`
+        // within the limit; anything longer is an oversized frame.
+        let read = (&mut reader)
+            .take((MAX_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut buf);
+        let n = match read {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break; // EOF: the client closed the connection.
+        }
+        if buf.last() != Some(&b'\n') {
+            // Oversized line (or EOF mid-line): treat the connection as
+            // broken rather than accumulating an unbounded buffer.
+            break;
+        }
+        let Ok(msg) = serde_json::from_slice::<BridgeToApp>(&buf) else {
             continue;
         };
         let BridgeToApp::Input(input) = msg;
-        if input_tx.send(input).is_err() {
-            break;
+        match input_tx.try_send(input) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let now = Instant::now();
+                if last_drop_warn.is_none_or(|at| now.duration_since(at) >= DROP_WARN_INTERVAL) {
+                    last_drop_warn = Some(now);
+                    eprintln!(
+                        "taria: agent input queue full ({INPUT_QUEUE}); dropping newest input"
+                    );
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => break,
         }
     }
     alive.store(false, Ordering::SeqCst);
@@ -354,6 +404,80 @@ fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
     let mut line = serde_json::to_string(msg).map_err(io::Error::other)?;
     line.push('\n');
     stream.write_all(line.as_bytes())
+}
+
+/// Create (if needed) and vet the directory that will hold the socket.
+///
+/// The socket's parent directory decides who can replace or redirect the
+/// socket: if it is a symlink, owned by another user, or accessible to
+/// group/others, a local attacker can swap the socket for their own and
+/// impersonate the app (or intercept the bridge). The directory is created
+/// with mode `0700`, then verified via `symlink_metadata` — it must be a
+/// real directory (not a symlink), owned by the current user, with no
+/// group/other permission bits. Any violation is an error.
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    // An existing directory is fine here; whether it is *acceptable* is
+    // decided by the checks below, which also surface real create failures.
+    let _ = builder.create(dir);
+
+    // symlink_metadata so a planted symlink is seen as itself, not followed.
+    let meta = fs::symlink_metadata(dir).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("socket directory {} is unusable: {err}", dir.display()),
+        )
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::other(format!(
+            "socket directory {} is not a real directory (it may be a symlink planted by \
+             another user to hijack the socket); refusing to use it",
+            dir.display()
+        )));
+    }
+    let uid = current_uid()?;
+    if meta.uid() != uid {
+        return Err(io::Error::other(format!(
+            "socket directory {} is owned by uid {} instead of the current user (uid {}); \
+             its owner could replace the socket to hijack the connection; refusing to use it",
+            dir.display(),
+            meta.uid(),
+            uid
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(io::Error::other(format!(
+            "socket directory {} is group/world-accessible (mode {:03o}); other users could \
+             replace the socket to hijack the connection; re-create it with mode 0700",
+            dir.display(),
+            meta.mode() & 0o777
+        )));
+    }
+    Ok(())
+}
+
+/// The current effective uid, without `unsafe` or extra dependencies.
+///
+/// On Linux, `/proc/self` is owned by this process's effective uid. On other
+/// Unixes, fall back to creating a probe file in the system temp dir: a file
+/// this process creates is owned by its effective uid.
+fn current_uid() -> io::Result<u32> {
+    if let Ok(meta) = fs::metadata("/proc/self") {
+        return Ok(meta.uid());
+    }
+    let probe = env::temp_dir().join(format!("taria-uid-probe-{}", std::process::id()));
+    let _ = fs::remove_file(&probe);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)?;
+    let uid = file.metadata()?.uid();
+    drop(file);
+    let _ = fs::remove_file(&probe);
+    Ok(uid)
 }
 
 /// Resolve the default socket path for `app_label` from the environment.
@@ -406,6 +530,8 @@ fn user_identity() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -455,6 +581,53 @@ mod tests {
         let path =
             resolve_socket_path_from(None, Some("".into()), Path::new("/tmp"), "alice", "demo");
         assert_eq!(path, PathBuf::from("/tmp/taria-alice/demo.sock"));
+    }
+
+    /// Unique, absent scratch path under the system temp dir.
+    fn scratch_path(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("taria-dirtest-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn ensure_private_dir_accepts_fresh_0700_dir() {
+        let dir = scratch_path("fresh");
+        ensure_private_dir(&dir).expect("fresh private dir should be accepted");
+        let meta = fs::symlink_metadata(&dir).unwrap();
+        assert!(meta.file_type().is_dir());
+        assert_eq!(meta.mode() & 0o077, 0, "mode: {:03o}", meta.mode() & 0o777);
+        // And it stays acceptable on a second call (existing private dir).
+        ensure_private_dir(&dir).expect("existing private dir should be accepted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_private_dir_rejects_symlinked_dir() {
+        let target = scratch_path("symlink-target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = scratch_path("symlink-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = ensure_private_dir(&link).expect_err("symlinked dir must be rejected");
+        assert!(err.to_string().contains("symlink"), "err: {err}");
+
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn ensure_private_dir_rejects_world_accessible_dir() {
+        let dir = scratch_path("world-writable");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = ensure_private_dir(&dir).expect_err("0777 dir must be rejected");
+        assert!(err.to_string().contains("group/world"), "err: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

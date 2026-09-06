@@ -2,7 +2,8 @@
 //! snapshot streaming, agent input, and reconnects, all over a real Unix
 //! domain socket.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -164,6 +165,99 @@ fn client_can_reconnect_after_disconnect() {
 
     // The fresh connection is fully functional in both directions.
     let sent = AgentInput::Key { key: "esc".into() };
+    second.send(&BridgeToApp::Input(sent.clone()));
+    assert_eq!(layer.recv_timeout(TIMEOUT), Some(sent));
+}
+
+#[test]
+fn oversized_line_disconnects_the_client() {
+    let layer = bind_layer("linecap");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    // Stream a few MiB with no newline; the layer must cut the connection
+    // (capped at 1 MiB per line) rather than buffer it all.
+    client.writer.set_write_timeout(Some(TIMEOUT)).unwrap();
+    let chunk = [b'a'; 64 * 1024];
+    let mut disconnected_while_writing = false;
+    for _ in 0..48 {
+        // 48 * 64 KiB = 3 MiB
+        if client.writer.write_all(&chunk).is_err() {
+            disconnected_while_writing = true;
+            break;
+        }
+    }
+    if !disconnected_while_writing {
+        // The server may still be draining; its close must reach us as EOF
+        // (or a reset), never as a timeout with the connection still open.
+        let mut line = String::new();
+        match client.reader.read_line(&mut line) {
+            Ok(0) => {}
+            Ok(n) => panic!("expected disconnect, read {n} bytes"),
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                panic!("server kept the connection open after an oversized line")
+            }
+            Err(_) => {} // connection reset: also a disconnect
+        }
+    }
+
+    // The listener recovers: a fresh client is served again.
+    let mut second = Client::connect(&layer);
+    assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
+}
+
+#[test]
+fn input_flood_is_bounded_and_does_not_block_the_socket_thread() {
+    let mut layer = bind_layer("inputflood");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    // Far more inputs than the queue holds, with the app not draining.
+    for i in 0..2000 {
+        client.send(&BridgeToApp::Input(AgentInput::Key {
+            key: format!("k{i}"),
+        }));
+    }
+
+    // The socket thread must stay live mid-flood: a publish still streams.
+    publish_single_node(&mut layer, "alive");
+    let AppToBridge::Snapshot(snapshot) = client.read_message() else {
+        panic!("expected a snapshot during the input flood");
+    };
+    assert_eq!(snapshot.root.children[0].id.0, "alive");
+
+    // Half-close the write side: the reader consumes the whole flood, sees
+    // EOF, and tears the connection down, which we observe as EOF here. This
+    // is the barrier proving the flood was fully processed without blocking.
+    client.writer.shutdown(Shutdown::Write).unwrap();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match client.reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(err) => panic!("expected EOF after write shutdown, got {err}"),
+        }
+    }
+
+    // Only the queue capacity (256) was retained; the overflow was dropped
+    // instead of buffered.
+    let mut received = 0;
+    while layer.try_recv().is_some() {
+        received += 1;
+    }
+    assert_eq!(received, 256, "input queue should be bounded at 256");
+
+    // And the layer still serves fresh clients and inputs afterwards.
+    let mut second = Client::connect(&layer);
+    assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
+    assert!(matches!(second.read_message(), AppToBridge::Snapshot(_)));
+    let sent = AgentInput::Key {
+        key: "after".into(),
+    };
     second.send(&BridgeToApp::Input(sent.clone()));
     assert_eq!(layer.recv_timeout(TIMEOUT), Some(sent));
 }
