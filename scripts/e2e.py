@@ -171,6 +171,17 @@ class PtyApp:
     def stderr_tail(self):
         return self._stderr.decode(errors="replace").strip()
 
+    def wait_stderr(self, timeout=READ_TIMEOUT):
+        """Wait for the drain thread to reach EOF on the app's stderr.
+
+        The demo prints its dropped- and discarded-input counts *after*
+        restoring the terminal, so they are the last thing it writes. Reading
+        stderr the instant the process exits can miss them, which would turn
+        an assertion about those lines into one that quietly always passes.
+        """
+        self._errdrain.join(timeout)
+        return not self._errdrain.is_alive()
+
     def kill(self):
         if self.proc.poll() is None:
             self.proc.kill()
@@ -739,10 +750,18 @@ def step_j_ignored_ack(client, ctx):
                 find(tree, "input")["value"] != draft,
                 f"the modal-blocked set_value took effect anyway (input={draft!r})",
             )
-            # The tree the note offers is whatever the bridge had when the
-            # Ignored ack landed, which for this adapter is the pre-input one
-            # (the app acks while draining, and publishes after).
-            replan = "with dialog" if find(tree, "dialog") else "pre-input, no dialog"
+            # The tree the note offers is the state to re-plan from, which
+            # means the frame that caused the ignore: the dialog the app
+            # refused this act for has to be in it. The app acks while
+            # draining and publishes after, so the ack lands first; the
+            # bridge waits out its budget for that frame rather than handing
+            # back the pre-input tree, in which nothing explains the refusal.
+            require(
+                find(tree, "dialog") is not None,
+                "the ignored ack's tree has no dialog node: it predates the "
+                "input, so it cannot explain why the act was refused",
+            )
+            replan = "with dialog"
 
             # The app really did nothing: the modal is still up, untouched.
             live = client.read_tree()
@@ -912,9 +931,36 @@ def step_o_shutdown(client, ctx, app):
         time.sleep(0.05)
     require(not os.path.exists(app.sock_path), "socket file still exists after exit")
 
+    # Both counters the demo reports once the terminal is restored must be
+    # zero for a whole scenario. Either line means the run above silently lost
+    # agent input -- inputs the app's queue overflowed on, or inputs discarded
+    # because the bridge connection they arrived on ended first -- and every
+    # step that passed did so over a hole. Checked here because this is the
+    # only point where the demo has printed them and is done writing.
+    app.wait_stderr()
+    stderr = app.stderr_tail()
+    silent_loss = [
+        what
+        for marker, what in (
+            ("taria-demo: dropped ", "dropped inputs (the app's queue overflowed)"),
+            (
+                "taria-demo: discarded ",
+                "discarded inputs (their bridge connection ended first)",
+            ),
+        )
+        if marker in stderr
+    ]
+    require(
+        not silent_loss,
+        f"a clean run reported {' and '.join(silent_loss)}; demo stderr:\n{stderr}",
+    )
+
     client.close()
     require(client.proc.poll() is not None, "taria-mcp did not exit on stdin EOF")
-    return f"app rc=0, socket removed, bridge exited ({not_connected[:40]}...)"
+    return (
+        f"app rc=0, socket removed, no dropped/discarded inputs, bridge exited "
+        f"({not_connected[:40]}...)"
+    )
 
 
 # --- Runner -----------------------------------------------------------------
