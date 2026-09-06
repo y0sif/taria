@@ -11,4 +11,6 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+ratatui = "0.30.2"
+serde_json.workspace = true
 taria.workspace = true
