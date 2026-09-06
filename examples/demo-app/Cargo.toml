@@ -3,9 +3,12 @@ name = "taria-demo"
 description = "Demo ratatui app used to show an agent driving a TUI through taria vs. fumbling through screen-scraping."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
+ratatui = "0.30.2"
 taria.workspace = true
+taria-ratatui = { path = "../../crates/taria-ratatui" }

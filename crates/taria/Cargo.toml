@@ -3,6 +3,7 @@ name = "taria"
 description = "Agent accessibility layer for terminal user interfaces. Lets TUI apps expose their widget tree, focus state, and available actions to AI agents, like ARIA does for the web."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

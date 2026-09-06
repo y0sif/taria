@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "taria": {
+      "type": "stdio",
+      "command": "./target/debug/taria-mcp",
+      "args": ["--app", "taria-demo"]
+    }
+  }
+}
