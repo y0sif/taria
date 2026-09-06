@@ -42,7 +42,9 @@ def has_action(node, name):
 
 
 def probe_act_while_dialog_open(client, ctx):
-    """set_value / activate on the input while the delete dialog is modal."""
+    """Modal enforcement: while the delete dialog is open, non-dialog nodes
+    advertise no actions, so the bridge must REJECT acts on them with a
+    'does not advertise' ToolError. Silent acceptance is a failure."""
     tree = client.read_tree()
     task = next(
         n["id"] for n in flatten(tree["root"]) if has_action(n, "delete")
@@ -51,44 +53,56 @@ def probe_act_while_dialog_open(client, ctx):
     require(find(tree, "dialog") is not None, "dialog did not open")
 
     info = []
-    tree = act(client, "input", "set_value", value="typed while modal")
-    if tree is None:
-        info.append("set_value while dialog open: no tree change")
-    else:
-        val = find(tree, "input").get("value")
+    try:
+        for action, value in (("set_value", "typed while modal"), ("activate", None)):
+            try:
+                act(client, "input", action, value=value, refresh=False)
+            except ToolError as err:
+                require(
+                    "does not advertise" in err.message,
+                    f"unexpected rejection for {action} while modal: "
+                    f"{err.message[:120]}",
+                )
+                info.append(f"{action} rejected while modal")
+                continue
+            # No exception: the bridge forwarded (or silently accepted) the
+            # act despite the modal dialog -> modality is not enforced.
+            raise StepFailure(
+                f"act input {action} while dialog open was ACCEPTED, expected "
+                "a 'does not advertise' rejection"
+            )
+
+        tree = client.read_tree()
+        node = find(tree, "input")
+        require(
+            node.get("actions", []) == [],
+            f"input still advertises {node.get('actions')} while dialog open",
+        )
         require(
             find(tree, "dialog") is not None,
-            "set_value while dialog open closed the dialog",
+            "dialog closed during rejected acts",
         )
-        one_focused(tree, "set_value while dialog open")
-        info.append(f"set_value while dialog open ACCEPTED (input value={val!r})")
-
-    before_tasks = len(
-        [n for n in flatten(tree["root"]) if n["id"].startswith("task-")]
-    )
-    tree2 = act(client, "input", "activate")
-    if tree2 is not None:
-        after_tasks = len(
-            [n for n in flatten(tree2["root"]) if n["id"].startswith("task-")]
+        require(
+            one_focused(tree, "while modal") == "dialog",
+            "dialog should hold focus while open",
         )
-        if after_tasks > before_tasks:
-            info.append(
-                "activate while dialog open ADDED A TASK (modality not enforced "
-                "for semantic acts)"
-            )
-        tree = tree2
+    finally:
+        # Always dismiss the dialog so a failing probe cannot leak modal
+        # state into later probes; also delete any task a leaked activate
+        # may have added.
+        try:
+            tree = act(client, "dialog", "dismiss")
+            for node in list(flatten(tree["root"])):
+                if node.get("label") == "typed while modal":
+                    act(client, node["id"], "delete")
+                    tree = act(client, "dialog-confirm", "activate")
+        except Exception:
+            pass  # best-effort cleanup; the probe's own failure wins
 
-    # Clean up: dismiss the dialog, delete the accidental task if present.
-    tree = act(client, "dialog", "dismiss")
-    require(find(tree, "dialog") is None, "dialog did not dismiss")
-    extra = [
-        n["id"] for n in flatten(tree["root"]) if n.get("label") == "typed while modal"
-    ]
-    for node_id in extra:
-        tree = act(client, node_id, "delete")
-        tree = act(client, "dialog-confirm", "activate")
+    tree = client.read_tree()
+    require(find(tree, "dialog") is None, "dialog did not dismiss in cleanup")
     one_focused(tree, "after dialog-open probe cleanup")
-    return "; ".join(info)
+    return "; ".join(info) + "; dialog kept focus, input advertised no actions"
 
 
 def probe_rapid_acts(client, ctx):
