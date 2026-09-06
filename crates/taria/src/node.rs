@@ -1,4 +1,7 @@
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Action;
 
@@ -7,7 +10,15 @@ use crate::Action;
 pub struct NodeId(pub String);
 
 /// Semantic role of a widget, the TUI analogue of an ARIA role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// A role name the reader does not know deserializes to [`Other`](Self::Other)
+/// rather than failing. The alternative is worse than it looks: a role is
+/// nested inside a [`Node`], so rejecting it rejects the whole
+/// [`Snapshot`](crate::Snapshot) that carries it, and a peer that skips
+/// unparseable lines then goes on serving its last tree with no error anywhere.
+/// Degrading one node's role is what lets an app that learned a new role keep
+/// talking to an agent built before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     App,
@@ -28,6 +39,82 @@ pub enum Role {
     Menu,
     MenuItem,
     Other,
+}
+
+impl Role {
+    /// Map a wire role name onto a variant, degrading an unrecognized name to
+    /// [`Other`](Self::Other).
+    ///
+    /// The names must stay in step with what the derived [`Serialize`] emits;
+    /// the `every_role_roundtrips` test is what enforces that.
+    fn from_wire(name: &str) -> Self {
+        match name {
+            "app" => Role::App,
+            "pane" => Role::Pane,
+            "list" => Role::List,
+            "list_item" => Role::ListItem,
+            "table" => Role::Table,
+            "row" => Role::Row,
+            "cell" => Role::Cell,
+            "text_input" => Role::TextInput,
+            "button" => Role::Button,
+            "checkbox" => Role::Checkbox,
+            "tabs" => Role::Tabs,
+            "tab" => Role::Tab,
+            "text" => Role::Text,
+            "progress_bar" => Role::ProgressBar,
+            "dialog" => Role::Dialog,
+            "menu" => Role::Menu,
+            "menu_item" => Role::MenuItem,
+            _ => Role::Other,
+        }
+    }
+}
+
+/// Hand-written so an unknown role name becomes [`Role::Other`] instead of an
+/// error. `#[serde(other)]` cannot express this: it is only available on
+/// internally and adjacently tagged enums, and this one is a plain string.
+impl<'de> Deserialize<'de> for Role {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RoleVisitor;
+
+        impl<'de> Visitor<'de> for RoleVisitor {
+            type Value = Role;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a role name")
+            }
+
+            fn visit_str<E>(self, name: &str) -> Result<Role, E>
+            where
+                E: de::Error,
+            {
+                Ok(Role::from_wire(name))
+            }
+
+            /// A role is always a bare string on the wire, but serde's derived
+            /// deserializer also accepted `{"app":null}`, so this one does too
+            /// rather than narrow what a peer may send.
+            fn visit_map<A>(self, mut map: A) -> Result<Role, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let Some(name) = map.next_key::<String>()? else {
+                    return Err(de::Error::invalid_length(0, &self));
+                };
+                map.next_value::<IgnoredAny>()?;
+                // Drain the rest: serde_json rejects a map the visitor left
+                // half-read.
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Role::from_wire(&name))
+            }
+        }
+
+        deserializer.deserialize_any(RoleVisitor)
+    }
 }
 
 /// One widget in the semantic tree.
@@ -111,46 +198,80 @@ impl Node {
 mod tests {
     use super::*;
 
-    const ALL_ROLES: [Role; 18] = [
-        Role::App,
-        Role::Pane,
-        Role::List,
-        Role::ListItem,
-        Role::Table,
-        Role::Row,
-        Role::Cell,
-        Role::TextInput,
-        Role::Button,
-        Role::Checkbox,
-        Role::Tabs,
-        Role::Tab,
-        Role::Text,
-        Role::ProgressBar,
-        Role::Dialog,
-        Role::Menu,
-        Role::MenuItem,
-        Role::Other,
+    /// Every role beside the exact JSON it must serialize to. Version 1 is
+    /// frozen, so these strings are the format itself, not a detail of how it
+    /// happens to be derived today. A hand-written deserializer also makes
+    /// this the only thing keeping `Role::from_wire` in step with `Serialize`.
+    const ROLE_JSON: [(Role, &str); 18] = [
+        (Role::App, r#""app""#),
+        (Role::Pane, r#""pane""#),
+        (Role::List, r#""list""#),
+        (Role::ListItem, r#""list_item""#),
+        (Role::Table, r#""table""#),
+        (Role::Row, r#""row""#),
+        (Role::Cell, r#""cell""#),
+        (Role::TextInput, r#""text_input""#),
+        (Role::Button, r#""button""#),
+        (Role::Checkbox, r#""checkbox""#),
+        (Role::Tabs, r#""tabs""#),
+        (Role::Tab, r#""tab""#),
+        (Role::Text, r#""text""#),
+        (Role::ProgressBar, r#""progress_bar""#),
+        (Role::Dialog, r#""dialog""#),
+        (Role::Menu, r#""menu""#),
+        (Role::MenuItem, r#""menu_item""#),
+        (Role::Other, r#""other""#),
     ];
 
     #[test]
+    fn every_role_serializes_to_its_frozen_json() {
+        for (role, expected) in ROLE_JSON {
+            assert_eq!(
+                serde_json::to_string(&role).unwrap(),
+                expected,
+                "role {role:?}"
+            );
+        }
+    }
+
+    #[test]
     fn every_role_roundtrips() {
-        for role in ALL_ROLES {
-            let json = serde_json::to_string(&role).unwrap();
-            let back: Role = serde_json::from_str(&json).unwrap();
+        for (role, json) in ROLE_JSON {
+            let back: Role = serde_json::from_str(json).unwrap();
             assert_eq!(back, role, "role {role:?} via {json}");
         }
     }
 
     #[test]
-    fn roles_serialize_as_snake_case() {
+    fn unknown_role_degrades_to_other() {
+        // A role added in a later version. It must cost this node its role,
+        // and nothing else.
+        let node: Node =
+            serde_json::from_str(r#"{"id":"n","role":"sparkline","focused":false,"label":"cpu"}"#)
+                .unwrap();
+        assert_eq!(node.role, Role::Other);
+        assert_eq!(node.label.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn role_object_form_still_parses() {
+        // What serde's derived deserializer accepted beside the bare string,
+        // kept so the hand-written one narrows nothing.
         assert_eq!(
-            serde_json::to_string(&Role::ListItem).unwrap(),
-            r#""list_item""#
+            serde_json::from_str::<Role>(r#"{"button":null}"#).unwrap(),
+            Role::Button
         );
         assert_eq!(
-            serde_json::to_string(&Role::ProgressBar).unwrap(),
-            r#""progress_bar""#
+            serde_json::from_str::<Role>(r#"{"sparkline":null}"#).unwrap(),
+            Role::Other
         );
+    }
+
+    #[test]
+    fn malformed_role_is_still_an_error() {
+        // Degrading unknown names must not turn into accepting anything.
+        assert!(serde_json::from_str::<Role>("7").is_err());
+        assert!(serde_json::from_str::<Role>("{}").is_err());
     }
 
     #[test]
