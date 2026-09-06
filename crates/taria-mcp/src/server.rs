@@ -9,7 +9,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use taria::{Action, AgentInput, Node, NodeId, Snapshot};
 use tokio::sync::{mpsc, watch};
 
-use crate::bridge::BridgeHandle;
+use crate::bridge::{BridgeHandle, BridgeState};
 
 /// How long `act`/`key` wait for the app to publish a newer snapshot before
 /// reporting that the tree did not change.
@@ -45,7 +45,7 @@ pub struct KeyParams {
 /// MCP server handler bridging tool calls to the socket-manager task.
 #[derive(Clone)]
 pub struct TariaMcpServer {
-    snapshot_rx: watch::Receiver<Option<Snapshot>>,
+    state_rx: watch::Receiver<BridgeState>,
     input_tx: mpsc::Sender<AgentInput>,
     tool_router: ToolRouter<Self>,
 }
@@ -54,7 +54,7 @@ impl TariaMcpServer {
     /// Build the handler on top of a spawned bridge.
     pub fn new(handle: BridgeHandle) -> Self {
         Self {
-            snapshot_rx: handle.snapshot_rx,
+            state_rx: handle.state_rx,
             input_tx: handle.input_tx,
             tool_router: Self::tool_router(),
         }
@@ -65,7 +65,7 @@ impl TariaMcpServer {
     /// result.
     async fn send_and_report(
         &self,
-        rx: watch::Receiver<Option<Snapshot>>,
+        rx: watch::Receiver<BridgeState>,
         pre: Option<Snapshot>,
         input: AgentInput,
     ) -> Result<CallToolResult, McpError> {
@@ -95,11 +95,7 @@ impl TariaMcpServer {
                        Call this first; act and key depend on ids and actions from this tree."
     )]
     pub async fn read_tree(&self) -> Result<CallToolResult, McpError> {
-        let snapshot = self
-            .snapshot_rx
-            .borrow()
-            .clone()
-            .ok_or_else(not_connected_error)?;
+        let snapshot = available_snapshot(self.state_rx.borrow().clone())?;
         tree_result(&snapshot)
     }
 
@@ -124,11 +120,8 @@ impl TariaMcpServer {
                 None,
             ));
         }
-        let mut rx = self.snapshot_rx.clone();
-        let snapshot = rx
-            .borrow_and_update()
-            .clone()
-            .ok_or_else(not_connected_error)?;
+        let mut rx = self.state_rx.clone();
+        let snapshot = available_snapshot(rx.borrow_and_update().clone())?;
 
         let Some(target) = find_node(&snapshot.root, &node) else {
             let mut ids = Vec::new();
@@ -184,13 +177,10 @@ impl TariaMcpServer {
         if key.is_empty() {
             return Err(McpError::invalid_params("key must be non-empty", None));
         }
-        let mut rx = self.snapshot_rx.clone();
+        let mut rx = self.state_rx.clone();
         // Like `act`, refuse while no app is connected: a key queued now
         // would only be delivered to (and confuse) the *next* app instance.
-        let pre = rx
-            .borrow_and_update()
-            .clone()
-            .ok_or_else(not_connected_error)?;
+        let pre = available_snapshot(rx.borrow_and_update().clone())?;
         self.send_and_report(rx, Some(pre), AgentInput::Key { key })
             .await
     }
@@ -238,13 +228,31 @@ pub fn action_name(action: &Action) -> String {
     }
 }
 
-/// Error for tool calls made while no snapshot is available.
-fn not_connected_error() -> McpError {
-    McpError::internal_error(
-        "no snapshot from the app yet - is the taria-enabled app running, and is the socket \
-         path correct? The bridge reconnects automatically; retry once the app is up.",
-        None,
-    )
+/// Extract the live snapshot from a [`BridgeState`], or the error explaining
+/// why none is available. The two failure modes call for different next
+/// steps, so they get distinct messages: an app that never connected (wrong
+/// socket path? not started?) versus an app that connected and then went
+/// away (it exited or crashed; waiting for it to come back is enough).
+fn available_snapshot(state: BridgeState) -> Result<Snapshot, McpError> {
+    match state {
+        BridgeState::Connected(snapshot) => Ok(snapshot),
+        BridgeState::Never => Err(McpError::internal_error(
+            "no snapshot from the app yet - is the taria-enabled app running, and is the socket \
+             path correct? The bridge reconnects automatically; retry once the app is up.",
+            None,
+        )),
+        BridgeState::Disconnected {
+            app_label,
+            last_seq,
+        } => Err(McpError::internal_error(
+            format!(
+                "app '{}' disconnected (last snapshot seq {last_seq}); it may have exited. The \
+                 bridge reconnects automatically; retry once the app is back.",
+                app_label.as_deref().unwrap_or("unknown")
+            ),
+            None,
+        )),
+    }
 }
 
 /// Render a snapshot as the standard tool result: compact JSON text.
@@ -261,11 +269,12 @@ fn tree_result(snapshot: &Snapshot) -> Result<CallToolResult, McpError> {
 /// "Differs" is a full comparison against the `pre` snapshot rather than a
 /// `seq > pre.seq` check: after an app restart the fresh instance's `seq`
 /// starts over at 1, so a lower (or equal) `seq` with different content is
-/// still a change. Observing the watch pass through `None` (the bridge's
-/// disconnect marker) also counts as a change, because the next snapshot then
-/// comes from a fresh app instance and should be reported as the new tree.
+/// still a change. Observing the watch pass through a non-`Connected` state
+/// (the bridge's disconnect marker) also counts as a change, because the
+/// next snapshot then comes from a fresh app instance and should be reported
+/// as the new tree.
 async fn wait_for_change(
-    mut rx: watch::Receiver<Option<Snapshot>>,
+    mut rx: watch::Receiver<BridgeState>,
     pre: Option<Snapshot>,
 ) -> Option<Snapshot> {
     tokio::time::timeout(UPDATE_WAIT, async move {
@@ -276,8 +285,8 @@ async fn wait_for_change(
             }
             let current = rx.borrow_and_update().clone();
             match current {
-                None => reconnected = true,
-                Some(snapshot) => {
+                BridgeState::Never | BridgeState::Disconnected { .. } => reconnected = true,
+                BridgeState::Connected(snapshot) => {
                     if reconnected || pre.as_ref() != Some(&snapshot) {
                         return Some(snapshot);
                     }

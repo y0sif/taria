@@ -2,9 +2,10 @@
 //!
 //! A single background task connects (retrying forever with capped backoff),
 //! reads `AppToBridge` ndjson lines into a [`watch`] channel holding the
-//! latest [`Snapshot`], and writes queued [`AgentInput`]s out as
-//! `BridgeToApp::Input` lines. On disconnect the watch is cleared to `None`
-//! so tool calls fail fast instead of acting on a stale tree.
+//! latest [`BridgeState`], and writes queued [`AgentInput`]s out as
+//! `BridgeToApp::Input` lines. On disconnect the watch flips to
+//! [`BridgeState::Disconnected`] so tool calls fail fast (instead of acting
+//! on a stale tree) with an error that says which app went away.
 
 use std::io;
 use std::path::PathBuf;
@@ -34,25 +35,43 @@ const INPUT_QUEUE: usize = 32;
 /// reconnect) so the bridge never buffers a line unboundedly.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// What the bridge currently knows about the app, as seen by the tool layer.
+///
+/// The distinction between [`Never`](Self::Never) and
+/// [`Disconnected`](Self::Disconnected) exists purely for error messages:
+/// "the app was never there" and "the app was there and died" call for very
+/// different next steps from the agent.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BridgeState {
+    /// No app has delivered a snapshot since the bridge started.
+    Never,
+    /// An app is connected; its latest snapshot is available.
+    Connected(Snapshot),
+    /// A previously connected app went away after delivering snapshots.
+    Disconnected {
+        /// Label from the app's handshake, if one was received.
+        app_label: Option<String>,
+        /// `seq` of the last snapshot delivered before the app went away.
+        last_seq: u64,
+    },
+}
+
 /// Handles the MCP tool layer uses to talk to the socket-manager task.
 #[derive(Clone)]
 pub struct BridgeHandle {
-    /// Latest snapshot from the app; `None` while disconnected or before the
-    /// first snapshot arrives.
-    pub snapshot_rx: watch::Receiver<Option<Snapshot>>,
+    /// Latest connection state; holds the current [`Snapshot`] while an app
+    /// is connected.
+    pub state_rx: watch::Receiver<BridgeState>,
     /// Queue of agent inputs to forward to the app.
     pub input_tx: mpsc::Sender<AgentInput>,
 }
 
 /// Spawn the socket-manager task for `socket_path` on the current runtime.
 pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
-    let (snapshot_tx, snapshot_rx) = watch::channel(None);
+    let (state_tx, state_rx) = watch::channel(BridgeState::Never);
     let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
-    tokio::spawn(manager_loop(socket_path, snapshot_tx, input_rx));
-    BridgeHandle {
-        snapshot_rx,
-        input_tx,
-    }
+    tokio::spawn(manager_loop(socket_path, state_tx, input_rx));
+    BridgeHandle { state_rx, input_tx }
 }
 
 /// Why one served connection ended.
@@ -67,7 +86,7 @@ enum ConnectionEnd {
 /// Connect-serve-reconnect forever (until the session is torn down).
 async fn manager_loop(
     path: PathBuf,
-    snapshot_tx: watch::Sender<Option<Snapshot>>,
+    state_tx: watch::Sender<BridgeState>,
     mut input_rx: mpsc::Receiver<AgentInput>,
 ) {
     let mut backoff = RETRY_MIN;
@@ -77,12 +96,28 @@ async fn manager_loop(
                 tracing::info!(path = %path.display(), "connected to app socket");
                 drain_stale_inputs(&mut input_rx);
                 let connected_at = Instant::now();
-                let end = run_connection(stream, &snapshot_tx, &mut input_rx).await;
-                // The watch only ever holds `Some` while this connection was
-                // being served (it is cleared below after every connection),
-                // so `Some` here means this connection delivered a snapshot.
-                let delivered_snapshot = snapshot_tx.borrow().is_some();
-                snapshot_tx.send_replace(None);
+                let mut conn_label = None;
+                let end = run_connection(stream, &state_tx, &mut input_rx, &mut conn_label).await;
+                // The watch only ever holds `Connected` while this connection
+                // was being served (it is demoted below after every
+                // connection), so `Connected` here means this connection
+                // delivered a snapshot.
+                let delivered_snapshot = matches!(&*state_tx.borrow(), BridgeState::Connected(_));
+                // Demote `Connected` to `Disconnected`, remembering which app
+                // died and its last seq. A connection that died before
+                // delivering a snapshot leaves the previous state (`Never`,
+                // or the `Disconnected` record of an older app) untouched.
+                state_tx.send_if_modified(|state| {
+                    if let BridgeState::Connected(snapshot) = state {
+                        *state = BridgeState::Disconnected {
+                            app_label: conn_label.take(),
+                            last_seq: snapshot.seq,
+                        };
+                        true
+                    } else {
+                        false
+                    }
+                });
                 match end {
                     ConnectionEnd::AppClosed => {
                         tracing::warn!(path = %path.display(), "app disconnected; reconnecting");
@@ -179,11 +214,13 @@ async fn read_line_capped(
 }
 
 /// Serve one connection: pump app lines into the watch and agent inputs onto
-/// the socket until either side goes away.
+/// the socket until either side goes away. The label from the app's `Hello`
+/// (if any) is stored in `conn_label` for the disconnect record.
 async fn run_connection(
     stream: UnixStream,
-    snapshot_tx: &watch::Sender<Option<Snapshot>>,
+    state_tx: &watch::Sender<BridgeState>,
     input_rx: &mut mpsc::Receiver<AgentInput>,
+    conn_label: &mut Option<String>,
 ) -> ConnectionEnd {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -192,7 +229,7 @@ async fn run_connection(
         tokio::select! {
             read = read_line_capped(&mut reader, &mut line_buf) => match read {
                 Ok(LineRead::Line) => {
-                    handle_app_line(&line_buf, snapshot_tx);
+                    handle_app_line(&line_buf, state_tx, conn_label);
                     line_buf.clear();
                 }
                 Ok(LineRead::Eof) => return ConnectionEnd::AppClosed,
@@ -232,7 +269,11 @@ async fn run_connection(
 
 /// Handle one ndjson line from the app. Malformed lines are logged and
 /// skipped so a buggy app cannot kill the bridge.
-fn handle_app_line(line: &[u8], snapshot_tx: &watch::Sender<Option<Snapshot>>) {
+fn handle_app_line(
+    line: &[u8],
+    state_tx: &watch::Sender<BridgeState>,
+    conn_label: &mut Option<String>,
+) {
     match serde_json::from_slice::<AppToBridge>(line) {
         Ok(AppToBridge::Hello {
             app_label,
@@ -248,10 +289,11 @@ fn handle_app_line(line: &[u8], snapshot_tx: &watch::Sender<Option<Snapshot>>) {
                     "protocol version mismatch; continuing, but messages may misparse"
                 );
             }
+            *conn_label = Some(app_label);
         }
         Ok(AppToBridge::Snapshot(snapshot)) => {
             tracing::debug!(seq = snapshot.seq, "snapshot received");
-            snapshot_tx.send_replace(Some(snapshot));
+            state_tx.send_replace(BridgeState::Connected(snapshot));
         }
         Err(err) => {
             tracing::warn!(%err, "ignoring malformed line from app");

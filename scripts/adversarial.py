@@ -217,7 +217,12 @@ def probe_kill_and_restart(client, ctx, app, sock):
         except TimeoutError:
             raise StepFailure("read_tree HUNG after SIGKILL of the app")
     require(err_msg is not None, "read_tree kept succeeding after SIGKILL")
-    require("no snapshot" in err_msg, f"unexpected error: {err_msg[:120]}")
+    # The app died after delivering snapshots, so the bridge must report the
+    # disconnect (which app, last seq), not the never-connected message.
+    require(
+        "disconnected" in err_msg and "last snapshot seq" in err_msg,
+        f"unexpected error: {err_msg[:120]}",
+    )
     errored_after = time.monotonic() - start
 
     # SIGKILL skips Drop, so the stale socket file is expected to linger.

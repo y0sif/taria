@@ -56,19 +56,13 @@ impl<'a> FrameRecorder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     use taria::{Node, NodeId, Role};
 
-    use crate::TariaLayer;
+    use crate::test_util::{TestLayer, bind_test_layer};
 
-    /// Bind a layer on a unique throwaway socket path.
-    fn test_layer(label: &str) -> TariaLayer {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir: PathBuf = std::env::temp_dir().join(format!("taria-rec-{}", std::process::id()));
-        TariaLayer::bind_at(label, dir.join(format!("{label}-{n}.sock"))).unwrap()
+    /// Bind a layer on a throwaway socket path cleaned up on drop.
+    fn test_layer(label: &str) -> TestLayer {
+        bind_test_layer("taria-rec-", label)
     }
 
     fn child_ids(root: &Node) -> Vec<&str> {

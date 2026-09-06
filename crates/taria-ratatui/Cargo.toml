@@ -15,3 +15,6 @@ categories.workspace = true
 ratatui = "0.30.2"
 serde_json.workspace = true
 taria.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

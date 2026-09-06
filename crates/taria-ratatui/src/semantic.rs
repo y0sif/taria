@@ -78,11 +78,11 @@ mod tests {
     use taria::{Node, Role};
 
     use super::sem;
-    use crate::TariaLayer;
+    use crate::test_util::{TestLayer, bind_test_layer};
 
-    fn test_layer(label: &str) -> TariaLayer {
-        let dir = std::env::temp_dir().join(format!("taria-sem-{}", std::process::id()));
-        TariaLayer::bind_at(label, dir.join(format!("{label}.sock"))).unwrap()
+    /// Bind a layer on a throwaway socket path cleaned up on drop.
+    fn test_layer(label: &str) -> TestLayer {
+        bind_test_layer("taria-sem-", label)
     }
 
     #[test]
