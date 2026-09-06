@@ -20,7 +20,7 @@
 //!
 //! [`apply_agent_input`] returns [`Applied`], because some inputs are
 //! deliberately dropped (the modal gate, an unknown node id, an action a node
-//! does not handle) and the caller acks those
+//! does not handle, a `set_value` carrying no value) and the caller acks those
 //! [`Ignored`](taria_ratatui::InputStatus::Ignored) so an agent waiting on an
 //! effect stops waiting.
 
@@ -102,11 +102,17 @@ fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -
             switch_tab(app, Tab::Done);
             Applied::Handled
         }
-        ("input", Action::SetValue) => {
-            app.input = value.unwrap_or_default();
-            app.focus = Focus::Input;
-            Applied::Handled
-        }
+        // `set_value` with no value asks for nothing. Treating a missing
+        // value as the empty string would clear the draft, an edit the agent
+        // never asked for, and report it as Handled.
+        ("input", Action::SetValue) => match value {
+            Some(value) => {
+                app.input = value;
+                app.focus = Focus::Input;
+                Applied::Handled
+            }
+            None => Applied::Ignored,
+        },
         ("input", Action::Activate) => submit_input(app),
         ("dialog-confirm", Action::Activate) => {
             confirm_delete(app);
@@ -343,6 +349,27 @@ mod tests {
         assert!(app.input.is_empty(), "input clears after submit");
         assert_eq!(app.focus, Focus::List, "focus returns to the list");
         assert_eq!(app.selected_id(), Some(new_id), "the new task is selected");
+    }
+
+    /// `set_value` with no value asks for nothing, so it must leave the draft
+    /// alone and say so, rather than clearing it and reporting Handled.
+    #[test]
+    fn set_value_without_a_value_leaves_the_draft_alone() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act_value("input", Action::SetValue, "half typed"));
+
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::SetValue)),
+            Applied::Ignored
+        );
+        assert_eq!(app.input, "half typed", "the draft must survive");
+
+        // An explicit empty value is a different request, and still clears it.
+        assert_eq!(
+            apply_agent_input(&mut app, act_value("input", Action::SetValue, "")),
+            Applied::Handled
+        );
+        assert!(app.input.is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use taria::key::KeyPress;
 use taria::wire::{InputId, InputStatus};
-use taria::{Action, AgentInput, Node, NodeId, Snapshot};
+use taria::{Action, AgentInput, Node, NodeId, PROTOCOL_VERSION, Snapshot};
 use tokio::sync::{broadcast, watch};
 
 use crate::bridge::{BridgeHandle, BridgeState};
@@ -16,6 +16,14 @@ use crate::bridge::{BridgeHandle, BridgeState};
 /// How long an input-sending tool waits for the app to answer, counting both
 /// the app's ack and any snapshot it publishes in response.
 const UPDATE_WAIT: Duration = Duration::from_millis(500);
+
+/// How long one input waits for room in the bridge's queue to the app.
+///
+/// The queue only backs up while the app is not draining its socket, so an
+/// unbounded send parks the whole tool call until the app comes back, with
+/// nothing said to the agent meanwhile. Bounding it turns an indefinite hang
+/// into an error naming the cause.
+const QUEUE_WAIT: Duration = Duration::from_millis(500);
 
 /// Most presses one `key` call may send.
 ///
@@ -87,11 +95,15 @@ impl TariaMcpServer {
         }
     }
 
-    /// Send `input` to the app `repeat` times and report on the last one.
+    /// Send `input` to the app `repeat` times and report what became of the
+    /// burst.
     ///
     /// Every copy carries its own [`InputId`], but they are the same input, so
-    /// the last id is the one worth waiting on: the app works through them in
-    /// order, and its answer to the last covers the ones before it.
+    /// the last id is the one the tree answer hangs on: the app works through
+    /// them in order, and its answer to the last covers the ones before it.
+    /// Every id in the burst is still watched, because a drop partway through
+    /// is invisible in the last input's ack and would otherwise be reported as
+    /// plain success.
     ///
     /// `repeat` of 0 still sends once. The count is validated by the caller,
     /// and sending nothing while reporting on an input that was never sent
@@ -103,26 +115,71 @@ impl TariaMcpServer {
         input: AgentInput,
         repeat: u32,
     ) -> Result<CallToolResult, McpError> {
+        self.check_protocol()?;
         // Subscribe before anything is sent: an ack published before this
         // point is one the receiver would never see.
         let acks = self.bridge.subscribe_acks();
+        let mut ids = Vec::with_capacity(repeat.max(1) as usize);
         for _ in 1..repeat {
-            self.send_input(input.clone()).await?;
+            ids.push(self.send_input(input.clone()).await?);
         }
-        let id = self.send_input(input).await?;
-        report(observe(acks, rx, &pre, id).await, pre)
+        ids.push(self.send_input(input).await?);
+        let seen = observe(acks, rx, &pre, &ids).await;
+        // The answer to an ignored input is a tree, and the freshest one the
+        // bridge holds beats the one the input was aimed at: the frame that
+        // caused the ignore can land after the ack that reports it.
+        let fallback = match self.bridge.state_rx.borrow().clone() {
+            BridgeState::Connected(snapshot) => snapshot,
+            BridgeState::Never | BridgeState::Disconnected { .. } => pre,
+        };
+        report(seen, fallback, ids.len())
+    }
+
+    /// Refuse to send input to a peer on another protocol version.
+    ///
+    /// Such a peer cannot parse the `Input` messages this bridge writes, so
+    /// every input it receives is skipped on its side. Warning and sending
+    /// anyway leaves the agent reading "it may not have reacted yet" for a
+    /// session that can never react.
+    fn check_protocol(&self) -> Result<(), McpError> {
+        let Some(app_version) = *self.bridge.protocol_rx.borrow() else {
+            return Ok(());
+        };
+        if app_version == PROTOCOL_VERSION {
+            return Ok(());
+        }
+        Err(McpError::internal_error(
+            format!(
+                "the app speaks taria protocol version {app_version}, this bridge speaks \
+                 {PROTOCOL_VERSION}: the app cannot parse input from this bridge, so nothing was \
+                 sent and no input tool will work against it. Match the app's taria dependency to \
+                 the bridge's version. read_tree still works, because snapshots parse across this \
+                 mismatch."
+            ),
+            None,
+        ))
     }
 
     /// Hand one input to the socket task, returning the id it was sent under.
     async fn send_input(&self, input: AgentInput) -> Result<InputId, McpError> {
         let id = self.bridge.next_input_id();
-        self.bridge.input_tx.send((id, input)).await.map_err(|_| {
-            McpError::internal_error(
+        let send = self.bridge.input_tx.send((id, input));
+        match tokio::time::timeout(QUEUE_WAIT, send).await {
+            Ok(Ok(())) => Ok(id),
+            Ok(Err(_)) => Err(McpError::internal_error(
                 "failed to forward input: the bridge connection task is gone",
                 None,
-            )
-        })?;
-        Ok(id)
+            )),
+            Err(_) => Err(McpError::internal_error(
+                format!(
+                    "the app is not accepting input: the bridge's queue to it stayed full for \
+                     {}ms, so this input was not sent. The app is stopped or not reading its \
+                     socket; retry once it is responsive.",
+                    QUEUE_WAIT.as_millis()
+                ),
+                None,
+            )),
+        }
     }
 }
 
@@ -174,8 +231,7 @@ impl TariaMcpServer {
                 None,
             ));
         };
-        let parsed = parse_action(&action);
-        if !target.actions.contains(&parsed) {
+        let Some(parsed) = resolve_action(&action, target) else {
             let advertised = if target.actions.is_empty() {
                 "none".to_string()
             } else {
@@ -193,7 +249,7 @@ impl TariaMcpServer {
                 ),
                 None,
             ));
-        }
+        };
 
         let input = AgentInput::Act {
             node: NodeId(node),
@@ -303,6 +359,24 @@ pub fn parse_action(s: &str) -> Action {
     }
 }
 
+/// Pick the [`Action`] to send for the agent-supplied name `action`, or
+/// `None` when `target` advertises neither form of it.
+///
+/// A name that maps to a built-in variant normally sends that variant, but a
+/// node is free to advertise [`Action::Custom`] under a built-in's name, and
+/// the tree spells both exactly the same way (see [`action_name`]). Without
+/// the fallback such a node is unreachable through the only name it ever
+/// showed, and says so in an error that contradicts itself: "does not
+/// advertise action `activate`; advertised actions: activate".
+fn resolve_action(action: &str, target: &Node) -> Option<Action> {
+    let parsed = parse_action(action);
+    if target.actions.contains(&parsed) {
+        return Some(parsed);
+    }
+    let custom = Action::Custom(action.to_string());
+    target.actions.contains(&custom).then_some(custom)
+}
+
 /// The string an agent would pass to invoke `action`; inverse of
 /// [`parse_action`] for every advertised action.
 pub fn action_name(action: &Action) -> String {
@@ -362,28 +436,40 @@ fn snapshot_json(snapshot: &Snapshot) -> Result<String, McpError> {
     })
 }
 
-/// What the app said about one input inside [`UPDATE_WAIT`].
+/// What the app said about one burst of inputs inside [`UPDATE_WAIT`].
 #[derive(Debug, Default)]
 struct Observed {
-    /// Newest ack naming that input, if the app sent one at all.
+    /// Newest ack naming the last input of the burst, if the app sent one.
     status: Option<InputStatus>,
+    /// How many inputs of the burst the app acked
+    /// [`Dropped`](InputStatus::Dropped).
+    dropped: usize,
     /// Newest snapshot differing from the one the input was aimed at.
     changed: Option<Snapshot>,
 }
 
 /// Watch the app's acks and snapshots for up to [`UPDATE_WAIT`], and report
-/// what arrived about the input sent as `id`.
+/// what arrived about the inputs sent as `ids`.
 ///
 /// Both signals are needed, and neither is sufficient: an ack says the app saw
 /// the input but not what it did, a new tree says something happened but not
 /// that this input caused it. Waiting on both, and on nothing else, is what
 /// separates "applied", "ignored", "dropped" and "no reaction".
 ///
+/// The last id drives the verdict, and the rest are watched only for drops:
+/// a burst whose middle presses overflowed the app's queue reads as success
+/// in the last press's ack alone, which is the misreport [`Observed::dropped`]
+/// exists to catch.
+///
 /// The window is not cut short by a snapshot that arrives without an ack: an
 /// app that acks could still be about to report this very input dropped, and
 /// answering "here is your new tree" to a dropped input is the misreport this
 /// whole path exists to prevent. An app that never acks pays the full window
-/// and gets its tree at the end of it.
+/// and gets its tree at the end of it. An `Ignored` ack does not cut it short
+/// either: the adapter flushes queued acks ahead of the pending snapshot in
+/// every writer pass, so the frame that caused the ignore arrives *after* the
+/// ack that reports it, and returning at the ack hands back a tree that
+/// predates the state the agent is told to re-plan from.
 ///
 /// "Differs" is a full comparison against `pre` rather than a `seq > pre.seq`
 /// check: after an app restart the fresh instance's `seq` starts over at 1, so
@@ -395,34 +481,52 @@ async fn observe(
     mut acks: broadcast::Receiver<(InputId, InputStatus)>,
     mut rx: watch::Receiver<BridgeState>,
     pre: &Snapshot,
-    id: InputId,
+    ids: &[InputId],
 ) -> Observed {
     let mut seen = Observed::default();
     let mut reconnected = false;
     let mut acks_open = true;
     let mut state_open = true;
+    let last = ids.last().copied();
     let deadline = tokio::time::sleep(UPDATE_WAIT);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
+            // Biased so the branches run in wire order: the app writes an ack
+            // before the snapshot that follows it, and a random pick would let
+            // the snapshot land first, making a `Delivered` still awaiting its
+            // `Ignored` refinement look like the final word. The deadline goes
+            // first of all, so a stream of acks cannot starve the timeout.
+            biased;
             () = &mut deadline => return seen,
             ack = acks.recv(), if acks_open => match ack {
                 Ok((acked, status)) => {
-                    // An ack for another id says nothing about this input,
-                    // and needs no bookkeeping beyond being skipped.
-                    if acked != id {
+                    // An ack for another call's input says nothing about this
+                    // burst, and needs no bookkeeping beyond being skipped.
+                    if !ids.contains(&acked) {
+                        continue;
+                    }
+                    if status == InputStatus::Dropped {
+                        seen.dropped += 1;
+                    }
+                    // Every id counts towards the drop tally, but only the
+                    // last one decides when there is nothing left to wait for.
+                    if Some(acked) != last {
                         continue;
                     }
                     seen.status = Some(status);
                     match status {
-                        // Both are final verdicts: the app looked at the
-                        // input and is done with it.
-                        InputStatus::Dropped | InputStatus::Ignored => return seen,
-                        // Delivered can still be refined to Ignored, so keep
-                        // listening unless the tree already answered.
-                        InputStatus::Delivered => if seen.changed.is_some() {
-                            return seen;
-                        },
+                        // A dropped input carries no tree and nothing later
+                        // can undo the drop: the verdict is final.
+                        InputStatus::Dropped => return seen,
+                        // Delivered can still be refined to Ignored, and an
+                        // ignored input still owes a tree, so keep listening
+                        // unless the tree already answered.
+                        InputStatus::Delivered | InputStatus::Ignored => {
+                            if seen.changed.is_some() {
+                                return seen;
+                            }
+                        }
                     }
                 }
                 // Lagging drops the oldest acks, which are the ones for
@@ -453,9 +557,26 @@ async fn observe(
 
 /// Turn what was observed into the tool's answer.
 ///
-/// `pre` is the tree the input was aimed at, used only when the app ignored
-/// the input and published nothing newer.
-fn report(seen: Observed, pre: Snapshot) -> Result<CallToolResult, McpError> {
+/// `fallback` is the freshest tree the bridge holds, used only when the app
+/// ignored the input and published nothing newer. `sent` is how many inputs
+/// the burst carried, which only a partial drop needs.
+fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolResult, McpError> {
+    // A drop anywhere in a burst is a partial failure of the whole call, even
+    // when the last press landed and the tree changed: reporting the tree
+    // would tell the agent the burst arrived intact.
+    if seen.dropped > 0 && sent > 1 {
+        let landed = sent - seen.dropped;
+        return Err(McpError::internal_error(
+            format!(
+                "the app dropped {} of the {sent} inputs this call sent because its input queue \
+                 was full, so at most {landed} landed and the effect is partial. Send fewer \
+                 inputs, or wait for each call to return before sending the next; slower input \
+                 gets through.",
+                seen.dropped
+            ),
+            None,
+        ));
+    }
     match (seen.status, seen.changed) {
         (Some(InputStatus::Dropped), _) => Err(McpError::internal_error(
             "the app dropped this input because its input queue was full, so nothing was \
@@ -464,7 +585,7 @@ fn report(seen: Observed, pre: Snapshot) -> Result<CallToolResult, McpError> {
             None,
         )),
         (Some(InputStatus::Ignored), changed) => {
-            let snapshot = changed.unwrap_or(pre);
+            let snapshot = changed.unwrap_or(fallback);
             Ok(text_result(format!(
                 "The app received this input and deliberately did nothing with it (for example \
                  an action a modal dialog blocks, or a node it no longer knows). Re-plan from \
@@ -555,6 +676,27 @@ mod tests {
         for action in actions {
             assert_eq!(parse_action(&action_name(&action)), action);
         }
+    }
+
+    /// The counterexample the inverse above does not cover: a node advertising
+    /// `Custom("activate")` spells its action exactly like the built-in, so
+    /// the built-in name has to reach it.
+    #[test]
+    fn a_custom_action_named_like_a_builtin_is_still_reachable() {
+        let custom = Action::Custom("activate".to_string());
+        let node = Node::new("x", Role::Button).action(custom.clone());
+        assert_eq!(resolve_action("activate", &node), Some(custom));
+
+        // The built-in still wins wherever a node advertises it.
+        let builtin = Node::new("y", Role::Button).action(Action::Activate);
+        assert_eq!(resolve_action("activate", &builtin), Some(Action::Activate));
+
+        // Neither form advertised is still a rejection.
+        let neither = Node::new("z", Role::Button).action(Action::Toggle);
+        assert_eq!(resolve_action("activate", &neither), None);
+
+        // And a custom name nothing advertises stays a rejection too.
+        assert_eq!(resolve_action("archive", &neither), None);
     }
 
     #[test]

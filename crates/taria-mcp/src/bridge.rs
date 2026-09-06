@@ -85,6 +85,19 @@ pub struct BridgeHandle {
     pub input_tx: mpsc::Sender<(InputId, AgentInput)>,
     /// Every ack the app sends, republished for whoever is waiting on one.
     pub ack_tx: broadcast::Sender<(InputId, InputStatus)>,
+    /// The `protocol_version` the connected app declared in its handshake.
+    ///
+    /// `None` before any handshake, and again once the app goes away, so a
+    /// stale version is never read as the current peer's. An app that sends
+    /// no `Hello` at all leaves it `None`, which reads as "no mismatch
+    /// known": the compatibility path for adapters that predate the
+    /// handshake.
+    ///
+    /// The tool layer needs this because a peer on another protocol version
+    /// still delivers parseable snapshots while being unable to parse the
+    /// inputs sent back to it, and reporting an input as sent to such a peer
+    /// would be a lie.
+    pub protocol_rx: watch::Receiver<Option<u32>>,
 }
 
 impl BridgeHandle {
@@ -113,16 +126,19 @@ pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
     let (state_tx, state_rx) = watch::channel(BridgeState::Never);
     let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
     let (ack_tx, _) = broadcast::channel(ACK_QUEUE);
+    let (protocol_tx, protocol_rx) = watch::channel(None);
     tokio::spawn(manager_loop(
         socket_path,
         state_tx,
         input_rx,
         ack_tx.clone(),
+        protocol_tx,
     ));
     BridgeHandle {
         state_rx,
         input_tx,
         ack_tx,
+        protocol_rx,
     }
 }
 
@@ -141,6 +157,7 @@ async fn manager_loop(
     state_tx: watch::Sender<BridgeState>,
     mut input_rx: mpsc::Receiver<(InputId, AgentInput)>,
     ack_tx: broadcast::Sender<(InputId, InputStatus)>,
+    protocol_tx: watch::Sender<Option<u32>>,
 ) {
     let mut backoff = RETRY_MIN;
     loop {
@@ -150,9 +167,19 @@ async fn manager_loop(
                 drain_stale_inputs(&mut input_rx);
                 let connected_at = Instant::now();
                 let mut conn_label = None;
-                let end =
-                    run_connection(stream, &state_tx, &mut input_rx, &ack_tx, &mut conn_label)
-                        .await;
+                let end = run_connection(
+                    stream,
+                    &state_tx,
+                    &mut input_rx,
+                    &ack_tx,
+                    &protocol_tx,
+                    &mut conn_label,
+                )
+                .await;
+                // The peer's protocol version belongs to the connection that
+                // declared it; forget it here so the next connection is never
+                // judged by the previous app's handshake.
+                protocol_tx.send_replace(None);
                 // The watch only ever holds `Connected` while this connection
                 // was being served (it is demoted below after every
                 // connection), so `Connected` here means this connection
@@ -276,6 +303,7 @@ async fn run_connection(
     state_tx: &watch::Sender<BridgeState>,
     input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>,
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
+    protocol_tx: &watch::Sender<Option<u32>>,
     conn_label: &mut Option<String>,
 ) -> ConnectionEnd {
     let (read_half, mut write_half) = stream.into_split();
@@ -285,7 +313,7 @@ async fn run_connection(
         tokio::select! {
             read = read_line_capped(&mut reader, &mut line_buf) => match read {
                 Ok(LineRead::Line) => {
-                    handle_app_line(&line_buf, state_tx, ack_tx, conn_label);
+                    handle_app_line(&line_buf, state_tx, ack_tx, protocol_tx, conn_label);
                     line_buf.clear();
                 }
                 Ok(LineRead::Eof) => return ConnectionEnd::AppClosed,
@@ -329,6 +357,7 @@ fn handle_app_line(
     line: &[u8],
     state_tx: &watch::Sender<BridgeState>,
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
+    protocol_tx: &watch::Sender<Option<u32>>,
     conn_label: &mut Option<String>,
 ) {
     match serde_json::from_slice::<AppToBridge>(line) {
@@ -343,9 +372,11 @@ fn handle_app_line(
                     app_label,
                     app_protocol = protocol_version,
                     bridge_protocol = PROTOCOL_VERSION,
-                    "protocol version mismatch; continuing, but messages may misparse"
+                    "protocol version mismatch; snapshots still parse, but the app cannot \
+                     receive input from this bridge"
                 );
             }
+            protocol_tx.send_replace(Some(protocol_version));
             *conn_label = Some(app_label);
         }
         Ok(AppToBridge::Snapshot(snapshot)) => {

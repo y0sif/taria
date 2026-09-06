@@ -46,6 +46,17 @@ fn main() -> io::Result<()> {
     if dropped > 0 {
         eprintln!("taria-demo: dropped {dropped} agent input(s): the app could not keep up");
     }
+    // The other silent discard: inputs the layer threw away because the
+    // bridge connection they were aimed at ended before this loop dequeued
+    // them. Nothing on the agent side is left to hear about those, so the
+    // person running the demo is the only one who can.
+    let stale = layer.stale_inputs();
+    if stale > 0 {
+        eprintln!(
+            "taria-demo: discarded {stale} agent input(s): the bridge connection they arrived on \
+             ended first"
+        );
+    }
     result
 }
 
