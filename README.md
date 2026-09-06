@@ -11,10 +11,11 @@ terminals and guessing at structure. taria works on the other side of the
 terminal: the app publishes what is on screen semantically, the way
 accessibility trees transformed GUI automation.
 
-> Status: pre-alpha. The v0 vertical slice works end to end: a ratatui
-> adapter, an MCP bridge, and a demo app an agent can drive today. The wire
-> format is not stable yet. See `docs/landscape.md` for why this project
-> exists and `docs/architecture.md` for how the pieces fit.
+> Status: pre-alpha. The vertical slice works end to end: a ratatui adapter,
+> an MCP bridge, and a demo app an agent can drive today. The wire format is
+> frozen at `PROTOCOL_VERSION` 1. See `docs/landscape.md` for why this
+> project exists, `docs/architecture.md` for how the pieces fit, and
+> `docs/integration-guide.md` for adding taria to an app you already have.
 
 ## Quick start
 
@@ -42,8 +43,8 @@ Prerequisites: a Rust toolchain (1.88 or newer) and, for step 2, the
 
 3. Ask the agent to drive the app: "read the tree, add a task called ship
    v0, mark it done, then delete it". The agent works through the
-   `read_tree`, `act`, and `key` tools while the TUI reacts in the first
-   terminal.
+   `read_tree`, `act`, `type_text`, and `key` tools while the TUI reacts in
+   the first terminal.
 
 ### Running the demo headless
 
@@ -74,7 +75,8 @@ The app publishes a semantic snapshot of its widget tree over a Unix domain
 socket, one JSON object per line (ndjson), on every meaningful change. The
 bridge holds the latest snapshot and exposes it, plus input back into the
 app, as MCP tools. Agent input reaches the app's event loop like any other
-input source.
+input source, and the app acknowledges each input by id, so the bridge can
+tell an input the app acted on from one it never saw.
 
 ```text
 +---------------+   Unix socket  +-----------+  MCP over stdio  +---------------+
@@ -83,16 +85,23 @@ input source.
 +---------------+                +-----------+                  +---------------+
 ```
 
-`docs/architecture.md` covers the wire protocol, socket lifecycle, and focus
-contract in detail.
+`docs/architecture.md` covers the wire protocol, acknowledgement, socket
+lifecycle, and focus contract in detail. `docs/integration-guide.md` is the
+guide to retrofitting taria into a ratatui app you already have.
 
 ## MCP tools
 
 | Tool | What it does |
 |---|---|
 | `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, and the actions each node advertises. |
-| `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`). Validated against the tree; returns the updated tree once the app reacts. |
-| `key` | Sends a raw key press (`"q"`, `"enter"`, `"ctrl+c"`). A fallback for parts of the UI without semantic coverage. |
+| `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`). The node id and the action are checked against the latest tree before anything is sent. |
+| `key` | Sends a raw key press (`"q"`, `"enter"`, `"ctrl+c"`), up to 64 times with `repeat`. A key that does not match the grammar is rejected here rather than swallowed by the app. A fallback for parts of the UI without semantic coverage. |
+| `type_text` | Types a literal string in one call instead of one `key` call per character, up to 4096 characters. The text lands wherever the app currently sends typing, so focus the target first. |
+
+The three input tools wait up to 500 ms for the app's answer and report what
+actually happened: the updated tree, an input the app deliberately ignored
+(with the current tree to re-plan from), or an error for an input that was
+dropped, never applied, or aimed at an app that has gone away.
 
 ## taria-mcp CLI
 
@@ -126,7 +135,7 @@ crates/taria-ratatui  Ratatui adapter: publish semantics alongside rendering
 crates/taria-mcp      MCP bridge binary for agent harnesses
 examples/demo-app     Demo ratatui app driven by an agent through taria
 scripts/              Python verification harnesses (e2e, adversarial)
-docs/                 Landscape research and architecture notes
+docs/                 Landscape research, architecture, integration guide
 ```
 
 ## Development
@@ -143,15 +152,31 @@ python3 scripts/adversarial.py   # edge-case probes (expects debug binaries buil
 Both scripts use only the Python standard library. `e2e.py` builds the debug
 binaries first; pass `--no-build` to skip that.
 
+## Compatibility
+
+`PROTOCOL_VERSION` is 1 and the wire format is frozen. Within version 1,
+changes are additive: new optional fields, new message variants, new roles,
+new action names. An older peer ignores fields it does not know, skips a
+message it cannot parse, and degrades an unknown role to `other` and an
+unknown action to a custom action keeping its name. So an app built against
+a later taria stays readable by an agent built against this one, at the cost
+of one degraded field rather than the whole tree.
+
+Removing a field, renaming one, making an optional field required, or
+changing what an existing field means bumps the version. `wire.rs` in
+`crates/taria` is the normative statement of the rule, and
+`docs/architecture.md` explains it.
+
 ## Limitations
 
 - The adapter serves one bridge client per app at a time.
-- A `protocol_version` mismatch in the handshake logs a warning on the
-  bridge; it does not disconnect.
+- An app on a different `protocol_version` can still be read: snapshots
+  parse, so `read_tree` works. Every input tool refuses, because the app
+  cannot parse the input messages this bridge writes.
 - Unix only for now: the transport is a Unix domain socket. Linux is the
   tested platform.
-- Pre-alpha wire format. `PROTOCOL_VERSION` is 0, and breaking changes will
-  bump it without a compatibility path.
+- Socket paths are capped at 107 bytes by AF_UNIX. Set `$TARIA_SOCK` to a
+  shorter path when the default is too long.
 
 ## License
 

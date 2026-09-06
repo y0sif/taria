@@ -549,9 +549,11 @@ impl Shared {
         self.lock_state().generation += 1;
     }
 
-    /// Forget every queued ack. An [`InputId`] is unique only within one
-    /// connection, so an ack outliving its connection would name an input the
-    /// next client never sent.
+    /// Forget every queued ack. An ack answers the client that sent the
+    /// input, so one outliving its connection would reach a client that never
+    /// sent it. Ids do not repeat for the lifetime of a bridge process (see
+    /// [`InputId`]), so the next client would not mistake it for its own, but
+    /// there is nothing useful to do with it either.
     fn clear_acks(&self) {
         self.lock_state().acks.clear();
     }
