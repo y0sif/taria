@@ -202,30 +202,63 @@ mod tests {
     /// frozen, so these strings are the format itself, not a detail of how it
     /// happens to be derived today. A hand-written deserializer also makes
     /// this the only thing keeping `Role::from_wire` in step with `Serialize`.
-    const ROLE_JSON: [(Role, &str); 18] = [
-        (Role::App, r#""app""#),
-        (Role::Pane, r#""pane""#),
-        (Role::List, r#""list""#),
-        (Role::ListItem, r#""list_item""#),
-        (Role::Table, r#""table""#),
-        (Role::Row, r#""row""#),
-        (Role::Cell, r#""cell""#),
-        (Role::TextInput, r#""text_input""#),
-        (Role::Button, r#""button""#),
-        (Role::Checkbox, r#""checkbox""#),
-        (Role::Tabs, r#""tabs""#),
-        (Role::Tab, r#""tab""#),
-        (Role::Text, r#""text""#),
-        (Role::ProgressBar, r#""progress_bar""#),
-        (Role::Dialog, r#""dialog""#),
-        (Role::Menu, r#""menu""#),
-        (Role::MenuItem, r#""menu_item""#),
-        (Role::Other, r#""other""#),
-    ];
+    ///
+    /// Built by walking an exhaustive `match`, so a role added later cannot be
+    /// left out: its arm, naming its JSON and the role that follows it, has to
+    /// be written before this compiles. Left out, it would serialize as its own
+    /// name and deserialize as [`Role::Other`] between two peers on the *same*
+    /// version, silently, with nothing here failing.
+    fn role_json() -> Vec<(Role, &'static str)> {
+        let mut table: Vec<(Role, &'static str)> = Vec::new();
+        let mut role = Some(Role::App);
+        while let Some(current) = role {
+            // A chain linked back on itself would push forever. Stopping
+            // leaves the coverage check below to report it.
+            if table.iter().any(|(seen, _)| *seen == current) {
+                break;
+            }
+            let (json, next) = match current {
+                Role::App => (r#""app""#, Some(Role::Pane)),
+                Role::Pane => (r#""pane""#, Some(Role::List)),
+                Role::List => (r#""list""#, Some(Role::ListItem)),
+                Role::ListItem => (r#""list_item""#, Some(Role::Table)),
+                Role::Table => (r#""table""#, Some(Role::Row)),
+                Role::Row => (r#""row""#, Some(Role::Cell)),
+                Role::Cell => (r#""cell""#, Some(Role::TextInput)),
+                Role::TextInput => (r#""text_input""#, Some(Role::Button)),
+                Role::Button => (r#""button""#, Some(Role::Checkbox)),
+                Role::Checkbox => (r#""checkbox""#, Some(Role::Tabs)),
+                Role::Tabs => (r#""tabs""#, Some(Role::Tab)),
+                Role::Tab => (r#""tab""#, Some(Role::Text)),
+                Role::Text => (r#""text""#, Some(Role::ProgressBar)),
+                Role::ProgressBar => (r#""progress_bar""#, Some(Role::Dialog)),
+                Role::Dialog => (r#""dialog""#, Some(Role::Menu)),
+                Role::Menu => (r#""menu""#, Some(Role::MenuItem)),
+                Role::MenuItem => (r#""menu_item""#, Some(Role::Other)),
+                Role::Other => (r#""other""#, None),
+            };
+            table.push((current, json));
+            role = next;
+        }
+        table
+    }
+
+    /// The compiler forces every role to have an arm; this forces the walk to
+    /// reach every arm, so a new role linked in as a dead end cannot quietly
+    /// cut the rest of the vocabulary out of the tests below.
+    #[test]
+    fn the_role_table_walks_the_whole_vocabulary() {
+        let table = role_json();
+        assert_eq!(
+            table.last().map(|(role, _)| *role),
+            Some(Role::Other),
+            "the walk must end at the last role, not partway: {table:?}"
+        );
+    }
 
     #[test]
     fn every_role_serializes_to_its_frozen_json() {
-        for (role, expected) in ROLE_JSON {
+        for (role, expected) in role_json() {
             assert_eq!(
                 serde_json::to_string(&role).unwrap(),
                 expected,
@@ -236,7 +269,7 @@ mod tests {
 
     #[test]
     fn every_role_roundtrips() {
-        for (role, json) in ROLE_JSON {
+        for (role, json) in role_json() {
             let back: Role = serde_json::from_str(json).unwrap();
             assert_eq!(back, role, "role {role:?} via {json}");
         }

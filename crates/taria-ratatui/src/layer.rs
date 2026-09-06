@@ -275,6 +275,10 @@ impl TariaLayer {
     /// layer has nothing to wait for but still waits out the timeout, so an
     /// app that paces its loop on this call keeps its timing whether or not
     /// taria bound.
+    ///
+    /// A `timeout` so large that no clock can hold the deadline (near
+    /// [`Duration::MAX`]) waits for an input for as long as the queue can
+    /// deliver one, which is what such a deadline asks for anyway.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<AgentInput> {
         self.recv_timeout_with_id(timeout).map(|(_, input)| input)
     }
@@ -307,10 +311,20 @@ impl TariaLayer {
         // Discarding a stale input must not cut the wait short: an app that
         // paces its event loop on this call would otherwise spin through the
         // rest of its budget the moment a bridge disconnects.
-        let deadline = Instant::now() + timeout;
+        //
+        // `Instant + Duration` panics when the deadline is not representable,
+        // and a library crate must not take the app down over an argument.
+        // A deadline that far out is indistinguishable from none at all, so
+        // it becomes a plain blocking wait instead.
+        let deadline = Instant::now().checked_add(timeout);
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let queued = inner.input_rx.recv_timeout(remaining).ok()?;
+            let queued = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    inner.input_rx.recv_timeout(remaining).ok()?
+                }
+                None => inner.input_rx.recv().ok()?,
+            };
             if inner.shared.deliver(queued.generation, queued.id) {
                 return Some((queued.id, queued.input));
             }
@@ -525,6 +539,16 @@ impl Shared {
         self.cv.notify_all();
     }
 
+    /// Retire the generation of the connection being served, so anything
+    /// still queued from it is discarded rather than delivered.
+    ///
+    /// [`reader_loop`] does this as it exits, which covers every connection
+    /// that reached the point of having a reader; [`serve_client`] calls it
+    /// for the ones that failed before that.
+    fn retire_generation(&self) {
+        self.lock_state().generation += 1;
+    }
+
     /// Forget every queued ack. An [`InputId`] is unique only within one
     /// connection, so an ack outliving its connection would name an input the
     /// next client never sent.
@@ -609,24 +633,27 @@ fn serve_client(
         state.generation += 1;
         (state.latest.clone(), state.epoch, state.generation)
     };
-    write_line(
-        &mut write_stream,
-        &AppToBridge::Hello {
-            app_label: shared.app_label.clone(),
-            protocol_version: PROTOCOL_VERSION,
-        },
-    )?;
-    if let Some(snapshot) = initial_snapshot {
-        write_line(&mut write_stream, &AppToBridge::Snapshot(snapshot))?;
-    }
-
     let alive = Arc::new(AtomicBool::new(true));
-    let reader = thread::Builder::new().name("taria-reader".into()).spawn({
-        let alive = Arc::clone(&alive);
-        let shared = Arc::clone(shared);
-        let input_tx = input_tx.clone();
-        move || reader_loop(stream, input_tx, alive, shared, generation)
-    })?;
+    let reader = match start_connection(
+        &mut write_stream,
+        stream,
+        shared,
+        input_tx,
+        initial_snapshot,
+        &alive,
+        generation,
+    ) {
+        Ok(reader) => reader,
+        Err(err) => {
+            // The reader thread normally retires this generation as it exits,
+            // and here it never started (or never got the handshake). Retire
+            // it by hand so the invariant holds through a failed connection
+            // too: between connections the counter matches no queued input.
+            shared.retire_generation();
+            shared.clear_acks();
+            return Err(err);
+        }
+    };
 
     writer_loop(&mut write_stream, shared, &alive, initial_epoch);
 
@@ -639,6 +666,36 @@ fn serve_client(
     // retired their generation, so the app discards them as it dequeues.
     shared.clear_acks();
     Ok(())
+}
+
+/// Send the handshake (and the snapshot a new client is owed) and start the
+/// connection's reader thread, so every way of failing to get a connection
+/// off the ground funnels through one `Err` for the caller to clean up after.
+fn start_connection(
+    write_stream: &mut UnixStream,
+    stream: UnixStream,
+    shared: &Arc<Shared>,
+    input_tx: &SyncSender<QueuedInput>,
+    initial_snapshot: Option<Snapshot>,
+    alive: &Arc<AtomicBool>,
+    generation: u64,
+) -> io::Result<JoinHandle<()>> {
+    write_line(
+        write_stream,
+        &AppToBridge::Hello {
+            app_label: shared.app_label.clone(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )?;
+    if let Some(snapshot) = initial_snapshot {
+        write_line(write_stream, &AppToBridge::Snapshot(snapshot))?;
+    }
+    thread::Builder::new().name("taria-reader".into()).spawn({
+        let alive = Arc::clone(alive);
+        let shared = Arc::clone(shared);
+        let input_tx = input_tx.clone();
+        move || reader_loop(stream, input_tx, alive, shared, generation)
+    })
 }
 
 /// Reader half of a connection: parse `BridgeToApp` lines and forward agent

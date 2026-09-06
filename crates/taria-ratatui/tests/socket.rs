@@ -211,6 +211,23 @@ fn inputs_reach_the_app_acked_delivered_and_malformed_lines_are_ignored() {
     assert_eq!(client.read_message(), ack(2, InputStatus::Delivered));
 }
 
+/// A timeout the clock cannot turn into a deadline must not abort the app:
+/// `Instant::now() + Duration::MAX` panics, and a panic here takes down the
+/// app that embedded the layer. Such a timeout asks to wait for as long as
+/// the queue can deliver an input, so that is what it gets.
+#[test]
+fn recv_timeout_survives_a_timeout_no_clock_can_hold() {
+    let layer = bind_layer("hugetimeout");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    // Queued before the wait starts, so the wait ends on the input rather
+    // than on a deadline that does not exist.
+    client.send_input(1, key("j"));
+    assert_eq!(layer.recv_timeout(Duration::MAX), Some(key("j")));
+    assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
+}
+
 #[test]
 fn ack_can_be_refined_to_ignored() {
     let layer = bind_layer("ackignored");

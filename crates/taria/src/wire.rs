@@ -9,19 +9,24 @@
 //!
 //! Handshake: the first message an app sends after connecting is
 //! [`AppToBridge::Hello`], carrying its label and
-//! [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION). Nothing rejects a peer over
-//! that number: the bridge logs a warning on a mismatch and keeps serving the
-//! connection. The warning is therefore the only signal there is, and it
-//! reports a hazard rather than a curiosity. Peers on different versions
-//! disagree about the shape of every message, so a v0 app fails to parse each
-//! input a v1 bridge sends it and skips them all, and the agent's calls do
-//! nothing while coming back answered. A mismatch is something to fix before
-//! use, not something to note. After the handshake the app
-//! streams [`AppToBridge::Snapshot`] messages, and the bridge sends
-//! [`BridgeToApp::Input`] whenever an agent submits input. Every input carries
-//! an [`InputId`], and the app answers it with an [`AppToBridge::Ack`] naming
-//! the same id, so the bridge can tell an input the app acted on from one it
-//! never saw.
+//! [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION). Nothing in this crate acts
+//! on that number; what a mismatch costs is decided by the transport. Peers on
+//! different versions disagree about the shape of every message, so a v0 app
+//! fails to parse each input a v1 bridge sends it and skips them all, which is
+//! why the reference bridge (`taria-mcp`) splits its tool surface by
+//! direction on a mismatch: it keeps the connection and logs a warning,
+//! reading the tree still works because snapshots parse, and every tool that
+//! sends input refuses up front with an error naming both versions, having
+//! sent nothing. A bridge that forwards input across a mismatch instead
+//! writes into a peer that cannot parse it, and leaves the agent reading "it
+//! may not have reacted yet" for a session that can never react. A mismatch is
+//! something to fix before use, not something to note.
+//!
+//! After the handshake the app streams [`AppToBridge::Snapshot`] messages, and
+//! the bridge sends [`BridgeToApp::Input`] whenever an agent submits input.
+//! Every input carries an [`InputId`], and the app answers it with an
+//! [`AppToBridge::Ack`] naming the same id, so the bridge can tell an input the
+//! app acted on from one it never saw.
 //!
 //! # Compatibility
 //!
@@ -44,6 +49,12 @@
 //! responding. New values in those two vocabularies are additive. An
 //! [`InputStatus`] has no such fallback, and its own documentation says why
 //! that one is safe.
+//!
+//! Both fallbacks are hand-written deserializers that call `deserialize_any`,
+//! so [`Role`](crate::Role) and [`Action`](crate::Action) decode from
+//! self-describing formats only. The transport is ndjson, which costs this
+//! nothing, but a format that needs the type to know what it is reading
+//! (bincode and its relatives) cannot carry these two types.
 //!
 //! Anything else needs a [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) bump:
 //! removing a field, renaming one, making an optional field required, or

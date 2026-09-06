@@ -24,6 +24,8 @@ use tokio::net::UnixStream;
 use tokio::net::unix::OwnedReadHalf;
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::server::MAX_KEY_REPEAT;
+
 /// First reconnect delay after a failed connect attempt.
 const RETRY_MIN: Duration = Duration::from_millis(250);
 /// Backoff cap; the manager keeps retrying at this pace forever.
@@ -36,11 +38,16 @@ const RETRY_MAX: Duration = Duration::from_secs(2);
 const HEALTHY_CONNECTION_MIN: Duration = Duration::from_secs(2);
 /// Queued agent inputs awaiting the socket writer.
 const INPUT_QUEUE: usize = 32;
-/// Acks buffered per subscriber. A waiter only needs the acks published while
-/// its own input is in flight, and one input draws at most two of them, so
-/// this leaves room for a burst of concurrent tool calls without ever making
-/// a slow subscriber miss the answer it is waiting for.
-const ACK_QUEUE: usize = 64;
+/// Acks buffered per subscriber.
+///
+/// A waiter only needs the acks published while its own input is in flight,
+/// but that is not one ack: an input draws up to two (a `Delivered` later
+/// refined to `Ignored`), and one `key` call sends up to [`MAX_KEY_REPEAT`]
+/// of them, so a single maximum burst can publish twice that many acks by
+/// itself. Sized for four such bursts at once, because falling behind is not
+/// a slow read that catches up: the broadcast channel drops the oldest acks,
+/// and the oldest are exactly the `Dropped` answers a burst is watching for.
+const ACK_QUEUE: usize = 8 * MAX_KEY_REPEAT as usize;
 /// Longest accepted ndjson line from the app. A peer that streams more than
 /// this without a newline is treated as a broken connection (disconnect and
 /// reconnect) so the bridge never buffers a line unboundedly.

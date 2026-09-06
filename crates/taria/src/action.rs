@@ -129,17 +129,52 @@ mod tests {
     /// frozen, so these strings are the format itself. A hand-written
     /// deserializer also makes this the only thing keeping `Action::from_wire`
     /// in step with `Serialize`.
-    fn action_json() -> Vec<(Action, &'static str)> {
-        vec![
-            (Action::Activate, r#""activate""#),
-            (Action::Focus, r#""focus""#),
-            (Action::Select, r#""select""#),
-            (Action::Toggle, r#""toggle""#),
-            (Action::Scroll, r#""scroll""#),
-            (Action::SetValue, r#""set_value""#),
-            (Action::Dismiss, r#""dismiss""#),
-            (Action::Custom("archive".into()), r#"{"custom":"archive"}"#),
-        ]
+    ///
+    /// Built by walking an exhaustive `match`, so an action added later cannot
+    /// be left out: its arm, naming its JSON and the action that follows it,
+    /// has to be written before this compiles. Left out, it would serialize as
+    /// its own name and deserialize as [`Action::Custom`] between two peers on
+    /// the *same* version, silently, with nothing here failing.
+    fn action_json() -> Vec<(Action, String)> {
+        let mut table: Vec<(Action, String)> = Vec::new();
+        let mut action = Some(Action::Activate);
+        while let Some(current) = action {
+            // A chain linked back on itself would push forever. Stopping
+            // leaves the coverage check below to report it.
+            if table.iter().any(|(seen, _)| *seen == current) {
+                break;
+            }
+            let (json, next) = match &current {
+                Action::Activate => (r#""activate""#.to_string(), Some(Action::Focus)),
+                Action::Focus => (r#""focus""#.to_string(), Some(Action::Select)),
+                Action::Select => (r#""select""#.to_string(), Some(Action::Toggle)),
+                Action::Toggle => (r#""toggle""#.to_string(), Some(Action::Scroll)),
+                Action::Scroll => (r#""scroll""#.to_string(), Some(Action::SetValue)),
+                Action::SetValue => (r#""set_value""#.to_string(), Some(Action::Dismiss)),
+                Action::Dismiss => (
+                    r#""dismiss""#.to_string(),
+                    Some(Action::Custom("archive".into())),
+                ),
+                // The only variant with a payload, so the only one whose JSON
+                // is built from the value rather than fixed.
+                Action::Custom(name) => (format!(r#"{{"custom":"{name}"}}"#), None),
+            };
+            table.push((current, json));
+            action = next;
+        }
+        table
+    }
+
+    /// The compiler forces every action to have an arm; this forces the walk
+    /// to reach every arm, so a new action linked in as a dead end cannot
+    /// quietly cut the rest of the vocabulary out of the tests below.
+    #[test]
+    fn the_action_table_walks_the_whole_vocabulary() {
+        let table = action_json();
+        assert!(
+            matches!(table.last(), Some((Action::Custom(_), _))),
+            "the walk must end at the last action, not partway: {table:?}"
+        );
     }
 
     #[test]
@@ -156,7 +191,7 @@ mod tests {
     #[test]
     fn every_action_roundtrips() {
         for (action, json) in action_json() {
-            let back: Action = serde_json::from_str(json).unwrap();
+            let back: Action = serde_json::from_str(&json).unwrap();
             assert_eq!(back, action, "action {action:?} via {json}");
         }
     }

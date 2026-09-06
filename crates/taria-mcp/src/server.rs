@@ -29,8 +29,9 @@ const QUEUE_WAIT: Duration = Duration::from_millis(500);
 ///
 /// The point of `repeat` is to spend one call on "move down five rows", not to
 /// hand an agent a way to fill the app's input queue from a single call; the
-/// app drops what overflows it.
-const MAX_KEY_REPEAT: u32 = 64;
+/// app drops what overflows it. Visible to the bridge because the ack channel
+/// has to hold the acks a maximum burst draws.
+pub(crate) const MAX_KEY_REPEAT: u32 = 64;
 
 /// Longest string one `type_text` call may carry, in characters.
 ///
@@ -105,6 +106,11 @@ impl TariaMcpServer {
     /// is invisible in the last input's ack and would otherwise be reported as
     /// plain success.
     ///
+    /// A send that fails partway is reported the same way, and for the same
+    /// reason: the copies already handed over may have taken effect, so the
+    /// call is neither the failure the send error describes on its own nor a
+    /// success.
+    ///
     /// `repeat` of 0 still sends once. The count is validated by the caller,
     /// and sending nothing while reporting on an input that was never sent
     /// would be the worse failure.
@@ -119,12 +125,37 @@ impl TariaMcpServer {
         // Subscribe before anything is sent: an ack published before this
         // point is one the receiver would never see.
         let acks = self.bridge.subscribe_acks();
-        let mut ids = Vec::with_capacity(repeat.max(1) as usize);
-        for _ in 1..repeat {
-            ids.push(self.send_input(input.clone()).await?);
+        let wanted = repeat.max(1) as usize;
+        let mut ids = Vec::with_capacity(wanted);
+        // Carried past `observe` rather than returned on the spot: failing out
+        // of the loop would tell the agent "this input was not sent" while the
+        // copies before it are already on the wire, and invite a retry of a
+        // burst that partly landed.
+        let mut cut_short = false;
+        for _ in 0..wanted {
+            match self.send_input(input.clone()).await {
+                Ok(id) => ids.push(id),
+                Err(err) => {
+                    if ids.is_empty() {
+                        // Nothing reached the app, so the send error is the
+                        // whole truth and already says so.
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        sent = ids.len(),
+                        wanted,
+                        err = %err.message,
+                        "input burst cut short; part of it is already on the wire"
+                    );
+                    cut_short = true;
+                    break;
+                }
+            }
         }
-        ids.push(self.send_input(input).await?);
         let seen = observe(acks, rx, &pre, &ids).await;
+        if cut_short {
+            return Err(partial_send_error(&seen, ids.len(), wanted));
+        }
         // The answer to an ignored input is a tree, and the freshest one the
         // bridge holds beats the one the input was aimed at: the frame that
         // caused the ignore can land after the ack that reports it.
@@ -444,6 +475,13 @@ struct Observed {
     /// How many inputs of the burst the app acked
     /// [`Dropped`](InputStatus::Dropped).
     dropped: usize,
+    /// How many acks were published while this call was in flight and never
+    /// read, because the observer fell behind the broadcast channel.
+    ///
+    /// Any of them could have been a [`Dropped`](InputStatus::Dropped) for one
+    /// of this burst's ids, so a nonzero count makes [`dropped`](Self::dropped)
+    /// a floor rather than a count, and the burst's fate only partly known.
+    lost: u64,
     /// Newest snapshot differing from the one the input was aimed at.
     changed: Option<Snapshot>,
 }
@@ -529,9 +567,12 @@ async fn observe(
                         }
                     }
                 }
-                // Lagging drops the oldest acks, which are the ones for
-                // inputs already answered; the newest keep arriving.
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                // Lagging drops the oldest acks, and the oldest are this
+                // burst's earliest presses: the very ones whose `Dropped`
+                // answers only the tally would ever show. Counted rather
+                // than shrugged off, so the report can say the observation
+                // is incomplete instead of under-counting the drops.
+                Err(broadcast::error::RecvError::Lagged(skipped)) => seen.lost += skipped,
                 Err(broadcast::error::RecvError::Closed) => acks_open = false,
             },
             changed = rx.changed(), if state_open => {
@@ -559,8 +600,33 @@ async fn observe(
 ///
 /// `fallback` is the freshest tree the bridge holds, used only when the app
 /// ignored the input and published nothing newer. `sent` is how many inputs
-/// the burst carried, which only a partial drop needs.
+/// the burst carried, which the two partial answers need: a drop somewhere in
+/// the burst, and an observation with acks missing from it.
 fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolResult, McpError> {
+    // Acks this call never read could have been its own `Dropped` answers, so
+    // none of the verdicts below can be stood behind: the drop tally is a
+    // floor, and a clean tree would claim an intact burst nobody watched.
+    if seen.lost > 0 {
+        let known = if seen.dropped > 0 {
+            format!(
+                "at least {} of them were dropped because the app's input queue was full, and the \
+                 rest may or may not have been applied",
+                seen.dropped
+            )
+        } else {
+            "they may or may not have been applied".to_string()
+        };
+        return Err(McpError::internal_error(
+            format!(
+                "the bridge lost {} of the app's acknowledgements while this call was in flight, \
+                 so what became of the {sent} inputs it sent cannot be reported in full: {known}. \
+                 Call read_tree to see what actually landed, and send fewer inputs per call so \
+                 the answers can be read as fast as they arrive.",
+                seen.lost
+            ),
+            None,
+        ));
+    }
     // A drop anywhere in a burst is a partial failure of the whole call, even
     // when the last press landed and the tree changed: reporting the tree
     // would tell the agent the burst arrived intact.
@@ -609,6 +675,34 @@ fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolRes
             UPDATE_WAIT.as_millis()
         ))),
     }
+}
+
+/// The error for a burst the bridge could not finish sending.
+///
+/// The `sent` inputs that did go out are on the wire and may already have been
+/// applied, so neither of the two answers this call could otherwise give is
+/// true: "this input was not sent" (what the send error says on its own) hides
+/// the part that landed, and a tree claims a burst that arrived intact. The
+/// agent needs both counts to know what is left to retry.
+fn partial_send_error(seen: &Observed, sent: usize, wanted: usize) -> McpError {
+    let unsent = wanted - sent;
+    let dropped = if seen.dropped > 0 {
+        format!(
+            " Of the {sent} sent, the app dropped {} because its input queue was full.",
+            seen.dropped
+        )
+    } else {
+        String::new()
+    };
+    McpError::internal_error(
+        format!(
+            "the app stopped accepting input partway through this call: {sent} of the {wanted} \
+             inputs were sent and may already have taken effect, and the remaining {unsent} were \
+             not sent, so the effect is partial.{dropped} Call read_tree to see what landed, then \
+             retry the rest once the app is responsive."
+        ),
+        None,
+    )
 }
 
 /// Depth-first search for a node by id.
@@ -697,6 +791,99 @@ mod tests {
 
         // And a custom name nothing advertises stays a rejection too.
         assert_eq!(resolve_action("archive", &neither), None);
+    }
+
+    fn snapshot(marker: &str) -> Snapshot {
+        Snapshot::new(1, Node::new("app", Role::App).label(marker))
+    }
+
+    /// Acks published faster than the observer reads them are dropped oldest
+    /// first, and the oldest are this burst's earliest presses. Skipping them
+    /// silently is what turns "3 of your 5 presses were dropped" into a clean
+    /// success, so they have to be counted and reported.
+    #[tokio::test]
+    async fn acks_lost_to_lag_are_counted_and_refuse_to_read_as_success() {
+        let (ack_tx, acks) = broadcast::channel(2);
+        let (_state_tx, rx) = watch::channel(BridgeState::Never);
+        let pre = snapshot("before");
+        // Four acks into a two-slot channel, all published before the observer
+        // reads: the two oldest are gone by its first recv.
+        for id in 1..=4 {
+            let _ = ack_tx.send((id, InputStatus::Delivered));
+        }
+
+        let seen = observe(acks, rx, &pre, &[1, 2, 3, 4]).await;
+        assert_eq!(seen.lost, 2, "skipped acks must be counted: {seen:?}");
+
+        let err = report(seen, pre, 4).expect_err("an incomplete observation is not a success");
+        assert!(
+            err.message.contains("lost 2 of the app's acknowledgements"),
+            "error should say how many answers went missing: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("the 4 inputs it sent"),
+            "error should say how much of the call is in question: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("read_tree"),
+            "error should say how to find out what landed: {}",
+            err.message
+        );
+    }
+
+    /// With acks lost, the drops that were seen are a floor and must not be
+    /// reported as the count.
+    #[test]
+    fn a_drop_seen_beside_a_lost_ack_is_reported_as_a_floor() {
+        let seen = Observed {
+            status: Some(InputStatus::Delivered),
+            dropped: 2,
+            lost: 1,
+            changed: None,
+        };
+        let err = report(seen, snapshot("after"), 5).expect_err("lost acks are not a success");
+        assert!(
+            err.message.contains("at least 2 of them were dropped"),
+            "a drop count that cannot be complete must not read as exact: {}",
+            err.message
+        );
+    }
+
+    /// The counts an agent needs after a burst that stopped partway: what went
+    /// out (and may have taken effect) and what never did.
+    #[test]
+    fn a_partial_send_names_both_halves_of_the_burst() {
+        let err = partial_send_error(&Observed::default(), 2, 5);
+        assert!(
+            err.message.contains("2 of the 5 inputs were sent"),
+            "error should say how much was sent: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("remaining 3 were not sent"),
+            "error should say how much was not: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("this input was not sent"),
+            "a partial send must not read like nothing was sent: {}",
+            err.message
+        );
+
+        // Drops seen among the sent part are named too, since they shrink the
+        // part that may have landed.
+        let dropped = Observed {
+            dropped: 1,
+            ..Observed::default()
+        };
+        assert!(
+            partial_send_error(&dropped, 2, 5)
+                .message
+                .contains("the app dropped 1"),
+            "drops in the sent part belong in the report"
+        );
     }
 
     #[test]

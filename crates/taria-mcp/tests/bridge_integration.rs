@@ -932,6 +932,73 @@ async fn a_full_input_queue_fails_the_call_instead_of_hanging() {
     );
 }
 
+/// The same jam, but partway through a burst: presses 1 and 2 are already on
+/// the wire when press 3 finds no room. Failing out with the single-input
+/// error would tell the agent nothing was sent and invite a retry of a burst
+/// that partly landed, so the call has to report both halves. Wired by hand
+/// for the same reason as the test above: a real app drains the queue faster
+/// than a test can fill it.
+#[tokio::test]
+async fn a_burst_cut_short_reports_how_much_of_it_was_sent() {
+    let (_state_tx, state_rx) = watch::channel(BridgeState::Connected(Snapshot::new(
+        1,
+        demo_root("stops-draining"),
+    )));
+    // Two slots and nobody reading them: the third press onwards has nowhere
+    // to go.
+    let (input_tx, mut input_rx) = mpsc::channel(2);
+    let (ack_tx, _ack_rx) = broadcast::channel(8);
+    let (_protocol_tx, protocol_rx) = watch::channel(Some(PROTOCOL_VERSION));
+    let server = TariaMcpServer::new(BridgeHandle {
+        state_rx,
+        input_tx,
+        ack_tx,
+        protocol_rx,
+    });
+
+    let err = timeout(
+        WAIT,
+        server.key(Parameters(KeyParams {
+            key: "down".to_string(),
+            repeat: Some(5),
+        })),
+    )
+    .await
+    .expect("the call must not park on a full queue")
+    .expect_err("a burst that could not be finished is not a success");
+    assert!(
+        err.message.contains("2 of the 5 inputs were sent"),
+        "error should count what went out: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("remaining 3 were not sent"),
+        "error should count what did not: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("may already have taken effect"),
+        "error should warn that the effect is partial: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("this input was not sent"),
+        "a partial burst must not read like nothing was sent: {}",
+        err.message
+    );
+
+    // The claim has to be true: those two really are queued for the app.
+    let mut queued = Vec::new();
+    while let Ok((_id, input)) = input_rx.try_recv() {
+        queued.push(input);
+    }
+    assert_eq!(
+        queued.len(),
+        2,
+        "the error names 2 sent; the queue must hold exactly those: {queued:?}"
+    );
+}
+
 #[tokio::test]
 async fn type_text_forwards_the_whole_string_in_one_input() {
     let (_dir, listener, mut handle, server) = setup("type-text").await;
