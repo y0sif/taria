@@ -647,10 +647,9 @@ def probe_set_value_without_value(client, ctx):
 
     # Leave the app as this probe found it. Seeding the draft moved focus to
     # the input, and `select` on a list item does not move it back (it only
-    # moves the list cursor, which the tree does not show while the input has
-    # focus), so the later probes would find the cursor somewhere they cannot
-    # read. `esc` is the demo's own way out: it clears the draft and hands
-    # focus back to the list.
+    # moves the list cursor), so the later probes would start with the
+    # keyboard somewhere they did not put it. `esc` is the demo's own way
+    # out: it clears the draft and hands focus back to the list.
     tree = client.call_tree("key", {"key": "esc"})
     if tree is None:
         tree = client.read_tree(retries=5)

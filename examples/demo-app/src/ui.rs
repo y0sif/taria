@@ -74,8 +74,14 @@ fn render_tasks(app: &App, frame: &mut Frame, area: Rect) {
         lines.push(Line::from(Span::styled("    (no tasks here)", dim())));
     }
     for (pos, task) in app.visible_tasks().enumerate() {
-        let is_selected = list_focused && pos == app.selection;
-        let marker = if is_selected { "> " } else { "  " };
+        // The cursor row keeps its marker whichever region owns the keyboard,
+        // matching the selection the tree publishes: an agent that selects a
+        // row while the input has focus moves a cursor a person can see too.
+        // Only the highlight tracks focus, so the screen still says where a
+        // keypress would land.
+        let is_cursor = pos == app.selection;
+        let is_selected = list_focused && is_cursor;
+        let marker = if is_cursor { "> " } else { "  " };
         let check = if task.done { "[x] " } else { "[ ] " };
         let style = if is_selected {
             bold()

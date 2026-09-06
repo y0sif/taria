@@ -21,6 +21,11 @@ pub const TASK_IDS: IdSpace = IdSpace::new("task");
 /// the delete dialog is open only the dialog nodes advertise actions. The
 /// rest of the tree stays visible (structure, labels, values) but inert,
 /// mirroring how [`mod@crate::update`] gates keys and acts behind the modal.
+///
+/// Focus and selection are separate facts. `focused` says where a raw key
+/// would land, so only one node carries it; the list's value says which row
+/// the cursor sits on, and it is published in every state so moving the
+/// cursor is observable even when the keyboard belongs to the input.
 pub fn build_nodes(app: &App) -> Vec<Node> {
     let mut nodes = vec![tabs_node(app), list_node(app), input_node(app)];
     if let Some(dialog) = dialog_node(app) {
@@ -71,7 +76,7 @@ fn list_node(app: &App) -> Node {
             node
         })
         .collect();
-    Node::new("tasks", Role::List)
+    let mut node = Node::new("tasks", Role::List)
         .label(match app.tab {
             Tab::Active => "Active tasks",
             Tab::Done => "Done tasks",
@@ -79,7 +84,19 @@ fn list_node(app: &App) -> Node {
         // An empty list would leave the frame with no focused node at all;
         // parking focus on the list itself keeps exactly one node focused.
         .focused(list_focused && items.is_empty())
-        .children(items)
+        .children(items);
+    // Selection is not focus. The cursor sits on a row whether or not the
+    // list owns the keyboard, so the list publishes the selected item's id as
+    // its own value the way the tabs node publishes the active tab. Without
+    // it, a `select` sent while the input has focus would move the cursor
+    // without changing anything an agent can read, and the bridge would
+    // truthfully report no change for an input the app handled. An empty
+    // list has no row to name and so has no value, matching the tab children
+    // where an absent value means "not selected".
+    if let Some(selected) = app.selected_id() {
+        node = node.value(TASK_IDS.id(selected));
+    }
+    node
 }
 
 fn input_node(app: &App) -> Node {
@@ -414,6 +431,85 @@ mod tests {
         assert_eq!(
             find(&nodes, "tab-active").unwrap().actions,
             vec![Action::Select]
+        );
+    }
+
+    #[test]
+    fn list_names_the_selected_item_in_both_focus_states() {
+        let mut app = App::new();
+        app.selection = 2;
+        let nodes = build_nodes(&app);
+        assert_eq!(
+            find(&nodes, "tasks").unwrap().value.as_deref(),
+            Some("task-4"),
+            "the list names the row the cursor sits on"
+        );
+        assert_eq!(focused_id(&nodes).as_deref(), Some("task-4"));
+
+        app.focus = Focus::Input;
+        let nodes = build_nodes(&app);
+        assert_eq!(
+            find(&nodes, "tasks").unwrap().value.as_deref(),
+            Some("task-4"),
+            "the cursor is still readable once the keyboard belongs to the input"
+        );
+        // Focus semantics are untouched: the keyboard is the input's, so no
+        // item claims focus and exactly one node in the tree does.
+        assert_eq!(count_focused(&nodes), 1);
+        assert_eq!(focused_id(&nodes).as_deref(), Some("input"));
+    }
+
+    #[test]
+    fn selecting_while_the_input_has_focus_changes_the_published_tree() {
+        let mut app = App::new();
+        app.focus = Focus::Input;
+        let before = build_nodes(&app);
+
+        assert_eq!(
+            apply_agent_input(&mut app, act("task-4", Action::Select)),
+            crate::update::Applied::Handled
+        );
+
+        let after = build_nodes(&app);
+        assert_ne!(
+            before, after,
+            "a handled select must be visible in the tree, or the bridge \
+             reports no change for a state change that happened"
+        );
+        assert_eq!(
+            find(&after, "tasks").unwrap().value.as_deref(),
+            Some("task-4")
+        );
+        assert_eq!(count_focused(&after), 1);
+        assert_eq!(focused_id(&after).as_deref(), Some("input"));
+    }
+
+    #[test]
+    fn an_empty_list_names_no_selection() {
+        let mut app = App::new();
+        for task in &mut app.tasks {
+            task.done = true;
+        }
+        app.clamp_selection();
+        let nodes = build_nodes(&app);
+        let list = find(&nodes, "tasks").unwrap();
+        assert!(list.children.is_empty());
+        assert_eq!(
+            list.value, None,
+            "with no row to name, the list publishes no selection"
+        );
+    }
+
+    #[test]
+    fn the_dialog_keeps_the_selection_readable() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("task-3", Action::Select));
+        apply_agent_input(&mut app, act("task-3", Action::Custom("delete".into())));
+        let nodes = build_nodes(&app);
+        assert_eq!(
+            find(&nodes, "tasks").unwrap().value.as_deref(),
+            Some("task-3"),
+            "values stay visible behind the modal, the selection with them"
         );
     }
 
