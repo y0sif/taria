@@ -1,7 +1,8 @@
 # taria
 
 Agent accessibility layer for TUIs (ARIA for terminals): protocol + ratatui
-adapter + MCP bridge. Pre-alpha; v0 is a demo-first vertical slice.
+adapter + MCP bridge. Pre-alpha; the v0 vertical slice (adapter + bridge +
+demo) works end to end.
 
 ## Commands
 
@@ -10,20 +11,33 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
+python3 scripts/e2e.py                      # end-to-end gate (builds debug binaries)
+python3 scripts/adversarial.py              # edge-case probes (needs debug binaries)
 ```
 
-Run all four before pushing.
+Run all six before pushing.
 
 ## Architecture
 
 - `crates/taria`: wire types only (`Snapshot`, `Node`, `Role`, `Action`,
-  `AgentInput`). Serde-serializable, no I/O, no framework deps. Breaking wire
+  `AgentInput`) plus the `wire` module (`AppToBridge`/`BridgeToApp` ndjson
+  messages). Serde-serializable, no I/O, no framework deps. Breaking wire
   changes bump `PROTOCOL_VERSION`.
-- `crates/taria-ratatui`: adapter that publishes a `Snapshot` per meaningful
-  frame and feeds `AgentInput` back to the app as events.
-- `crates/taria-mcp`: bridge binary exposing `read_tree` / `act` / `key` MCP
-  tools to harnesses, talking to the app over the taria transport.
-- `examples/demo-app`: ratatui task-manager demo an agent drives end to end.
+- `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket, vets the
+  socket directory, and serves one bridge client at a time from background
+  threads (listener plus per-connection reader/writer). `FrameRecorder`/`sem`
+  record nodes per frame; identical trees are deduped; `AgentInput` reaches
+  the app via `try_recv`/`recv_timeout` like any other event.
+- `crates/taria-mcp`: rmcp stdio server exposing `read_tree`/`act`/`key`. A
+  socket-manager task reconnects with capped backoff and holds the latest
+  snapshot in a watch channel; `act` validates node ids and advertised
+  actions against that snapshot before forwarding.
+- `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
+  input, confirm-delete dialog) an agent drives end to end. `tree.rs` and
+  `update.rs` are pure and unit-tested, including the one-focused-node and
+  modal-dialog invariants.
+
+Details: docs/architecture.md.
 
 ## Conventions
 
