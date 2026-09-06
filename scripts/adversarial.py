@@ -19,6 +19,7 @@ Usage:  python3 scripts/adversarial.py   (expects target/debug binaries built)
 import contextlib
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -28,6 +29,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from e2e import (  # noqa: E402
+    EXPECT_ACK,
     INVALID_PARAMS,
     McpClient,
     PtyApp,
@@ -38,6 +40,7 @@ from e2e import (  # noqa: E402
     deletable_task,
     find,
     flatten,
+    key,
     one_focused,
     parse_result,
     require,
@@ -83,6 +86,32 @@ def partial_drop_error(dropped, sent):
     )
 
 
+# A burst the bridge could not finish handing over. The counts are whatever
+# the kernel's socket buffer happened to hold, so they are captured rather
+# than spelled out; every other word is verbatim, and the bracketed drop
+# clause must be absent when the app acked nothing.
+PARTIAL_SEND_RE = re.compile(
+    r"^the app stopped accepting input partway through this call: (?P<sent>\d+) of the "
+    r"(?P<wanted>\d+) inputs were sent and may already have taken effect, and the "
+    r"remaining (?P<unsent>\d+) were not sent, so the effect is partial\."
+    r"(?P<dropped> Of the (?P=sent) sent, the app dropped (?P<n>\d+) because its input "
+    r"queue was full\.)? Call read_tree to see what landed, then retry the rest once "
+    r"the app is responsive\.$"
+)
+
+# The bridge's ack channel fell behind while a call was in flight. `lost` is a
+# function of how fast the reader outran the observer, so it is captured; the
+# `{known}` clause has exactly two shapes and both are spelled out.
+LOST_ACKS_RE = re.compile(
+    r"^the bridge lost (?P<lost>\d+) of the app's acknowledgements while this call was "
+    r"in flight, so what became of the (?P<sent>\d+) inputs it sent cannot be reported "
+    r"in full: (?P<known>they may or may not have been applied|at least (?P<dropped>\d+)"
+    r" of them were dropped because the app's input queue was full, and the rest may or "
+    r"may not have been applied)\. Call read_tree to see what actually landed, and send "
+    r"fewer inputs per call so the answers can be read as fast as they arrive\.$"
+)
+
+
 class FakeApp:
     """An app that speaks the taria ndjson wire directly.
 
@@ -103,6 +132,7 @@ class FakeApp:
         self.read_inputs = read_inputs
         self.conn = None
         self._lines = []
+        self._malformed = []
         self._lock = threading.Lock()
         self._connected = threading.Event()
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -144,8 +174,20 @@ class FakeApp:
                 line, buf = buf.split(b"\n", 1)
                 if not line.strip():
                     continue
+                # This runs on a daemon thread, where an exception kills the
+                # thread and nothing else: the probe waiting on `wait_inputs`
+                # would then time out with a message about a missing input
+                # rather than about the line the bridge actually wrote. Keep
+                # the line instead and let [`malformed`] fail the probe with
+                # it in hand.
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    with self._lock:
+                        self._malformed.append(line[:400])
+                    continue
                 with self._lock:
-                    self._lines.append(json.loads(line))
+                    self._lines.append(parsed)
 
     def send(self, msg):
         self.conn.sendall((json.dumps(msg) + "\n").encode())
@@ -171,6 +213,16 @@ class FakeApp:
         """Every message received from the bridge, in arrival order."""
         with self._lock:
             return list(self._lines)
+
+    def malformed(self):
+        """Lines from the bridge this app could not parse as JSON.
+
+        Non-empty means the wire carried something the protocol does not
+        describe, which is a finding rather than a reason for the reader
+        thread to disappear.
+        """
+        with self._lock:
+            return list(self._malformed)
 
     def inputs(self):
         return [msg for msg in self.lines() if msg.get("type") == "input"]
@@ -253,6 +305,13 @@ def fake_session(**kwargs):
         client.initialize()
         require(app.wait_connected(), "the bridge never connected to the fake app")
         yield client, app
+        # Only on the success path: a probe's own failure is the better
+        # report, and this one would otherwise hide it.
+        require(
+            not app.malformed(),
+            f"the bridge wrote lines the wire format does not describe: "
+            f"{app.malformed()[:3]}",
+        )
     finally:
         if client is not None:
             client.close()
@@ -287,8 +346,13 @@ def probe_act_while_dialog_open(client, ctx):
         require(find(tree, "dialog") is not None, "dialog did not open")
 
         for action, value in (("set_value", MODAL_DRAFT), ("activate", None)):
+            args = {"node": "input", "action": action}
+            if value is not None:
+                args["value"] = value
             try:
-                act(client, "input", action, value=value, refresh=False)
+                # `call_raw`: nothing is expected to reach the app, so there
+                # is no result shape to hold the call to.
+                client.call_raw("act", args)
             except ToolError as err:
                 require(
                     "does not advertise" in err.message,
@@ -406,7 +470,15 @@ def probe_act_while_dialog_open(client, ctx):
 
 
 def probe_rapid_acts(client, ctx):
-    """Fire 10 selects back-to-back without waiting for responses."""
+    """Fire 10 selects back-to-back without waiting for responses.
+
+    Answering all ten without an error is only half of it. "The tree did not
+    change within 500ms" is a success result, so an app that acknowledged ten
+    selects and applied none would pass an errors-only probe -- and so would
+    a bridge that answered without forwarding anything. The burst therefore
+    ends on a row it did not start on, and the list has to name that row when
+    the dust settles.
+    """
     tree = client.read_tree()
     tasks = [
         c["id"]
@@ -415,6 +487,14 @@ def probe_rapid_acts(client, ctx):
     ]
     require(len(tasks) >= 2, f"need two selectable tasks, have {tasks}")
     a, b = tasks[0], tasks[1]
+    # Park the cursor on `a` first, so the row the burst ends on is not the
+    # row it started on and "nothing moved" cannot look like success.
+    start = act(client, a, "select", expect=EXPECT_ACK)
+    require(
+        find(start, "tasks").get("value") == a,
+        f"could not park the cursor on {a}: tasks names "
+        f"{find(start, 'tasks').get('value')!r}",
+    )
 
     ids = []
     for i in range(10):
@@ -446,10 +526,17 @@ def probe_rapid_acts(client, ctx):
                 errors.append(resp["error"].get("message", "?")[:60])
             elif resp.get("result", {}).get("isError"):
                 errors.append("isError result")
-    tree = client.read_tree()
-    focused = one_focused(tree, "after rapid acts")
     require(errors == [], f"rapid acts returned errors: {errors}")
-    return f"10/10 responses, no errors, final focus {focused}"
+    tree = client.read_tree()
+    selected = find(tree, "tasks").get("value")
+    require(
+        selected == b,
+        f"the last of 10 rapid selects asked for {b}, but the list names "
+        f"{selected!r} (the burst started parked on {a}): acts were "
+        "acknowledged and not applied",
+    )
+    focused = one_focused(tree, "after rapid acts")
+    return f"10/10 responses, no errors, cursor {a} -> {selected} (focus {focused})"
 
 
 def probe_empty_key(client, ctx):
@@ -552,30 +639,37 @@ def probe_key_repeat_bounds(client, ctx):
 
     rows = [item["id"] for item in task_items(before)]
     require(len(rows) >= 2, f"need two rows to count moves, have {rows}")
-    tree = act(client, rows[0], "select")
+    # 64 presses over a list whose length divides 64 wrap exactly back to the
+    # start -- which is also where a burst that lost every press sits. The
+    # landing assertion below would then hold with nothing moved at all, so
+    # refuse to run rather than report a pass that proves nothing. Three
+    # active rows is what the demo seeds; if that ever changes to 2, 4, 8 or
+    # 16, this is the loud failure that says so.
+    require(
+        64 % len(rows) != 0,
+        f"cannot count 64 presses over {len(rows)} rows ({rows}): they wrap "
+        "exactly back to the starting row, so landing there would prove "
+        "nothing about whether any press arrived",
+    )
+    tree = act(client, rows[0], "select", expect=EXPECT_ACK)
     require(
         one_focused(tree, "before repeat=64") == rows[0],
         f"select did not park the cursor on {rows[0]}",
     )
     expected = rows[64 % len(rows)]
-    kind, tree = client.call_outcome("key", {"key": "down", "repeat": 64})
-    if kind == "no_change":
-        # Only legitimate when 64 presses wrap exactly back to the start.
-        require(
-            expected == rows[0],
-            f"key repeat=64 reported no change, but 64 presses over "
-            f"{len(rows)} rows should have landed on {expected}",
-        )
-        tree = client.read_tree()
-    else:
-        require(kind == "tree", f"key repeat=64 answered {kind!r}, expected a tree")
+    # `no_change` is not a legitimate answer any more: with the wrap ruled out
+    # above, 64 presses must move the cursor and the app must publish it.
+    tree = key(client, "down", repeat=64)
     landed = one_focused(tree, "after repeat=64")
     require(
         landed == expected,
         f"repeat=64 over {len(rows)} rows landed on {landed}, expected "
         f"{expected}: presses were lost or coalesced",
     )
-    return f"0 and 65 rejected; 64 accepted, all 64 presses landed ({landed})"
+    return (
+        f"0 and 65 rejected; 64 accepted, all 64 presses landed over "
+        f"{len(rows)} rows ({rows[0]} -> {landed})"
+    )
 
 
 def probe_empty_action(client, ctx):
@@ -595,7 +689,7 @@ def probe_stale_node(client, ctx):
     tree = client.read_tree()
     require(find(tree, "dialog") is None, "dialog unexpectedly open")
     try:
-        act(client, "dialog-cancel", "activate", refresh=False)
+        client.call_raw("act", {"node": "dialog-cancel", "action": "activate"})
         raise StepFailure("act on a stale (absent) node id succeeded")
     except ToolError as err:
         require(
@@ -606,10 +700,60 @@ def probe_stale_node(client, ctx):
 
 
 def probe_ctrl_c_key(client, ctx):
-    text = client.call_raw("key", {"key": "ctrl+c"})
-    tree = client.read_tree()
-    require(tree is not None, "app died or bridge lost it after ctrl+c key")
-    return "ctrl+c forwarded, app alive"
+    """ctrl+c reaches the app, is acknowledged, and types nothing.
+
+    Sent with the *input* focused, which is the only place the modifier
+    matters: the demo's input handler appends a bare `c` to the draft and its
+    guard is what stops `ctrl+c` from doing the same
+    (examples/demo-app/src/update.rs, the `KeyCode::Char(c)` arm). Sent with
+    the list focused instead, `c` is unbound either way, so the probe would
+    pass whether the guard existed or not.
+
+    The answer has to be the acknowledged-no-change shape: the app dequeued
+    the press and chose to do nothing. A tree back would mean the guard let
+    the character through, and no ack at all would mean the press vanished.
+    """
+    draft = "ctrl guard"
+    tree = act(client, "input", "set_value", value=draft)
+    require(
+        one_focused(tree, "before ctrl+c") == "input",
+        "set_value must leave the input focused for the guard to be reachable",
+    )
+    require(
+        find(tree, "input")["value"] == draft,
+        f"could not seed the draft: input is {find(tree, 'input').get('value')!r}",
+    )
+
+    kind, _ = client.call_outcome("key", {"key": "ctrl+c"})
+    require(
+        kind == "no_change",
+        f"ctrl+c into the focused input answered {kind!r}; expected the app to "
+        "acknowledge a press it deliberately does nothing with",
+    )
+    live = client.read_tree()
+    require(
+        find(live, "input")["value"] == draft,
+        f"ctrl+c typed into the draft: it now reads "
+        f"{find(live, 'input').get('value')!r}, expected {draft!r}",
+    )
+    require(
+        one_focused(live, "after ctrl+c") == "input",
+        "ctrl+c moved the keyboard out of the input",
+    )
+
+    # Leave the app where this probe found it: draft cleared, keyboard back
+    # on the list. `esc` is the demo's own way out of the input.
+    tree = key(client, "esc")
+    require(
+        find(tree, "input")["value"] in (None, ""),
+        "could not clear the draft after the ctrl+c probe",
+    )
+    back_on = one_focused(tree, "after the ctrl+c probe")
+    require(back_on != "input", "esc did not hand the keyboard back to the list")
+    return (
+        f"ctrl+c acked with no change; draft {draft!r} untouched, focus "
+        f"restored to {back_on}"
+    )
 
 
 def probe_set_value_without_value(client, ctx):
@@ -650,9 +794,7 @@ def probe_set_value_without_value(client, ctx):
     # moves the list cursor), so the later probes would start with the
     # keyboard somewhere they did not put it. `esc` is the demo's own way
     # out: it clears the draft and hands focus back to the list.
-    tree = client.call_tree("key", {"key": "esc"})
-    if tree is None:
-        tree = client.read_tree(retries=5)
+    tree = key(client, "esc")
     require(
         find(tree, "input")["value"] in (None, ""),
         "could not clear the draft again after the probe",
@@ -826,13 +968,22 @@ def probe_partial_burst_drop(client, ctx):
 
 
 def probe_input_queue_full(client, ctx):
-    """An app that stops reading its socket gets an error, not a hang.
+    """An app that stops reading its socket gets errors, not a hang.
 
     Without the bounded wait the tool call parks until the app comes back,
     with nothing said to the agent meanwhile. The stand-in app here accepts
-    the connection and never reads it, which is the state the error names;
-    the bridge's queue to it fills, and the next input is refused instead of
-    queued forever.
+    the connection and never reads it, which is the state the errors name.
+
+    Backing the queue up passes through two distinct reports, and both are
+    asserted here because they say different things to the agent:
+
+    - the burst that runs out of room *partway* is neither a failure nor a
+      success. Some of its presses are on the wire and may already have
+      landed, so "this input was not sent" would hide them and a tree would
+      claim a burst that arrived intact. Nothing lines the queue's capacity
+      up with a multiple of 64, so one call has to straddle the boundary.
+    - every call after it is refused outright, and only then does "this input
+      was not sent" mean exactly that.
     """
     with fake_session(read_inputs=False) as (mcp, app):
         app.snapshot(1, FAKE_ROOT)
@@ -842,17 +993,51 @@ def probe_input_queue_full(client, ctx):
         # an ack that cannot come times out, so a handful of calls is enough
         # to back the queue up; the cap is a guard against looping forever if
         # the bound ever goes away.
+        partial = None
         for attempt in range(1, 17):
             try:
                 mcp.call_raw("key", {"key": "down", "repeat": 64})
             except ToolError as err:
+                match = PARTIAL_SEND_RE.match(err.message)
+                if match:
+                    require(
+                        partial is None,
+                        f"a second burst was cut short partway ({err.message}); "
+                        f"the first was {partial}, so the queue drained in "
+                        "between and the app is reading after all",
+                    )
+                    sent, wanted, unsent = (
+                        int(match["sent"]),
+                        int(match["wanted"]),
+                        int(match["unsent"]),
+                    )
+                    require(
+                        wanted == 64 and 0 < sent < 64 and sent + unsent == wanted,
+                        f"partial-send counts do not add up: {err.message}",
+                    )
+                    # The app never read a line, so it acked nothing, so the
+                    # drop clause has no business being here.
+                    require(
+                        match["dropped"] is None,
+                        f"the partial-send report claims drops from an app that "
+                        f"never read its socket: {err.message}",
+                    )
+                    partial = f"{sent} of {wanted} sent"
+                    continue
                 require(
                     err.message == QUEUE_FULL_ERROR,
                     f"the queue-full report reads:\n{err.message}",
                 )
+                require(
+                    partial is not None,
+                    f"the queue went from accepting a whole 64-press burst to "
+                    f"refusing one outright at call {attempt}, with no call cut "
+                    "short partway: the partial-send report is unreachable here "
+                    "and untested",
+                )
                 return (
-                    f"refused after {attempt} calls to an app that stopped "
-                    "reading, no hang"
+                    f"burst cut short partway ({partial}), then refused outright "
+                    f"after {attempt} calls to an app that stopped reading, no hang"
                 )
         raise StepFailure(
             "16 key calls (up to 1024 inputs) queued for an app that never "
@@ -860,9 +1045,92 @@ def probe_input_queue_full(client, ctx):
         )
 
 
-def probe_kill_and_restart(client, ctx, app, sock):
+def probe_lost_acks(client, ctx):
+    """Acks the bridge never got to read make the whole call unreportable.
+
+    The bridge's ack channel drops the *oldest* entries when a reader falls
+    behind, and the oldest are a burst's earliest presses -- exactly the ones
+    whose `Dropped` answers nothing else would ever show. So a call that fell
+    behind cannot stand behind any verdict: a clean tree would claim an
+    intact burst nobody watched, and the drop tally it does have is a floor.
+
+    No real app produces this on demand: it needs acks arriving faster than
+    one tool call can read them, which is a property of the bridge's channel
+    rather than of any app. The stand-in floods acks for ids nobody is
+    waiting on, which is what a busy app looks like from the channel's side.
+    Both halves of the report are covered: with no drops seen, and with one
+    seen first so the tally is known to be incomplete rather than zero.
+    """
+    flood = 2000
+    seen = []
+    for label, drop_first in (("nothing known", False), ("a drop seen first", True)):
+        sent = 2 if drop_first else 1
+        with fake_session() as (mcp, app):
+            app.snapshot(1, FAKE_ROOT)
+            mcp.read_tree()
+
+            req = mcp.send_call("key", {"key": "down", "repeat": sent})
+            require(
+                app.wait_inputs(sent),
+                f"only {len(app.inputs())}/{sent} inputs reached the fake app",
+            )
+            ids = [msg["id"] for msg in app.inputs()]
+            if drop_first:
+                # Read before the flood, so the tally is a known 1 rather
+                # than a casualty of the lag it is meant to qualify.
+                app.ack(ids[0], "dropped")
+                time.sleep(0.05)
+            # One write, so the bridge's reader drains a full buffer of acks
+            # per scheduling slot and outruns the call watching for its own.
+            app.conn.sendall(
+                b"".join(
+                    b'{"type":"ack","id":%d,"status":"delivered"}\n' % (10_000_000 + i)
+                    for i in range(flood)
+                )
+            )
+            app.ack(ids[-1], "delivered")
+
+            try:
+                text = response_text(mcp.collect([req], timeout=20.0)[req])
+            except ToolError as err:
+                match = LOST_ACKS_RE.match(err.message)
+                require(match, f"the lost-acks report reads:\n{err.message}")
+                require(
+                    int(match["lost"]) > 0 and int(match["sent"]) == sent,
+                    f"lost-acks report counts {match['lost']} lost of "
+                    f"{match['sent']} sent, expected some lost of {sent}",
+                )
+                if drop_first:
+                    require(
+                        match["dropped"] == "1",
+                        f"the report should name the one drop it did read: "
+                        f"{err.message}",
+                    )
+                else:
+                    require(
+                        match["dropped"] is None,
+                        f"the report claims drops none of which were read: "
+                        f"{err.message}",
+                    )
+                seen.append(f"{label} ({match['lost']} lost)")
+                continue
+            raise StepFailure(
+                f"a call that lost acks to the channel answered as if it had "
+                f"watched the whole burst: {text[:200]}"
+            )
+    return "; ".join(seen)
+
+
+def probe_kill_and_restart(client, ctx, app, sock, launched):
     """SIGKILL the app mid-session; read_tree must error (not hang); then a
-    restarted app must be picked up by the bridge's reconnect loop."""
+    restarted app must be picked up by the bridge's reconnect loop.
+
+    `launched` is the runner's list of every demo process this script has
+    started. The restarted app joins it the moment it exists, before anything
+    that can fail: reached only through a return value, a failure between the
+    launch and the return would leave the runner killing the corpse of the
+    old one and deleting the socket directory out from under a live demo.
+    """
     app.proc.kill()
     app.proc.wait(timeout=READ_TIMEOUT)
 
@@ -890,6 +1158,7 @@ def probe_kill_and_restart(client, ctx, app, sock):
     # SIGKILL skips Drop, so the stale socket file is expected to linger.
     stale = os.path.exists(sock)
     new_app = PtyApp(sock)
+    launched.append(new_app)
     require(new_app.wait_for_socket(), "restarted app never bound the socket")
     tree = client.read_tree()  # retries while the bridge reconnects
     focused = one_focused(tree, "after restart")
@@ -900,12 +1169,16 @@ def probe_kill_and_restart(client, ctx, app, sock):
     return (
         f"errored {errored_after:.1f}s after SIGKILL (stale socket file: {stale}); "
         f"bridge reconnected to restarted app, focus={focused}"
-    ), new_app
+    )
 
 
 def main():
     tmpdir = tempfile.mkdtemp(prefix="taria-adv-")
     sock = os.path.join(tmpdir, "adv.sock")
+    # Every demo process this run starts, in start order. The restart probe
+    # adds one, and teardown has to reach all of them: removing `tmpdir` with
+    # a live demo still bound to the socket inside it leaves an orphan.
+    launched = []
     app = None
     client = None
     results = []
@@ -928,10 +1201,12 @@ def main():
         ("unknown role and action", probe_unknown_vocabulary),
         ("partial burst drop", probe_partial_burst_drop),
         ("app stops reading its socket", probe_input_queue_full),
+        ("acks lost to the bridge's channel", probe_lost_acks),
     ]
 
     try:
         app = PtyApp(sock)
+        launched.append(app)
         if not app.wait_for_socket():
             print("FAIL setup: socket never appeared")
             sys.exit(1)
@@ -952,7 +1227,7 @@ def main():
 
         name = "kill app + restart/reconnect"
         try:
-            evidence, app = probe_kill_and_restart(client, {}, app, sock)
+            evidence = probe_kill_and_restart(client, {}, app, sock, launched)
             results.append((name, True, evidence))
             print(f"PASS {name}: {evidence}", flush=True)
         except (StepFailure, ToolError, TimeoutError) as err:
@@ -963,8 +1238,10 @@ def main():
             client.close()
             if client.proc.poll() is None:
                 client.proc.kill()
-        if app is not None:
-            app.kill()
+        # Every app, not just the last one named: the socket directory goes
+        # with them, so a demo still running would lose its socket and linger.
+        for started in launched:
+            started.kill()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     print("\n== adversarial summary ==")

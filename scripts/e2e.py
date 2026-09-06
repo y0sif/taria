@@ -121,20 +121,31 @@ class PtyApp:
     def __init__(self, sock_path):
         self.sock_path = sock_path
         self.master, slave = pty.openpty()
-        # Give the pty a sane size so ratatui has an area to draw into.
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-        env = dict(os.environ)
-        env["TARIA_SOCK"] = sock_path
-        env.setdefault("TERM", "xterm-256color")
-        self.proc = subprocess.Popen(
-            [DEMO_BIN],
-            stdin=slave,
-            stdout=slave,
-            stderr=subprocess.PIPE,
-            env=env,
-            close_fds=True,
-        )
-        os.close(slave)
+        # Both fds are owned from here on, so every exit from this block has
+        # to account for them: `finally` for the slave (handed to the child
+        # or not, this side is done with it), and the `except` for the master
+        # (nothing will ever call `kill` on a half-built object, so this is
+        # its only chance to be closed). Two leaked fds per failed launch is
+        # enough to exhaust the limit in a script that restarts the app.
+        try:
+            # Give the pty a sane size so ratatui has an area to draw into.
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+            env = dict(os.environ)
+            env["TARIA_SOCK"] = sock_path
+            env.setdefault("TERM", "xterm-256color")
+            self.proc = subprocess.Popen(
+                [DEMO_BIN],
+                stdin=slave,
+                stdout=slave,
+                stderr=subprocess.PIPE,
+                env=env,
+                close_fds=True,
+            )
+        except BaseException:
+            os.close(self.master)
+            raise
+        finally:
+            os.close(slave)
         self._stderr = bytearray()
         self._screen = bytearray()
         # Drain the pty master forever: if nobody reads, the kernel pty
@@ -340,32 +351,27 @@ class McpClient:
         """tools/call, classified by [`parse_result`]: (kind, tree)."""
         return parse_result(self.call_raw(tool, arguments))
 
-    def call_tree(self, tool, arguments=None):
-        """tools/call for a tool expected to have an effect: the new tree, or
-        None when the app acked but published nothing new.
-
-        An `ignored` ack is a failure here, not a None: the app said it
-        deliberately did nothing, and a step that asked for an effect wants
-        to hear that rather than quietly retry a read_tree.
-        """
-        kind, tree = self.call_outcome(tool, arguments)
-        if kind == "ignored":
-            raise StepFailure(
-                f"{tool} {arguments!r} was IGNORED by the app; expected it to apply"
-            )
-        return tree
-
     def read_tree(self, retries=25, delay=0.2):
         """read_tree with retries while the bridge is still connecting.
 
         Retryable errors are the bridge's two "no app right now" states:
         never connected ("no snapshot ...") and app went away
         ("... disconnected ..."); both clear once the app (re)connects.
+
+        read_tree sends no input, so it has exactly one successful shape: a
+        tree. Any of the input-tool shapes coming back here means read_tree
+        grew a behaviour it is not supposed to have.
         """
         last = None
         for _ in range(retries):
             try:
-                return self.call_tree("read_tree")
+                kind, tree = self.call_outcome("read_tree")
+                require(
+                    kind == "tree",
+                    f"read_tree answered {kind!r}; it sends no input, so a tree "
+                    "is its only successful answer",
+                )
+                return tree
             except ToolError as err:
                 last = err
                 if (
@@ -414,24 +420,100 @@ def one_focused(snapshot, context):
     return ids[0]
 
 
-def act(client, node, action, value=None, refresh=True):
-    """act, falling back to read_tree when the tool says nothing changed."""
+# What a step says it expects back from an input-sending tool.
+#
+# Which of these a call site picks is the whole assertion: the three answers
+# an app can give -- a new tree, "acknowledged, nothing changed", "nothing
+# came back at all" -- are exactly what v0.1's per-input acknowledgement made
+# distinguishable, and a helper that silently re-read the tree on the last two
+# erased the difference. So the expectation is named at every call site, and
+# anything weaker than TREE has to be asked for.
+#
+#   TREE  the app must have reacted: a fresh tree, or the step fails. The
+#         strongest and the default, because a step that sends an input
+#         usually wants its effect.
+#   ACK   the app must have acknowledged the input; whether the tree moved is
+#         then the step's own business, and a re-read fills in the tree. This
+#         is the visible opt-in for a step that tolerates a delayed or absent
+#         effect -- selecting the tab that may already be selected, parking a
+#         cursor that may already be parked -- and such a step asserts the
+#         state it wanted separately. `no_ack` still fails: an app that says
+#         nothing at all is not one that had nothing to do.
+#
+# There is deliberately no third mode that absorbs `no_ack` too. Under the
+# v0.1 contract an app answers every input it dequeues, so a step written
+# against `taria-demo` that shrugged at silence would be tolerating a broken
+# contract rather than a slow app.
+EXPECT_TREE = "tree"
+EXPECT_ACK = "ack"
+
+
+def expect_input(client, tool, args, expect):
+    """Send one input and hold the tool to `expect`; returns a tree.
+
+    An `ignored` ack fails every expectation here: the app said it
+    deliberately did nothing, and a caller that asked for an effect wants to
+    hear that rather than quietly retry a read_tree. Steps that mean to
+    provoke an ignore classify the result themselves with `call_outcome`.
+    """
+    kind, tree = client.call_outcome(tool, args)
+    if kind == "ignored":
+        raise StepFailure(
+            f"{tool} {args!r} was IGNORED by the app; expected it to apply"
+        )
+    if expect == EXPECT_TREE:
+        require(
+            kind == "tree",
+            f"{tool} {args!r} answered {kind!r}; expected the app to react and "
+            "publish a new tree",
+        )
+        return tree
+    if expect == EXPECT_ACK:
+        require(
+            kind in ("tree", "no_change"),
+            f"{tool} {args!r} answered {kind!r}; expected the app to acknowledge "
+            "it, whether or not the tree moved",
+        )
+        return tree if tree is not None else client.read_tree(retries=5)
+    raise StepFailure(f"unknown expectation {expect!r}")
+
+
+def act(client, node, action, value=None, expect=EXPECT_TREE):
     args = {"node": node, "action": action}
     if value is not None:
         args["value"] = value
-    tree = client.call_tree("act", args)
-    if tree is None and refresh:
-        tree = client.read_tree(retries=5)
-    return tree
+    return expect_input(client, "act", args, expect)
 
 
-def key(client, key_name, repeat=None, refresh=True):
+def key(client, key_name, repeat=None, expect=EXPECT_TREE):
     args = {"key": key_name}
     if repeat is not None:
         args["repeat"] = repeat
-    tree = client.call_tree("key", args)
-    if tree is None and refresh:
-        tree = client.read_tree(retries=5)
+    return expect_input(client, "key", args, expect)
+
+
+def type_text(client, text, expect=EXPECT_TREE):
+    return expect_input(client, "type_text", {"text": text}, expect)
+
+
+TAB_LABELS = {"tab-active": "Active", "tab-done": "Done"}
+
+
+def show_tab(client, tab_id):
+    """Put one tab on screen and return the tree showing it.
+
+    Selecting the tab that is already selected is a no-op the app still
+    dequeues and acknowledges, and which tab a step inherits depends on the
+    step before it. So the expectation here is the acknowledgement, and the
+    thing the caller actually needs -- this tab on screen -- is asserted
+    outright rather than inferred from the tree having changed.
+    """
+    tree = act(client, tab_id, "select", expect=EXPECT_ACK)
+    require(
+        find(tree, "tabs")["value"] == TAB_LABELS[tab_id],
+        f"selected {tab_id}, but the tabs node reads "
+        f"{find(tree, 'tabs').get('value')!r}, expected {TAB_LABELS[tab_id]!r}",
+    )
     return tree
 
 
@@ -512,7 +594,6 @@ def step_c_act_select(client, ctx):
     require(candidates, "no unfocused task with a select action to target")
     target = candidates[-1]
     tree = act(client, target, "select")
-    require(tree is not None, "act select produced no tree")
     after = one_focused(tree, "after select")
     require(
         after == target and after != before,
@@ -530,12 +611,11 @@ def step_d_act_toggle(client, ctx):
 
     # Toggle: the task flips to done and therefore moves to the Done tab.
     tree = act(client, target, "toggle")
-    require(tree is not None, "act toggle produced no tree")
     require(
         find(tree, target) is None,
         f"{target} still visible on the Active tab after toggling to done",
     )
-    tree = act(client, "tab-done", "select")
+    tree = show_tab(client, "tab-done")
     node = find(tree, target)
     require(node is not None, f"{target} not found on the Done tab after toggle")
     require(node["value"] == "done", f"{target} value {node['value']!r}, expected done")
@@ -546,7 +626,7 @@ def step_d_act_toggle(client, ctx):
         find(tree, target) is None,
         f"{target} still on the Done tab after toggling back",
     )
-    tree = act(client, "tab-active", "select")
+    tree = show_tab(client, "tab-active")
     node = find(tree, target)
     require(node is not None, f"{target} not back on the Active tab")
     require(node["value"] == "todo", f"{target} value {node['value']!r}, expected todo")
@@ -558,7 +638,6 @@ def step_d_act_toggle(client, ctx):
 def step_e_add_task(client, ctx):
     title = "Bought via e2e"
     tree = act(client, "input", "set_value", value=title)
-    require(tree is not None, "act set_value produced no tree")
     node = find(tree, "input")
     require(
         node["value"] == title,
@@ -567,7 +646,6 @@ def step_e_add_task(client, ctx):
     one_focused(tree, "after set_value")
 
     tree = act(client, "input", "activate")
-    require(tree is not None, "act activate produced no tree")
     added = [n for n in flatten(tree["root"]) if n.get("label") == title]
     require(added, f"no node labeled {title!r} after activate")
     require(added[0]["value"] == "todo", "new task should start as todo")
@@ -584,14 +662,12 @@ def step_e_add_task(client, ctx):
 def step_f_dialog(client, ctx):
     target = ctx["new_task"]
     tree = act(client, target, "delete")
-    require(tree is not None, "act custom delete produced no tree")
     dialog = find(tree, "dialog")
     require(dialog is not None, "no node id 'dialog' after custom delete action")
     require(find(tree, "dialog-cancel") is not None, "dialog has no dialog-cancel")
     require(one_focused(tree, "dialog open") == "dialog", "dialog should hold focus")
 
     tree = act(client, "dialog-cancel", "activate")
-    require(tree is not None, "act activate on dialog-cancel produced no tree")
     require(find(tree, "dialog") is None, "dialog still present after cancel")
     require(
         find(tree, target) is not None,
@@ -602,8 +678,10 @@ def step_f_dialog(client, ctx):
 
 
 def step_g_errors(client, ctx):
+    # Called through `call_raw` rather than `act`: nothing here is expected to
+    # reach the app at all, so there is no result shape to hold the call to.
     try:
-        act(client, "no-such-node", "select", refresh=False)
+        client.call_raw("act", {"node": "no-such-node", "action": "select"})
         raise StepFailure("act on bogus node id succeeded, expected an error")
     except ToolError as err:
         require(
@@ -613,7 +691,7 @@ def step_g_errors(client, ctx):
         bogus_msg = err.message
 
     try:
-        act(client, "input", "toggle", refresh=False)
+        client.call_raw("act", {"node": "input", "action": "toggle"})
         raise StepFailure("act with unadvertised action succeeded, expected an error")
     except ToolError as err:
         require(
@@ -632,7 +710,6 @@ def step_g_errors(client, ctx):
 def step_h_keys(client, ctx):
     before_tab = find(ctx["snapshot"], "tabs")["value"]
     tree = key(client, "tab")
-    require(tree is not None, "key tab produced no tree")
     after_tab = find(tree, "tabs")["value"]
     require(
         after_tab != before_tab,
@@ -640,7 +717,6 @@ def step_h_keys(client, ctx):
     )
     before_focus = one_focused(tree, "before key down")
     tree = key(client, "down")
-    require(tree is not None, "key down produced no tree")
     after_focus = one_focused(tree, "after key down")
     require(
         after_focus != before_focus,
@@ -653,7 +729,7 @@ def step_h_keys(client, ctx):
 def step_i_type_text(client, ctx):
     """type_text is the v0.1 headline: one call types a whole title."""
     title = "Typed end to end"
-    act(client, "tab-active", "select")  # step h left the Done tab on screen
+    show_tab(client, "tab-active")  # step h left the Done tab on screen
     before = client.read_tree()
     require(
         title not in task_labels(before).values(),
@@ -674,9 +750,7 @@ def step_i_type_text(client, ctx):
     )
 
     # One call types the title and the trailing newline that submits it.
-    tree = client.call_tree("type_text", {"text": title + "\n"})
-    if tree is None:
-        tree = client.read_tree(retries=5)
+    tree = type_text(client, title + "\n")
 
     added = [n for n in flatten(tree["root"]) if n.get("label") == title]
     require(
@@ -797,7 +871,9 @@ def step_k_key_repeat(client, ctx):
     """key repeat sends exactly that many presses."""
     items = [item["id"] for item in task_items(client.read_tree())]
     require(len(items) >= 3, f"need three visible tasks to count moves, have {items}")
-    tree = act(client, items[0], "select")
+    # The cursor may already be parked on the first row, so this select is
+    # held to its acknowledgement and the parking is asserted below.
+    tree = act(client, items[0], "select", expect=EXPECT_ACK)
     require(
         one_focused(tree, "before key repeat") == items[0],
         f"select did not park the cursor on {items[0]}",
@@ -844,9 +920,9 @@ def step_l_bad_key(client, ctx):
 
 def step_m_id_stability(client, ctx):
     """Deleting a task leaves every surviving task id exactly as it was."""
-    active_before = task_labels(client.read_tree())
-    done_before = task_labels(act(client, "tab-done", "select"))
-    tree = act(client, "tab-active", "select")
+    active_before = task_labels(show_tab(client, "tab-active"))
+    done_before = task_labels(show_tab(client, "tab-done"))
+    show_tab(client, "tab-active")
     victim = ctx.get("typed_task") or next(iter(active_before))
     require(victim in active_before, f"{victim} is not on the Active tab")
     require(len(active_before) >= 2, f"need a survivor to check, have {active_before}")
@@ -856,8 +932,8 @@ def step_m_id_stability(client, ctx):
     tree = act(client, "dialog-confirm", "activate")
 
     active_after = task_labels(tree)
-    done_after = task_labels(act(client, "tab-done", "select"))
-    act(client, "tab-active", "select")
+    done_after = task_labels(show_tab(client, "tab-done"))
+    show_tab(client, "tab-active")
 
     require(victim not in active_after, f"{victim} survived its own delete")
     require(
@@ -893,7 +969,99 @@ def step_n_snapshot_size(client, ctx):
     return f"{size} bytes < {SNAPSHOT_LIMIT}"
 
 
-def step_o_shutdown(client, ctx, app):
+def step_o_select_while_typing(client, ctx):
+    """`select` moves the cursor even when the keyboard belongs to the input.
+
+    Focus and selection are separate facts. With the input focused, a select
+    on a task must not steal the keyboard, so `focused` cannot report it and
+    the list's own value is the only thing that can. A tree publishing focus
+    alone answers this call with "acknowledged, nothing changed", and the
+    agent that just moved the cursor has no way to see that it moved -- which
+    is why every other select in this scenario is sent from list focus, where
+    focus moves anyway and would cover for a missing value.
+    """
+    tree = show_tab(client, "tab-active")
+    rows = [item["id"] for item in task_items(tree)]
+    require(len(rows) >= 2, f"need two visible tasks to move between, have {rows}")
+    target = rows[-1]
+
+    # Park the cursor away from the target, then hand the keyboard to the
+    # input. `set_value` focuses the input as a side effect, which is how an
+    # agent gets there without a raw key.
+    tree = act(client, rows[0], "select", expect=EXPECT_ACK)
+    require(
+        find(tree, "tasks").get("value") == rows[0],
+        f"tasks value {find(tree, 'tasks').get('value')!r} after parking the "
+        f"cursor on {rows[0]}",
+    )
+    draft = "typing while the cursor moves"
+    tree = act(client, "input", "set_value", value=draft)
+    require(
+        one_focused(tree, "before the select") == "input",
+        "set_value must leave the input focused",
+    )
+
+    tree = act(client, target, "select")
+    require(
+        find(tree, "tasks").get("value") == target,
+        f"select moved the cursor to {target}, but the tasks node names "
+        f"{find(tree, 'tasks').get('value')!r}",
+    )
+    require(
+        one_focused(tree, "after the select") == "input",
+        "select stole the keyboard from the input",
+    )
+    require(
+        find(tree, "input")["value"] == draft,
+        f"the draft became {find(tree, 'input').get('value')!r} during a select",
+    )
+
+    # `esc` is the demo's way out of the input: it clears the draft and hands
+    # the keyboard back to the list, which the shutdown step needs (`q` typed
+    # into a focused input is a character, not a quit).
+    tree = key(client, "esc")
+    require(
+        find(tree, "input")["value"] in (None, ""),
+        "esc did not clear the draft",
+    )
+    require(
+        one_focused(tree, "after esc") != "input",
+        "esc did not hand the keyboard back to the list",
+    )
+    ctx["snapshot"] = tree
+    return f"cursor moved {rows[0]} -> {target} with the keyboard in the input"
+
+
+def step_p_ack_without_change(client, ctx):
+    """The app acknowledges an input it deliberately does nothing about.
+
+    This is the shape v0.1 added, and the one no other step in this scenario
+    can distinguish: `no_change` says the app dequeued the input, looked at it
+    and had nothing to do, while `no_ack` says nothing came back at all. An
+    agent tells "done, nothing to see" from "still busy, ask again" by exactly
+    that difference, so a step that accepted either would assert nothing. The
+    other half of the contract -- the `Ignored` refinement -- is step j.
+    """
+    before = show_tab(client, "tab-active")
+    kind, _ = client.call_outcome("act", {"node": "tab-active", "action": "select"})
+    require(
+        kind == "no_change",
+        f"selecting the tab that is already selected answered {kind!r}; expected "
+        "the app to acknowledge an input it deliberately did nothing about",
+    )
+    # And it really did nothing: an app that redrew something would have
+    # published a new tree rather than the no-change note.
+    after = client.read_tree()
+    require(
+        after == before,
+        f"the tree moved under a no-change answer: seq {before['seq']} -> "
+        f"{after['seq']}",
+    )
+    ctx["snapshot"] = after
+    return "re-selecting the current tab: acknowledged, no tree change"
+
+
+def step_q_shutdown(client, ctx, app):
     client.call_raw("key", {"key": "q"})  # quit; tree may or may not update
 
     # The bridge must notice the disconnect and fail read_tree cleanly.
@@ -937,7 +1105,16 @@ def step_o_shutdown(client, ctx, app):
     # because the bridge connection they arrived on ended first -- and every
     # step that passed did so over a hole. Checked here because this is the
     # only point where the demo has printed them and is done writing.
-    app.wait_stderr()
+    # A join that timed out leaves the drain mid-stream, so the absence
+    # assertion below would be run against whatever happened to have arrived
+    # -- possibly nothing at all -- and pass for the wrong reason. The point
+    # of the wait is that the lines cannot still be in flight.
+    require(
+        app.wait_stderr(),
+        "taria-demo's stderr never reached EOF, so its dropped/discarded "
+        "counts may not have been written yet and their absence proves "
+        "nothing",
+    )
     stderr = app.stderr_tail()
     silent_loss = [
         what
@@ -1005,6 +1182,8 @@ def main():
         ("l unparseable key rejected", step_l_bad_key),
         ("m node ids stable across delete", step_m_id_stability),
         ("n snapshot < 8KB", step_n_snapshot_size),
+        ("o select moves the cursor while typing", step_o_select_while_typing),
+        ("p input acked with no tree change", step_p_ack_without_change),
     ]
 
     try:
@@ -1043,13 +1222,13 @@ def main():
                     failed_hard = True
 
         # Shutdown is special: it consumes both processes.
-        name = "o clean shutdown"
+        name = "q clean shutdown"
         if failed_hard:
             results.append((name, False, "skipped: earlier step failed"))
             print(f"FAIL {name}: skipped after earlier failure", flush=True)
         else:
             try:
-                evidence = step_o_shutdown(client, ctx, app)
+                evidence = step_q_shutdown(client, ctx, app)
                 results.append((name, True, evidence))
                 print(f"PASS {name}: {evidence}", flush=True)
             except (StepFailure, ToolError, TimeoutError) as err:
