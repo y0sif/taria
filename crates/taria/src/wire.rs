@@ -15,9 +15,12 @@
 //! fails to parse each input a v1 bridge sends it and skips them all, which is
 //! why the reference bridge (`taria-mcp`) splits its tool surface by
 //! direction on a mismatch: it keeps the connection and logs a warning,
-//! reading the tree still works because snapshots parse, and every tool that
-//! sends input refuses up front with an error naming both versions, having
-//! sent nothing. A bridge that forwards input across a mismatch instead
+//! reading the tree still works for as long as the peer's snapshots parse,
+//! and every tool that sends input refuses up front with an error naming both
+//! versions, having sent nothing. Reading is the common case, not a promise:
+//! the changes that need a bump are exactly the ones that break parsing, so a
+//! peer whose [`Snapshot`] shape moved leaves the reader with no tree at all.
+//! A bridge that forwards input across a mismatch instead
 //! writes into a peer that cannot parse it, and leaves the agent reading "it
 //! may not have reacted yet" for a session that can never react. A mismatch is
 //! something to fix before use, not something to note.

@@ -1,7 +1,7 @@
 # Competitive Landscape (Phase 0, researched 2026-09-04)
 
-Live-web research done before scaffolding. This document feeds the README intro,
-`docs/comparison.md`, `docs/faq.md`, and SEO keywords.
+Live-web research done before scaffolding. It is where the README intro, the
+positioning the rest of the docs assume, and the project's keywords come from.
 
 ## The original idea, and why it pivoted
 

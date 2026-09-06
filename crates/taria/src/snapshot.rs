@@ -6,7 +6,17 @@ use crate::{Node, PROTOCOL_VERSION};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub protocol_version: u32,
-    /// Monotonic sequence number so agents can detect staleness.
+    /// Sequence number, incremented once per published snapshot within one run
+    /// of the app.
+    ///
+    /// It tells which of two snapshots from the same run is the newer one, and
+    /// nothing beyond that. A restarted app starts counting again, so a lower
+    /// `seq` with different content is still a change and not a stale tree,
+    /// and a reader that orders on `seq` across connections orders a fresh
+    /// app's first tree before the previous app's last. A frame an adapter
+    /// deduplicates, because its tree is identical to the one already
+    /// published, does not move it either: it counts publishes, not frames.
+    /// Compare whole snapshots to detect change.
     pub seq: u64,
     pub root: Node,
 }

@@ -66,8 +66,8 @@ VERSION_MISMATCH_ERROR = (
     f"the app speaks taria protocol version {OTHER_PROTOCOL}, this bridge speaks "
     f"{BRIDGE_PROTOCOL}: the app cannot parse input from this bridge, so nothing was "
     "sent and no input tool will work against it. Match the app's taria dependency "
-    "to the bridge's version. read_tree still works, because snapshots parse across "
-    "this mismatch."
+    "to the bridge's version. read_tree keeps working for as long as the app's "
+    "snapshots still parse, which a mismatch does not guarantee."
 )
 QUEUE_FULL_ERROR = (
     "the app is not accepting input: the bridge's queue to it stayed full for 500ms, "

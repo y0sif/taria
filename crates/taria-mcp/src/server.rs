@@ -184,8 +184,8 @@ impl TariaMcpServer {
                 "the app speaks taria protocol version {app_version}, this bridge speaks \
                  {PROTOCOL_VERSION}: the app cannot parse input from this bridge, so nothing was \
                  sent and no input tool will work against it. Match the app's taria dependency to \
-                 the bridge's version. read_tree still works, because snapshots parse across this \
-                 mismatch."
+                 the bridge's version. read_tree keeps working for as long as the app's snapshots \
+                 still parse, which a mismatch does not guarantee."
             ),
             None,
         ))
@@ -335,9 +335,9 @@ impl TariaMcpServer {
                        turn. One call instead of one key call per character: a 100-character \
                        string costs 1 call, not 100. This is the tool for filling a text input, \
                        and for any app that scores individual keystrokes. The text goes wherever \
-                       the app currently sends typing, so put the target in focus first (act \
-                       with focus, or key). Up to 4096 characters. Returns the updated tree once \
-                       the app reacts."
+                       the app currently sends typing: read_tree names the focused node, so move \
+                       focus to the target first if it is not already there. Up to 4096 \
+                       characters. Returns the updated tree once the app reacts."
     )]
     pub async fn type_text(
         &self,

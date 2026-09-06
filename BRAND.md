@@ -23,6 +23,6 @@ before any image asset exists.
 
 ## Don'ts
 
-- Don't call it a "driver", "scraper", or "automation tool" — that's the
+- Don't call it a "driver", "scraper", or "automation tool": that is the
   competition's side of the terminal.
 - Don't pitch against tmux with hostility; taria composes with those tools.

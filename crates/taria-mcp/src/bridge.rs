@@ -76,10 +76,14 @@ pub enum BridgeState {
 
 /// Source of the [`InputId`]s the tool layer stamps on outgoing inputs.
 ///
-/// Process-wide and monotonic. The protocol only asks for ids that are unique
-/// within one connection, and monotonic ids give that for free; they also make
-/// an ack left over from a previous connection trivially non-matching, since
-/// no waiter is ever looking for an id that low again.
+/// Process-wide and monotonic, which is what the protocol asks for: an id must
+/// not repeat for the lifetime of the bridge process, not merely for the
+/// lifetime of one connection. Acks outlive the connection they were sent on,
+/// so a scheme that restarts its ids per connection lets a dead app's in-flight
+/// ack answer a live waiter holding the same id. Counting up across every
+/// connection makes a leftover ack trivially non-matching, since no waiter is
+/// ever looking for an id that low again. [`InputId`] is the normative
+/// statement of the rule.
 static NEXT_INPUT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Handles the MCP tool layer uses to talk to the socket-manager task.
@@ -379,8 +383,8 @@ fn handle_app_line(
                     app_label,
                     app_protocol = protocol_version,
                     bridge_protocol = PROTOCOL_VERSION,
-                    "protocol version mismatch; snapshots still parse, but the app cannot \
-                     receive input from this bridge"
+                    "protocol version mismatch; the app cannot receive input from this bridge, \
+                     and its snapshots parse only for as long as their shape has not moved"
                 );
             }
             protocol_tx.send_replace(Some(protocol_version));

@@ -51,6 +51,33 @@ and an input the app deliberately dropped looks like a slow one.
 - Dedup: a frame whose tree is identical to the previous publish is skipped
   entirely; `seq` does not move.
 
+### Key strings
+
+`AgentInput::Key` carries the press as a plain string, so every adapter and
+every bridge has to read the same grammar or the two disagree about what a
+key means. `KEY_GRAMMAR` in `crates/taria/src/key.rs` is the normative
+statement, and this is it verbatim, phrased there to follow "expected":
+
+> a single character (`a`, `Q`, `?`, `+`), or a named key (enter, esc, tab,
+> backtab, backspace, delete, up, down, left, right, home, end, pageup,
+> pagedown, space, f1 through f12, plus the aliases return, escape, del),
+> optionally prefixed with modifiers joined by `+` (ctrl, alt, shift;
+> `control` is an alias for ctrl). Names and modifiers are case-insensitive,
+> a single character keeps its case. Examples: `q`, `Q`, `ctrl+c`,
+> `alt+enter`, `ctrl+shift+p`, `space`
+
+Two rules the sentence above leaves implicit, both pinned by tests in the
+same module. A `+` that opens or closes the rest is the base key rather than
+a separator, so `ctrl++` is ctrl plus the `+` character while `+a` and
+`ctrl+` are errors. And `shift+tab` and `backtab` are the same press, because
+a terminal delivers shift+tab as a distinct backwards tab.
+
+A Rust peer parses this with `taria::key`, which is why the bridge's verdict
+on a key and the app's are identical by construction. An adapter in another
+language reimplements it, and `KeyPress`'s parse/render round-trip is the
+contract to reimplement against: every press the parser can produce renders
+to a string that parses back to the same press.
+
 ### Version 1 is frozen
 
 `PROTOCOL_VERSION` is 1 and the format is fixed. Within version 1, changes
@@ -86,10 +113,17 @@ bincode and its relatives are not.
 Peers on different versions disagree about the shape of every message, so an
 app on another version cannot parse a single input this bridge sends it. The
 bridge splits its tool surface by direction: it keeps the connection and
-logs a warning, `read_tree` keeps working because snapshots still parse, and
-`act`, `key`, and `type_text` refuse up front with an error naming both
-versions, having sent nothing. Forwarding input across a mismatch would
-leave the agent waiting on a session that can never react.
+logs a warning, `read_tree` keeps working for as long as the peer's snapshots
+still parse, and `act`, `key`, and `type_text` refuse up front with an error
+naming both versions, having sent nothing. Forwarding input across a mismatch
+would leave the agent waiting on a session that can never react.
+
+Reading across a mismatch is the common case, not a guarantee. A bump is
+defined by the changes that break parsing, so a peer that moved a field of
+`Snapshot` delivers lines the bridge skips one by one, holds no tree at all,
+and answers `read_tree` with "no snapshot from the app yet" rather than with
+a degraded one. What survives a bump is whatever the two versions still
+happen to spell the same way.
 
 ## Input acknowledgement
 
@@ -118,11 +152,17 @@ An input tool sends, then watches acks and snapshots for up to 500 ms. Both
 signals are needed and neither is sufficient: an ack says the app saw the
 input but not what it did, a new tree says something happened but not that
 this input caused it. The window is not cut short by a tree arriving without
-an ack, because a `delivered` can still be refined to `dropped` or
-`ignored`.
+an ack, because the ack still owed can be a `dropped`, for an input that
+never reached the app while an unrelated redraw did, and answering that with
+a tree would report a dropped input as applied. A `delivered` does not cut it
+short either: the app can still refine it to `ignored`. What a `delivered`
+never becomes is a `dropped`, which says the input never reached the app at
+all.
 
 | Outcome | Tool answer |
 |---|---|
+| Nothing could be handed over: the bridge's queue to the app stayed full for 500 ms | Error: this input was not sent; the app is stopped or not reading its socket. |
+| A burst the bridge could not finish sending | Error: how many went out and may already have taken effect, how many did not, and that the effect is partial. |
 | Acks lost (the bridge fell behind its own ack channel) | Error: what became of the inputs cannot be reported in full; call `read_tree`, send fewer inputs per call. |
 | Any input of a multi-input burst `dropped` | Error: how many landed, and that the effect is partial. |
 | The app went away and did not come back | Error: it received the input and then disconnected, or disconnected before acknowledging it. |
@@ -133,11 +173,15 @@ an ack, because a `delivered` can still be refined to `dropped` or
 | No ack, tree changed | The new tree. |
 | No ack, no change | Text: neither acknowledged nor changed; it may be an adapter that sends no acks. |
 
-The order matters. A drop outranks a departure, because "never applied"
-stays true whether or not the app is still there. A departure outranks a
-tree, because a tree would describe a UI that no longer exists. Lost acks
-outrank everything, because any of them could have been a `dropped` this
-call was watching for.
+The order matters. The two send failures come first: an input that never left
+the bridge has no ack to wait for, and a burst cut short still waits out the
+window, because its earlier copies can be dropped too, but answers with the
+partial-send error whatever else it sees. "Some of this landed and some was
+never sent" is the only true report of it. Below those, a drop outranks a
+departure, because "never applied" stays true whether or not the app is still
+there. A departure outranks a tree, because a tree would describe a UI that
+no longer exists. Lost acks outrank the rest, because any of them could have
+been a `dropped` this call was watching for.
 
 An adapter that sends no acks at all still works, which is what the last two
 rows are for.

@@ -3,8 +3,8 @@
 **ARIA for terminals.** taria is an agent accessibility layer for terminal
 user interfaces. A TUI app declares its live widget tree, focus state, and
 available actions through a small protocol. An MCP bridge exposes that tree
-to any agent harness (Claude Code, OpenCode, Cursor), which can then drive
-the app without modification.
+to any agent harness (Claude Code, OpenCode, Cursor): the harness drives the
+app through ordinary MCP tools, with no taria-specific code of its own.
 
 Agents today reach TUIs by scraping rendered screens through tmux or headless
 terminals and guessing at structure. taria works on the other side of the
@@ -117,7 +117,7 @@ Environment variables:
 
 | Variable | Effect |
 |---|---|
-| `TARIA_SOCK` | Overrides the socket path, on both the app side and the bridge side. |
+| `TARIA_SOCK` | Socket path, used verbatim. Replaces the default on the app side always, and on the bridge side only when the path is derived from `--app`; an explicit `--socket` wins over it. |
 | `TARIA_LOG` | Bridge log filter (tracing env-filter syntax), default `info`. Logs go to stderr; stdout carries MCP. |
 
 With `--app <label>`, the bridge resolves the socket path the same way the
@@ -170,9 +170,12 @@ changing what an existing field means bumps the version. `wire.rs` in
 ## Limitations
 
 - The adapter serves one bridge client per app at a time.
-- An app on a different `protocol_version` can still be read: snapshots
-  parse, so `read_tree` works. Every input tool refuses, because the app
-  cannot parse the input messages this bridge writes.
+- An app on a different `protocol_version` can still be read for as long as
+  its snapshots parse, which is the common case rather than a guarantee: a
+  version bump is defined by the changes that break parsing, so a peer whose
+  snapshot shape moved leaves the bridge with no tree at all and `read_tree`
+  reports that none has arrived. Every input tool refuses either way,
+  because the app cannot parse the input messages this bridge writes.
 - Unix only for now: the transport is a Unix domain socket. Linux is the
   tested platform.
 - Socket paths are capped at 107 bytes by AF_UNIX. Set `$TARIA_SOCK` to a

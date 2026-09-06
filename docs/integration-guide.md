@@ -17,7 +17,38 @@ The work is five edits, in this order:
 4. Drain agent input around the blocking call in your event loop.
 5. Acknowledge the inputs you deliberately ignore.
 
-Nothing above touches your rendering, your state, or your key handling.
+Nothing above touches your rendering or your state. Your key handling is
+touched only indirectly, by the raw-input fallbacks lowering into it, which is
+its own section below.
+
+## Add the dependency
+
+Neither crate is published yet, so both come from the repository. They carry
+version `0.0.1` there, which is a placeholder rather than something to pin
+against; pin a git revision if you want the same build twice.
+
+```toml
+[dependencies]
+taria-ratatui = { git = "https://github.com/y0sif/taria" }
+```
+
+One line is enough. `taria-ratatui` re-exports the protocol crate, so the
+`taria::{Action, Node, Role}` and `taria::id::IdSpace` the samples below
+import are reachable as `taria_ratatui::taria::{Action, Node, Role}` and
+`taria_ratatui::taria::id::IdSpace`. Add `taria` as a dependency of its own
+if you would rather write them under the name they are spelled here:
+
+```toml
+taria = { git = "https://github.com/y0sif/taria" }
+```
+
+What the two sides do have to agree on is `PROTOCOL_VERSION`. Version 1 is
+frozen and changes within it are additive, so two builds of taria from
+different days still understand each other; a bridge from another protocol
+generation does not, and the cost is every input tool. `act`, `key` and
+`type_text` refuse up front on a mismatch, and `read_tree` survives only for
+as long as the peer's snapshots still parse. Building your app's `taria` and
+the bridge from the same checkout is how you stop having to think about it.
 
 ## Bind without risking startup
 
@@ -134,10 +165,16 @@ and agent input then sits in the queue until a human touches a key. The demo
 runs a tick thread that sends an event every 50 ms, which bounds the latency
 between an act and its effect.
 
-If you have no tick, `layer.recv_timeout(Duration::from_millis(50))` is a
-blocking wait on agent input with a deadline, usable as the loop's clock. It
-waits out the timeout even on a disabled layer, so an app that paces itself
+If you have no tick, `layer.recv_timeout_with_id(Duration::from_millis(50))`
+is a blocking wait on agent input with a deadline, usable as the loop's clock.
+It waits out the timeout even on a disabled layer, so an app that paces itself
 on it keeps its timing whether or not taria bound.
+
+Pace on that variant rather than `recv_timeout`. The plain one drops the
+`InputId`, and without the id you cannot ack `Ignored`, which the next section
+makes mandatory. The same pairing runs through the rest of the API:
+`try_recv_with_id` to `try_recv`, and `drain_with_ids` to `drain`, which is
+that loop already written for you.
 
 ## Give things identities, not positions
 
@@ -318,8 +355,11 @@ input still queued, which a harness restart mid-call will do.
 ## Socket paths
 
 By default the socket is `$XDG_RUNTIME_DIR/taria/<label>.sock`, falling back
-to `<temp dir>/taria-<uid>/<label>.sock`. `$TARIA_SOCK` overrides both, on
-the app side and the bridge side, and is used verbatim.
+to `<temp dir>/taria-<uid>/<label>.sock`. `$TARIA_SOCK` replaces both and is
+used verbatim: on the app side always, and on the bridge side whenever the
+bridge derives its path from `--app`. A bridge started with `--socket <path>`
+takes that path and never reads the variable, so set the variable for both
+processes rather than mixing the two ways of saying it.
 
 Unix domain socket paths are capped at 107 bytes, because `sun_path` holds
 108 including the NUL. It is a low limit and a deep `$XDG_RUNTIME_DIR` or a
@@ -339,7 +379,19 @@ point `$TARIA_SOCK` somewhere shared, expect binding to be refused.
 
 ## Checking your work
 
-Run the app, then the bridge against it, and ask an agent to read the tree.
+Run the app, then attach the bridge to it and ask an agent to read the tree.
+The bridge is `taria-mcp`, built from the same checkout, and its `--app` takes
+the label you passed to `bind_or_disabled`, so it derives the path your app
+bound:
+
+```bash
+cargo build -p taria-mcp
+claude mcp add taria -- /path/to/taria/target/debug/taria-mcp --app my-app
+```
+
+That registration line is Claude Code's; any MCP harness works, and the
+README's quick start walks the same steps against the demo app.
+
 The three things worth confirming by hand:
 
 - Exactly one node is focused in every state, including the empty ones.
