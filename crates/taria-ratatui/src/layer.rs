@@ -11,11 +11,11 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use taria::wire::{AppToBridge, BridgeToApp};
 use taria::{AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
@@ -32,13 +32,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Capacity of the agent-input queue between the socket thread and the app.
-/// When the app is not draining inputs, the newest input is dropped (with a
-/// rate-limited warning) instead of blocking the socket thread or queueing
-/// without bound.
+/// When the app is not draining inputs, the newest input is dropped and
+/// counted (see [`TariaLayer::dropped_inputs`]) instead of blocking the
+/// socket thread or queueing without bound.
 const INPUT_QUEUE: usize = 256;
-
-/// Minimum interval between "input queue full" warnings on stderr.
-const DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The embeddable taria endpoint for a ratatui app.
 ///
@@ -105,6 +102,7 @@ impl TariaLayer {
             app_label: app_label.to_string(),
             state: Mutex::new(State::default()),
             cv: Condvar::new(),
+            dropped_inputs: AtomicU64::new(0),
         });
         let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
 
@@ -156,6 +154,23 @@ impl TariaLayer {
     /// Wait up to `timeout` for the next agent input.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<AgentInput> {
         self.input_rx.recv_timeout(timeout).ok()
+    }
+
+    /// How many agent inputs have been dropped so far because the input
+    /// queue was full.
+    ///
+    /// When an agent floods inputs faster than the app drains them, the
+    /// layer silently drops the newest input rather than blocking the socket
+    /// thread — and rather than printing a warning, which would garble the
+    /// display while the app owns the alternate screen. Each drop bumps this
+    /// monotonic counter instead; it accumulates across reconnects for the
+    /// lifetime of the layer.
+    ///
+    /// Apps should read it after restoring the terminal (e.g. right before
+    /// exit, once the alternate screen has been left) and report a nonzero
+    /// value to the user on stderr or in a log.
+    pub fn dropped_inputs(&self) -> u64 {
+        self.shared.dropped_inputs.load(Ordering::Relaxed)
     }
 
     /// Publish a frame's recorded top-level nodes as a new snapshot.
@@ -215,6 +230,9 @@ struct Shared {
     app_label: String,
     state: Mutex<State>,
     cv: Condvar,
+    /// Agent inputs dropped because the input queue was full. Written by
+    /// reader threads, read via [`TariaLayer::dropped_inputs`].
+    dropped_inputs: AtomicU64,
 }
 
 #[derive(Default)]
@@ -319,8 +337,10 @@ fn serve_client(
 /// inputs to the app. Malformed lines are ignored. A line longer than
 /// [`MAX_LINE_BYTES`] marks the connection broken (the loop exits and the
 /// client is disconnected) instead of buffering it. When the input queue is
-/// full the newest input is dropped with a rate-limited warning, so a flood
-/// of inputs can never block this thread.
+/// full the newest input is silently dropped and counted (the app owns the
+/// terminal, so printing here would garble the display; see
+/// [`TariaLayer::dropped_inputs`]) — a flood of inputs can never block this
+/// thread.
 fn reader_loop(
     stream: UnixStream,
     input_tx: SyncSender<AgentInput>,
@@ -329,7 +349,6 @@ fn reader_loop(
 ) {
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
-    let mut last_drop_warn: Option<Instant> = None;
     loop {
         buf.clear();
         // Read at most one byte past the cap: a line that fits ends in `\n`
@@ -356,13 +375,7 @@ fn reader_loop(
         match input_tx.try_send(input) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
-                let now = Instant::now();
-                if last_drop_warn.is_none_or(|at| now.duration_since(at) >= DROP_WARN_INTERVAL) {
-                    last_drop_warn = Some(now);
-                    eprintln!(
-                        "taria: agent input queue full ({INPUT_QUEUE}); dropping newest input"
-                    );
-                }
+                shared.dropped_inputs.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => break,
         }

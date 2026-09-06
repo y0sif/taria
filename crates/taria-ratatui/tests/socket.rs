@@ -241,6 +241,8 @@ fn input_flood_is_bounded_and_does_not_block_the_socket_thread() {
     let mut client = Client::connect(&layer);
     assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
 
+    assert_eq!(layer.dropped_inputs(), 0, "no drops before any flood");
+
     // Far more inputs than the queue holds, with the app not draining.
     for i in 0..2000 {
         client.send(&BridgeToApp::Input(AgentInput::Key {
@@ -277,6 +279,14 @@ fn input_flood_is_bounded_and_does_not_block_the_socket_thread() {
     }
     assert_eq!(received, 256, "input queue should be bounded at 256");
 
+    // Every overflowed input was accounted for: nothing is printed while the
+    // app owns the terminal, so the drop counter is the only signal.
+    assert_eq!(
+        layer.dropped_inputs(),
+        2000 - 256,
+        "each dropped input must be counted exactly once"
+    );
+
     // And the layer still serves fresh clients and inputs afterwards.
     let mut second = Client::connect(&layer);
     assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
@@ -286,6 +296,9 @@ fn input_flood_is_bounded_and_does_not_block_the_socket_thread() {
     };
     second.send(&BridgeToApp::Input(sent.clone()));
     assert_eq!(layer.recv_timeout(TIMEOUT), Some(sent));
+
+    // Accepted inputs never bump the counter.
+    assert_eq!(layer.dropped_inputs(), 2000 - 256);
 }
 
 #[test]
