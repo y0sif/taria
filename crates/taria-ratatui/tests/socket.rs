@@ -1,6 +1,6 @@
 //! Integration tests for the taria transport side of `TariaLayer`: handshake,
-//! snapshot streaming, agent input, and reconnects, all over a real Unix
-//! domain socket.
+//! snapshot streaming, agent input, per-input acks, and reconnects, all over a
+//! real Unix domain socket.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use taria::wire::{AppToBridge, BridgeToApp};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{AgentInput, Node, PROTOCOL_VERSION, Role};
 use taria_ratatui::TariaLayer;
 
@@ -83,6 +83,27 @@ impl Client {
         let line = serde_json::to_string(msg).unwrap();
         self.write_line(&line);
     }
+
+    /// Send one input under `id`; every ack answering it carries that id.
+    fn send_input(&mut self, id: InputId, input: AgentInput) {
+        self.send(&BridgeToApp::Input { id, input });
+    }
+}
+
+/// Write one input straight to a stream, for tests that hand the read half to
+/// another thread and so cannot use [`Client`].
+fn write_input(stream: &mut UnixStream, id: InputId, input: AgentInput) {
+    let mut line = serde_json::to_string(&BridgeToApp::Input { id, input }).unwrap();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).unwrap();
+}
+
+fn key(name: &str) -> AgentInput {
+    AgentInput::Key { key: name.into() }
+}
+
+fn ack(id: InputId, status: InputStatus) -> AppToBridge {
+    AppToBridge::Ack { id, status }
 }
 
 /// Poll `try_recv` until an input arrives or the timeout passes.
@@ -91,6 +112,18 @@ fn poll_try_recv(layer: &TariaLayer) -> Option<AgentInput> {
     while Instant::now() < deadline {
         if let Some(input) = layer.try_recv() {
             return Some(input);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// [`poll_try_recv`], keeping the id the app has to ack.
+fn poll_try_recv_with_id(layer: &TariaLayer) -> Option<(InputId, AgentInput)> {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(pair) = layer.try_recv_with_id() {
+            return Some(pair);
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -150,7 +183,7 @@ fn latest_snapshot_is_replayed_on_connect() {
 }
 
 #[test]
-fn inputs_reach_the_app_and_malformed_lines_are_ignored() {
+fn inputs_reach_the_app_acked_delivered_and_malformed_lines_are_ignored() {
     let layer = bind_layer("input");
     let mut client = Client::connect(&layer);
     assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
@@ -161,17 +194,86 @@ fn inputs_reach_the_app_and_malformed_lines_are_ignored() {
     client.write_line("not json at all");
     client.write_line(r#"{"type":"unknown"}"#);
 
-    let sent = AgentInput::Key { key: "q".into() };
-    client.send(&BridgeToApp::Input(sent.clone()));
+    let sent = key("q");
+    client.send_input(1, sent.clone());
     assert_eq!(poll_try_recv(&layer), Some(sent));
+    // Nothing was written before the app dequeued it: delivered means the
+    // event loop took it, so the ack is the first thing the client sees.
+    assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
 
     let act = AgentInput::Act {
         node: taria::NodeId("btn".into()),
         action: taria::Action::Activate,
         value: None,
     };
-    client.send(&BridgeToApp::Input(act.clone()));
+    client.send_input(2, act.clone());
     assert_eq!(layer.recv_timeout(TIMEOUT), Some(act));
+    assert_eq!(client.read_message(), ack(2, InputStatus::Delivered));
+}
+
+#[test]
+fn ack_can_be_refined_to_ignored() {
+    let layer = bind_layer("ackignored");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    client.send_input(9, key("q"));
+    let (id, input) = poll_try_recv_with_id(&layer).expect("input should reach the app");
+    assert_eq!((id, input), (9, key("q")));
+    assert_eq!(client.read_message(), ack(9, InputStatus::Delivered));
+
+    // The app looked at it and deliberately did nothing. Last ack wins, so
+    // an agent waiting on an effect can stop waiting.
+    layer.ack(id, InputStatus::Ignored);
+    assert_eq!(client.read_message(), ack(9, InputStatus::Ignored));
+}
+
+#[test]
+fn ack_precedes_the_snapshot_published_after_it() {
+    let mut layer = bind_layer("ackorder");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    client.send_input(3, key("j"));
+    assert_eq!(poll_try_recv(&layer), Some(key("j")));
+    // The app reacts to the input by publishing a new tree.
+    publish_single_node(&mut layer, "moved");
+
+    // Order matters: an agent seeing the snapshot first cannot tell whether
+    // it already reflects the input.
+    assert_eq!(client.read_message(), ack(3, InputStatus::Delivered));
+    let AppToBridge::Snapshot(snapshot) = client.read_message() else {
+        panic!("expected the snapshot after the ack");
+    };
+    assert_eq!(snapshot.root.children[0].id.0, "moved");
+}
+
+#[test]
+fn drain_hands_over_every_queued_input_and_acks_each() {
+    let layer = bind_layer("drain");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    for id in 0..3 {
+        client.send_input(id, key(&format!("k{id}")));
+    }
+
+    // The inputs cross a socket, so drain until all three have landed.
+    let mut got = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while got.len() < 3 && Instant::now() < deadline {
+        layer.drain_with_ids(|id, input| got.push((id, input)));
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        got,
+        vec![(0, key("k0")), (1, key("k1")), (2, key("k2"))],
+        "drain must hand over every queued input, in order"
+    );
+
+    for id in 0..3 {
+        assert_eq!(client.read_message(), ack(id, InputStatus::Delivered));
+    }
 }
 
 #[test]
@@ -190,9 +292,9 @@ fn client_can_reconnect_after_disconnect() {
     assert!(matches!(second.read_message(), AppToBridge::Snapshot(_)));
 
     // The fresh connection is fully functional in both directions.
-    let sent = AgentInput::Key { key: "esc".into() };
-    second.send(&BridgeToApp::Input(sent.clone()));
-    assert_eq!(layer.recv_timeout(TIMEOUT), Some(sent));
+    second.send_input(1, key("esc"));
+    assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("esc")));
+    assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
 }
 
 #[test]
@@ -236,69 +338,119 @@ fn oversized_line_disconnects_the_client() {
 }
 
 #[test]
-fn input_flood_is_bounded_and_does_not_block_the_socket_thread() {
-    let mut layer = bind_layer("inputflood");
-    let mut client = Client::connect(&layer);
-    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
+    const FLOOD: u64 = 2000;
+    const QUEUE: u64 = 256;
 
+    let mut layer = bind_layer("inputflood");
     assert_eq!(layer.dropped_inputs(), 0, "no drops before any flood");
 
+    // Read on a second thread for the whole flood: every dropped input is
+    // acked, and a client that only wrote would let those acks back up until
+    // the layer's write timeout killed the connection.
+    let stream = UnixStream::connect(layer.socket_path()).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let collector = thread::spawn(move || {
+        let mut reader = BufReader::new(stream);
+        let mut messages = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // the layer closed the connection
+                Ok(_) => messages.push(serde_json::from_str::<AppToBridge>(&line).unwrap()),
+                Err(err) => panic!("client read failed: {err}"),
+            }
+        }
+        messages
+    });
+
     // Far more inputs than the queue holds, with the app not draining.
-    for i in 0..2000 {
-        client.send(&BridgeToApp::Input(AgentInput::Key {
-            key: format!("k{i}"),
-        }));
+    for id in 0..FLOOD {
+        write_input(&mut writer, id, key(&format!("k{id}")));
     }
 
     // The socket thread must stay live mid-flood: a publish still streams.
     publish_single_node(&mut layer, "alive");
-    let AppToBridge::Snapshot(snapshot) = client.read_message() else {
-        panic!("expected a snapshot during the input flood");
-    };
-    assert_eq!(snapshot.root.children[0].id.0, "alive");
 
     // Half-close the write side: the reader consumes the whole flood, sees
-    // EOF, and tears the connection down, which we observe as EOF here. This
-    // is the barrier proving the flood was fully processed without blocking.
-    client.writer.shutdown(Shutdown::Write).unwrap();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match client.reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(err) => panic!("expected EOF after write shutdown, got {err}"),
-        }
-    }
+    // EOF, and tears the connection down, which the collector observes as
+    // EOF. This is the barrier proving the flood was fully processed without
+    // blocking.
+    writer.shutdown(Shutdown::Write).unwrap();
+    let messages = collector.join().expect("collector thread");
 
-    // Only the queue capacity (256) was retained; the overflow was dropped
-    // instead of buffered.
+    // Only the queue capacity was retained; the overflow was dropped instead
+    // of buffered.
     let mut received = 0;
     while layer.try_recv().is_some() {
         received += 1;
     }
-    assert_eq!(received, 256, "input queue should be bounded at 256");
-
-    // Every overflowed input was accounted for: nothing is printed while the
-    // app owns the terminal, so the drop counter is the only signal.
+    assert_eq!(received, QUEUE, "input queue should be bounded at {QUEUE}");
     assert_eq!(
         layer.dropped_inputs(),
-        2000 - 256,
+        FLOOD - QUEUE,
         "each dropped input must be counted exactly once"
     );
+
+    assert!(
+        matches!(messages.first(), Some(AppToBridge::Hello { .. })),
+        "the handshake is always first"
+    );
+    assert!(
+        messages.iter().any(|msg| matches!(
+            msg,
+            AppToBridge::Snapshot(snapshot) if snapshot.root.children[0].id.0 == "alive"
+        )),
+        "a publish mid-flood must still reach the client"
+    );
+
+    // The drops reach the agent, which used to see nothing at all. Not
+    // necessarily all of them: the connection ends the moment the reader
+    // hits EOF, and acks still queued then die with it.
+    let dropped: Vec<InputId> = messages
+        .iter()
+        .filter_map(|msg| match msg {
+            AppToBridge::Ack {
+                id,
+                status: InputStatus::Dropped,
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert!(!dropped.is_empty(), "dropped inputs must be acked dropped");
+    assert!(
+        dropped.len() as u64 <= FLOOD - QUEUE,
+        "more drops acked ({}) than dropped",
+        dropped.len()
+    );
+    assert!(
+        dropped.iter().all(|id| *id < FLOOD),
+        "a dropped ack must name an input the client actually sent"
+    );
+    // Nothing was acked delivered: the app drained only after the flood, by
+    // which point the connection was gone.
+    let other_acks = messages
+        .iter()
+        .filter(
+            |msg| matches!(msg, AppToBridge::Ack { status, .. } if *status != InputStatus::Dropped),
+        )
+        .count();
+    assert_eq!(other_acks, 0, "the only acks during a flood are drops");
 
     // And the layer still serves fresh clients and inputs afterwards.
     let mut second = Client::connect(&layer);
     assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
     assert!(matches!(second.read_message(), AppToBridge::Snapshot(_)));
-    let sent = AgentInput::Key {
-        key: "after".into(),
-    };
-    second.send(&BridgeToApp::Input(sent.clone()));
-    assert_eq!(layer.recv_timeout(TIMEOUT), Some(sent));
+    second.send_input(0, key("after"));
+    assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("after")));
+    // A stale ack from the dead connection must not surface here: ids start
+    // over with each client.
+    assert_eq!(second.read_message(), ack(0, InputStatus::Delivered));
 
-    // Accepted inputs never bump the counter.
-    assert_eq!(layer.dropped_inputs(), 2000 - 256);
+    // Accepted inputs never bump the drop counter.
+    assert_eq!(layer.dropped_inputs(), FLOOD - QUEUE);
 }
 
 #[test]

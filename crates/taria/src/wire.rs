@@ -66,6 +66,13 @@ pub enum AppToBridge {
 }
 
 /// Fate of one input, reported back by the app.
+///
+/// One input may be acked more than once, and the last ack wins. An app acks
+/// [`Delivered`](Self::Delivered) the moment its event loop dequeues the
+/// input, before it knows what it will do with it, and may follow up with
+/// [`Ignored`](Self::Ignored) once it turns out to have done nothing. Acks for
+/// one input reach the bridge in the order the app sent them, so the newest
+/// one received is the app's current answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputStatus {

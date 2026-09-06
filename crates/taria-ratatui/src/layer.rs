@@ -1,8 +1,8 @@
-//! The [`TariaLayer`]: socket lifecycle, background threads, and snapshot
-//! publishing for a ratatui app.
+//! The [`TariaLayer`]: socket lifecycle, background threads, snapshot
+//! publishing, and input acknowledgement for a ratatui app.
 
+use std::collections::VecDeque;
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -17,7 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use taria::wire::{AppToBridge, BridgeToApp};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
 
 use crate::FrameRecorder;
@@ -32,26 +32,44 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Capacity of the agent-input queue between the socket thread and the app.
-/// When the app is not draining inputs, the newest input is dropped and
-/// counted (see [`TariaLayer::dropped_inputs`]) instead of blocking the
-/// socket thread or queueing without bound.
+/// When the app is not draining inputs, the newest input is dropped, counted
+/// (see [`TariaLayer::dropped_inputs`]) and acked
+/// [`Dropped`](InputStatus::Dropped), instead of blocking the socket thread
+/// or queueing without bound.
 const INPUT_QUEUE: usize = 256;
 
 /// The embeddable taria endpoint for a ratatui app.
 ///
 /// Binding a layer opens a Unix domain socket and spawns a listener thread
-/// that serves one bridge client at a time: on connect it sends a
+/// that serves one bridge client at a time: on connect it sends an
 /// [`AppToBridge::Hello`] handshake plus the latest snapshot, then streams
 /// every newly published snapshot and forwards incoming [`AgentInput`]
-/// messages to the app via [`try_recv`](TariaLayer::try_recv) /
-/// [`recv_timeout`](TariaLayer::recv_timeout).
+/// messages to the app via [`try_recv`](Self::try_recv) /
+/// [`recv_timeout`](Self::recv_timeout). Every forwarded input is answered
+/// with an [`AppToBridge::Ack`], so an agent can tell an input the app acted
+/// on from one it never saw.
+///
+/// A layer may also be *disabled*: [`bind_or_disabled`](Self::bind_or_disabled)
+/// hands back an inert layer rather than an error, so taria failing to bind
+/// can never stop an app from starting. Every method stays callable on a
+/// disabled layer, which is what lets an app keep one code path.
 ///
 /// Dropping the layer shuts the threads down and removes the socket file
 /// (best-effort).
 pub struct TariaLayer {
+    app_label: String,
     socket_path: PathBuf,
+    /// Everything that exists only once the socket is bound. `None` on a
+    /// disabled layer, so no method can reach machinery that is not running.
+    inner: Option<Inner>,
+    /// Why binding failed, on a disabled layer.
+    bind_error: Option<io::Error>,
+}
+
+/// The parts of a layer that exist only while its socket is bound.
+struct Inner {
     shared: Arc<Shared>,
-    input_rx: Receiver<AgentInput>,
+    input_rx: Receiver<(InputId, AgentInput)>,
     listener: Option<JoinHandle<()>>,
     seq: u64,
     last_root: Option<Node>,
@@ -60,7 +78,8 @@ pub struct TariaLayer {
 impl TariaLayer {
     /// Bind the taria socket for this app and start serving.
     ///
-    /// The socket path is resolved in order of preference:
+    /// The socket path is resolved by [`taria::socket::resolve_path`], in
+    /// order of preference:
     ///
     /// 1. `$TARIA_SOCK` verbatim, if set and non-empty;
     /// 2. `$XDG_RUNTIME_DIR/taria/<app_label>.sock`;
@@ -72,6 +91,9 @@ impl TariaLayer {
     /// because a directory another user controls would let them replace or
     /// redirect the socket. A stale socket file at the path is removed before
     /// binding.
+    ///
+    /// Apps that would rather run without taria than not run at all should
+    /// use [`bind_or_disabled`](Self::bind_or_disabled).
     pub fn bind(app_label: &str) -> io::Result<Self> {
         Self::bind_at(app_label, resolve_socket_path(app_label))
     }
@@ -87,6 +109,13 @@ impl TariaLayer {
         // "app.sock" has an empty parent, which must not bypass the privacy
         // check by silently binding in an unvetted current directory.
         let socket_path = absolutize(socket_path.into())?;
+
+        // Check the length here, before anything is created: over the limit,
+        // `bind` below would fail with `InvalidInput: path must be shorter
+        // than SUN_LEN`, which names neither the path, its length, the limit,
+        // nor a way out. `SocketPathTooLong` names all four.
+        taria::socket::check_path_len(&socket_path)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
 
         if let Some(parent) = socket_path.parent()
             && !parent.as_os_str().is_empty()
@@ -119,16 +148,73 @@ impl TariaLayer {
         };
 
         Ok(Self {
+            app_label: app_label.to_string(),
             socket_path,
-            shared,
-            input_rx,
-            listener: Some(handle),
-            seq: 0,
-            last_root: None,
+            inner: Some(Inner {
+                shared,
+                input_rx,
+                listener: Some(handle),
+                seq: 0,
+                last_root: None,
+            }),
+            bind_error: None,
         })
     }
 
-    /// The path of the Unix socket this layer is serving on.
+    /// Bind like [`bind`](Self::bind), or return a disabled layer when that
+    /// fails, so an app never has to choose between starting and having
+    /// taria.
+    ///
+    /// A disabled layer answers every method: publishing does nothing, no
+    /// input ever arrives, and [`frame`](Self::frame) still hands back a
+    /// recorder, so the render path needs no branch on whether taria came up.
+    /// [`is_enabled`](Self::is_enabled) and [`bind_error`](Self::bind_error)
+    /// report what happened.
+    ///
+    /// The layer deliberately prints nothing itself: once the app owns the
+    /// alternate screen, a stray print garbles the display. Print
+    /// [`bind_error`](Self::bind_error) at the moment the app chooses, which
+    /// is usually before entering the alternate screen or after leaving it.
+    pub fn bind_or_disabled(app_label: &str) -> Self {
+        Self::bind_or_disabled_at(app_label, resolve_socket_path(app_label))
+    }
+
+    /// [`bind_or_disabled`](Self::bind_or_disabled) at an explicit path, so
+    /// the disabled branch can be exercised without mutating the process
+    /// environment (which no test can do safely while other tests run).
+    fn bind_or_disabled_at(app_label: &str, socket_path: PathBuf) -> Self {
+        match Self::bind_at(app_label, socket_path.clone()) {
+            Ok(layer) => layer,
+            Err(err) => Self {
+                app_label: app_label.to_string(),
+                socket_path,
+                inner: None,
+                bind_error: Some(err),
+            },
+        }
+    }
+
+    /// Is this layer serving on a socket?
+    ///
+    /// False only for a disabled layer from
+    /// [`bind_or_disabled`](Self::bind_or_disabled); see
+    /// [`bind_error`](Self::bind_error) for why it is disabled.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// Why binding failed, on a disabled layer. `None` while the layer is
+    /// serving.
+    ///
+    /// The layer never prints this itself, because a print while the
+    /// alternate screen is up garbles the display. The app decides when it is
+    /// safe to show and whether it is worth showing at all.
+    pub fn bind_error(&self) -> Option<&io::Error> {
+        self.bind_error.as_ref()
+    }
+
+    /// The path of the Unix socket this layer is serving on, or the path it
+    /// tried to bind if it is disabled, so an app can print either.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
@@ -136,41 +222,133 @@ impl TariaLayer {
     /// The label passed to [`bind`](Self::bind), used in the handshake and as
     /// the auto-generated root node's label.
     pub fn app_label(&self) -> &str {
-        &self.shared.app_label
+        &self.app_label
     }
 
     /// Begin recording a new frame. Record nodes with
     /// [`FrameRecorder::push`] or [`sem`](crate::sem), then call
     /// [`FrameRecorder::publish`].
+    ///
+    /// Works on a disabled layer too, where publishing is simply a no-op, so
+    /// the render path never branches on whether taria is up.
     pub fn frame(&mut self) -> FrameRecorder<'_> {
         FrameRecorder::new(self)
     }
 
     /// Non-blocking poll for the next agent input, if one has arrived.
+    ///
+    /// Acks the input [`Delivered`](InputStatus::Delivered) on its way out.
+    /// Delivered means the app's event loop dequeued it, nothing more; an app
+    /// that then decides to do nothing with it should say so with
+    /// [`ack`](Self::ack), whose id comes from
+    /// [`try_recv_with_id`](Self::try_recv_with_id).
+    ///
+    /// Always `None` on a disabled layer.
     pub fn try_recv(&self) -> Option<AgentInput> {
-        self.input_rx.try_recv().ok()
+        self.try_recv_with_id().map(|(_, input)| input)
     }
 
     /// Wait up to `timeout` for the next agent input.
+    ///
+    /// Acks [`Delivered`](InputStatus::Delivered) exactly like
+    /// [`try_recv`](Self::try_recv). A disabled layer has nothing to wait for
+    /// but still waits out the timeout, so an app that paces its loop on this
+    /// call keeps its timing whether or not taria bound.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<AgentInput> {
-        self.input_rx.recv_timeout(timeout).ok()
+        self.recv_timeout_with_id(timeout).map(|(_, input)| input)
+    }
+
+    /// [`try_recv`](Self::try_recv), keeping the [`InputId`] so the app can
+    /// answer the input again later with [`ack`](Self::ack).
+    ///
+    /// The ack still happens here, so an app can never leave an input
+    /// unacknowledged by forgetting to call something.
+    pub fn try_recv_with_id(&self) -> Option<(InputId, AgentInput)> {
+        let inner = self.inner.as_ref()?;
+        let (id, input) = inner.input_rx.try_recv().ok()?;
+        inner.shared.queue_ack(id, InputStatus::Delivered);
+        Some((id, input))
+    }
+
+    /// [`recv_timeout`](Self::recv_timeout), keeping the [`InputId`] so the
+    /// app can answer the input again later with [`ack`](Self::ack).
+    pub fn recv_timeout_with_id(&self, timeout: Duration) -> Option<(InputId, AgentInput)> {
+        let Some(inner) = self.inner.as_ref() else {
+            // No socket, so no input will ever arrive. Sleep it out anyway: a
+            // caller using this as its clock must not spin because taria
+            // happened to be unavailable.
+            thread::sleep(timeout);
+            return None;
+        };
+        let (id, input) = inner.input_rx.recv_timeout(timeout).ok()?;
+        inner.shared.queue_ack(id, InputStatus::Delivered);
+        Some((id, input))
+    }
+
+    /// Hand every queued agent input to `f`, in arrival order.
+    ///
+    /// The drain loop an app otherwise writes by hand, once per place it
+    /// polls for input, with nothing keeping the copies in step.
+    pub fn drain(&self, mut f: impl FnMut(AgentInput)) {
+        while let Some(input) = self.try_recv() {
+            f(input);
+        }
+    }
+
+    /// [`drain`](Self::drain), passing each input's [`InputId`] alongside it
+    /// so the handler can [`ack`](Self::ack) whatever it chose to ignore.
+    pub fn drain_with_ids(&self, mut f: impl FnMut(InputId, AgentInput)) {
+        while let Some((id, input)) = self.try_recv_with_id() {
+            f(id, input);
+        }
+    }
+
+    /// Answer an input again, overriding the ack it already has.
+    ///
+    /// Last ack wins. An app that dequeued an input (acked
+    /// [`Delivered`](InputStatus::Delivered) by that dequeue) and then
+    /// deliberately did nothing with it, say an act blocked by a modal dialog
+    /// or naming a node it does not know, can refine that to
+    /// [`Ignored`](InputStatus::Ignored) so an agent waiting on an effect
+    /// stops waiting.
+    ///
+    /// The ack travels the same path as snapshots, so it can never overtake
+    /// the snapshot published after it. Does nothing on a disabled layer.
+    pub fn ack(&self, id: InputId, status: InputStatus) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner.shared.queue_ack(id, status);
+        }
     }
 
     /// How many agent inputs have been dropped so far because the input
-    /// queue was full.
+    /// queue was full. Always 0 on a disabled layer.
     ///
-    /// When an agent floods inputs faster than the app drains them, the
-    /// layer silently drops the newest input rather than blocking the socket
-    /// thread — and rather than printing a warning, which would garble the
-    /// display while the app owns the alternate screen. Each drop bumps this
-    /// monotonic counter instead; it accumulates across reconnects for the
+    /// When an agent floods inputs faster than the app drains them, the layer
+    /// drops the newest input rather than blocking the socket thread. The
+    /// agent learns of each drop from its [`Dropped`](InputStatus::Dropped)
+    /// ack; this counter is the app-facing tally of the same event, kept
+    /// because the layer must not print while the app owns the alternate
+    /// screen. It is monotonic and accumulates across reconnects for the
     /// lifetime of the layer.
     ///
-    /// Apps should read it after restoring the terminal (e.g. right before
-    /// exit, once the alternate screen has been left) and report a nonzero
-    /// value to the user on stderr or in a log.
+    /// Apps should read it after restoring the terminal (for example right
+    /// before exit, once the alternate screen has been left) and report a
+    /// nonzero value on stderr or in a log.
     pub fn dropped_inputs(&self) -> u64 {
-        self.shared.dropped_inputs.load(Ordering::Relaxed)
+        self.inner.as_ref().map_or(0, |inner| {
+            inner.shared.dropped_inputs.load(Ordering::Relaxed)
+        })
+    }
+
+    /// Publish `nodes` as a snapshot, without going through a
+    /// [`FrameRecorder`].
+    ///
+    /// For apps that build their node list separately from drawing, where the
+    /// recorder's frame, push-loop and publish triplet is three lines saying
+    /// one thing. The nodes are wrapped in the same auto-generated root, so
+    /// both paths produce the same tree.
+    pub fn publish(&mut self, nodes: impl IntoIterator<Item = Node>) {
+        self.publish_nodes(nodes.into_iter().collect());
     }
 
     /// Publish a frame's recorded top-level nodes as a new snapshot.
@@ -178,47 +356,56 @@ impl TariaLayer {
     /// Wraps the nodes in an auto-generated `app` root (focused only if no
     /// recorded node is), bumps `seq`, and hands the snapshot to the writer
     /// thread. Skipped entirely when the tree is identical to the previous
-    /// publish. Never blocks the render path beyond a brief mutex hold.
+    /// publish, and on a disabled layer. Never blocks the render path beyond
+    /// a brief mutex hold.
     pub(crate) fn publish_nodes(&mut self, nodes: Vec<Node>) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
         let focus_recorded = nodes.iter().any(subtree_has_focus);
         let root = Node::new("app", Role::App)
-            .label(self.shared.app_label.clone())
+            .label(inner.shared.app_label.clone())
             .focused(!focus_recorded)
             .children(nodes);
 
-        if self.last_root.as_ref() == Some(&root) {
+        if inner.last_root.as_ref() == Some(&root) {
             return;
         }
-        self.seq += 1;
-        let snapshot = Snapshot::new(self.seq, root.clone());
-        self.last_root = Some(root);
+        inner.seq += 1;
+        let snapshot = Snapshot::new(inner.seq, root.clone());
+        inner.last_root = Some(root);
 
-        let mut state = self.shared.lock_state();
+        let mut state = inner.shared.lock_state();
         state.latest = Some(snapshot);
         state.epoch += 1;
         drop(state);
-        self.shared.cv.notify_all();
+        inner.shared.cv.notify_all();
     }
 
     /// The most recently published snapshot, if any. Test-only introspection.
     #[cfg(test)]
     pub(crate) fn latest_snapshot(&self) -> Option<Snapshot> {
-        self.shared.lock_state().latest.clone()
+        self.inner.as_ref()?.shared.lock_state().latest.clone()
     }
 }
 
 impl Drop for TariaLayer {
+    /// Stop the threads and unlink the socket. A disabled layer has neither,
+    /// so it touches no filesystem at all.
     fn drop(&mut self) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
         {
-            let mut state = self.shared.lock_state();
+            let mut state = inner.shared.lock_state();
             state.shutdown = true;
-            self.shared.cv.notify_all();
+            inner.shared.cv.notify_all();
         }
         // Wake the listener thread if it is blocked in accept(); the dummy
         // connection is never served because the shutdown flag is checked
         // right after accept returns.
         let _ = UnixStream::connect(&self.socket_path);
-        if let Some(handle) = self.listener.take() {
+        if let Some(handle) = inner.listener.take() {
             let _ = handle.join();
         }
         let _ = fs::remove_file(&self.socket_path);
@@ -242,6 +429,10 @@ struct State {
     latest: Option<Snapshot>,
     /// Bumped on every publish so the writer knows something new exists.
     epoch: u64,
+    /// Acks waiting to go out, oldest first. Queued for the writer rather
+    /// than written where they are produced, so that one thread owns the
+    /// stream and an ack can never overtake the snapshot published after it.
+    acks: VecDeque<(InputId, InputStatus)>,
     shutdown: bool,
 }
 
@@ -255,6 +446,21 @@ impl Shared {
     fn is_shutdown(&self) -> bool {
         self.lock_state().shutdown
     }
+
+    /// Queue an ack for the writer and wake it.
+    fn queue_ack(&self, id: InputId, status: InputStatus) {
+        let mut state = self.lock_state();
+        state.acks.push_back((id, status));
+        drop(state);
+        self.cv.notify_all();
+    }
+
+    /// Forget every queued ack. An [`InputId`] is unique only within one
+    /// connection, so an ack outliving its connection would name an input the
+    /// next client never sent.
+    fn clear_acks(&self) {
+        self.lock_state().acks.clear();
+    }
 }
 
 /// Does `node` or any of its descendants have focus?
@@ -263,7 +469,11 @@ fn subtree_has_focus(node: &Node) -> bool {
 }
 
 /// Accept loop: serves one bridge client at a time until shutdown.
-fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender<AgentInput>) {
+fn accept_loop(
+    listener: UnixListener,
+    shared: Arc<Shared>,
+    input_tx: SyncSender<(InputId, AgentInput)>,
+) {
     loop {
         if shared.is_shutdown() {
             return;
@@ -292,7 +502,7 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender
 fn serve_client(
     stream: UnixStream,
     shared: &Arc<Shared>,
-    input_tx: &SyncSender<AgentInput>,
+    input_tx: &SyncSender<(InputId, AgentInput)>,
 ) -> io::Result<()> {
     // SO_SNDTIMEO is shared across the duplicated fds; only writes block long
     // enough to need it.
@@ -300,9 +510,14 @@ fn serve_client(
     let mut write_stream = stream.try_clone()?;
 
     // Capture the snapshot and epoch atomically so the writer loop neither
-    // misses nor duplicates a publish that races the handshake.
+    // misses nor duplicates a publish that races the handshake. Acks left
+    // over from the previous connection go here: they name ids this client
+    // never used. An input queued before that connection dropped can still be
+    // dequeued (and so acked) after this one starts, so a bridge must ignore
+    // acks for ids it has no input pending for.
     let (initial_snapshot, initial_epoch) = {
-        let state = shared.lock_state();
+        let mut state = shared.lock_state();
+        state.acks.clear();
         (state.latest.clone(), state.epoch)
     };
     write_line(
@@ -330,6 +545,9 @@ fn serve_client(
     // going back to accept the next client.
     let _ = write_stream.shutdown(Shutdown::Both);
     let _ = reader.join();
+    // Whatever is still queued can no longer be delivered, and means nothing
+    // to the next client.
+    shared.clear_acks();
     Ok(())
 }
 
@@ -337,13 +555,13 @@ fn serve_client(
 /// inputs to the app. Malformed lines are ignored. A line longer than
 /// [`MAX_LINE_BYTES`] marks the connection broken (the loop exits and the
 /// client is disconnected) instead of buffering it. When the input queue is
-/// full the newest input is silently dropped and counted (the app owns the
-/// terminal, so printing here would garble the display; see
-/// [`TariaLayer::dropped_inputs`]) — a flood of inputs can never block this
+/// full the newest input is dropped, acked [`Dropped`](InputStatus::Dropped)
+/// so the agent learns of it, and counted for the app (see
+/// [`TariaLayer::dropped_inputs`]); a flood of inputs can never block this
 /// thread.
 fn reader_loop(
     stream: UnixStream,
-    input_tx: SyncSender<AgentInput>,
+    input_tx: SyncSender<(InputId, AgentInput)>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
 ) {
@@ -371,11 +589,12 @@ fn reader_loop(
         let Ok(msg) = serde_json::from_slice::<BridgeToApp>(&buf) else {
             continue;
         };
-        let BridgeToApp::Input(input) = msg;
-        match input_tx.try_send(input) {
+        let BridgeToApp::Input { id, input } = msg;
+        match input_tx.try_send((id, input)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 shared.dropped_inputs.fetch_add(1, Ordering::Relaxed);
+                shared.queue_ack(id, InputStatus::Dropped);
             }
             Err(TrySendError::Disconnected(_)) => break,
         }
@@ -388,20 +607,30 @@ fn reader_loop(
     drop(guard);
 }
 
-/// Writer half of a connection: send each newly published snapshot as a line.
+/// Writer half of a connection: send queued acks, then each newly published
+/// snapshot, as lines. Acks go first in every pass, so an ack always reaches
+/// the client before the snapshot published after it; an agent that saw the
+/// snapshot first could not tell whether it reflects its input yet.
+///
 /// Returns when the layer shuts down, the reader reports the client gone, or
 /// a write fails.
 fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut last_epoch: u64) {
     loop {
-        let snapshot = {
+        let (acks, snapshot) = {
             let mut state = shared.lock_state();
             loop {
                 if state.shutdown || !alive.load(Ordering::SeqCst) {
                     return;
                 }
-                if state.epoch != last_epoch {
-                    last_epoch = state.epoch;
-                    break state.latest.clone();
+                if !state.acks.is_empty() || state.epoch != last_epoch {
+                    let acks = std::mem::take(&mut state.acks);
+                    let snapshot = if state.epoch == last_epoch {
+                        None
+                    } else {
+                        last_epoch = state.epoch;
+                        state.latest.clone()
+                    };
+                    break (acks, snapshot);
                 }
                 state = shared
                     .cv
@@ -409,6 +638,11 @@ fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
+        for (id, status) in acks {
+            if write_line(stream, &AppToBridge::Ack { id, status }).is_err() {
+                return;
+            }
+        }
         if let Some(snapshot) = snapshot
             && write_line(stream, &AppToBridge::Snapshot(snapshot)).is_err()
         {
@@ -441,7 +675,7 @@ fn absolutize(path: PathBuf) -> io::Result<PathBuf> {
 /// socket: if it is a symlink, owned by another user, or accessible to
 /// group/others, a local attacker can swap the socket for their own and
 /// impersonate the app (or intercept the bridge). The directory is created
-/// with mode `0700`, then verified via `symlink_metadata` — it must be a
+/// with mode `0700`, then verified via `symlink_metadata`: it must be a
 /// real directory (not a symlink), owned by the current user, with no
 /// group/other permission bits. Any violation is an error.
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
@@ -510,40 +744,18 @@ fn current_uid() -> io::Result<u32> {
 }
 
 /// Resolve the default socket path for `app_label` from the environment.
+///
+/// The rule itself lives in [`taria::socket::resolve_path`], shared with the
+/// bridge so the two sides cannot look for the socket in different places.
+/// Reading the environment stays here, where the process actually is.
 fn resolve_socket_path(app_label: &str) -> PathBuf {
-    resolve_socket_path_from(
+    taria::socket::resolve_path(
         env::var_os("TARIA_SOCK"),
         env::var_os("XDG_RUNTIME_DIR"),
         &env::temp_dir(),
         &user_identity(),
         app_label,
     )
-}
-
-/// Pure resolution logic, split out so it can be tested without touching the
-/// process environment.
-fn resolve_socket_path_from(
-    taria_sock: Option<OsString>,
-    xdg_runtime_dir: Option<OsString>,
-    temp_dir: &Path,
-    user: &str,
-    app_label: &str,
-) -> PathBuf {
-    if let Some(path) = taria_sock
-        && !path.is_empty()
-    {
-        return PathBuf::from(path);
-    }
-    if let Some(dir) = xdg_runtime_dir
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir)
-            .join("taria")
-            .join(format!("{app_label}.sock"));
-    }
-    temp_dir
-        .join(format!("taria-{user}"))
-        .join(format!("{app_label}.sock"))
 }
 
 /// Uid where available (via `/proc/self` on Linux), else `$USER`/`$LOGNAME`,
@@ -562,55 +774,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-
-    #[test]
-    fn taria_sock_env_wins() {
-        let path = resolve_socket_path_from(
-            Some("/custom/app.sock".into()),
-            Some("/run/user/1000".into()),
-            Path::new("/tmp"),
-            "1000",
-            "demo",
-        );
-        assert_eq!(path, PathBuf::from("/custom/app.sock"));
-    }
-
-    #[test]
-    fn empty_taria_sock_is_ignored() {
-        let path = resolve_socket_path_from(
-            Some("".into()),
-            Some("/run/user/1000".into()),
-            Path::new("/tmp"),
-            "1000",
-            "demo",
-        );
-        assert_eq!(path, PathBuf::from("/run/user/1000/taria/demo.sock"));
-    }
-
-    #[test]
-    fn xdg_runtime_dir_is_second_choice() {
-        let path = resolve_socket_path_from(
-            None,
-            Some("/run/user/1000".into()),
-            Path::new("/tmp"),
-            "1000",
-            "demo",
-        );
-        assert_eq!(path, PathBuf::from("/run/user/1000/taria/demo.sock"));
-    }
-
-    #[test]
-    fn temp_dir_is_last_resort() {
-        let path = resolve_socket_path_from(None, None, Path::new("/tmp"), "1000", "demo");
-        assert_eq!(path, PathBuf::from("/tmp/taria-1000/demo.sock"));
-    }
-
-    #[test]
-    fn empty_xdg_falls_through_to_temp_dir() {
-        let path =
-            resolve_socket_path_from(None, Some("".into()), Path::new("/tmp"), "alice", "demo");
-        assert_eq!(path, PathBuf::from("/tmp/taria-alice/demo.sock"));
-    }
+    use crate::test_util::bind_test_layer;
 
     /// Unique, absent scratch path under the system temp dir.
     fn scratch_path(name: &str) -> PathBuf {
@@ -618,6 +782,16 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         let _ = fs::remove_file(&path);
         path
+    }
+
+    /// A private (0700) temp dir that removes itself when the test ends, so
+    /// nothing is left in the system temp dir even on panic.
+    fn private_temp_dir(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("create test dir")
     }
 
     #[test]
@@ -704,6 +878,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Over the kernel's limit, `bind` alone would say only
+    /// `InvalidInput: path must be shorter than SUN_LEN`. The named error has
+    /// to survive the trip through `io::Error`.
+    #[test]
+    fn bind_at_refuses_an_over_long_socket_path() {
+        let dir = private_temp_dir("taria-longpath-");
+        let path = dir.path().join(format!("{}.sock", "x".repeat(120)));
+
+        let Err(err) = TariaLayer::bind_at("toolong", &path) else {
+            panic!("over-long path must be refused, not bound");
+        };
+        let message = err.to_string();
+        assert!(message.contains("107 byte"), "err: {message}");
+        assert!(message.contains("TARIA_SOCK"), "err: {message}");
+        assert!(!path.exists(), "no socket file may be left behind");
+    }
+
+    /// The whole point of a disabled layer: every method still answers, and
+    /// none of them does anything.
+    #[test]
+    fn disabled_layer_is_inert() {
+        let dir = private_temp_dir("taria-disabled-");
+        // A regular file where the socket's parent directory should be: the
+        // bind cannot succeed, and nothing about that is timing-dependent.
+        let blocker = dir.path().join("not-a-directory");
+        fs::write(&blocker, b"").expect("create blocker file");
+        let socket_path = blocker.join("app.sock");
+
+        let mut layer = TariaLayer::bind_or_disabled_at("disabled", socket_path.clone());
+
+        assert!(!layer.is_enabled());
+        assert!(layer.bind_error().is_some(), "a disabled layer says why");
+        assert_eq!(layer.socket_path(), socket_path);
+        assert_eq!(layer.app_label(), "disabled");
+        assert_eq!(layer.dropped_inputs(), 0);
+
+        assert_eq!(layer.try_recv(), None);
+        assert_eq!(layer.try_recv_with_id(), None);
+        assert_eq!(layer.recv_timeout(Duration::from_millis(1)), None);
+        assert_eq!(layer.recv_timeout_with_id(Duration::from_millis(1)), None);
+        layer.ack(0, InputStatus::Ignored);
+
+        let mut drained = 0;
+        layer.drain(|_| drained += 1);
+        layer.drain_with_ids(|_, _| drained += 1);
+        assert_eq!(drained, 0, "a disabled layer has nothing to drain");
+
+        // The render path works unchanged; it just publishes nowhere.
+        let mut rec = layer.frame();
+        rec.push(Node::new("pane", Role::Pane));
+        rec.publish();
+        layer.publish([Node::new("pane", Role::Pane)]);
+        assert_eq!(layer.latest_snapshot(), None);
+
+        drop(layer);
+        assert!(!socket_path.exists(), "a disabled layer creates no socket");
+        assert!(blocker.exists(), "dropping it must unlink nothing");
+    }
+
+    #[test]
+    fn publish_wraps_nodes_like_the_recorder_does() {
+        let mut layer = bind_test_layer("taria-layer-", "publish");
+        layer.publish([
+            Node::new("a", Role::Text),
+            Node::new("b", Role::Button).focused(true),
+        ]);
+
+        let root = layer.latest_snapshot().expect("published").root;
+        assert_eq!(root.id.0, "app");
+        assert_eq!(root.label.as_deref(), Some("publish"));
+        assert!(!root.focused, "a focused node unfocuses the auto root");
+        let ids: Vec<&str> = root.children.iter().map(|c| c.id.0.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
     }
 
     #[test]
