@@ -40,6 +40,8 @@ mod key;
 mod layer;
 mod recorder;
 mod semantic;
+#[cfg(test)]
+mod test_util;
 
 pub use key::to_crossterm_key;
 pub use layer::TariaLayer;

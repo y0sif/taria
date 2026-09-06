@@ -4,9 +4,9 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
+use std::ops::{Deref, DerefMut};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,12 +16,38 @@ use taria_ratatui::TariaLayer;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bind a layer on a unique throwaway socket path.
-fn bind_layer(label: &str) -> TariaLayer {
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir: PathBuf = std::env::temp_dir().join(format!("taria-it-{}", std::process::id()));
-    TariaLayer::bind_at(label, dir.join(format!("{label}-{n}.sock"))).unwrap()
+/// A [`TariaLayer`] bound in its own temp dir. Dropping the guard drops the
+/// layer first (which unlinks the socket file) and then removes the dir
+/// itself - also when the test panics - so runs leave nothing in /tmp.
+struct TestLayer {
+    layer: TariaLayer,
+    _dir: tempfile::TempDir,
+}
+
+impl Deref for TestLayer {
+    type Target = TariaLayer;
+
+    fn deref(&self) -> &TariaLayer {
+        &self.layer
+    }
+}
+
+impl DerefMut for TestLayer {
+    fn deref_mut(&mut self) -> &mut TariaLayer {
+        &mut self.layer
+    }
+}
+
+/// Bind a layer on a throwaway socket path cleaned up on drop.
+fn bind_layer(label: &str) -> TestLayer {
+    let dir = tempfile::Builder::new()
+        .prefix("taria-it-")
+        // The layer vets the socket dir: it must be private (0700).
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("create test socket dir");
+    let layer = TariaLayer::bind_at(label, dir.path().join(format!("{label}.sock"))).unwrap();
+    TestLayer { layer, _dir: dir }
 }
 
 /// A test stand-in for the bridge: a line-framed client on the layer's socket.
@@ -215,6 +241,8 @@ fn input_flood_is_bounded_and_does_not_block_the_socket_thread() {
     let mut client = Client::connect(&layer);
     assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
 
+    assert_eq!(layer.dropped_inputs(), 0, "no drops before any flood");
+
     // Far more inputs than the queue holds, with the app not draining.
     for i in 0..2000 {
         client.send(&BridgeToApp::Input(AgentInput::Key {
@@ -251,6 +279,14 @@ fn input_flood_is_bounded_and_does_not_block_the_socket_thread() {
     }
     assert_eq!(received, 256, "input queue should be bounded at 256");
 
+    // Every overflowed input was accounted for: nothing is printed while the
+    // app owns the terminal, so the drop counter is the only signal.
+    assert_eq!(
+        layer.dropped_inputs(),
+        2000 - 256,
+        "each dropped input must be counted exactly once"
+    );
+
     // And the layer still serves fresh clients and inputs afterwards.
     let mut second = Client::connect(&layer);
     assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
@@ -260,13 +296,19 @@ fn input_flood_is_bounded_and_does_not_block_the_socket_thread() {
     };
     second.send(&BridgeToApp::Input(sent.clone()));
     assert_eq!(layer.recv_timeout(TIMEOUT), Some(sent));
+
+    // Accepted inputs never bump the counter.
+    assert_eq!(layer.dropped_inputs(), 2000 - 256);
 }
 
 #[test]
 fn drop_removes_the_socket_file() {
-    let layer = bind_layer("cleanup");
-    let path = layer.socket_path().to_path_buf();
+    let bound = bind_layer("cleanup");
+    let path = bound.socket_path().to_path_buf();
     assert!(path.exists());
+    // Split the guard so only the layer is dropped here: the socket file
+    // removal being asserted must come from the layer, not the temp dir.
+    let TestLayer { layer, _dir } = bound;
     drop(layer);
     assert!(!path.exists(), "socket file should be removed on drop");
 }

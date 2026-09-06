@@ -9,7 +9,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ContentBlock;
 use taria::wire::{AppToBridge, BridgeToApp};
 use taria::{Action, AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::bridge::{self, BridgeHandle};
+use taria_mcp::bridge::{self, BridgeHandle, BridgeState};
 use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -20,11 +20,22 @@ use tokio::time::timeout;
 /// Generous bound for local socket round trips.
 const WAIT: Duration = Duration::from_secs(5);
 
-/// Unique socket path per test, in the system temp dir.
-fn test_socket_path(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("taria-mcp-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create test socket dir");
-    dir.join(format!("{name}.sock"))
+/// Fresh per-test socket directory. The directory and everything in it
+/// (socket files included) are removed when the guard drops, even when the
+/// test fails, so test runs leave no litter in the system temp dir.
+fn test_socket_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("taria-mcp-test-")
+        .tempdir()
+        .expect("create test socket dir")
+}
+
+/// A socket path for `name` in its own self-cleaning directory. Keep the
+/// returned guard alive for the duration of the test.
+fn test_socket_path(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = test_socket_dir();
+    let path = dir.path().join(format!("{name}.sock"));
+    (dir, path)
 }
 
 /// A demo tree: an `app` root with one `btn` button advertising `activate`
@@ -93,15 +104,14 @@ impl FakeApp {
     }
 }
 
-/// Wait until the watch holds a snapshot with at least `min_seq`.
-async fn wait_for_snapshot(rx: &mut watch::Receiver<Option<Snapshot>>, min_seq: u64) -> Snapshot {
+/// Wait until the watch holds a connected snapshot with at least `min_seq`.
+async fn wait_for_snapshot(rx: &mut watch::Receiver<BridgeState>, min_seq: u64) -> Snapshot {
     timeout(WAIT, async {
         loop {
-            let hit = rx
-                .borrow_and_update()
-                .as_ref()
-                .filter(|s| s.seq >= min_seq)
-                .cloned();
+            let hit = match &*rx.borrow_and_update() {
+                BridgeState::Connected(s) if s.seq >= min_seq => Some(s.clone()),
+                _ => None,
+            };
             if let Some(snapshot) = hit {
                 return snapshot;
             }
@@ -112,18 +122,18 @@ async fn wait_for_snapshot(rx: &mut watch::Receiver<Option<Snapshot>>, min_seq: 
     .expect("snapshot should arrive")
 }
 
-/// Wait until the watch is cleared back to `None` (disconnect observed).
-async fn wait_for_clear(rx: &mut watch::Receiver<Option<Snapshot>>) {
+/// Wait until the watch leaves `Connected` (disconnect observed).
+async fn wait_for_disconnect(rx: &mut watch::Receiver<BridgeState>) {
     timeout(WAIT, async {
         loop {
-            if rx.borrow_and_update().is_none() {
+            if !matches!(&*rx.borrow_and_update(), BridgeState::Connected(_)) {
                 return;
             }
             rx.changed().await.expect("watch sender alive");
         }
     })
     .await
-    .expect("watch should clear to None");
+    .expect("watch should leave Connected");
 }
 
 /// The text of a successful tool result's single content block.
@@ -134,35 +144,48 @@ fn result_text(result: &rmcp::model::CallToolResult) -> &str {
     }
 }
 
-/// Spin up listener + bridge + server for one test.
-async fn setup(name: &str) -> (UnixListener, BridgeHandle, TariaMcpServer) {
-    let path = test_socket_path(name);
-    let _ = std::fs::remove_file(&path);
+/// Spin up listener + bridge + server for one test. The first element is the
+/// socket directory guard; hold it (as `_dir`, not `_`) until the test ends.
+async fn setup(
+    name: &str,
+) -> (
+    tempfile::TempDir,
+    UnixListener,
+    BridgeHandle,
+    TariaMcpServer,
+) {
+    let (dir, path) = test_socket_path(name);
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let handle = bridge::spawn(path);
     let server = TariaMcpServer::new(handle.clone());
-    (listener, handle, server)
+    (dir, listener, handle, server)
 }
 
 #[tokio::test]
 async fn read_tree_errors_before_any_connection() {
     // Nothing listens on this path; the manager retries in the background.
-    let handle = bridge::spawn(test_socket_path("never-connects"));
+    let (_dir, path) = test_socket_path("never-connects");
+    let handle = bridge::spawn(path);
     let server = TariaMcpServer::new(handle);
     let err = server.read_tree().await.expect_err("no app, no snapshot");
     assert!(
-        err.message.contains("running"),
-        "error should hint at the app not running: {}",
+        err.message.contains("no snapshot") && err.message.contains("running"),
+        "never-connected error should hint at the app not running: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("disconnected"),
+        "never-connected must not read as a disconnect: {}",
         err.message
     );
 }
 
 #[tokio::test]
 async fn manager_connects_and_watch_gets_snapshot() {
-    let (listener, mut handle, server) = setup("connects").await;
+    let (_dir, listener, mut handle, server) = setup("connects").await;
     let _app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("hello-tree"))).await;
 
-    let snapshot = wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    let snapshot = wait_for_snapshot(&mut handle.state_rx, 1).await;
     assert_eq!(snapshot.seq, 1);
     assert_eq!(snapshot.root.id.0, "app");
 
@@ -174,9 +197,9 @@ async fn manager_connects_and_watch_gets_snapshot() {
 
 #[tokio::test]
 async fn act_forwards_input_and_returns_updated_tree() {
-    let (listener, mut handle, server) = setup("act-roundtrip").await;
+    let (_dir, listener, mut handle, server) = setup("act-roundtrip").await;
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
 
     // Fake app: apply the input by publishing seq 2 with a marker change.
     let echo = tokio::spawn(async move {
@@ -214,9 +237,9 @@ async fn act_forwards_input_and_returns_updated_tree() {
 
 #[tokio::test]
 async fn act_reports_when_tree_does_not_change() {
-    let (listener, mut handle, server) = setup("act-no-change").await;
+    let (_dir, listener, mut handle, server) = setup("act-no-change").await;
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("static"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
 
     // The fake app swallows the input and never publishes a new snapshot.
     let result = server
@@ -237,9 +260,9 @@ async fn act_reports_when_tree_does_not_change() {
 
 #[tokio::test]
 async fn act_rejects_unknown_node_and_lists_valid_ids() {
-    let (listener, mut handle, server) = setup("act-bad-node").await;
+    let (_dir, listener, mut handle, server) = setup("act-bad-node").await;
     let _app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("tree"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
 
     let err = server
         .act(Parameters(ActParams {
@@ -261,9 +284,9 @@ async fn act_rejects_unknown_node_and_lists_valid_ids() {
 
 #[tokio::test]
 async fn act_rejects_unadvertised_action_and_lists_advertised() {
-    let (listener, mut handle, server) = setup("act-bad-action").await;
+    let (_dir, listener, mut handle, server) = setup("act-bad-action").await;
     let _app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("tree"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
 
     let err = server
         .act(Parameters(ActParams {
@@ -283,9 +306,9 @@ async fn act_rejects_unadvertised_action_and_lists_advertised() {
 
 #[tokio::test]
 async fn key_forwards_input_and_returns_updated_tree() {
-    let (listener, mut handle, server) = setup("key-roundtrip").await;
+    let (_dir, listener, mut handle, server) = setup("key-roundtrip").await;
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
 
     let echo = tokio::spawn(async move {
         let input = app.recv_input().await;
@@ -317,7 +340,7 @@ async fn key_forwards_input_and_returns_updated_tree() {
 
 #[tokio::test]
 async fn key_rejects_empty_key() {
-    let (_listener, _handle, server) = setup("key-empty").await;
+    let (_dir, _listener, _handle, server) = setup("key-empty").await;
     let err = server
         .key(Parameters(KeyParams { key: String::new() }))
         .await
@@ -329,7 +352,8 @@ async fn key_rejects_empty_key() {
 async fn key_errors_before_any_connection() {
     // Nothing listens on this path; `key` must refuse (like `act`) instead of
     // queueing input that would replay into the next app instance.
-    let handle = bridge::spawn(test_socket_path("key-never-connects"));
+    let (_dir, path) = test_socket_path("key-never-connects");
+    let handle = bridge::spawn(path);
     let server = TariaMcpServer::new(handle);
     let err = server
         .key(Parameters(KeyParams {
@@ -352,8 +376,7 @@ async fn key_errors_before_any_connection() {
 /// cycles).
 #[tokio::test]
 async fn accept_then_drop_connections_are_backed_off() {
-    let path = test_socket_path("accept-drop-backoff");
-    let _ = std::fs::remove_file(&path);
+    let (_dir, path) = test_socket_path("accept-drop-backoff");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let _handle = bridge::spawn(path); // keep the handle alive: dropping it ends the manager
 
@@ -377,19 +400,18 @@ async fn accept_then_drop_connections_are_backed_off() {
 /// through the raw bridge handle (the race window the reconnect drain covers).
 #[tokio::test]
 async fn stale_inputs_do_not_replay_into_next_connection() {
-    let path = test_socket_path("stale-inputs");
-    let _ = std::fs::remove_file(&path);
+    let (_dir, path) = test_socket_path("stale-inputs");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
     let server = TariaMcpServer::new(handle.clone());
 
     // First instance comes up, then dies.
     let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("gen-one"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
     drop(app);
     drop(listener);
     std::fs::remove_file(&path).expect("remove old socket file");
-    wait_for_clear(&mut handle.snapshot_rx).await;
+    wait_for_disconnect(&mut handle.state_rx).await;
 
     // The `key` tool refuses while down...
     let err = server
@@ -398,7 +420,7 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
         }))
         .await
         .expect_err("key while disconnected must refuse");
-    assert!(err.message.contains("running"), "err: {}", err.message);
+    assert!(err.message.contains("disconnected"), "err: {}", err.message);
 
     // ...so queue stale inputs directly; the listener is still unbound, so
     // these sit in the channel until the next successful connect.
@@ -415,7 +437,7 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
     // Restart the app; the bridge must drain the stale queue on reconnect.
     let listener = UnixListener::bind(&path).expect("rebind fake app socket");
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("gen-two"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
 
     // A fresh key sent through the tool must be the FIRST input the new
     // instance sees; with no drain, the FIFO queue would deliver "q" first.
@@ -441,9 +463,9 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
 
 #[tokio::test]
 async fn newline_free_flood_disconnects_the_app_connection() {
-    let (listener, mut handle, _server) = setup("line-flood").await;
+    let (_dir, listener, mut handle, _server) = setup("line-flood").await;
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("pre-flood"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
 
     // Stream a few MiB with no newline; the bridge must treat the connection
     // as broken (watch clears to None) instead of buffering it all.
@@ -454,7 +476,7 @@ async fn newline_free_flood_disconnects_the_app_connection() {
             break; // the bridge already dropped the connection
         }
     }
-    wait_for_clear(&mut handle.snapshot_rx).await;
+    wait_for_disconnect(&mut handle.state_rx).await;
 }
 
 /// Simulate an app restart mid-`act`: the fake app receives the input, then
@@ -478,15 +500,14 @@ async fn restart_app_on_input(
 
 #[tokio::test]
 async fn act_returns_fresh_tree_after_app_restart() {
-    let path = test_socket_path("restart-act");
-    let _ = std::fs::remove_file(&path);
+    let (_dir, path) = test_socket_path("restart-act");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
     let server = TariaMcpServer::new(handle.clone());
 
     // The old instance is at seq 5; the restarted one starts over at seq 1.
     let app = FakeApp::accept(&listener, Snapshot::new(5, demo_root("before-restart"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 5).await;
+    wait_for_snapshot(&mut handle.state_rx, 5).await;
     let restart = tokio::spawn(restart_app_on_input(
         listener,
         path,
@@ -515,15 +536,14 @@ async fn act_returns_fresh_tree_after_app_restart() {
 
 #[tokio::test]
 async fn act_detects_restart_even_when_seq_matches() {
-    let path = test_socket_path("restart-act-same-seq");
-    let _ = std::fs::remove_file(&path);
+    let (_dir, path) = test_socket_path("restart-act-same-seq");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
     let server = TariaMcpServer::new(handle.clone());
 
     // Both instances publish seq 1, but the trees differ.
     let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("generation-one"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
     let restart = tokio::spawn(restart_app_on_input(
         listener,
         path,
@@ -549,21 +569,74 @@ async fn act_detects_restart_even_when_seq_matches() {
     restart.await.expect("fake app restart task");
 }
 
+/// After the app dies, all three tools must say WHICH app went away and at
+/// what seq (not the generic never-connected message), and once the app is
+/// back the bridge must serve trees again.
 #[tokio::test]
-async fn disconnect_clears_watch_and_read_tree_errors_again() {
-    let (listener, mut handle, server) = setup("disconnect").await;
-    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("alive"))).await;
-    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+async fn disconnect_reports_app_label_and_last_seq_then_recovers() {
+    let (_dir, path) = test_socket_path("disconnect");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+
+    let app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("alive"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 3).await;
     server.read_tree().await.expect("connected read_tree works");
 
-    // Kill the app side; the manager must clear the watch to None.
+    // Kill the app side; the manager must record the disconnect.
     drop(app);
     drop(listener);
-    wait_for_clear(&mut handle.snapshot_rx).await;
+    std::fs::remove_file(&path).expect("remove old socket file");
+    wait_for_disconnect(&mut handle.state_rx).await;
 
-    let err = server
+    // All three tools refuse, naming the dead app and its last snapshot seq.
+    let read_err = server
         .read_tree()
         .await
         .expect_err("read_tree must fail after disconnect");
-    assert!(err.message.contains("running"), "err: {}", err.message);
+    let act_err = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect_err("act must refuse after disconnect");
+    let key_err = server
+        .key(Parameters(KeyParams {
+            key: "q".to_string(),
+        }))
+        .await
+        .expect_err("key must refuse after disconnect");
+    for err in [&read_err, &act_err, &key_err] {
+        assert!(
+            err.message.contains("'fake-app' disconnected"),
+            "error should name the dead app: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("last snapshot seq 3"),
+            "error should carry the last seq: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("no snapshot"),
+            "disconnect must not reuse the never-connected message: {}",
+            err.message
+        );
+    }
+
+    // The app comes back: the bridge reconnects and serves trees again.
+    let listener = UnixListener::bind(&path).expect("rebind fake app socket");
+    let _app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("back-again"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+    let result = server
+        .read_tree()
+        .await
+        .expect("read_tree once the app is back");
+    assert!(
+        result_text(&result).contains("back-again"),
+        "tree json: {}",
+        result_text(&result)
+    );
 }

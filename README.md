@@ -45,6 +45,29 @@ Prerequisites: a Rust toolchain (1.88 or newer) and, for step 2, the
    `read_tree`, `act`, and `key` tools while the TUI reacts in the first
    terminal.
 
+### Running the demo headless
+
+Backgrounding the demo with plain `&` fails. Crossterm needs a real terminal
+for raw mode, so a detached process exits immediately. Give it a terminal
+with tmux instead:
+
+```bash
+cargo build -p taria-demo
+tmux new-session -d -s taria-demo -x 120 -y 34 './target/debug/taria-demo'
+```
+
+Peek at the screen without attaching:
+
+```bash
+tmux capture-pane -p -t taria-demo
+```
+
+Stop it when you are done:
+
+```bash
+tmux kill-session -t taria-demo
+```
+
 ## How it works
 
 The app publishes a semantic snapshot of its widget tree over a Unix domain

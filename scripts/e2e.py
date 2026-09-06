@@ -247,14 +247,22 @@ class McpClient:
             raise StepFailure(f"unparseable tool result: {text[:200]}")
 
     def read_tree(self, retries=25, delay=0.2):
-        """read_tree with retries while the bridge is still connecting."""
+        """read_tree with retries while the bridge is still connecting.
+
+        Retryable errors are the bridge's two "no app right now" states:
+        never connected ("no snapshot ...") and app went away
+        ("... disconnected ..."); both clear once the app (re)connects.
+        """
         last = None
         for _ in range(retries):
             try:
                 return self.call_tree("read_tree")
             except ToolError as err:
                 last = err
-                if "no snapshot" not in err.message:
+                if (
+                    "no snapshot" not in err.message
+                    and "disconnected" not in err.message
+                ):
                     raise
                 time.sleep(delay)
         raise StepFailure(f"read_tree never connected: {last.message}")
@@ -516,8 +524,10 @@ def step_j_shutdown(client, ctx, app):
         not_connected is not None,
         "read_tree kept succeeding after the app quit",
     )
+    # The app was connected and then quit, so the bridge must report the
+    # disconnect (which app, last seq), not the never-connected message.
     require(
-        "no snapshot" in not_connected or "running" in not_connected,
+        "disconnected" in not_connected and "last snapshot seq" in not_connected,
         f"unexpected disconnect error: {not_connected[:200]}",
     )
 
