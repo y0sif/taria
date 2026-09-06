@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""End-to-end verification of the taria v0 vertical slice.
+"""End-to-end verification of the taria v0.1 vertical slice.
 
 Launches the taria-demo TUI headless under a pty, connects the taria-mcp
 bridge to its socket, speaks MCP (newline-delimited JSON-RPC 2.0) over the
-bridge's stdio, and drives a full scenario through the read_tree / act / key
-tools. Prints one PASS/FAIL line per scenario step, a summary table, and
-exits non-zero on any FAIL.
+bridge's stdio, and drives a full scenario through the read_tree / act / key /
+type_text tools. Prints one PASS/FAIL line per scenario step, a summary table,
+and exits non-zero on any FAIL.
 
 Python 3 stdlib only. Usage:  python3 scripts/e2e.py [--no-build]
 """
@@ -28,7 +28,20 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEMO_BIN = os.path.join(REPO, "target", "debug", "taria-demo")
 MCP_BIN = os.path.join(REPO, "target", "debug", "taria-mcp")
 READ_TIMEOUT = 5.0
-SNAPSHOT_LIMIT = 8 * 1024  # scenario (i): compact tree must stay under 8KB
+SNAPSHOT_LIMIT = 8 * 1024  # scenario (n): compact tree must stay under 8KB
+INVALID_PARAMS = -32602  # JSON-RPC code the bridge rejects bad arguments with
+
+# The four shapes an input-sending tool (act / key / type_text) can answer
+# with, as of the v0.1 ack protocol. Matched by prefix, verbatim: an agent
+# reads these strings, so a reworded one is a behaviour change this script has
+# to notice rather than absorb.
+IGNORED_PREFIX = (
+    "The app received this input and deliberately did nothing with it "
+    "(for example an action a modal dialog blocks, or a node it no longer "
+    "knows). Re-plan from the current tree below."
+)
+NO_CHANGE_PREFIX = "The app received this input, and its tree did not change within"
+NO_ACK_PREFIX = "The app neither acknowledged this input nor changed its tree within"
 
 
 class ToolError(Exception):
@@ -47,6 +60,56 @@ class StepFailure(Exception):
 def require(cond, msg):
     if not cond:
         raise StepFailure(msg)
+
+
+def parse_result(text):
+    """Classify one act / key / type_text result as (kind, tree).
+
+    kind is one of:
+      "tree"      the app applied the input and published a new tree
+      "ignored"   the app acked Ignored; the tree to re-plan from follows
+                  the note on the second line
+      "no_change" the app acked Delivered but published nothing new
+      "no_ack"    no ack and no new tree inside the bridge's window
+
+    Anything else is a failure, not a shape to absorb: an unrecognised
+    result means the tool surface moved and this script is asserting on a
+    contract that no longer exists.
+    """
+    if text.startswith(IGNORED_PREFIX):
+        parts = text.split("\n", 1)
+        require(
+            len(parts) == 2 and parts[1].strip(),
+            f"ignored result carried no tree on its second line: {text[:200]}",
+        )
+        try:
+            return "ignored", json.loads(parts[1])
+        except json.JSONDecodeError:
+            raise StepFailure(
+                f"ignored result's second line is not a tree: {parts[1][:200]}"
+            )
+    if text.startswith(NO_CHANGE_PREFIX):
+        return "no_change", None
+    if text.startswith(NO_ACK_PREFIX):
+        return "no_ack", None
+    try:
+        return "tree", json.loads(text)
+    except json.JSONDecodeError:
+        raise StepFailure(f"unparseable tool result: {text[:200]}")
+
+
+def response_text(resp):
+    """Text content of one tools/call response; raises ToolError on failure."""
+    if "error" in resp:
+        err = resp["error"]
+        raise ToolError(err.get("message", str(err)), err.get("code"))
+    result = resp["result"]
+    text = "\n".join(
+        c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"
+    )
+    if result.get("isError"):
+        raise ToolError(text or "tool reported isError with no content")
+    return text
 
 
 # --- Process management -----------------------------------------------------
@@ -220,31 +283,66 @@ class McpClient:
 
     def call_raw(self, tool, arguments=None):
         """tools/call; returns the text content. Raises ToolError on failure."""
-        resp = self.request(
-            "tools/call", {"name": tool, "arguments": arguments or {}}
+        return response_text(
+            self.request("tools/call", {"name": tool, "arguments": arguments or {}})
         )
-        if "error" in resp:
-            err = resp["error"]
-            raise ToolError(err.get("message", str(err)), err.get("code"))
-        result = resp["result"]
-        texts = [
-            c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"
-        ]
-        text = "\n".join(texts)
-        if result.get("isError"):
-            raise ToolError(text or "tool reported isError with no content")
-        return text
+
+    def send_call(self, tool, arguments=None):
+        """Write one tools/call without waiting for it; returns its id.
+
+        Pipelining two calls is the only way to reach the app's own gates
+        from here: the bridge validates a call against the newest tree it
+        has, so a second call written before the app has published the
+        effect of the first is the one the app itself gets to refuse.
+        """
+        self._next_id += 1
+        req_id = self._next_id
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments or {}},
+            }
+        )
+        return req_id
+
+    def collect(self, ids, timeout=15.0):
+        """Wait for the responses to `ids`; returns {id: response}."""
+        out = {}
+        deadline = time.monotonic() + timeout
+        while len(out) < len(ids):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"only {len(out)}/{len(ids)} pipelined responses within {timeout}s"
+                )
+            line = self._read_line(timeout=remaining)
+            if not line.strip():
+                continue
+            resp = json.loads(line)
+            if resp.get("id") in ids:
+                out[resp["id"]] = resp
+        return out
+
+    def call_outcome(self, tool, arguments=None):
+        """tools/call, classified by [`parse_result`]: (kind, tree)."""
+        return parse_result(self.call_raw(tool, arguments))
 
     def call_tree(self, tool, arguments=None):
-        """tools/call and parse the returned tree; None if the tree did not
-        change (the bridge's 'Input sent, but ...' message)."""
-        text = self.call_raw(tool, arguments)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            if "did not change" in text:
-                return None
-            raise StepFailure(f"unparseable tool result: {text[:200]}")
+        """tools/call for a tool expected to have an effect: the new tree, or
+        None when the app acked but published nothing new.
+
+        An `ignored` ack is a failure here, not a None: the app said it
+        deliberately did nothing, and a step that asked for an effect wants
+        to hear that rather than quietly retry a read_tree.
+        """
+        kind, tree = self.call_outcome(tool, arguments)
+        if kind == "ignored":
+            raise StepFailure(
+                f"{tool} {arguments!r} was IGNORED by the app; expected it to apply"
+            )
+        return tree
 
     def read_tree(self, retries=25, delay=0.2):
         """read_tree with retries while the bridge is still connecting.
@@ -316,11 +414,55 @@ def act(client, node, action, value=None, refresh=True):
     return tree
 
 
-def key(client, key_name, refresh=True):
-    tree = client.call_tree("key", {"key": key_name})
+def key(client, key_name, repeat=None, refresh=True):
+    args = {"key": key_name}
+    if repeat is not None:
+        args["repeat"] = repeat
+    tree = client.call_tree("key", args)
     if tree is None and refresh:
         tree = client.read_tree(retries=5)
     return tree
+
+
+def task_items(snapshot):
+    """The visible task list items, in list order."""
+    tasks = find(snapshot, "tasks")
+    require(tasks is not None, "tree has no 'tasks' node")
+    return tasks.get("children", [])
+
+
+def task_labels(snapshot):
+    """{node id: label} for every visible task."""
+    return {item["id"]: item.get("label") for item in task_items(snapshot)}
+
+
+def has_action(node, name):
+    """True if the node advertises `name` (built-in string or custom object)."""
+    for action in node.get("actions", []):
+        if action == name or (isinstance(action, dict) and action.get("custom") == name):
+            return True
+    return False
+
+
+def deletable_task(snapshot):
+    """A visible task advertising the app's custom delete action."""
+    for node in flatten(snapshot["root"]):
+        if has_action(node, "delete"):
+            return node["id"]
+    raise StepFailure("no node advertises the custom delete action")
+
+
+def close_any_dialog(client):
+    """Best-effort dismiss of an open modal, for cleanup paths.
+
+    A step that fails with the dialog up would otherwise hand every later
+    step an app that refuses acts and will not even quit on `q`.
+    """
+    try:
+        if find(client.read_tree(retries=5), "dialog") is not None:
+            client.call_raw("act", {"node": "dialog", "action": "dismiss"})
+    except (ToolError, StepFailure, TimeoutError):
+        pass
 
 
 # --- Scenario steps ---------------------------------------------------------
@@ -329,8 +471,9 @@ def key(client, key_name, refresh=True):
 def step_a_tools_list(client, ctx):
     names = client.tools_list()
     require(
-        sorted(names) == ["act", "key", "read_tree"],
-        f"tools/list returned {names}, expected exactly read_tree, act, key",
+        sorted(names) == ["act", "key", "read_tree", "type_text"],
+        f"tools/list returned {names}, expected exactly read_tree, act, key, "
+        "type_text",
     )
     return f"tools: {', '.join(sorted(names))}"
 
@@ -496,7 +639,231 @@ def step_h_keys(client, ctx):
     return f"tab {before_tab}->{after_tab}, focus {before_focus}->{after_focus}"
 
 
-def step_i_snapshot_size(client, ctx):
+def step_i_type_text(client, ctx):
+    """type_text is the v0.1 headline: one call types a whole title."""
+    title = "Typed end to end"
+    act(client, "tab-active", "select")  # step h left the Done tab on screen
+    before = client.read_tree()
+    require(
+        title not in task_labels(before).values(),
+        f"a task labelled {title!r} exists before typing it",
+    )
+    before_ids = set(task_labels(before))
+
+    # Focus the input the way an agent would, and from a known empty draft, so
+    # what ends up in the task is exactly what type_text typed.
+    tree = act(client, "input", "set_value", value="")
+    require(
+        one_focused(tree, "before typing") == "input",
+        "set_value must leave the input focused before typing",
+    )
+    require(
+        find(tree, "input")["value"] in (None, ""),
+        f"draft is {find(tree, 'input').get('value')!r}, expected empty",
+    )
+
+    # One call types the title and the trailing newline that submits it.
+    tree = client.call_tree("type_text", {"text": title + "\n"})
+    if tree is None:
+        tree = client.read_tree(retries=5)
+
+    added = [n for n in flatten(tree["root"]) if n.get("label") == title]
+    require(
+        len(added) == 1,
+        f"expected exactly one node labelled {title!r}, got {len(added)}",
+    )
+    node = added[0]
+    require(
+        node["id"] not in before_ids,
+        f"{node['id']} existed before type_text; no new task was created",
+    )
+    require(node["value"] == "todo", f"typed task value {node['value']!r}, expected todo")
+    require(
+        find(tree, "input")["value"] in (None, ""),
+        "input should clear after the typed newline submits it",
+    )
+    require(
+        node["id"] == one_focused(tree, "after typing"),
+        "the typed task should be the selected one after submitting",
+    )
+    ctx["snapshot"] = tree
+    ctx["typed_task"] = node["id"]
+    return f"one type_text call created {node['id']} labelled {title!r}"
+
+
+def step_j_ignored_ack(client, ctx):
+    """An act the modal blocks answers with the ignored shape, not silence.
+
+    The bridge refuses an act on a node whose actions the modal stripped, so
+    the app only gets to refuse one handed to it before the dialog existed:
+    both calls go out back to back, and the second is validated against the
+    pre-dialog tree. Losing that race is the bridge doing its job, so it is
+    retried rather than failed.
+    """
+    draft = "typed while modal"
+    target = deletable_task(client.read_tree())
+    rejected = 0
+    try:
+        for _ in range(5):
+            ids = [
+                client.send_call("act", {"node": target, "action": "delete"}),
+                client.send_call(
+                    "act", {"node": "input", "action": "set_value", "value": draft}
+                ),
+            ]
+            responses = client.collect(ids)
+            opened = parse_result(response_text(responses[ids[0]]))[1]
+            require(opened is not None, "the delete act published no tree")
+            require(find(opened, "dialog") is not None, "delete did not open the dialog")
+
+            try:
+                text = response_text(responses[ids[1]])
+            except ToolError as err:
+                # The bridge saw the dialog first and refused on advertisement.
+                require(
+                    "does not advertise" in err.message,
+                    f"unexpected rejection while modal: {err.message[:160]}",
+                )
+                rejected += 1
+                act(client, "dialog", "dismiss")
+                continue
+
+            kind, tree = parse_result(text)
+            require(
+                kind == "ignored",
+                f"act blocked by the modal came back as {kind!r}, expected the "
+                f"ignored shape: {text[:160]}",
+            )
+            require(tree is not None, "ignored result carried no tree")
+            require(
+                find(tree, "input")["value"] != draft,
+                f"the modal-blocked set_value took effect anyway (input={draft!r})",
+            )
+            # The tree the note offers is whatever the bridge had when the
+            # Ignored ack landed, which for this adapter is the pre-input one
+            # (the app acks while draining, and publishes after).
+            replan = "with dialog" if find(tree, "dialog") else "pre-input, no dialog"
+
+            # The app really did nothing: the modal is still up, untouched.
+            live = client.read_tree()
+            require(find(live, "dialog") is not None, "the modal closed by itself")
+            require(
+                find(live, "input")["value"] != draft,
+                "the modal-blocked draft reached the app after all",
+            )
+
+            # Leave the app as the other dialog steps do: no modal, task intact.
+            tree = act(client, "dialog-cancel", "activate")
+            require(find(tree, "dialog") is None, "dialog still open after cancel")
+            require(find(tree, target) is not None, "the modal probe deleted its task")
+            require(
+                find(tree, "input")["value"] in (None, ""),
+                "the modal-blocked draft leaked into the input after cancel",
+            )
+            ctx["snapshot"] = tree
+            races = f", {rejected} race(s) refused by the bridge first" if rejected else ""
+            return (
+                f"set_value while the dialog was open -> ignored ack + tree "
+                f"({replan}){races}"
+            )
+        raise StepFailure(
+            f"never reached the app's modal gate: the bridge refused all "
+            f"{rejected} attempts on advertisement"
+        )
+    finally:
+        close_any_dialog(client)
+
+
+def step_k_key_repeat(client, ctx):
+    """key repeat sends exactly that many presses."""
+    items = [item["id"] for item in task_items(client.read_tree())]
+    require(len(items) >= 3, f"need three visible tasks to count moves, have {items}")
+    tree = act(client, items[0], "select")
+    require(
+        one_focused(tree, "before key repeat") == items[0],
+        f"select did not park the cursor on {items[0]}",
+    )
+
+    # One short of the list length: every press lands on a distinct row, so a
+    # press too few or too many cannot alias back onto the expected one.
+    steps = len(items) - 1
+    tree = key(client, "down", repeat=steps)
+    after = one_focused(tree, "after key repeat")
+    require(
+        after == items[steps],
+        f"key down repeat={steps} moved {items[0]} -> {after}, expected "
+        f"{items[steps]} (rows: {items})",
+    )
+    ctx["snapshot"] = tree
+    return f"repeat={steps} moved exactly {steps} rows ({items[0]} -> {after})"
+
+
+def step_l_bad_key(client, ctx):
+    """An unparseable key is refused with the grammar, and changes nothing."""
+    before = client.read_tree()
+    try:
+        client.call_raw("key", {"key": "inx"})
+        raise StepFailure("key 'inx' was accepted, expected an invalid_params error")
+    except ToolError as err:
+        require(
+            err.code == INVALID_PARAMS,
+            f"bad key error code {err.code}, expected {INVALID_PARAMS}",
+        )
+        require(
+            "unrecognized key `inx`" in err.message and "expected" in err.message,
+            f"bad key error does not name the key and the grammar: {err.message[:200]}",
+        )
+        message = err.message
+    after = client.read_tree()
+    require(
+        after == before,
+        f"tree changed after a rejected key: seq {before['seq']} -> {after['seq']}",
+    )
+    ctx["snapshot"] = after
+    return f"rejected at the bridge ({message[:60]}...), tree unchanged"
+
+
+def step_m_id_stability(client, ctx):
+    """Deleting a task leaves every surviving task id exactly as it was."""
+    active_before = task_labels(client.read_tree())
+    done_before = task_labels(act(client, "tab-done", "select"))
+    tree = act(client, "tab-active", "select")
+    victim = ctx.get("typed_task") or next(iter(active_before))
+    require(victim in active_before, f"{victim} is not on the Active tab")
+    require(len(active_before) >= 2, f"need a survivor to check, have {active_before}")
+
+    tree = act(client, victim, "delete")
+    require(find(tree, "dialog") is not None, "delete did not open the dialog")
+    tree = act(client, "dialog-confirm", "activate")
+
+    active_after = task_labels(tree)
+    done_after = task_labels(act(client, "tab-done", "select"))
+    act(client, "tab-active", "select")
+
+    require(victim not in active_after, f"{victim} survived its own delete")
+    require(
+        set(active_after) == set(active_before) - {victim},
+        f"Active ids {sorted(active_after)}, expected "
+        f"{sorted(set(active_before) - {victim})}",
+    )
+    require(
+        set(done_after) == set(done_before),
+        f"Done ids moved: {sorted(done_before)} -> {sorted(done_after)}",
+    )
+    for node_id, label in list(active_after.items()) + list(done_after.items()):
+        was = {**active_before, **done_before}[node_id]
+        require(
+            label == was,
+            f"{node_id} now labels {label!r}, was {was!r}: ids are positional",
+        )
+    ctx["snapshot"] = client.read_tree()
+    return (
+        f"deleted {victim}; {len(active_after) + len(done_after)} surviving ids "
+        "kept id and label"
+    )
+
+
+def step_n_snapshot_size(client, ctx):
     text = client.call_raw("read_tree")
     size = len(text.encode())
     require(
@@ -507,7 +874,7 @@ def step_i_snapshot_size(client, ctx):
     return f"{size} bytes < {SNAPSHOT_LIMIT}"
 
 
-def step_j_shutdown(client, ctx, app):
+def step_o_shutdown(client, ctx, app):
     client.call_raw("key", {"key": "q"})  # quit; tree may or may not update
 
     # The bridge must notice the disconnect and fail read_tree cleanly.
@@ -586,7 +953,12 @@ def main():
         ("f custom delete dialog + cancel", step_f_dialog),
         ("g error messages", step_g_errors),
         ("h key tab / key down", step_h_keys),
-        ("i snapshot < 8KB", step_i_snapshot_size),
+        ("i type_text adds a task", step_i_type_text),
+        ("j modal-blocked act is ignored", step_j_ignored_ack),
+        ("k key repeat moves N rows", step_k_key_repeat),
+        ("l unparseable key rejected", step_l_bad_key),
+        ("m node ids stable across delete", step_m_id_stability),
+        ("n snapshot < 8KB", step_n_snapshot_size),
     ]
 
     try:
@@ -616,20 +988,22 @@ def main():
             except (StepFailure, ToolError, TimeoutError) as err:
                 results.append((name, False, str(err)))
                 print(f"FAIL {name}: {err}", flush=True)
-                # steps share state; keep going only if the tree still reads
+                # steps share state; keep going only if the tree still reads,
+                # and never leave a modal up for the steps that follow.
                 try:
+                    close_any_dialog(client)
                     ctx["snapshot"] = client.read_tree(retries=3)
                 except Exception:
                     failed_hard = True
 
         # Shutdown is special: it consumes both processes.
-        name = "j clean shutdown"
+        name = "o clean shutdown"
         if failed_hard:
             results.append((name, False, "skipped: earlier step failed"))
             print(f"FAIL {name}: skipped after earlier failure", flush=True)
         else:
             try:
-                evidence = step_j_shutdown(client, ctx, app)
+                evidence = step_o_shutdown(client, ctx, app)
                 results.append((name, True, evidence))
                 print(f"PASS {name}: {evidence}", flush=True)
             except (StepFailure, ToolError, TimeoutError) as err:
