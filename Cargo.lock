@@ -1598,7 +1598,9 @@ dependencies = [
 name = "taria-demo"
 version = "0.0.1"
 dependencies = [
+ "ratatui",
  "taria",
+ "taria-ratatui",
 ]
 
 [[package]]
