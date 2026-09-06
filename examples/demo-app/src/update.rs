@@ -37,6 +37,13 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) {
 }
 
 fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) {
+    // The delete dialog is modal: mirror `handle_key` by ignoring any act
+    // that targets a node outside the dialog while it is open. The tree
+    // stops advertising those actions too (see `crate::tree::build_nodes`),
+    // so behavior and advertisement agree.
+    if app.dialog.is_some() && !matches!(node, "dialog" | "dialog-confirm" | "dialog-cancel") {
+        return;
+    }
     match (node, action) {
         ("tab-active", Action::Select) => switch_tab(app, Tab::Active),
         ("tab-done", Action::Select) => switch_tab(app, Tab::Done),
@@ -306,6 +313,48 @@ mod tests {
             assert_eq!(app.dialog, None);
             assert_eq!(app.tasks.len(), before, "cancel must not delete");
         }
+    }
+
+    #[test]
+    fn dialog_blocks_acts_on_nodes_outside_it() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("task-0", Action::Custom("delete".into())));
+        assert_eq!(app.dialog, Some(0));
+        let before = app.tasks.len();
+
+        apply_agent_input(
+            &mut app,
+            act_value("input", Action::SetValue, "sneaky task"),
+        );
+        assert!(app.input.is_empty(), "set_value must not reach the input");
+        assert_eq!(app.focus, Focus::List, "focus must not move to the input");
+
+        apply_agent_input(&mut app, act("input", Action::Activate));
+        assert_eq!(app.tasks.len(), before, "activate must not add a task");
+
+        apply_agent_input(&mut app, act("task-2", Action::Toggle));
+        assert!(!app.tasks[2].done, "toggle must not flip a task");
+        apply_agent_input(&mut app, act("task-3", Action::Select));
+        assert_eq!(app.selection, 0, "select must not move the selection");
+        apply_agent_input(&mut app, act("tab-done", Action::Select));
+        assert_eq!(app.tab, Tab::Active, "tab switch must not happen");
+
+        assert_eq!(app.dialog, Some(0), "the dialog stays open throughout");
+    }
+
+    #[test]
+    fn acts_work_again_after_dialog_cancel() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("task-0", Action::Custom("delete".into())));
+        apply_agent_input(&mut app, act("dialog-cancel", Action::Activate));
+        assert_eq!(app.dialog, None);
+
+        apply_agent_input(
+            &mut app,
+            act_value("input", Action::SetValue, "back to work"),
+        );
+        assert_eq!(app.input, "back to work");
+        assert_eq!(app.focus, Focus::Input);
     }
 
     #[test]

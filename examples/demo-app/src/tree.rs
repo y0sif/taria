@@ -11,7 +11,10 @@ use crate::app::{App, Focus, Tab};
 
 /// Build the top-level semantic nodes for the current app state.
 ///
-/// Invariant: exactly one node in the returned forest is focused.
+/// Invariants: exactly one node in the returned forest is focused, and while
+/// the delete dialog is open only the dialog nodes advertise actions — the
+/// rest of the tree stays visible (structure, labels, values) but inert,
+/// mirroring how [`crate::update`] gates keys and acts behind the modal.
 pub fn build_nodes(app: &App) -> Vec<Node> {
     let mut nodes = vec![tabs_node(app), list_node(app), input_node(app)];
     if let Some(dialog) = dialog_node(app) {
@@ -21,10 +24,12 @@ pub fn build_nodes(app: &App) -> Vec<Node> {
 }
 
 fn tabs_node(app: &App) -> Node {
+    let modal = app.dialog.is_some();
     let tab_child = |id: &str, tab: Tab| {
-        let mut node = Node::new(id, Role::Tab)
-            .label(tab.label())
-            .action(Action::Select);
+        let mut node = Node::new(id, Role::Tab).label(tab.label());
+        if !modal {
+            node = node.action(Action::Select);
+        }
         if app.tab == tab {
             node = node.value("selected");
         }
@@ -41,21 +46,25 @@ fn tabs_node(app: &App) -> Node {
 
 fn list_node(app: &App) -> Node {
     let visible = app.visible_indices();
-    let list_focused = app.focus == Focus::List && app.dialog.is_none();
+    let modal = app.dialog.is_some();
+    let list_focused = app.focus == Focus::List && !modal;
     let items: Vec<Node> = visible
         .iter()
         .enumerate()
         .map(|(pos, &idx)| {
             let task = &app.tasks[idx];
-            Node::new(format!("task-{idx}"), Role::ListItem)
+            let mut node = Node::new(format!("task-{idx}"), Role::ListItem)
                 .label(task.title.clone())
                 .value(if task.done { "done" } else { "todo" })
-                .focused(list_focused && pos == app.selection)
-                .actions([
+                .focused(list_focused && pos == app.selection);
+            if !modal {
+                node = node.actions([
                     Action::Select,
                     Action::Toggle,
                     Action::Custom("delete".into()),
-                ])
+                ]);
+            }
+            node
         })
         .collect();
     Node::new("tasks", Role::List)
@@ -70,11 +79,15 @@ fn list_node(app: &App) -> Node {
 }
 
 fn input_node(app: &App) -> Node {
-    Node::new("input", Role::TextInput)
+    let modal = app.dialog.is_some();
+    let mut node = Node::new("input", Role::TextInput)
         .label("New task")
         .value(app.input.clone())
-        .focused(app.focus == Focus::Input && app.dialog.is_none())
-        .actions([Action::SetValue, Action::Activate])
+        .focused(app.focus == Focus::Input && !modal);
+    if !modal {
+        node = node.actions([Action::SetValue, Action::Activate]);
+    }
+    node
 }
 
 fn dialog_node(app: &App) -> Option<Node> {
@@ -270,6 +283,64 @@ mod tests {
         let input = find(&nodes, "input").unwrap();
         assert_eq!(input.actions, vec![Action::SetValue, Action::Activate]);
         assert_eq!(input.label.as_deref(), Some("New task"));
+    }
+
+    #[test]
+    fn dialog_strips_actions_outside_it_and_cancel_restores_them() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("task-0", Action::Custom("delete".into())));
+        let nodes = build_nodes(&app);
+
+        for id in ["tabs", "tab-active", "tab-done", "tasks", "input"] {
+            assert!(
+                find(&nodes, id).unwrap().actions.is_empty(),
+                "{id} must advertise no actions while the dialog is open"
+            );
+        }
+        assert!(
+            find(&nodes, "tasks")
+                .unwrap()
+                .children
+                .iter()
+                .all(|item| item.actions.is_empty()),
+            "task items must advertise no actions while the dialog is open"
+        );
+
+        // Structure, labels, and values stay visible.
+        let input = find(&nodes, "input").unwrap();
+        assert_eq!(input.label.as_deref(), Some("New task"));
+        let task = find(&nodes, "task-0").unwrap();
+        assert_eq!(task.label.as_deref(), Some(app.tasks[0].title.as_str()));
+        assert_eq!(task.value.as_deref(), Some("todo"));
+
+        // The dialog keeps its own actions.
+        assert_eq!(
+            find(&nodes, "dialog").unwrap().actions,
+            vec![Action::Dismiss]
+        );
+        for id in ["dialog-confirm", "dialog-cancel"] {
+            assert_eq!(find(&nodes, id).unwrap().actions, vec![Action::Activate]);
+        }
+
+        // Cancelling brings the actions back.
+        apply_agent_input(&mut app, act("dialog-cancel", Action::Activate));
+        let nodes = build_nodes(&app);
+        assert_eq!(
+            find(&nodes, "input").unwrap().actions,
+            vec![Action::SetValue, Action::Activate]
+        );
+        assert_eq!(
+            find(&nodes, "task-0").unwrap().actions,
+            vec![
+                Action::Select,
+                Action::Toggle,
+                Action::Custom("delete".into())
+            ]
+        );
+        assert_eq!(
+            find(&nodes, "tab-active").unwrap().actions,
+            vec![Action::Select]
+        );
     }
 
     #[test]
