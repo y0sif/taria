@@ -29,7 +29,13 @@ pub enum AgentInput {
         value: Option<String>,
     },
     /// Raw key fallback for apps or regions without semantic coverage.
+    ///
+    /// The string follows the grammar in [`key`](crate::key), which both peers
+    /// parse with the same code.
     Key { key: String },
+    /// Literal text to type, lowered by the adapter into one key event per
+    /// character. One message instead of one round trip per character.
+    Text { text: String },
 }
 
 #[cfg(test)]
@@ -81,6 +87,9 @@ mod tests {
             AgentInput::Key {
                 key: "ctrl+c".into(),
             },
+            AgentInput::Text {
+                text: "buy milk".into(),
+            },
         ];
         for input in inputs {
             let json = serde_json::to_string(&input).unwrap();
@@ -91,7 +100,27 @@ mod tests {
 
     #[test]
     fn agent_input_uses_kind_tag() {
-        let json = serde_json::to_string(&AgentInput::Key { key: "q".into() }).unwrap();
-        assert_eq!(json, r#"{"kind":"key","key":"q"}"#);
+        let cases = [
+            (
+                AgentInput::Key { key: "q".into() },
+                r#"{"kind":"key","key":"q"}"#,
+            ),
+            (
+                AgentInput::Text { text: "hi".into() },
+                r#"{"kind":"text","text":"hi"}"#,
+            ),
+            (
+                AgentInput::Act {
+                    node: NodeId("btn-1".into()),
+                    action: Action::Activate,
+                    value: None,
+                },
+                r#"{"kind":"act","node":"btn-1","action":"activate"}"#,
+            ),
+        ];
+        for (input, expected) in cases {
+            let json = serde_json::to_string(&input).unwrap();
+            assert_eq!(json, expected, "input: {input:?}");
+        }
     }
 }
