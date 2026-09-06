@@ -8,7 +8,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use taria::wire::{AppToBridge, BridgeToApp};
 use taria::{AgentInput, PROTOCOL_VERSION, Snapshot};
@@ -21,6 +21,12 @@ use tokio::sync::{mpsc, watch};
 const RETRY_MIN: Duration = Duration::from_millis(250);
 /// Backoff cap; the manager keeps retrying at this pace forever.
 const RETRY_MAX: Duration = Duration::from_secs(2);
+/// A connection that delivered no snapshot and died before living this long
+/// is treated like a failed connect attempt: the backoff keeps growing
+/// instead of resetting, so an app that accepts and immediately drops (e.g.
+/// one whose snapshot always overflows [`MAX_LINE_BYTES`]) cannot pull the
+/// manager into a full-CPU reconnect loop.
+const HEALTHY_CONNECTION_MIN: Duration = Duration::from_secs(2);
 /// Queued agent inputs awaiting the socket writer.
 const INPUT_QUEUE: usize = 32;
 /// Longest accepted ndjson line from the app. A peer that streams more than
@@ -69,8 +75,13 @@ async fn manager_loop(
         match UnixStream::connect(&path).await {
             Ok(stream) => {
                 tracing::info!(path = %path.display(), "connected to app socket");
-                backoff = RETRY_MIN;
+                drain_stale_inputs(&mut input_rx);
+                let connected_at = Instant::now();
                 let end = run_connection(stream, &snapshot_tx, &mut input_rx).await;
+                // The watch only ever holds `Some` while this connection was
+                // being served (it is cleared below after every connection),
+                // so `Some` here means this connection delivered a snapshot.
+                let delivered_snapshot = snapshot_tx.borrow().is_some();
                 snapshot_tx.send_replace(None);
                 match end {
                     ConnectionEnd::AppClosed => {
@@ -80,6 +91,20 @@ async fn manager_loop(
                         tracing::debug!("all input senders dropped; bridge task exiting");
                         return;
                     }
+                }
+                if delivered_snapshot || connected_at.elapsed() >= HEALTHY_CONNECTION_MIN {
+                    // A healthy connection: reconnect eagerly, from scratch.
+                    backoff = RETRY_MIN;
+                } else {
+                    // Accepted but died young without a snapshot: back off
+                    // exactly like a failed connect, or a peer that always
+                    // accept-and-drops spins this loop at full CPU.
+                    tracing::debug!(
+                        retry_in_ms = backoff.as_millis() as u64,
+                        "connection died without a snapshot; backing off"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RETRY_MAX);
                 }
             }
             Err(err) => {
@@ -93,6 +118,27 @@ async fn manager_loop(
                 backoff = (backoff * 2).min(RETRY_MAX);
             }
         }
+    }
+}
+
+/// Drop any inputs queued while no app was connected.
+///
+/// The `key`/`act` tools refuse to queue while the watch is `None`, but
+/// inputs can still slip in through a race with a dying connection (or a
+/// direct [`BridgeHandle::input_tx`] sender). Replaying them into a freshly
+/// connected app instance would deliver keystrokes ("q", "y", ...) the agent
+/// aimed at a UI that no longer exists, so they are discarded instead.
+fn drain_stale_inputs(input_rx: &mut mpsc::Receiver<AgentInput>) {
+    let mut drained = 0usize;
+    while input_rx.try_recv().is_ok() {
+        drained += 1;
+    }
+    if drained > 0 {
+        tracing::warn!(
+            drained,
+            "dropped agent inputs queued before this connection; they targeted a previous app \
+             instance"
+        );
     }
 }
 

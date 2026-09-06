@@ -185,8 +185,14 @@ impl TariaMcpServer {
             return Err(McpError::invalid_params("key must be non-empty", None));
         }
         let mut rx = self.snapshot_rx.clone();
-        let pre = rx.borrow_and_update().clone();
-        self.send_and_report(rx, pre, AgentInput::Key { key }).await
+        // Like `act`, refuse while no app is connected: a key queued now
+        // would only be delivered to (and confuse) the *next* app instance.
+        let pre = rx
+            .borrow_and_update()
+            .clone()
+            .ok_or_else(not_connected_error)?;
+        self.send_and_report(rx, Some(pre), AgentInput::Key { key })
+            .await
     }
 }
 

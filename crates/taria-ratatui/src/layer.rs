@@ -82,9 +82,14 @@ impl TariaLayer {
     /// Like [`bind`](Self::bind), but at an explicit socket path, skipping
     /// resolution. Useful for tests and apps that manage their own runtime
     /// directories. The same parent-directory creation and privacy checks as
-    /// [`bind`](Self::bind) apply.
+    /// [`bind`](Self::bind) apply: a relative path (including a bare
+    /// filename) is resolved against the current directory first, so the
+    /// parent directory that would hold the socket is always vetted.
     pub fn bind_at(app_label: &str, socket_path: impl Into<PathBuf>) -> io::Result<Self> {
-        let socket_path = socket_path.into();
+        // Absolutize before looking at the parent: a bare filename like
+        // "app.sock" has an empty parent, which must not bypass the privacy
+        // check by silently binding in an unvetted current directory.
+        let socket_path = absolutize(socket_path.into())?;
 
         if let Some(parent) = socket_path.parent()
             && !parent.as_os_str().is_empty()
@@ -406,6 +411,17 @@ fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
     stream.write_all(line.as_bytes())
 }
 
+/// Make `path` absolute, resolving a relative path (including a bare
+/// filename) against the current directory. Ensures the socket path always
+/// has a real parent directory for [`ensure_private_dir`] to vet.
+fn absolutize(path: PathBuf) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
+}
+
 /// Create (if needed) and vet the directory that will hold the socket.
 ///
 /// The socket's parent directory decides who can replace or redirect the
@@ -628,6 +644,53 @@ mod tests {
         assert!(err.to_string().contains("group/world"), "err: {err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absolutize_joins_relative_paths_onto_cwd() {
+        let cwd = env::current_dir().unwrap();
+
+        let bare = absolutize(PathBuf::from("bare.sock")).unwrap();
+        assert!(bare.is_absolute());
+        assert_eq!(bare, cwd.join("bare.sock"));
+        // The parent is now the (vetable) cwd, not the empty path.
+        assert_eq!(bare.parent(), Some(cwd.as_path()));
+
+        let nested = absolutize(PathBuf::from("sub/dir/app.sock")).unwrap();
+        assert_eq!(nested, cwd.join("sub/dir/app.sock"));
+
+        let absolute = absolutize(PathBuf::from("/already/abs.sock")).unwrap();
+        assert_eq!(absolute, PathBuf::from("/already/abs.sock"));
+    }
+
+    /// A bare filename must not bypass the parent-directory privacy check:
+    /// it resolves against the cwd, and binding succeeds only when the cwd
+    /// itself passes [`ensure_private_dir`]. Tested without touching
+    /// `set_current_dir` (racy across parallel tests) by comparing against
+    /// vetting the cwd directly.
+    #[test]
+    fn bind_at_bare_filename_vets_cwd() {
+        let cwd = env::current_dir().unwrap();
+        let name = format!("taria-bare-vet-{}.sock", std::process::id());
+        let result = TariaLayer::bind_at("bare-demo", &name);
+
+        match ensure_private_dir(&cwd) {
+            Ok(()) => {
+                let layer = result.expect("private cwd: bare filename should bind in it");
+                assert_eq!(layer.socket_path(), cwd.join(&name));
+                drop(layer); // removes the socket file
+            }
+            Err(_) => {
+                assert!(
+                    result.is_err(),
+                    "bare filename in an unvetted cwd must be refused, not bound"
+                );
+                assert!(
+                    !cwd.join(&name).exists(),
+                    "no socket may be created in an unvetted cwd"
+                );
+            }
+        }
     }
 
     #[test]

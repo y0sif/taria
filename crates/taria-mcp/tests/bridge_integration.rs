@@ -326,6 +326,120 @@ async fn key_rejects_empty_key() {
 }
 
 #[tokio::test]
+async fn key_errors_before_any_connection() {
+    // Nothing listens on this path; `key` must refuse (like `act`) instead of
+    // queueing input that would replay into the next app instance.
+    let handle = bridge::spawn(test_socket_path("key-never-connects"));
+    let server = TariaMcpServer::new(handle);
+    let err = server
+        .key(Parameters(KeyParams {
+            key: "q".to_string(),
+        }))
+        .await
+        .expect_err("key with no app connected must error");
+    assert!(
+        err.message.contains("running"),
+        "error should hint at the app not running: {}",
+        err.message
+    );
+}
+
+/// Regression test for the reconnect hot loop: an app that accepts and then
+/// immediately drops the connection (e.g. one whose snapshot always exceeds
+/// the line cap) must not be reconnected to at full CPU. Each connection here
+/// dies young without delivering a snapshot, so consecutive accepts must be
+/// spaced by the growing backoff (at least 250 + 500 + 1000 ms across four
+/// cycles).
+#[tokio::test]
+async fn accept_then_drop_connections_are_backed_off() {
+    let path = test_socket_path("accept-drop-backoff");
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let _handle = bridge::spawn(path); // keep the handle alive: dropping it ends the manager
+
+    let started = std::time::Instant::now();
+    for _ in 0..4 {
+        let (stream, _addr) = timeout(WAIT, listener.accept())
+            .await
+            .expect("bridge should keep reconnecting")
+            .expect("accept");
+        drop(stream); // immediate close: an unhealthy connection
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1400),
+        "4 accept-and-drop cycles finished in {elapsed:?}; reconnects are not backed off"
+    );
+}
+
+/// Inputs queued while no app is connected must not replay into the next app
+/// instance. `key` refuses while disconnected, so the stale inputs are queued
+/// through the raw bridge handle (the race window the reconnect drain covers).
+#[tokio::test]
+async fn stale_inputs_do_not_replay_into_next_connection() {
+    let path = test_socket_path("stale-inputs");
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+
+    // First instance comes up, then dies.
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("gen-one"))).await;
+    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+    drop(app);
+    drop(listener);
+    std::fs::remove_file(&path).expect("remove old socket file");
+    wait_for_clear(&mut handle.snapshot_rx).await;
+
+    // The `key` tool refuses while down...
+    let err = server
+        .key(Parameters(KeyParams {
+            key: "q".to_string(),
+        }))
+        .await
+        .expect_err("key while disconnected must refuse");
+    assert!(err.message.contains("running"), "err: {}", err.message);
+
+    // ...so queue stale inputs directly; the listener is still unbound, so
+    // these sit in the channel until the next successful connect.
+    for key in ["q", "y"] {
+        handle
+            .input_tx
+            .send(AgentInput::Key {
+                key: key.to_string(),
+            })
+            .await
+            .expect("queue input while down");
+    }
+
+    // Restart the app; the bridge must drain the stale queue on reconnect.
+    let listener = UnixListener::bind(&path).expect("rebind fake app socket");
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("gen-two"))).await;
+    wait_for_snapshot(&mut handle.snapshot_rx, 1).await;
+
+    // A fresh key sent through the tool must be the FIRST input the new
+    // instance sees; with no drain, the FIFO queue would deliver "q" first.
+    server
+        .key(Parameters(KeyParams {
+            key: "enter".to_string(),
+        }))
+        .await
+        .expect("key against the restarted app");
+    let input = app.recv_input().await;
+    assert_eq!(
+        input,
+        AgentInput::Key {
+            key: "enter".to_string(),
+        },
+        "stale inputs leaked into the new app instance"
+    );
+
+    // And nothing stale trails behind it.
+    let extra = timeout(Duration::from_millis(300), app.lines.next_line()).await;
+    assert!(extra.is_err(), "no further input expected, got {extra:?}");
+}
+
+#[tokio::test]
 async fn newline_free_flood_disconnects_the_app_connection() {
     let (listener, mut handle, _server) = setup("line-flood").await;
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("pre-flood"))).await;
