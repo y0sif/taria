@@ -12,23 +12,33 @@ use taria::key::{Key, KeyPress, Modifiers};
 /// Parse a key description from a [`taria::AgentInput::Key`] message into a
 /// crossterm [`KeyEvent`] (via ratatui's `crossterm` re-export).
 ///
-/// The accepted syntax is [`taria::key::KEY_GRAMMAR`]. `None` means the string
-/// does not match it, which is the same verdict the bridge reaches from the
-/// same parser. A caller that already holds a parsed
+/// The accepted syntax is [`taria::key::KEY_GRAMMAR`]. `None` means either that
+/// the string does not match it, which is the same verdict the bridge reaches
+/// from the same parser, or that [`to_crossterm`] has no crossterm counterpart
+/// for the key it parsed to. A caller that already holds a parsed
 /// [`KeyPress`](taria::key::KeyPress) should use [`to_crossterm`] rather than
 /// render it back to a string to re-parse here.
 pub fn to_crossterm_key(key: &str) -> Option<KeyEvent> {
-    key.parse::<KeyPress>().ok().map(to_crossterm)
+    key.parse::<KeyPress>().ok().and_then(to_crossterm)
 }
 
-/// Lower an already-parsed [`KeyPress`] into a crossterm [`KeyEvent`].
+/// Lower an already-parsed [`KeyPress`] into a crossterm [`KeyEvent`], or
+/// `None` for a key this build cannot express.
 ///
-/// Total, because every key the grammar can produce has a crossterm
-/// counterpart. [`Key::BackTab`] always arrives from the parser with `shift`
-/// set, so it needs no special case: it lowers like any other modified press
-/// and comes out as [`KeyCode::BackTab`] with [`KeyModifiers::SHIFT`], which is
-/// what a terminal delivers for shift+tab.
-pub fn to_crossterm(press: KeyPress) -> KeyEvent {
+/// It covers every key in [`Key`] as of this version, so `None` means the app
+/// was built against a newer taria whose grammar learned a key this adapter
+/// has not: the string parsed, and there is no crossterm event to deliver for
+/// it. Reported rather than approximated, so the app can ack the input
+/// [`Ignored`](taria::wire::InputStatus::Ignored) the way it already does for a
+/// key the grammar rejects. Lowering it to some near-miss event would put a
+/// keystroke into the app that the agent never asked for and report it as
+/// applied.
+///
+/// [`Key::BackTab`] always arrives from the parser with `shift` set, so it
+/// needs no special case: it lowers like any other modified press and comes out
+/// as [`KeyCode::BackTab`] with [`KeyModifiers::SHIFT`], which is what a
+/// terminal delivers for shift+tab.
+pub fn to_crossterm(press: KeyPress) -> Option<KeyEvent> {
     let code = match press.key {
         Key::Char(c) => KeyCode::Char(c),
         Key::Enter => KeyCode::Enter,
@@ -46,8 +56,12 @@ pub fn to_crossterm(press: KeyPress) -> KeyEvent {
         Key::PageUp => KeyCode::PageUp,
         Key::PageDown => KeyCode::PageDown,
         Key::F(n) => KeyCode::F(n),
+        // A key taria added after this adapter was written. Deliberately not
+        // mapped to a placeholder such as `KeyCode::Null`: the app would then
+        // handle a press nobody sent, and ack it as delivered.
+        _ => return None,
     };
-    KeyEvent::new(code, to_crossterm_modifiers(press.modifiers))
+    Some(KeyEvent::new(code, to_crossterm_modifiers(press.modifiers)))
 }
 
 /// Lower taria's modifier flags into the matching [`KeyModifiers`] bits.
@@ -104,21 +118,9 @@ pub fn text_to_keys(text: &str) -> Vec<KeyEvent> {
 mod tests {
     use super::*;
 
-    const CTRL: Modifiers = Modifiers {
-        ctrl: true,
-        alt: false,
-        shift: false,
-    };
-    const SHIFT: Modifiers = Modifiers {
-        ctrl: false,
-        alt: false,
-        shift: true,
-    };
-    const CTRL_ALT_SHIFT: Modifiers = Modifiers {
-        ctrl: true,
-        alt: true,
-        shift: true,
-    };
+    const CTRL: Modifiers = Modifiers::new(true, false, false);
+    const SHIFT: Modifiers = Modifiers::new(false, false, true);
+    const CTRL_ALT_SHIFT: Modifiers = Modifiers::new(true, true, true);
 
     fn event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -152,7 +154,7 @@ mod tests {
         for (key, code) in cases {
             assert_eq!(
                 to_crossterm(KeyPress::new(key, Modifiers::NONE)),
-                event(code, KeyModifiers::NONE),
+                Some(event(code, KeyModifiers::NONE)),
                 "key: {key:?}"
             );
         }
@@ -172,7 +174,7 @@ mod tests {
         for (modifiers, expected) in cases {
             assert_eq!(
                 to_crossterm(KeyPress::new(Key::Char('x'), modifiers)),
-                event(KeyCode::Char('x'), expected),
+                Some(event(KeyCode::Char('x'), expected)),
                 "modifiers: {modifiers:?}"
             );
         }
@@ -183,7 +185,7 @@ mod tests {
     fn backtab_keeps_its_shift() {
         assert_eq!(
             to_crossterm(KeyPress::new(Key::BackTab, SHIFT)),
-            event(KeyCode::BackTab, KeyModifiers::SHIFT)
+            Some(event(KeyCode::BackTab, KeyModifiers::SHIFT))
         );
     }
 

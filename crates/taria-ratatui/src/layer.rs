@@ -743,7 +743,14 @@ fn reader_loop(
         let Ok(msg) = serde_json::from_slice::<BridgeToApp>(&buf) else {
             continue;
         };
-        let BridgeToApp::Input { id, input } = msg;
+        let BridgeToApp::Input { id, input } = msg else {
+            // A message variant added to the protocol after this adapter was
+            // written. Skipped like a line that failed to parse, and for the
+            // same reason: it asks for something this build cannot do. It
+            // cannot be acked either, because an ack answers an input id and
+            // this message is not an input.
+            continue;
+        };
         let queued = QueuedInput {
             generation,
             id,

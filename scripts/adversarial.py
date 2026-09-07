@@ -270,6 +270,9 @@ FAKE_ROOT = {
 # the vocabularies grew their fallbacks a single such leaf cost the whole
 # tree: the bridge skipped every line as malformed and went on serving its
 # last good snapshot, and the app looked frozen with no error anywhere.
+# Kept as literal JSON-shaped data because the probe now asserts the agent
+# reads these values back exactly, not a round trip through the bridge's own
+# types.
 UNKNOWN_VOCAB_ROOT = {
     "id": "root",
     "role": "app",
@@ -867,14 +870,25 @@ def probe_version_mismatch(client, ctx):
 
 
 def probe_unknown_vocabulary(client, ctx):
-    """A role and an action this build has never heard of cost one field each.
+    """A role and an action this build has never heard of reach the agent by
+    name.
 
-    Both sit nested inside a snapshot, where serde's usual escape hatches do
-    not reach: rejecting one used to reject the whole tree, and a reader that
-    skips malformed lines then goes on serving its last good snapshot, so the
-    app looks frozen to an agent with no error printed anywhere. The unknown
-    role must degrade to `other` and the unknown action to a custom action
-    keeping its name, leaving every sibling node exactly as it was sent.
+    Two failures live here, one behind the other. The first is the whole
+    snapshot: a role or an action sits nested inside it, where serde's usual
+    escape hatches do not reach, so rejecting one used to reject the tree it
+    was in, and a reader that skips malformed lines then goes on serving its
+    last good snapshot with the app looking frozen and no error anywhere. The
+    vocabularies grew fallbacks for that.
+
+    The second is what the bridge then did with the tree it had kept. It
+    deserialized the app's line into its own `Snapshot` and serialized that
+    back out, so an app publishing `"role":"sparkline"` had the agent read
+    `"role":"other"`: the name was on the wire and the relay threw it away.
+    The bridge now forwards the app's line as sent, so the name survives, and
+    so does every field a newer app adds. The principle is the one the project
+    already applies to `Action::Custom` below, which keeps an unknown action's
+    name for exactly this reason; the relay extends it to everything else in
+    the line.
     """
     with fake_session() as (mcp, app):
         app.snapshot(9, UNKNOWN_VOCAB_ROOT)
@@ -889,16 +903,17 @@ def probe_unknown_vocabulary(client, ctx):
 
         chart, button = children
         require(
-            chart["role"] == "other",
-            f"unknown role degraded to {chart['role']!r}, expected 'other'",
+            chart["role"] == "sparkline",
+            f"the role reached the agent as {chart['role']!r}, expected the "
+            "'sparkline' the app published",
         )
-        require(chart["label"] == "cpu", f"degraded node lost its label: {chart}")
+        require(chart["label"] == "cpu", f"the relayed node lost its label: {chart}")
         require(
-            chart["actions"] == [{"custom": "zoom"}, {"custom": "set_range"}],
-            f"unknown actions came back as {chart['actions']}, expected custom "
-            "actions keeping their names",
+            chart["actions"] == ["zoom", {"set_range": {"from": 1, "to": 9}}],
+            f"unknown actions came back as {chart['actions']}, expected them "
+            "exactly as the app sent them",
         )
-        # The sibling is the point: a degraded node must cost only itself.
+        # The sibling is the point: an unknown vocabulary must cost nothing.
         require(
             button
             == {
@@ -908,19 +923,24 @@ def probe_unknown_vocabulary(client, ctx):
                 "focused": True,
                 "actions": ["activate"],
             },
-            f"the sibling of the degraded node came back as {button}",
+            f"the sibling of the relayed node came back as {button}",
         )
 
-        # Keeping the name is what keeps the action usable: an agent can read
-        # `zoom` out of the tree and invoke it, all the way back to the app.
+        # The relayed line is untyped, so `act` validates against the bridge's
+        # parse of it, where the unknown action is a custom one keeping its
+        # name. That is what keeps it usable: an agent reads `zoom` out of the
+        # tree and invokes it, all the way back to the app.
         mcp.call_raw("act", {"node": "chart", "action": "zoom"})
-        require(app.wait_inputs(1), "the degraded custom action never reached the app")
+        require(app.wait_inputs(1), "the unknown custom action never reached the app")
         sent = app.inputs()[0]["input"]
         require(
             sent == {"kind": "act", "node": "chart", "action": {"custom": "zoom"}},
             f"the bridge forwarded {sent}, expected the custom action by name",
         )
-    return "unknown role -> other, unknown actions -> custom by name, siblings intact"
+    return (
+        "unknown role and actions relayed verbatim, siblings intact, "
+        "the unknown action still invocable"
+    )
 
 
 def probe_partial_burst_drop(client, ctx):

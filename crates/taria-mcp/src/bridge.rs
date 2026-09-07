@@ -3,7 +3,10 @@
 //! A single background task connects (retrying forever with capped backoff),
 //! reads `AppToBridge` ndjson lines into a [`watch`] channel holding the
 //! latest [`BridgeState`], and writes queued [`AgentInput`]s out as
-//! `BridgeToApp::Input` lines. On disconnect the watch flips to
+//! `BridgeToApp::Input` lines. A snapshot is stored as an [`AppSnapshot`],
+//! which keeps the app's line as it was sent alongside the parse of it, so the
+//! tool layer relays what the app wrote instead of re-serializing what this
+//! build could decode. On disconnect the watch flips to
 //! [`BridgeState::Disconnected`] so tool calls fail fast (instead of acting
 //! on a stale tree) with an error that says which app went away.
 //!
@@ -53,6 +56,36 @@ const ACK_QUEUE: usize = 8 * MAX_KEY_REPEAT as usize;
 /// reconnect) so the bridge never buffers a line unboundedly.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// One snapshot as the app published it, in both the forms the bridge needs.
+///
+/// They are kept together because neither can stand in for the other. The
+/// **raw line is authoritative for what the agent reads**: it is the app's own
+/// ndjson, forwarded verbatim, so a role, an action or a field this build has
+/// never heard of reaches the agent by name instead of being flattened into
+/// whatever the typed struct could hold. Re-serializing
+/// [`parsed`](Self::parsed) destroyed exactly that information: an app
+/// publishing `"role":"sparkline"` had the agent read `"role":"other"`, and the
+/// real name had been on the wire all along for the bridge to pass on.
+///
+/// The **parsed form is authoritative for what the bridge decides**: `act`
+/// validates node ids and advertised actions against it, and the tool layer
+/// compares it to tell a tree that changed from one that did not. Neither of
+/// those may read the raw line, which is untyped and, across a version
+/// mismatch, not even shaped like this build's [`Snapshot`].
+///
+/// A line reaches here only after it parsed, so a malformed line is still
+/// skipped rather than forwarded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppSnapshot {
+    /// The app's `AppToBridge::Snapshot` line, exactly as it was sent, with
+    /// the framing newline stripped. What `read_tree` and every tool result
+    /// hand back.
+    pub line: String,
+    /// The same message decoded into this build's types. For validation and
+    /// change detection only, never for output.
+    pub parsed: Snapshot,
+}
+
 /// What the bridge currently knows about the app, as seen by the tool layer.
 ///
 /// The distinction between [`Never`](Self::Never) and
@@ -64,7 +97,7 @@ pub enum BridgeState {
     /// No app has delivered a snapshot since the bridge started.
     Never,
     /// An app is connected; its latest snapshot is available.
-    Connected(Snapshot),
+    Connected(AppSnapshot),
     /// A previously connected app went away after delivering snapshots.
     Disconnected {
         /// Label from the app's handshake, if one was received.
@@ -204,7 +237,7 @@ async fn manager_loop(
                     if let BridgeState::Connected(snapshot) = state {
                         *state = BridgeState::Disconnected {
                             app_label: conn_label.take(),
-                            last_seq: snapshot.seq,
+                            last_seq: snapshot.parsed.seq,
                         };
                         true
                     } else {
@@ -371,7 +404,15 @@ fn handle_app_line(
     protocol_tx: &watch::Sender<Option<u32>>,
     conn_label: &mut Option<String>,
 ) {
-    match serde_json::from_slice::<AppToBridge>(line) {
+    // Decoded from `&str` rather than `&[u8]` because the snapshot arm keeps
+    // the line: JSON is defined over UTF-8, so a line that parses is valid
+    // UTF-8 anyway, and taking the check first means the kept line is a
+    // borrowed `&str` rather than a lossy conversion of bytes.
+    let Ok(line) = str::from_utf8(line) else {
+        tracing::warn!("ignoring a line from app that is not valid UTF-8");
+        return;
+    };
+    match serde_json::from_str::<AppToBridge>(line) {
         Ok(AppToBridge::Hello {
             app_label,
             protocol_version,
@@ -390,9 +431,15 @@ fn handle_app_line(
             protocol_tx.send_replace(Some(protocol_version));
             *conn_label = Some(app_label);
         }
-        Ok(AppToBridge::Snapshot(snapshot)) => {
-            tracing::debug!(seq = snapshot.seq, "snapshot received");
-            state_tx.send_replace(BridgeState::Connected(snapshot));
+        Ok(AppToBridge::Snapshot(parsed)) => {
+            tracing::debug!(seq = parsed.seq, "snapshot received");
+            // The line is kept beside the parsed form, not instead of it: the
+            // agent reads the line and the bridge reasons about the parse.
+            // See [`AppSnapshot`].
+            state_tx.send_replace(BridgeState::Connected(AppSnapshot {
+                line: line.to_string(),
+                parsed,
+            }));
         }
         Ok(AppToBridge::Ack { id, status }) => {
             tracing::debug!(id, ?status, "input ack received");
@@ -400,6 +447,14 @@ fn handle_app_line(
             // that sent the input has already returned), so a send with no
             // subscribers is not an error worth reporting.
             let _ = ack_tx.send((id, status));
+        }
+        // A message variant added to the protocol after this bridge was
+        // written. Not a warning like a malformed line: the app is conforming
+        // and merely newer, which the wire format calls an additive change, so
+        // the bridge ignores what it has no handler for and keeps serving the
+        // rest of the stream.
+        Ok(_) => {
+            tracing::debug!("ignoring an app message this bridge has no handler for");
         }
         Err(err) => {
             tracing::warn!(%err, "ignoring malformed line from app");

@@ -32,7 +32,15 @@ pub const KEY_GRAMMAR: &str = "a single character (`a`, `Q`, `?`, `+`), or a nam
 ///
 /// `Char` holds the character verbatim, so case is meaningful: `Char('Q')` and
 /// `Char('q')` are different presses.
+///
+/// `#[non_exhaustive]` because the grammar is expected to learn keys (insert,
+/// the keypad, media keys) that terminals already deliver. A key added here is
+/// additive on the wire, since it travels as a string every peer parses with
+/// this module, but an adapter lowering keys into its framework matches on
+/// this enum: without the attribute, one new key fails to compile every
+/// adapter, which is the population taria exists to attract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Key {
     /// A literal character, including `Char(' ')` for the space bar.
     Char(char),
@@ -56,7 +64,14 @@ pub enum Key {
 }
 
 /// Modifier keys held during a [`KeyPress`].
+///
+/// `#[non_exhaustive]` because terminals report modifiers this set does not
+/// carry yet (super, hyper, meta), and adding a field is the cheapest way to
+/// grow the grammar. Nothing outside this crate loses anything to it:
+/// [`NONE`](Self::NONE) and [`new`](Self::new) are both const and together
+/// reach every value a struct literal could build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Modifiers {
     pub ctrl: bool,
     pub alt: bool,

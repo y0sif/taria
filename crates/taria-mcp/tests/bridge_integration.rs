@@ -9,7 +9,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ContentBlock;
 use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{Action, AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::bridge::{self, BridgeHandle, BridgeState};
+use taria_mcp::bridge::{self, AppSnapshot, BridgeHandle, BridgeState};
 use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer, TypeTextParams};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -115,7 +115,16 @@ impl FakeApp {
     }
 
     async fn send(&mut self, msg: &AppToBridge) {
-        let mut line = serde_json::to_string(msg).expect("serialize app message");
+        let line = serde_json::to_string(msg).expect("serialize app message");
+        self.send_raw(&line).await;
+    }
+
+    /// Send one line exactly as given, without going through this build's
+    /// types. The only way to play an app whose format this build cannot
+    /// spell: a newer vocabulary, a field added later, or simply a serializer
+    /// that lays its keys out differently.
+    async fn send_raw(&mut self, line: &str) {
+        let mut line = line.to_string();
         line.push('\n');
         self.write
             .write_all(line.as_bytes())
@@ -137,7 +146,10 @@ impl FakeApp {
             .expect("read from bridge")
             .expect("bridge closed the socket");
         let BridgeToApp::Input { id, input } =
-            serde_json::from_str(&line).expect("parse bridge message");
+            serde_json::from_str(&line).expect("parse bridge message")
+        else {
+            panic!("expected an input message, got: {line}");
+        };
         if let Some(status) = self.ack_with {
             self.ack(id, status).await;
         }
@@ -151,12 +163,24 @@ impl FakeApp {
     }
 }
 
+/// One snapshot in the form the watch holds it: the line an app would have
+/// sent, beside the parse of that line. Tests that wire a `BridgeHandle` by
+/// hand publish through this rather than inventing a line, so what they put in
+/// the watch is what a real connection would have put there.
+fn published(parsed: Snapshot) -> AppSnapshot {
+    AppSnapshot {
+        line: serde_json::to_string(&AppToBridge::Snapshot(parsed.clone()))
+            .expect("a snapshot serializes"),
+        parsed,
+    }
+}
+
 /// Wait until the watch holds a connected snapshot with at least `min_seq`.
-async fn wait_for_snapshot(rx: &mut watch::Receiver<BridgeState>, min_seq: u64) -> Snapshot {
+async fn wait_for_snapshot(rx: &mut watch::Receiver<BridgeState>, min_seq: u64) -> AppSnapshot {
     timeout(WAIT, async {
         loop {
             let hit = match &*rx.borrow_and_update() {
-                BridgeState::Connected(s) if s.seq >= min_seq => Some(s.clone()),
+                BridgeState::Connected(s) if s.parsed.seq >= min_seq => Some(s.clone()),
                 _ => None,
             };
             if let Some(snapshot) = hit {
@@ -233,8 +257,8 @@ async fn manager_connects_and_watch_gets_snapshot() {
     let _app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("hello-tree"))).await;
 
     let snapshot = wait_for_snapshot(&mut handle.state_rx, 1).await;
-    assert_eq!(snapshot.seq, 1);
-    assert_eq!(snapshot.root.id.0, "app");
+    assert_eq!(snapshot.parsed.seq, 1);
+    assert_eq!(snapshot.parsed.root.id.0, "app");
 
     let result = server.read_tree().await.expect("read_tree after snapshot");
     let text = result_text(&result);
@@ -935,10 +959,10 @@ async fn protocol_mismatch_keeps_read_tree_and_refuses_every_input_tool() {
 /// snapshot to get past the liveness check, and a one-slot queue nobody reads.
 #[tokio::test]
 async fn a_full_input_queue_fails_the_call_instead_of_hanging() {
-    let (_state_tx, state_rx) = watch::channel(BridgeState::Connected(Snapshot::new(
+    let (_state_tx, state_rx) = watch::channel(BridgeState::Connected(published(Snapshot::new(
         1,
         demo_root("not-draining"),
-    )));
+    ))));
     let (input_tx, _input_rx) = mpsc::channel(1);
     let (ack_tx, _ack_rx) = broadcast::channel(8);
     let (_protocol_tx, protocol_rx) = watch::channel(Some(PROTOCOL_VERSION));
@@ -991,10 +1015,10 @@ async fn a_full_input_queue_fails_the_call_instead_of_hanging() {
 /// than a test can fill it.
 #[tokio::test]
 async fn a_burst_cut_short_reports_how_much_of_it_was_sent() {
-    let (_state_tx, state_rx) = watch::channel(BridgeState::Connected(Snapshot::new(
+    let (_state_tx, state_rx) = watch::channel(BridgeState::Connected(published(Snapshot::new(
         1,
         demo_root("stops-draining"),
-    )));
+    ))));
     // Two slots and nobody reading them: the third press onwards has nowhere
     // to go.
     let (input_tx, mut input_rx) = mpsc::channel(2);
@@ -1422,5 +1446,168 @@ async fn disconnect_reports_app_label_and_last_seq_then_recovers() {
         result_text(&result).contains("back-again"),
         "tree json: {}",
         result_text(&result)
+    );
+}
+
+/// One line from an app on a later version of the format: a role and an action
+/// this build has never heard of, a node field it has no place for, and a key
+/// order and spacing no serializer here would produce. Every one of those is
+/// information the bridge is relaying, not information it owns.
+const NEWER_APP_LINE: &str = concat!(
+    r#"{"seq": 2, "type": "snapshot", "protocol_version": 1, "root":"#,
+    r#" {"id": "app", "role": "app", "focused": false, "children": ["#,
+    r#"{"id": "chart", "role": "sparkline", "label": "cpu", "focused": true,"#,
+    r#" "actions": ["zoom"], "sample_hz": 30}]}}"#
+);
+
+/// The bridge relays the app's snapshot line; it does not re-serialize its own
+/// parse of it.
+///
+/// Deserializing into `Snapshot` and serializing back is lossy by
+/// construction: it can only emit what this build's types can hold. An app
+/// publishing `"role":"sparkline"` had the agent read `"role":"other"`, and the
+/// real name had been on the wire the whole time. Everything the typed struct
+/// cannot spell went the same way, which made the format's promise that
+/// additive changes are safe true of the connection and false of the
+/// information travelling over it.
+#[tokio::test]
+async fn read_tree_relays_the_apps_own_line_rather_than_its_parse() {
+    let (_dir, listener, mut handle, server) = setup("relay-verbatim").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("first"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    app.send_raw(NEWER_APP_LINE).await;
+    wait_for_snapshot(&mut handle.state_rx, 2).await;
+
+    let result = server.read_tree().await.expect("read_tree after snapshot");
+    let text = result_text(&result);
+    assert_eq!(
+        text, NEWER_APP_LINE,
+        "read_tree must hand back the app's line byte for byte"
+    );
+    // Spelled out, because these three are the losses the relay exists to
+    // prevent and an equality failure alone would not name them.
+    assert!(
+        text.contains(r#""role": "sparkline""#) && !text.contains("other"),
+        "the role the app published must reach the agent by name: {text}"
+    );
+    assert!(
+        text.contains(r#""actions": ["zoom"]"#),
+        "the action the app published must reach the agent by name: {text}"
+    );
+    assert!(
+        text.contains(r#""sample_hz": 30"#),
+        "a field added after this build must survive the relay: {text}"
+    );
+}
+
+/// The parse stays authoritative for what the bridge decides. The line the
+/// agent reads is untyped, so `act` cannot validate against it: node ids and
+/// advertised actions still come from the parse, where the unknown action is
+/// `Custom("zoom")` and reaches the app under the name the tree showed.
+#[tokio::test]
+async fn the_parse_still_validates_acts_against_the_relayed_tree() {
+    let (_dir, listener, mut handle, server) = setup("relay-validate").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("first"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+    app.send_raw(NEWER_APP_LINE).await;
+    wait_for_snapshot(&mut handle.state_rx, 2).await;
+
+    // The app is handed back rather than dropped: a closed socket would end
+    // the connection and turn the second act below into a disconnect report.
+    let echo = tokio::spawn(async move {
+        let (_id, input) = app.recv_input().await;
+        (app, input)
+    });
+
+    server
+        .act(Parameters(ActParams {
+            node: "chart".to_string(),
+            action: "zoom".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("an action the relayed tree advertises");
+    let (_app, input) = echo.await.expect("fake app task");
+    assert_eq!(
+        input,
+        AgentInput::Act {
+            node: taria::NodeId("chart".to_string()),
+            action: Action::Custom("zoom".to_string()),
+            value: None,
+        }
+    );
+
+    // And a node the relayed line does not carry is still refused, from the
+    // same parse.
+    let err = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect_err("the newer tree has no `btn`");
+    assert!(
+        err.message.contains("unknown node id `btn`"),
+        "validation must follow the current tree: {}",
+        err.message
+    );
+}
+
+/// The tools that answer with a tree relay it too, not just `read_tree`.
+/// Anything that re-serialized here would put the agent back where it started
+/// one call later.
+#[tokio::test]
+async fn a_tool_result_relays_the_line_the_app_published() {
+    let (_dir, listener, mut handle, server) = setup("relay-tool-result").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let (_id, _input) = app.recv_input().await;
+        app.send_raw(NEWER_APP_LINE).await;
+        app
+    });
+
+    let result = server
+        .key(Parameters(KeyParams {
+            key: "z".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect("key against a connected app");
+    assert_eq!(
+        result_text(&result),
+        NEWER_APP_LINE,
+        "the tree a tool answers with must be the app's line"
+    );
+
+    echo.await.expect("fake app task");
+}
+
+/// A line that failed to parse is still skipped, not relayed. The raw line is
+/// the agent's view of the app, and forwarding one the bridge could not read
+/// would hand the agent something no peer has vouched for; the last good tree
+/// is the honest answer until a readable one arrives.
+#[tokio::test]
+async fn a_line_that_does_not_parse_is_never_relayed() {
+    let (_dir, listener, mut handle, server) = setup("relay-skips-junk").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("good-tree"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    app.send_raw(r#"{"type":"snapshot","protocol_version":1,"seq":2"#)
+        .await;
+    app.send_raw(r#"{"type":"snapshot","protocol_version":1,"seq":3,"root":42}"#)
+        .await;
+    // Nothing to wait for, so give the manager a window to have relayed them
+    // if it were going to.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let text = result_text(&server.read_tree().await.expect("read_tree")).to_string();
+    assert!(
+        text.contains("good-tree") && text.contains(r#""seq":1"#),
+        "a malformed line must leave the last good tree standing: {text}"
     );
 }

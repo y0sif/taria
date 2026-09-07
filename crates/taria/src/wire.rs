@@ -59,6 +59,21 @@
 //! nothing, but a format that needs the type to know what it is reading
 //! (bincode and its relatives) cannot carry these two types.
 //!
+//! Additive on the wire is not automatically additive in Rust. A peer skips a
+//! message variant it cannot parse, but a peer *rebuilt* against the version
+//! that added one meets it in an exhaustive `match` and stops compiling. The
+//! peers this format is written for are exactly the ones that match on these
+//! types: an adapter dispatching [`BridgeToApp`], a bridge dispatching
+//! [`AppToBridge`] and reading an [`InputStatus`]. So every type a version-1
+//! addition can reach is `#[non_exhaustive]`: those three, [`AgentInput`],
+//! [`Action`](crate::Action), [`Key`](crate::key::Key),
+//! [`Modifiers`](crate::key::Modifiers), [`Role`](crate::Role),
+//! [`Node`](crate::Node) and [`Snapshot`]. Marking them is itself a breaking
+//! change, which is why it is done before the first release rather than at the
+//! first addition. Each one costs an outside peer one wildcard arm (or one
+//! `..` in a pattern), and buys back that a new variant, field, role, action
+//! or key is a recompile rather than a repair.
+//!
 //! Anything else needs a [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) bump:
 //! removing a field, renaming one, making an optional field required, or
 //! changing what an existing field or variant means. The last is the dangerous
@@ -83,8 +98,14 @@ use crate::{AgentInput, Snapshot};
 pub type InputId = u64;
 
 /// Message sent from a TUI app to the bridge.
+///
+/// `#[non_exhaustive]` because this module's own compatibility rule calls a new
+/// message variant additive, and that is only true on the wire: a bridge
+/// matches on this enum to dispatch every line it reads, so without the
+/// attribute the additive change breaks its build.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
+#[non_exhaustive]
 pub enum AppToBridge {
     /// Handshake, sent once as the app's first message.
     Hello {
@@ -121,11 +142,16 @@ pub enum AppToBridge {
 /// [`Action::Custom`](crate::Action::Custom), because a status sits at the top
 /// of a message rather than nested inside one: losing the ack loses only the
 /// ack, and an input with no ack already means "unacknowledged", which is the
-/// safe reading of a status the receiver cannot interpret. Adding a variant is
-/// still worth doing when a status is next added, and it is a breaking change
-/// for every peer that matches on this enum.
+/// safe reading of a status the receiver cannot interpret.
+///
+/// `#[non_exhaustive]` because a status added later is worth adding, and a
+/// bridge matches on this enum to decide what to report about an input it
+/// sent. The attribute makes such a bridge keep compiling; what it must then
+/// do with a status it cannot interpret is not silence, and not a guess about
+/// whether the input landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InputStatus {
     /// The app's event loop dequeued the input.
     Delivered,
@@ -137,8 +163,13 @@ pub enum InputStatus {
 }
 
 /// Message sent from the bridge to a TUI app.
+///
+/// `#[non_exhaustive]` for the reason on [`AppToBridge`], from the other side:
+/// an adapter matches on this enum to apply what the bridge sends, so a variant
+/// added within version 1 must not break its build.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
+#[non_exhaustive]
 pub enum BridgeToApp {
     /// Agent input to apply against the latest snapshot.
     Input {

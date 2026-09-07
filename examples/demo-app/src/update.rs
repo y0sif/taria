@@ -56,8 +56,10 @@ pub fn update(app: &mut App, event: AppEvent) {
 /// it changed anything.
 ///
 /// A key that parses counts as handled even if nothing is bound to it, the
-/// same verdict a person gets for pressing an unbound key; only a key the
-/// grammar rejects is ignored here.
+/// same verdict a person gets for pressing an unbound key. What is ignored here
+/// is input this app cannot act on at all: a key the shared grammar rejects or
+/// the adapter cannot lower, and an input kind added to taria after this app
+/// was written.
 pub fn apply_agent_input(app: &mut App, input: AgentInput) -> Applied {
     match input {
         AgentInput::Act {
@@ -82,6 +84,11 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) -> Applied {
             }
             Applied::Handled
         }
+        // An input kind taria added after this app was written. Reported the
+        // way the app reports every other input it looks at and does not act
+        // on, so the agent hears "this app did nothing with it" rather than
+        // waiting out the bridge's window for an effect that cannot come.
+        _ => Applied::Ignored,
     }
 }
 

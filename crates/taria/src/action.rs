@@ -21,8 +21,15 @@ use crate::NodeId;
 /// that a hand-built `Custom` holding a built-in name does not survive a round
 /// trip, which is correct: it was never a distinct action, only the older
 /// spelling of one.
+///
+/// `#[non_exhaustive]` says to the compiler what [`Custom`](Self::Custom) says
+/// to the parser: this vocabulary keeps growing. An action promoted to a
+/// built-in is additive on the wire, and the attribute is what makes it
+/// additive in Rust too, so a peer that matches on actions keeps compiling
+/// across a taria upgrade.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Action {
     Activate,
     Focus,
@@ -115,8 +122,15 @@ impl<'de> Deserialize<'de> for Action {
 }
 
 /// Input submitted by an agent against a published snapshot.
+///
+/// `#[non_exhaustive]` because a new way for an agent to address an app (a
+/// paste, a pointer event) is an additive message on the wire: an app skips a
+/// `kind` it cannot parse. Without the attribute the same addition breaks the
+/// build of every app that matches on this enum to apply agent input, which is
+/// every app using an adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
 pub enum AgentInput {
     /// Invoke an advertised action on a node.
     Act {

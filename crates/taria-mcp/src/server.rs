@@ -8,10 +8,10 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use taria::key::KeyPress;
 use taria::wire::{InputId, InputStatus};
-use taria::{Action, AgentInput, Node, NodeId, PROTOCOL_VERSION, Snapshot};
+use taria::{Action, AgentInput, Node, NodeId, PROTOCOL_VERSION};
 use tokio::sync::{broadcast, watch};
 
-use crate::bridge::{BridgeHandle, BridgeState};
+use crate::bridge::{AppSnapshot, BridgeHandle, BridgeState};
 
 /// How long an input-sending tool waits for the app to answer, counting both
 /// the app's ack and any snapshot it publishes in response.
@@ -131,7 +131,7 @@ impl TariaMcpServer {
     async fn send_and_report(
         &self,
         rx: watch::Receiver<BridgeState>,
-        pre: Snapshot,
+        pre: AppSnapshot,
         input: AgentInput,
         repeat: u32,
     ) -> Result<CallToolResult, McpError> {
@@ -279,9 +279,9 @@ impl TariaMcpServer {
         let mut rx = self.bridge.state_rx.clone();
         let snapshot = available_snapshot(rx.borrow_and_update().clone())?;
 
-        let Some(target) = find_node(&snapshot.root, &node) else {
+        let Some(target) = find_node(&snapshot.parsed.root, &node) else {
             let mut ids = Vec::new();
-            collect_node_ids(&snapshot.root, &mut ids);
+            collect_node_ids(&snapshot.parsed.root, &mut ids);
             return Err(McpError::invalid_params(
                 format!(
                     "unknown node id `{node}`; valid node ids: {}",
@@ -433,11 +433,30 @@ fn resolve_action(action: &str, target: &Node) -> Option<Action> {
         return Some(parsed);
     }
     let custom = Action::Custom(action.to_string());
-    target.actions.contains(&custom).then_some(custom)
+    if target.actions.contains(&custom) {
+        return Some(custom);
+    }
+    // An action taria promoted to a built-in after `parse_action` was written:
+    // the tree spells it as that built-in, `parse_action` still reads the name
+    // as `Custom`, and neither lookup above can match. Matching on the name
+    // `action_name` prints for it closes that gap, so an action a node
+    // advertises stays invocable through the only name it ever showed.
+    target
+        .actions
+        .iter()
+        .find(|advertised| action_name(advertised) == action)
+        .cloned()
 }
 
 /// The string an agent would pass to invoke `action`; inverse of
 /// [`parse_action`] for every advertised action.
+///
+/// An action taria promoted to a built-in after this bridge was written has no
+/// arm below, and a placeholder there would print a name no agent could
+/// invoke. The derived `Serialize` still holds that action's real wire name, so
+/// the fallback reads it back from there; only a future variant carrying a
+/// payload (as [`Action::Custom`] does) fails that and falls through to the
+/// debug form, which at least names the variant.
 pub fn action_name(action: &Action) -> String {
     match action {
         Action::Activate => "activate".to_string(),
@@ -448,6 +467,10 @@ pub fn action_name(action: &Action) -> String {
         Action::SetValue => "set_value".to_string(),
         Action::Dismiss => "dismiss".to_string(),
         Action::Custom(name) => name.clone(),
+        other => match serde_json::to_value(other) {
+            Ok(serde_json::Value::String(name)) => name,
+            _ => format!("{other:?}"),
+        },
     }
 }
 
@@ -456,7 +479,7 @@ pub fn action_name(action: &Action) -> String {
 /// steps, so they get distinct messages: an app that never connected (wrong
 /// socket path? not started?) versus an app that connected and then went
 /// away (it exited or crashed; waiting for it to come back is enough).
-fn available_snapshot(state: BridgeState) -> Result<Snapshot, McpError> {
+fn available_snapshot(state: BridgeState) -> Result<AppSnapshot, McpError> {
     match state {
         BridgeState::Connected(snapshot) => Ok(snapshot),
         BridgeState::Never => Err(McpError::internal_error(
@@ -478,9 +501,9 @@ fn available_snapshot(state: BridgeState) -> Result<Snapshot, McpError> {
     }
 }
 
-/// Render a snapshot as the standard tool result: compact JSON text.
-fn tree_result(snapshot: &Snapshot) -> Result<CallToolResult, McpError> {
-    Ok(text_result(snapshot_json(snapshot)?))
+/// Render a snapshot as the standard tool result: the app's own JSON.
+fn tree_result(snapshot: &AppSnapshot) -> Result<CallToolResult, McpError> {
+    Ok(text_result(snapshot_json(snapshot)))
 }
 
 /// One text block, the shape every result of this server takes.
@@ -488,11 +511,18 @@ fn text_result(text: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
-/// Serialize a snapshot as the compact JSON agents read the tree from.
-fn snapshot_json(snapshot: &Snapshot) -> Result<String, McpError> {
-    serde_json::to_string(snapshot).map_err(|err| {
-        McpError::internal_error(format!("failed to serialize snapshot: {err}"), None)
-    })
+/// The JSON agents read the tree from: the app's own snapshot line, relayed.
+///
+/// Not `serde_json::to_string(&snapshot.parsed)`. Round-tripping through this
+/// build's types is what turned an app's `"role":"sparkline"` into
+/// `"role":"other"` on the way to the agent, and would do the same to every
+/// field a newer app adds. Two things follow from relaying instead. The output
+/// is no longer canonicalized by this bridge's serializer, so an
+/// odd-but-parseable line reaches the agent as the app wrote it. And there is
+/// nothing left to fail, so the result no longer carries a serialization error
+/// no peer could have provoked.
+fn snapshot_json(snapshot: &AppSnapshot) -> String {
+    snapshot.line.clone()
 }
 
 /// What the app said about one burst of inputs inside [`UPDATE_WAIT`].
@@ -518,7 +548,7 @@ struct Observed {
     /// a floor rather than a count, and the burst's fate only partly known.
     lost: u64,
     /// Newest snapshot differing from the one the input was aimed at.
-    changed: Option<Snapshot>,
+    changed: Option<AppSnapshot>,
     /// The state the bridge was left in when the app went away and had not
     /// come back by the end of the window.
     ///
@@ -565,7 +595,7 @@ struct Observed {
 async fn observe(
     mut acks: broadcast::Receiver<(InputId, InputStatus)>,
     mut rx: watch::Receiver<BridgeState>,
-    pre: &Snapshot,
+    pre: &AppSnapshot,
     ids: &[InputId],
 ) -> Observed {
     let mut seen = Observed::default();
@@ -610,18 +640,22 @@ async fn observe(
                         continue;
                     }
                     seen.status = Some(status);
-                    match status {
-                        // A dropped input carries no tree and nothing later
-                        // can undo the drop: the verdict is final.
-                        InputStatus::Dropped => return seen,
-                        // Delivered can still be refined to Ignored, and an
-                        // ignored input still owes a tree, so keep listening
-                        // unless the tree already answered.
-                        InputStatus::Delivered | InputStatus::Ignored => {
-                            if seen.changed.is_some() {
-                                return seen;
-                            }
-                        }
+                    // A dropped input carries no tree and nothing later can
+                    // undo the drop: the verdict is final.
+                    if status == InputStatus::Dropped {
+                        return seen;
+                    }
+                    // Delivered can still be refined to Ignored, and an ignored
+                    // input still owes a tree, so keep listening unless the
+                    // tree already answered. A status added to the protocol
+                    // after this bridge was written waits here too, rather than
+                    // ending the window: it is an answer this build cannot
+                    // read, and the tree is the only part of it still legible.
+                    // A test on `Dropped` rather than a match with a wildcard,
+                    // so an unreadable status cannot fall into the arm that
+                    // declares a verdict final.
+                    if seen.changed.is_some() {
+                        return seen;
                     }
                 }
                 // Lagging drops the oldest acks, and the oldest are this
@@ -644,7 +678,10 @@ async fn observe(
                     }
                     BridgeState::Connected(snapshot) => {
                         seen.gone = None;
-                        if reconnected || snapshot != *pre {
+                        // Compared on the parse, not on the line the agent
+                        // reads: two lines spelling the same tree differently
+                        // are not a change the agent needs to hear about.
+                        if reconnected || snapshot.parsed != pre.parsed {
                             seen.changed = Some(snapshot);
                             if seen.status.is_some() {
                                 return seen;
@@ -663,7 +700,7 @@ async fn observe(
 /// ignored the input and published nothing newer. `sent` is how many inputs
 /// the burst carried, which the two partial answers need: a drop somewhere in
 /// the burst, and an observation with acks missing from it.
-fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolResult, McpError> {
+fn report(seen: Observed, fallback: AppSnapshot, sent: usize) -> Result<CallToolResult, McpError> {
     // Acks this call never read could have been its own `Dropped` answers, so
     // none of the verdicts below can be stood behind: the drop tally is a
     // floor, and a clean tree would claim an intact burst nobody watched.
@@ -750,7 +787,7 @@ fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolRes
                 "The app received this input and deliberately did nothing with it (for example \
                  an action a modal dialog blocks, or a node it no longer knows). Re-plan from \
                  the current tree below.\n{}",
-                snapshot_json(&snapshot)?
+                snapshot_json(&snapshot)
             )))
         }
         (Some(InputStatus::Delivered), Some(snapshot)) => tree_result(&snapshot),
@@ -768,6 +805,22 @@ fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolRes
              re-check.",
             UPDATE_WAIT.as_millis()
         ))),
+        // A status added to the protocol after this bridge was written. The
+        // app answered, so this is not the silence above, and none of the four
+        // verdicts can be claimed for it: an unreadable status is not a
+        // licence to guess `Delivered`. Said plainly, with the freshest tree,
+        // because the agent can still re-plan from a tree and cannot re-plan
+        // from an error.
+        (Some(_), changed) => {
+            let snapshot = changed.unwrap_or(fallback);
+            Ok(text_result(format!(
+                "The app acknowledged this input with a status this bridge does not recognize, \
+                 so whether it was applied cannot be reported. The app is built against a newer \
+                 taria than this bridge; matching their versions restores the full report. The \
+                 current tree follows.\n{}",
+                snapshot_json(&snapshot)
+            )))
+        }
     }
 }
 
@@ -858,7 +911,7 @@ fn collect_node_ids(node: &Node, out: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use taria::Role;
+    use taria::{Role, Snapshot};
 
     #[test]
     fn known_action_names_parse_to_builtin_variants() {
@@ -927,8 +980,16 @@ mod tests {
         assert_eq!(resolve_action("archive", &neither), None);
     }
 
-    fn snapshot(marker: &str) -> Snapshot {
-        Snapshot::new(1, Node::new("app", Role::App).label(marker))
+    /// A published snapshot in both forms, with the line built the way an
+    /// app would send it: the tests below compare parses, and the results they
+    /// read back are the line.
+    fn snapshot(marker: &str) -> AppSnapshot {
+        let parsed = Snapshot::new(1, Node::new("app", Role::App).label(marker));
+        AppSnapshot {
+            line: serde_json::to_string(&taria::wire::AppToBridge::Snapshot(parsed.clone()))
+                .expect("a snapshot serializes"),
+            parsed,
+        }
     }
 
     /// Acks published faster than the observer reads them are dropped oldest
