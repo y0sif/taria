@@ -3,7 +3,12 @@ use serde::{Deserialize, Serialize};
 use crate::{Node, PROTOCOL_VERSION};
 
 /// One published state of the app's semantic tree.
+///
+/// `#[non_exhaustive]` for the same reason as [`Node`]: new optional fields
+/// are the format's cheapest additive change, and [`new`](Self::new) already
+/// builds one, so closing the struct literal costs a caller nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Snapshot {
     pub protocol_version: u32,
     /// Sequence number, incremented once per published snapshot within one run

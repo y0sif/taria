@@ -70,6 +70,16 @@ impl Modifiers {
         alt: false,
         shift: false,
     };
+
+    /// Build a set of held modifiers, in the order the grammar spells them.
+    ///
+    /// Const so it can stand wherever [`NONE`](Self::NONE) does. It exists
+    /// because the alternative is a struct literal naming all three fields,
+    /// which is the one form of construction a type closed to outside
+    /// construction cannot offer.
+    pub const fn new(ctrl: bool, alt: bool, shift: bool) -> Self {
+        Self { ctrl, alt, shift }
+    }
 }
 
 /// One key press: a [`Key`] plus the [`Modifiers`] held with it.
@@ -287,6 +297,18 @@ mod tests {
 
     fn press(input: &str) -> Option<KeyPress> {
         input.parse::<KeyPress>().ok()
+    }
+
+    /// Three bools in a row is exactly the shape a transposition hides in, so
+    /// the constructor is pinned against the literals rather than assumed.
+    #[test]
+    fn modifiers_new_takes_its_arguments_in_field_order() {
+        assert_eq!(Modifiers::new(false, false, false), Modifiers::NONE);
+        assert_eq!(Modifiers::new(true, false, false), CTRL);
+        assert_eq!(Modifiers::new(false, true, false), ALT);
+        assert_eq!(Modifiers::new(false, false, true), SHIFT);
+        assert_eq!(Modifiers::new(true, true, false), CTRL_ALT);
+        assert_eq!(Modifiers::new(true, false, true), CTRL_SHIFT);
     }
 
     #[test]

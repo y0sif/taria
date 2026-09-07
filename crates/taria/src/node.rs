@@ -18,23 +18,87 @@ pub struct NodeId(pub String);
 /// unparseable lines then goes on serving its last tree with no error anywhere.
 /// Degrading one node's role is what lets an app that learned a new role keep
 /// talking to an agent built before it.
+///
+/// `#[non_exhaustive]` says the same thing to the compiler that the fallback
+/// says to the parser: this vocabulary is expected to keep growing. A role
+/// added later is additive on the wire, and the attribute is what makes it
+/// additive in Rust too, so an adapter that matches on roles keeps compiling
+/// across a taria upgrade instead of breaking once per new widget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Role {
     App,
     Pane,
     List,
     ListItem,
+    /// Hierarchical collection: a file browser, a repository's working tree, a
+    /// database schema sidebar. Choose this over [`List`](Self::List) when an
+    /// entry can own entries of its own, and [`List`](Self::List) when the
+    /// rows are flat. Naming a flat list a tree sends an agent looking for
+    /// structure to expand that is not there; naming a tree a list hides the
+    /// nesting that decides what an agent has actually seen.
+    Tree,
+    /// One entry in a [`Tree`](Self::Tree), with its own entries as children,
+    /// so the shape of the node tree is the shape of the widget's.
+    TreeItem,
     Table,
     Row,
     Cell,
     TextInput,
     Button,
     Checkbox,
+    /// A control that holds one choice out of a fixed set: a dropdown, a radio
+    /// group, a settings picker. Choose this over [`List`](Self::List) when
+    /// the point is to commit to a value rather than to browse rows, and put
+    /// the committed choice in the node's value, so an agent can read the
+    /// current setting without walking the children. A list reports where a
+    /// cursor sits; a select reports what the app will use.
+    Select,
+    /// One choice inside a [`Select`](Self::Select). Distinct from
+    /// [`ListItem`](Self::ListItem) because activating it sets the parent's
+    /// value rather than moving a cursor within it.
+    Option,
     Tabs,
     Tab,
+    /// A reference to somewhere else: an OSC 8 terminal hyperlink, or a path,
+    /// URL or issue number the app opens when it is activated. Put the
+    /// destination in the node's value, so an agent can read where it leads
+    /// without following it.
+    Link,
     Text,
+    /// Append-only stream of lines: command output, a journal tail, a model's
+    /// streaming response. Distinct from [`Text`](Self::Text) because the
+    /// content grows at the end, which tells an agent the value it read is a
+    /// prefix of what is there now rather than the whole of it.
+    Log,
+    /// An embedded terminal emulator, a pty another program is drawing into.
+    /// Its contents are a screen rather than a semantic tree, so an agent
+    /// should read the value as opaque text and drive it with keys.
+    Terminal,
+    /// A picture rendered into cells, whether through a terminal image
+    /// protocol or as block characters. An agent cannot see it, so the label
+    /// is all it gets: say what the image is of, not that it is an image.
+    Image,
+    /// A data visualization: sparkline, bar chart, histogram, time series. The
+    /// rendering is unreadable to an agent, so put the numbers that carry the
+    /// meaning (the latest sample, the peak, the unit) in the node's value.
+    Chart,
     ProgressBar,
+    /// A transient notice: a spinner, a throbber, a toast, a "saving" line
+    /// that appears and clears itself. Distinct from
+    /// [`ProgressBar`](Self::ProgressBar), which reports a known fraction of a
+    /// known total; a status says work is happening without saying how much of
+    /// it is left, and is the right role when there is no fraction to report.
+    /// Publishing it is what makes it observable at all: a toast that appears
+    /// and vanishes between two reads is invisible to an agent, which then
+    /// reads the app as having done nothing.
+    Status,
+    /// The scroll position of a scrollable region, and how much of that region
+    /// is on screen. Worth publishing rather than dropping as decoration: it
+    /// is the only thing telling an agent that the pane it just read has more
+    /// content past the edge. Put the position in the node's value.
+    Scrollbar,
     Dialog,
     Menu,
     MenuItem,
@@ -53,16 +117,27 @@ impl Role {
             "pane" => Role::Pane,
             "list" => Role::List,
             "list_item" => Role::ListItem,
+            "tree" => Role::Tree,
+            "tree_item" => Role::TreeItem,
             "table" => Role::Table,
             "row" => Role::Row,
             "cell" => Role::Cell,
             "text_input" => Role::TextInput,
             "button" => Role::Button,
             "checkbox" => Role::Checkbox,
+            "select" => Role::Select,
+            "option" => Role::Option,
             "tabs" => Role::Tabs,
             "tab" => Role::Tab,
+            "link" => Role::Link,
             "text" => Role::Text,
+            "log" => Role::Log,
+            "terminal" => Role::Terminal,
+            "image" => Role::Image,
+            "chart" => Role::Chart,
             "progress_bar" => Role::ProgressBar,
+            "status" => Role::Status,
+            "scrollbar" => Role::Scrollbar,
             "dialog" => Role::Dialog,
             "menu" => Role::Menu,
             "menu_item" => Role::MenuItem,
@@ -118,7 +193,14 @@ impl<'de> Deserialize<'de> for Role {
 }
 
 /// One widget in the semantic tree.
+///
+/// `#[non_exhaustive]` because a node is where new optional fields land, and
+/// an optional field is the cheapest additive change the format has. Nothing
+/// outside this crate loses anything to it: [`new`](Self::new) plus the
+/// chainable setters below already reach every field, so a struct literal was
+/// never the way to build one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Node {
     pub id: NodeId,
     pub role: Role,
@@ -221,17 +303,28 @@ mod tests {
                 Role::App => (r#""app""#, Some(Role::Pane)),
                 Role::Pane => (r#""pane""#, Some(Role::List)),
                 Role::List => (r#""list""#, Some(Role::ListItem)),
-                Role::ListItem => (r#""list_item""#, Some(Role::Table)),
+                Role::ListItem => (r#""list_item""#, Some(Role::Tree)),
+                Role::Tree => (r#""tree""#, Some(Role::TreeItem)),
+                Role::TreeItem => (r#""tree_item""#, Some(Role::Table)),
                 Role::Table => (r#""table""#, Some(Role::Row)),
                 Role::Row => (r#""row""#, Some(Role::Cell)),
                 Role::Cell => (r#""cell""#, Some(Role::TextInput)),
                 Role::TextInput => (r#""text_input""#, Some(Role::Button)),
                 Role::Button => (r#""button""#, Some(Role::Checkbox)),
-                Role::Checkbox => (r#""checkbox""#, Some(Role::Tabs)),
+                Role::Checkbox => (r#""checkbox""#, Some(Role::Select)),
+                Role::Select => (r#""select""#, Some(Role::Option)),
+                Role::Option => (r#""option""#, Some(Role::Tabs)),
                 Role::Tabs => (r#""tabs""#, Some(Role::Tab)),
-                Role::Tab => (r#""tab""#, Some(Role::Text)),
-                Role::Text => (r#""text""#, Some(Role::ProgressBar)),
-                Role::ProgressBar => (r#""progress_bar""#, Some(Role::Dialog)),
+                Role::Tab => (r#""tab""#, Some(Role::Link)),
+                Role::Link => (r#""link""#, Some(Role::Text)),
+                Role::Text => (r#""text""#, Some(Role::Log)),
+                Role::Log => (r#""log""#, Some(Role::Terminal)),
+                Role::Terminal => (r#""terminal""#, Some(Role::Image)),
+                Role::Image => (r#""image""#, Some(Role::Chart)),
+                Role::Chart => (r#""chart""#, Some(Role::ProgressBar)),
+                Role::ProgressBar => (r#""progress_bar""#, Some(Role::Status)),
+                Role::Status => (r#""status""#, Some(Role::Scrollbar)),
+                Role::Scrollbar => (r#""scrollbar""#, Some(Role::Dialog)),
                 Role::Dialog => (r#""dialog""#, Some(Role::Menu)),
                 Role::Menu => (r#""menu""#, Some(Role::MenuItem)),
                 Role::MenuItem => (r#""menu_item""#, Some(Role::Other)),

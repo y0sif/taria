@@ -14,6 +14,13 @@ use crate::NodeId;
 /// later is still a name an agent can advertise, echo back, and have the app
 /// recognize. This is also what `taria-mcp` already does with an action name an
 /// agent supplies.
+///
+/// The two spellings converge on the way in: `{"custom":"activate"}` reads as
+/// [`Activate`](Self::Activate), not as `Custom("activate")`, so an action
+/// promoted to a built-in still reaches the peer that promoted it. The cost is
+/// that a hand-built `Custom` holding a built-in name does not survive a round
+/// trip, which is correct: it was never a distinct action, only the older
+/// spelling of one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
@@ -80,7 +87,14 @@ impl<'de> Deserialize<'de> for Action {
                     return Err(de::Error::invalid_length(0, &self));
                 };
                 let action = if name == "custom" {
-                    Action::Custom(map.next_value()?)
+                    // Fold the envelope back onto the built-ins rather than
+                    // trusting it, so `{"custom":"activate"}` and `"activate"`
+                    // are the same action. Without this an action name cannot
+                    // survive graduating to a built-in: an older peer reads
+                    // the new name as `Custom`, correctly, and echoes it back
+                    // in this form, and the newer peer's own variant never
+                    // fires, so the act is accepted and silently does nothing.
+                    Action::from_wire(&map.next_value::<String>()?)
                 } else {
                     // A variant added later may carry a payload this build has
                     // no field for. Its name is still the useful part, so keep
@@ -244,6 +258,56 @@ mod tests {
             AgentInput::Act {
                 node: NodeId("btn".into()),
                 action: Action::Custom("set_range".into()),
+                value: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_custom_envelope_folds_onto_every_built_in() {
+        // Reading direction: the envelope form of a built-in name is that
+        // built-in, not a `Custom` shadowing it. Driven off the frozen table
+        // so a built-in added later is covered the moment it is listed there.
+        for (action, json) in action_json() {
+            // `Custom`'s own JSON is already an envelope, and the name it
+            // carries is deliberately not a built-in.
+            let Some(name) = json.strip_prefix('"').and_then(|j| j.strip_suffix('"')) else {
+                continue;
+            };
+            let enveloped = format!(r#"{{"custom":"{name}"}}"#);
+            assert_eq!(
+                serde_json::from_str::<Action>(&enveloped).unwrap(),
+                action,
+                "{enveloped} must parse as {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_echoed_custom_reaches_the_built_in_it_names() {
+        // Writing direction, and the whole reason for the fold. An older peer
+        // that has never heard of `dismiss` reads it as `Custom`, keeps the
+        // name, and sends it back in the only form it has. The peer that does
+        // know the name has to see its own variant, or the act is accepted and
+        // nothing happens.
+        let echoed = Action::Custom("dismiss".into());
+        let json = serde_json::to_string(&echoed).unwrap();
+        assert_eq!(json, r#"{"custom":"dismiss"}"#);
+        assert_eq!(
+            serde_json::from_str::<Action>(&json).unwrap(),
+            Action::Dismiss
+        );
+
+        // And through the buffered detour an internally tagged `AgentInput`
+        // takes, which is how such an echo actually arrives.
+        let input: AgentInput =
+            serde_json::from_str(r#"{"kind":"act","node":"btn","action":{"custom":"dismiss"}}"#)
+                .unwrap();
+        assert_eq!(
+            input,
+            AgentInput::Act {
+                node: NodeId("btn".into()),
+                action: Action::Dismiss,
                 value: None,
             }
         );
