@@ -25,3 +25,17 @@ jobs:
         run: cargo test --workspace
       - name: Build
         run: cargo build --workspace
+      # The two scripts are where agent-contract breakage shows up: the tool
+      # results an agent actually reads, the acknowledgement shapes, and the
+      # edge cases (a peer on another protocol version, a burst half dropped,
+      # an app that stops reading). Nothing in the Rust suites covers a real
+      # bridge against a real app, so a change can pass everything above and
+      # still break every agent driving a TUI. Both build what they test, so
+      # they cannot score a stale target/debug; both exit non-zero on any
+      # failed step or probe, which fails the job.
+      - name: End-to-end scenario
+        run: python3 scripts/e2e.py
+        timeout-minutes: 10
+      - name: Adversarial probes
+        run: python3 scripts/adversarial.py
+        timeout-minutes: 10

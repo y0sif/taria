@@ -13,7 +13,7 @@ app that drops half a burst, an app that stops reading its socket. Those are
 probed against [`FakeApp`], which speaks the ndjson wire directly, so the
 bridge under test is the real one and only the app is a stand-in.
 
-Usage:  python3 scripts/adversarial.py   (expects target/debug binaries built)
+Usage:  python3 scripts/adversarial.py [--no-build]
 """
 
 import contextlib
@@ -22,10 +22,12 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from e2e import (  # noqa: E402
@@ -36,6 +38,7 @@ from e2e import (  # noqa: E402
     StepFailure,
     ToolError,
     act,
+    build,
     close_any_dialog,
     deletable_task,
     find,
@@ -44,12 +47,33 @@ from e2e import (  # noqa: E402
     one_focused,
     parse_result,
     require,
+    require_fresh_binaries,
     response_text,
     task_items,
+    type_text,
 )
 
 READ_TIMEOUT = 5.0
 MODAL_DRAFT = "typed while modal"
+
+# Every socket this script owns gets a deadline. The only unbounded wait left
+# in the harness was the ack flood in [`probe_lost_acks`]: ~90KB in one
+# `sendall` to a bridge that is expected to drain it, which parks forever if
+# it ever stops. Generous rather than tight, because it also bounds the
+# stand-in app's `recv`, which idles between probes.
+SOCKET_TIMEOUT = 10.0
+
+# Ceiling for the whole run. Nothing here should come close; the point is that
+# a gate which hangs reports nothing at all, and in CI burns a runner doing it.
+WATCHDOG_SECONDS = 900.0
+
+# What a failing probe is allowed to raise. `subprocess.TimeoutExpired` is
+# spelled out because it is *not* a `TimeoutError`: it derives from
+# `SubprocessError`, so a child process that would not die used to escape the
+# runner, take the whole script down and destroy the summary table -- the one
+# place a reader learns which probes passed. e2e.py already catches it where
+# it can be raised.
+PROBE_FAILURES = (StepFailure, ToolError, TimeoutError, subprocess.TimeoutExpired)
 
 # --- A stand-in app, for states the demo cannot be driven into ---------------
 
@@ -139,6 +163,7 @@ class FakeApp:
         self._malformed = []
         self._lock = threading.Lock()
         self._connected = threading.Event()
+        self._closing = threading.Event()
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(path)
         self.srv.listen(1)
@@ -150,6 +175,12 @@ class FakeApp:
             conn, _ = self.srv.accept()
         except OSError:
             return  # closed during teardown
+        # Both directions get a deadline, so neither this thread's `recv` nor
+        # a probe's write can park forever on a peer that stopped. A read
+        # timeout is normal here (the app idles between probes) and just goes
+        # round the loop again; a write timeout is not, and surfaces as the
+        # failure of whichever probe was writing.
+        conn.settimeout(SOCKET_TIMEOUT)
         self.conn = conn
         self.send(
             {
@@ -169,6 +200,14 @@ class FakeApp:
         while True:
             try:
                 chunk = conn.recv(65536)
+            except socket.timeout:
+                # Idle, not gone: keep waiting unless teardown has started.
+                # (`socket.timeout` is `TimeoutError` from 3.10 on, and a
+                # subclass of `OSError` before it, so it has to be caught
+                # ahead of the clause below.)
+                if self._closing.is_set():
+                    return
+                continue
             except OSError:
                 return
             if not chunk:
@@ -194,7 +233,18 @@ class FakeApp:
                     self._lines.append(parsed)
 
     def send(self, msg):
-        self.conn.sendall((json.dumps(msg) + "\n").encode())
+        self.send_raw((json.dumps(msg) + "\n").encode())
+
+    def send_raw(self, data):
+        """Write bytes to the bridge, under the connection's write deadline.
+
+        The ack flood in [`probe_lost_acks`] is one ~90KB write, far past any
+        socket buffer, so it only completes because the bridge is draining the
+        other end. Unbounded, a bridge that stopped reading would hang the
+        whole gate here with nothing printed; bounded, it fails that probe and
+        names this write.
+        """
+        self.conn.sendall(data)
 
     def wait_connected(self, timeout=READ_TIMEOUT):
         return self._connected.wait(timeout)
@@ -240,6 +290,7 @@ class FakeApp:
         return False
 
     def close(self):
+        self._closing.set()
         for sock in (self.srv, self.conn):
             if sock is not None:
                 try:
@@ -296,6 +347,16 @@ UNKNOWN_VOCAB_ROOT = {
 }
 
 
+# Every bridge process alive right now, including the ones a `fake_session`
+# owns. The watchdog is the only reader: the client a fake session holds is
+# not the one `main` does, and a hard stop taken inside a session would
+# otherwise reach neither. Such a bridge usually exits by itself when this
+# process dies and its stdin pipe closes -- but "the bridge notices and exits"
+# is exactly the assumption the watchdog runs on the failure of, so it is
+# killed outright rather than relied upon.
+LIVE_CLIENTS = set()
+
+
 @contextlib.contextmanager
 def fake_session(**kwargs):
     """A real bridge wired to a [`FakeApp`], torn down together.
@@ -309,6 +370,7 @@ def fake_session(**kwargs):
     try:
         app = FakeApp(os.path.join(tmpdir, "fake.sock"), **kwargs)
         client = McpClient(app.path)
+        LIVE_CLIENTS.add(client)
         client.initialize()
         require(app.wait_connected(), "the bridge never connected to the fake app")
         yield client, app
@@ -321,6 +383,7 @@ def fake_session(**kwargs):
         )
     finally:
         if client is not None:
+            LIVE_CLIENTS.discard(client)
             client.close()
             if client.proc.poll() is None:
                 client.proc.kill()
@@ -590,8 +653,16 @@ def probe_unparseable_key(client, ctx):
 
 
 def probe_type_text_bounds(client, ctx):
-    """type_text takes 1 to 4096 characters; both ends are refused before
-    anything reaches the app."""
+    """type_text takes 1 to 4096 characters: 0 and 4097 are refused before
+    anything reaches the app, and 4096 is typed in full.
+
+    The accepted end is the half a bounds check most easily loses. Refusing 0
+    and 4097 says nothing about 4096 being allowed -- an off-by-one that
+    refused the limit itself would look identical from outside -- and the
+    documented limit is the number an agent plans its chunking around, so it
+    has to be a number that works. `probe_key_repeat_bounds` covers its own
+    accepted bound the same way.
+    """
     before = client.read_tree()
     info = []
     for text, expected in (("", "non-empty"), ("a" * 4097, "4096")):
@@ -616,7 +687,52 @@ def probe_type_text_bounds(client, ctx):
         f"tree changed after rejected type_text calls: seq {before['seq']} -> "
         f"{after['seq']}",
     )
-    return "; ".join(info) + "; nothing typed"
+
+    # Now the limit itself. Typed into the demo's input, where a character is
+    # text rather than a binding, so the draft's own value is the proof that
+    # all 4096 arrived -- and that they arrived as one input, not 4096 of
+    # them, which the app's queue of 256 would have shredded.
+    payload = "a" * 4096
+    restored = False
+    try:
+        tree = act(client, "input", "set_value", value="", expect=EXPECT_ACK)
+        require(
+            one_focused(tree, "before typing the limit") == "input",
+            "set_value must leave the input focused before typing",
+        )
+        require(
+            find(tree, "input")["value"] in (None, ""),
+            f"draft is {find(tree, 'input').get('value')!r}, expected empty",
+        )
+        tree = type_text(client, payload)
+        typed = find(tree, "input")["value"] or ""
+        require(
+            typed == payload,
+            f"type_text at the 4096-character limit left a draft of "
+            f"{len(typed)} characters, expected {len(payload)}",
+        )
+
+        # `esc` is the demo's way out: it clears the draft and hands the
+        # keyboard back to the list, where the probes after this one expect
+        # it.
+        tree = key(client, "esc")
+        require(
+            find(tree, "input")["value"] in (None, ""),
+            "could not clear the 4096-character draft",
+        )
+        back_on = one_focused(tree, "after the type_text bounds probe")
+        require(back_on != "input", "esc did not hand the keyboard back to the list")
+        restored = True
+    finally:
+        # However this ends, no later probe should inherit the keyboard -- or
+        # 4096 characters of draft -- from it. Unchecked, because this only
+        # runs on the failure path, where the probe's own report wins.
+        if not restored:
+            try:
+                client.call_raw("key", {"key": "esc"})
+            except (ToolError, StepFailure, TimeoutError):
+                pass
+    return "; ".join(info) + f"; 4096 accepted and all {len(payload)} typed"
 
 
 def probe_key_repeat_bounds(client, ctx):
@@ -943,6 +1059,69 @@ def probe_unknown_vocabulary(client, ctx):
     )
 
 
+def probe_ack_vs_silence(client, ctx):
+    """A peer that acknowledges and one that says nothing answer differently.
+
+    This is the only place in the gate where the two can be put to the same
+    question. On a call whose tree changes the bridge returns a byte-identical
+    payload either way, deliberately: the no-ack path is the compatibility
+    path for adapters that never implement acks, and an agent driving one of
+    those must still get its tree. So most assertions in both scripts cannot
+    see an acknowledgement at all, and no amount of them adds up to evidence
+    that acks are read.
+
+    The paths part exactly where the tree does not move, and only a stand-in
+    app can hold everything else still: same input, same silent tree, same
+    bridge, and the single difference is whether an `ack` line came back.
+    Both answers are asserted, and so is the fact that they are not the same
+    string -- an agent decides whether to keep waiting on that difference.
+
+    `taria-demo` covers the acking half against a real adapter (e2e steps p, q
+    and r); nothing but a stand-in can supply the silent half, because the
+    demo always answers.
+    """
+    answers = {}
+    for label, acknowledge in (("acking peer", True), ("silent peer", False)):
+        with fake_session() as (mcp, app):
+            app.snapshot(1, FAKE_ROOT)
+            mcp.read_tree()
+
+            req = mcp.send_call("key", {"key": "down"})
+            require(
+                app.wait_inputs(1),
+                f"the {label} never received the input, so its answer says "
+                "nothing about acknowledgement",
+            )
+            if acknowledge:
+                app.ack(app.inputs()[0]["id"], "delivered")
+            # No new snapshot on either run: what the agent can see of the app
+            # is identical, so the answers can differ only by the ack.
+            text = response_text(mcp.collect([req], timeout=20.0)[req])
+            answers[label] = (parse_result(text)[0], text)
+
+    require(
+        answers["acking peer"][0] == "no_change",
+        f"a peer that acked Delivered and published nothing answered "
+        f"{answers['acking peer'][0]!r}, expected the acknowledged-no-change "
+        f"note: {answers['acking peer'][1][:160]}",
+    )
+    require(
+        answers["silent peer"][0] == "no_ack",
+        f"a peer that answered nothing at all answered "
+        f"{answers['silent peer'][0]!r}, expected the no-acknowledgement note: "
+        f"{answers['silent peer'][1][:160]}",
+    )
+    require(
+        answers["acking peer"][1] != answers["silent peer"][1],
+        "the acking and the silent peer produced the same text, so the ack "
+        "changed nothing an agent can read",
+    )
+    return (
+        "same input, same silent tree: acking peer -> no_change, silent peer "
+        "-> no_ack, and the two notes differ"
+    )
+
+
 def probe_partial_burst_drop(client, ctx):
     """A burst whose middle presses were dropped is an error, not a tree.
 
@@ -1106,7 +1285,10 @@ def probe_lost_acks(client, ctx):
                 time.sleep(0.05)
             # One write, so the bridge's reader drains a full buffer of acks
             # per scheduling slot and outruns the call watching for its own.
-            app.conn.sendall(
+            # ~90KB, which no socket buffer holds: it completes only because
+            # the bridge is reading, and `send_raw` bounds the wait if it
+            # stops.
+            app.send_raw(
                 b"".join(
                     b'{"type":"ack","id":%d,"status":"delivered"}\n' % (10_000_000 + i)
                     for i in range(flood)
@@ -1156,7 +1338,10 @@ def probe_kill_and_restart(client, ctx, app, sock, launched):
     old one and deleting the socket directory out from under a live demo.
     """
     app.proc.kill()
-    app.proc.wait(timeout=READ_TIMEOUT)
+    try:
+        app.proc.wait(timeout=READ_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise StepFailure("taria-demo survived SIGKILL, or was never reaped")
 
     start = time.monotonic()
     deadline = start + READ_TIMEOUT
@@ -1196,7 +1381,49 @@ def probe_kill_and_restart(client, ctx, app, sock, launched):
     )
 
 
+def start_watchdog(seconds, teardown):
+    """Hard-stop the run if it stops producing results.
+
+    Every wait in this harness is bounded, but "every wait I know about" is
+    the exact claim a hang disproves, and a gate that hangs prints no summary
+    at all -- in CI it burns a runner and reports nothing about why. So the
+    ceiling is enforced from outside the probes: dump every thread's stack,
+    which is the one artefact that says where it stopped, tear the child
+    processes down so nothing outlives this script, and exit non-zero.
+
+    Returns the event that cancels it.
+    """
+    finished = threading.Event()
+
+    def wait_and_stop():
+        if finished.wait(seconds):
+            return
+        print(
+            f"\nFAIL watchdog: no result within {seconds:.0f}s; thread stacks "
+            "follow",
+            flush=True,
+        )
+        for thread_id, frame in sys._current_frames().items():
+            print(f"-- thread {thread_id} --", flush=True)
+            traceback.print_stack(frame)
+        try:
+            teardown()
+        except Exception:  # teardown is best effort; exiting is not
+            traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(2)
+
+    threading.Thread(target=wait_and_stop, daemon=True).start()
+    return finished
+
+
 def main():
+    if "--no-build" in sys.argv:
+        require_fresh_binaries()
+    else:
+        build()
+
     tmpdir = tempfile.mkdtemp(prefix="taria-adv-")
     sock = os.path.join(tmpdir, "adv.sock")
     # Every demo process this run starts, in start order. The restart probe
@@ -1223,10 +1450,34 @@ def main():
         # the probes above share.
         ("protocol version mismatch", probe_version_mismatch),
         ("unknown role and action", probe_unknown_vocabulary),
+        ("acking peer vs silent peer", probe_ack_vs_silence),
         ("partial burst drop", probe_partial_burst_drop),
         ("app stops reading its socket", probe_input_queue_full),
         ("acks lost to the bridge's channel", probe_lost_acks),
     ]
+
+    def teardown():
+        # Every bridge, not only the one this function can name: when the
+        # watchdog calls this, a fake session may be open and its client is
+        # not `client`. Reached through the registry so a hard stop cannot
+        # orphan one.
+        for bridge in [client, *LIVE_CLIENTS]:
+            if bridge is None:
+                continue
+            LIVE_CLIENTS.discard(bridge)
+            try:
+                bridge.close()
+            except Exception:
+                pass
+            if bridge.proc.poll() is None:
+                bridge.proc.kill()
+        # Every app, not just the last one named: the socket directory goes
+        # with them, so a demo still running would lose its socket and linger.
+        for started in launched:
+            started.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    finished = start_watchdog(WATCHDOG_SECONDS, teardown)
 
     try:
         app = PtyApp(sock)
@@ -1242,7 +1493,7 @@ def main():
                 evidence = fn(client, {})
                 results.append((name, True, evidence))
                 print(f"PASS {name}: {evidence}", flush=True)
-            except (StepFailure, ToolError, TimeoutError) as err:
+            except PROBE_FAILURES as err:
                 results.append((name, False, str(err)))
                 print(f"FAIL {name}: {err}", flush=True)
                 # A probe that failed mid-modal must not hand the next one an
@@ -1254,19 +1505,12 @@ def main():
             evidence = probe_kill_and_restart(client, {}, app, sock, launched)
             results.append((name, True, evidence))
             print(f"PASS {name}: {evidence}", flush=True)
-        except (StepFailure, ToolError, TimeoutError) as err:
+        except PROBE_FAILURES as err:
             results.append((name, False, str(err)))
             print(f"FAIL {name}: {err}", flush=True)
     finally:
-        if client is not None:
-            client.close()
-            if client.proc.poll() is None:
-                client.proc.kill()
-        # Every app, not just the last one named: the socket directory goes
-        # with them, so a demo still running would lose its socket and linger.
-        for started in launched:
-            started.kill()
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        finished.set()
+        teardown()
 
     print("\n== adversarial summary ==")
     for name, ok, evidence in results:

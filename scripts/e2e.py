@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import shutil
 import struct
@@ -31,6 +32,15 @@ READ_TIMEOUT = 5.0
 SNAPSHOT_LIMIT = 8 * 1024  # scenario (n): compact tree must stay under 8KB
 INVALID_PARAMS = -32602  # JSON-RPC code the bridge rejects bad arguments with
 
+# Where the binaries under test come from. Both scripts build before they run,
+# and `--no-build` swaps the build for [`require_fresh_binaries`] rather than
+# for trust: a run against a `target/debug` older than these trees tests a
+# build nobody asked for, which has already happened twice -- once scoring a
+# leftover mutant as the product, and the more dangerous inverse, an edit that
+# was never compiled passing green.
+SOURCE_ROOTS = ("crates", "examples", "Cargo.toml", "Cargo.lock")
+SOURCE_SUFFIXES = (".rs", ".toml", ".lock")
+
 # The four shapes an input-sending tool (act / key / type_text) can answer
 # with, as of the v0.1 ack protocol. Matched by prefix, verbatim: an agent
 # reads these strings, so a reworded one is a behaviour change this script has
@@ -42,6 +52,18 @@ IGNORED_PREFIX = (
 )
 NO_CHANGE_PREFIX = "The app received this input, and its tree did not change within"
 NO_ACK_PREFIX = "The app neither acknowledged this input nor changed its tree within"
+
+# The bridge's report for a burst the app dropped part of, and the demo's own
+# tally of the same event once the terminal is restored. The scenario's clean
+# run asserts the demo line is *absent*, which proves nothing on its own -- the
+# demo prints it only above zero, so a deleted counter would pass too. The
+# positive control below drives a second demo into really dropping input and
+# holds the two numbers against each other.
+BRIDGE_DROP_RE = re.compile(
+    r"^the app dropped (?P<dropped>\d+) of the (?P<sent>\d+) inputs this call sent "
+    r"because its input queue was full,"
+)
+DEMO_DROPPED_RE = re.compile(r"^taria-demo: dropped (\d+) agent input\(s\)", re.M)
 
 
 class ToolError(Exception):
@@ -439,13 +461,35 @@ def one_focused(snapshot, context):
 #         cursor that may already be parked -- and such a step asserts the
 #         state it wanted separately. `no_ack` still fails: an app that says
 #         nothing at all is not one that had nothing to do.
+#   NONE  the app must have acknowledged the input and published nothing: the
+#         `no_change` note exactly, never a tree and never silence. This is
+#         the only expectation that can see an acknowledgement at all, and it
+#         is why the steps using it exist (see below).
 #
-# There is deliberately no third mode that absorbs `no_ack` too. Under the
-# v0.1 contract an app answers every input it dequeues, so a step written
-# against `taria-demo` that shrugged at silence would be tolerating a broken
-# contract rather than a slow app.
+# There is deliberately no mode that absorbs `no_ack` too. Under the v0.1
+# contract an app answers every input it dequeues, so a step written against
+# `taria-demo` that shrugged at silence would be tolerating a broken contract
+# rather than a slow app.
+#
+# # Where the acknowledgement is actually observable
+#
+# On a call whose tree changes, the bridge answers with that tree whether the
+# app acked `Delivered` or said nothing at all: the no-ack path is the
+# compatibility path for adapters that do not implement acks, and those two
+# results are byte-identical by design. So `EXPECT_TREE`, the default and the
+# expectation of most calls here, cannot see an ack and is not meant to. The
+# contract is testable exactly where no tree change is expected, because
+# `no_change` (acked, nothing to do) and `no_ack` (nothing came back) are
+# distinct messages there. Three steps assert it outright -- p (re-selecting
+# the current tab), q (a key the app has no binding for) and r (a `set_value`
+# that sets the value it already holds) -- each reaching it a different way,
+# and none of them borrowing its setup from a helper that would go red first.
+# scripts/adversarial.py carries the other half: `probe_ack_vs_silence` puts
+# the same input to a peer that acks and to one that does not, which is the
+# only place the two paths can be compared side by side.
 EXPECT_TREE = "tree"
 EXPECT_ACK = "ack"
+EXPECT_NO_CHANGE = "no_change"
 
 
 def expect_input(client, tool, args, expect):
@@ -475,6 +519,13 @@ def expect_input(client, tool, args, expect):
             "it, whether or not the tree moved",
         )
         return tree if tree is not None else client.read_tree(retries=5)
+    if expect == EXPECT_NO_CHANGE:
+        require(
+            kind == "no_change",
+            f"{tool} {args!r} answered {kind!r}; expected the app to acknowledge "
+            "an input it had nothing to do about, and to publish nothing",
+        )
+        return None
     raise StepFailure(f"unknown expectation {expect!r}")
 
 
@@ -647,7 +698,15 @@ def step_e_add_task(client, ctx):
 
     tree = act(client, "input", "activate")
     added = [n for n in flatten(tree["root"]) if n.get("label") == title]
-    require(added, f"no node labeled {title!r} after activate")
+    # Exactly one, not merely at least one: an `activate` applied twice -- the
+    # layer redelivering an input, the demo submitting on both the act and a
+    # lowered Enter -- adds the task twice, and a truthiness check would call
+    # that a pass. Step i counts the same way for the same reason.
+    require(
+        len(added) == 1,
+        f"expected exactly one node labelled {title!r} after activate, got "
+        f"{len(added)}: {[n['id'] for n in added]}",
+    )
     require(added[0]["value"] == "todo", "new task should start as todo")
     require(
         find(tree, "input")["value"] in (None, ""),
@@ -1035,19 +1094,33 @@ def step_o_select_while_typing(client, ctx):
 def step_p_ack_without_change(client, ctx):
     """The app acknowledges an input it deliberately does nothing about.
 
-    This is the shape v0.1 added, and the one no other step in this scenario
-    can distinguish: `no_change` says the app dequeued the input, looked at it
-    and had nothing to do, while `no_ack` says nothing came back at all. An
-    agent tells "done, nothing to see" from "still busy, ask again" by exactly
-    that difference, so a step that accepted either would assert nothing. The
-    other half of the contract -- the `Ignored` refinement -- is step j.
+    This is the shape v0.1 added, and the one most of this scenario cannot
+    distinguish: `no_change` says the app dequeued the input, looked at it and
+    had nothing to do, while `no_ack` says nothing came back at all. An agent
+    tells "done, nothing to see" from "still busy, ask again" by exactly that
+    difference, so a step that accepted either would assert nothing. The other
+    half of the contract -- the `Ignored` refinement -- is step j.
+
+    The re-selected tab is whichever one is on screen right now, read out of
+    the tree rather than put there by `show_tab`. The helper takes either
+    answer and re-reads, so setting the scene with it made this step's own
+    assertion reachable only when the tab happened to be selected already:
+    deleting the app's acks failed the helper on a different call, and
+    reordering an earlier step would have left this one asserting nothing at
+    all. Nothing here depends on a helper or on the step before it.
     """
-    before = show_tab(client, "tab-active")
-    kind, _ = client.call_outcome("act", {"node": "tab-active", "action": "select"})
+    before = client.read_tree()
+    require(find(before, "dialog") is None, "a modal is open; the tab acts are gated")
+    label = find(before, "tabs").get("value")
+    current = [tab_id for tab_id, name in TAB_LABELS.items() if name == label]
     require(
-        kind == "no_change",
-        f"selecting the tab that is already selected answered {kind!r}; expected "
-        "the app to acknowledge an input it deliberately did nothing about",
+        len(current) == 1,
+        f"the tabs node reads {label!r}, which names none of {sorted(TAB_LABELS)}",
+    )
+    tab_id = current[0]
+
+    expect_input(
+        client, "act", {"node": tab_id, "action": "select"}, EXPECT_NO_CHANGE
     )
     # And it really did nothing: an app that redrew something would have
     # published a new tree rather than the no-change note.
@@ -1058,10 +1131,104 @@ def step_p_ack_without_change(client, ctx):
         f"{after['seq']}",
     )
     ctx["snapshot"] = after
-    return "re-selecting the current tab: acknowledged, no tree change"
+    return f"re-selecting {tab_id} (already current): acknowledged, no tree change"
 
 
-def step_q_shutdown(client, ctx, app):
+def step_q_unbound_key_acked(client, ctx):
+    """A key the app has no binding for is acknowledged, not swallowed.
+
+    The second way into the observable half of the ack contract, and the one
+    that needs no state at all: `f1` parses in the shared grammar, lowers to a
+    real crossterm event, reaches the demo's key handler and falls off the end
+    of its match. The app has looked at the press and has nothing to do, which
+    is `no_change`; silence would mean the press vanished somewhere between
+    the bridge and the handler, and a tree would mean it did something.
+
+    Deliberately not a key the demo binds and not a key the grammar rejects:
+    the first would change the tree, the second never leaves the bridge.
+    """
+    before = client.read_tree()
+    require(find(before, "dialog") is None, "a modal is open; it eats every key")
+    expect_input(client, "key", {"key": "f1"}, EXPECT_NO_CHANGE)
+    after = client.read_tree()
+    require(
+        after == before,
+        f"an unbound key moved the app: seq {before['seq']} -> {after['seq']}",
+    )
+    ctx["snapshot"] = after
+    return "key f1 (bound to nothing): acknowledged, no tree change"
+
+
+def step_r_idempotent_set_value(client, ctx):
+    """Setting the value the input already holds is acked, and publishes
+    nothing.
+
+    The third way in, and the only one that goes through `act` with a payload:
+    the app applies the value, the frame it draws is identical to the last
+    one, and the layer dedupes it. So the input was handled -- `Handled`, not
+    `Ignored` -- and still nothing is published, which is the case an agent
+    most easily mistakes for a stalled app.
+    """
+    draft = "already what the input holds"
+    before = client.read_tree()
+    require(
+        find(before, "input").get("value") != draft,
+        f"the input already reads {draft!r}, so the first set_value below "
+        "would be the no-op instead of the second",
+    )
+
+    restored = False
+    try:
+        tree = act(client, "input", "set_value", value=draft)
+        require(
+            find(tree, "input")["value"] == draft,
+            f"could not seed the draft: input is {find(tree, 'input').get('value')!r}",
+        )
+        require(
+            one_focused(tree, "before the repeat set_value") == "input",
+            "set_value must leave the input focused",
+        )
+
+        expect_input(
+            client,
+            "act",
+            {"node": "input", "action": "set_value", "value": draft},
+            EXPECT_NO_CHANGE,
+        )
+        live = client.read_tree()
+        require(
+            live == tree,
+            f"the tree moved under a no-change answer: seq {tree['seq']} -> "
+            f"{live['seq']}",
+        )
+
+        # `esc` is the demo's way out of the input: it clears the draft and
+        # hands the keyboard back to the list, which the shutdown step needs.
+        tree = key(client, "esc")
+        require(
+            find(tree, "input")["value"] in (None, ""), "esc did not clear the draft"
+        )
+        require(
+            one_focused(tree, "after esc") != "input",
+            "esc did not hand the keyboard back to the list",
+        )
+        ctx["snapshot"] = tree
+        restored = True
+    finally:
+        # Whatever happened above, do not hand the shutdown step an app whose
+        # keyboard belongs to the input: `q` typed there is the letter q, not
+        # a quit, and the step would report the app as still running -- a
+        # second failure that says nothing about the app and buries the first.
+        # Sent raw and unchecked, because this only runs on the failure path.
+        if not restored:
+            try:
+                client.call_raw("key", {"key": "esc"})
+            except (ToolError, StepFailure, TimeoutError):
+                pass
+    return f"set_value repeating {draft!r}: acknowledged, no tree change"
+
+
+def step_s_shutdown(client, ctx, app):
     # `q` quits, so the app is gone before this call can answer. The answer
     # has to say that: an input that ended the app reported as "the tree did
     # not change" tells the agent the app is idle while it is in fact gone.
@@ -1117,6 +1284,12 @@ def step_q_shutdown(client, ctx, app):
     # because the bridge connection they arrived on ended first -- and every
     # step that passed did so over a hole. Checked here because this is the
     # only point where the demo has printed them and is done writing.
+    #
+    # An absence proves nothing by itself: the demo prints each line only when
+    # its count is above zero, so a deleted counter would satisfy this too.
+    # [`step_t_dropped_counter`] is the positive control -- it drives a demo
+    # of its own into really dropping input and holds the printed count
+    # against the bridge's tally of the same drops.
     # A join that timed out leaves the drain mid-stream, so the absence
     # assertion below would be run against whatever happened to have arrived
     # -- possibly nothing at all -- and pass for the wrong reason. The point
@@ -1152,6 +1325,128 @@ def step_q_shutdown(client, ctx, app):
     )
 
 
+def step_t_dropped_counter(ctx):
+    """Positive control for the counter the shutdown step asserts is silent.
+
+    "No dropped-input line in the demo's stderr" is an assertion about a line
+    the demo prints only when its count is above zero, so on its own it holds
+    just as well for a demo that lost the counter entirely, or for a layer
+    that stopped counting. This step makes the line appear on purpose and
+    reads the number in it.
+
+    Its own demo and its own bridge: the scenario's app has to finish clean,
+    and dropping input into it would turn the shutdown step's assertion into
+    the failure it is meant to catch.
+
+    Overflow is provoked rather than timed. The layer's input queue holds 256
+    and the demo drains it around a 50ms tick, so a round of six pipelined
+    64-press bursts puts 384 inputs in front of it inside one tick; rounds are
+    repeated until the bridge reports a drop, which also gives the exact tally
+    to hold the demo's number against. One round stays under the bridge's ack
+    channel too (384 acks against 512 slots), so the tally cannot quietly be
+    a floor.
+    """
+    rounds, per_round, repeat = 0, 6, 64
+    tmpdir = tempfile.mkdtemp(prefix="taria-e2e-drops-")
+    sock = os.path.join(tmpdir, "drops.sock")
+    app = None
+    client = None
+    try:
+        app = PtyApp(sock)
+        require(app.wait_for_socket(), f"the flood demo never bound {sock}")
+        client = McpClient(sock)
+        client.initialize()
+        client.read_tree()
+
+        # What the bridge itself saw dropped, summed over every call. Only
+        # comparable to the demo's tally when every call gave a definite
+        # answer: a call that lost acks to the bridge's channel, or one that
+        # timed out waiting for them, knows less than it sent.
+        reported = 0
+        definite = True
+        while rounds < 8 and reported == 0:
+            rounds += 1
+            ids = [
+                client.send_call("key", {"key": "down", "repeat": repeat})
+                for _ in range(per_round)
+            ]
+            for resp in client.collect(ids, timeout=30.0).values():
+                try:
+                    kind, _ = parse_result(response_text(resp))
+                except ToolError as err:
+                    match = BRIDGE_DROP_RE.match(err.message)
+                    if match:
+                        reported += int(match["dropped"])
+                    else:
+                        definite = False
+                    continue
+                if kind == "no_ack":
+                    definite = False
+        sent = rounds * per_round * repeat
+        require(
+            reported > 0,
+            f"{sent} inputs across {rounds} rounds never overflowed the app's "
+            "256-slot queue, so this control proved nothing about the counter",
+        )
+
+        # Quit the way the scenario does, so the demo restores the terminal
+        # and gets to print. The call itself cannot answer: the app is gone.
+        try:
+            client.call_raw("key", {"key": "q"})
+        except ToolError:
+            pass
+        try:
+            app.proc.wait(timeout=READ_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise StepFailure("the flood demo did not exit after key q")
+        require(
+            app.proc.returncode == 0,
+            f"the flood demo exited with {app.proc.returncode}",
+        )
+        require(
+            app.wait_stderr(),
+            "the flood demo's stderr never reached EOF, so its dropped count "
+            "may not have been written yet",
+        )
+        stderr = app.stderr_tail()
+        match = DEMO_DROPPED_RE.search(stderr)
+        require(
+            match,
+            f"the app dropped {reported} input(s) and printed no dropped-input "
+            f"line; demo stderr:\n{stderr}",
+        )
+        counted = int(match.group(1))
+        require(
+            0 < counted <= sent,
+            f"the demo reports {counted} dropped of {sent} sent",
+        )
+        require(
+            counted >= reported,
+            f"the demo counted {counted} drops but the bridge was told about "
+            f"{reported}: the app's tally cannot be the smaller of the two",
+        )
+        if definite:
+            require(
+                counted == reported,
+                f"the demo counted {counted} drops, the bridge was told about "
+                f"{reported}, and every call answered definitively: the two "
+                "tallies are the same event and have to agree",
+            )
+        return (
+            f"{sent} inputs in {rounds} round(s) -> demo reports {counted} "
+            f"dropped, bridge reported {reported}"
+            + ("" if definite else " (a floor: some call lost acks)")
+        )
+    finally:
+        if client is not None:
+            client.close()
+            if client.proc.poll() is None:
+                client.proc.kill()
+        if app is not None:
+            app.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # --- Runner -----------------------------------------------------------------
 
 
@@ -1169,8 +1464,77 @@ def build():
             sys.exit(1)
 
 
+def newest_source():
+    """The most recently modified file the binaries under test are built from.
+
+    Returns `(path, mtime)`, or `(None, 0.0)` if nothing matched, which is
+    treated as "cannot tell" rather than "up to date".
+    """
+    newest, newest_at = None, 0.0
+    for root in SOURCE_ROOTS:
+        path = os.path.join(REPO, root)
+        if os.path.isfile(path):
+            candidates = [path]
+        else:
+            candidates = [
+                os.path.join(dirpath, name)
+                for dirpath, _, names in os.walk(path)
+                for name in names
+                if name.endswith(SOURCE_SUFFIXES)
+            ]
+        for candidate in candidates:
+            try:
+                mtime = os.path.getmtime(candidate)
+            except OSError:
+                continue
+            if mtime > newest_at:
+                newest, newest_at = candidate, mtime
+    return newest, newest_at
+
+
+def require_fresh_binaries():
+    """Refuse to run against a `target/debug` older than the sources.
+
+    The `--no-build` escape hatch is for a caller that has just built, not for
+    trusting whatever is lying around: a stale binary makes every result in
+    this script a report about a build nobody asked for. Both directions have
+    bitten -- a leftover mutant scored as the product, and the worse inverse,
+    an edit that was never compiled passing green.
+    """
+    missing = [binary for binary in (DEMO_BIN, MCP_BIN) if not os.path.exists(binary)]
+    if missing:
+        print(
+            f"FAIL build: --no-build was passed but {', '.join(missing)} "
+            "do(es) not exist; run cargo build --workspace",
+            flush=True,
+        )
+        sys.exit(1)
+    source, source_at = newest_source()
+    if source is None:
+        print("FAIL build: found no sources to date the binaries against", flush=True)
+        sys.exit(1)
+    # The *newest* binary, not each one: a build relinks only what changed, so
+    # editing the adapter leaves taria-mcp's timestamp where it was and
+    # comparing binaries one by one would refuse a perfectly fresh
+    # target/debug. What the newest one dates is the last build, and a last
+    # build older than the newest source is the state this guard exists for.
+    built_at = max(os.path.getmtime(binary) for binary in (DEMO_BIN, MCP_BIN))
+    if built_at < source_at:
+        print(
+            f"FAIL build: the last build in target/debug predates "
+            f"{os.path.relpath(source, REPO)} by "
+            f"{source_at - built_at:.0f}s; the binaries under test are not "
+            "this source tree. Run cargo build --workspace, or drop "
+            "--no-build.",
+            flush=True,
+        )
+        sys.exit(1)
+
+
 def main():
-    if "--no-build" not in sys.argv:
+    if "--no-build" in sys.argv:
+        require_fresh_binaries()
+    else:
         build()
 
     tmpdir = tempfile.mkdtemp(prefix="taria-e2e-")
@@ -1195,7 +1559,9 @@ def main():
         ("m node ids stable across delete", step_m_id_stability),
         ("n snapshot < 8KB", step_n_snapshot_size),
         ("o select moves the cursor while typing", step_o_select_while_typing),
-        ("p input acked with no tree change", step_p_ack_without_change),
+        ("p re-select of the current tab acked, no change", step_p_ack_without_change),
+        ("q unbound key acked, no change", step_q_unbound_key_acked),
+        ("r repeated set_value acked, no change", step_r_idempotent_set_value),
     ]
 
     try:
@@ -1234,18 +1600,31 @@ def main():
                     failed_hard = True
 
         # Shutdown is special: it consumes both processes.
-        name = "q clean shutdown"
+        name = "s clean shutdown"
         if failed_hard:
             results.append((name, False, "skipped: earlier step failed"))
             print(f"FAIL {name}: skipped after earlier failure", flush=True)
         else:
             try:
-                evidence = step_q_shutdown(client, ctx, app)
+                evidence = step_s_shutdown(client, ctx, app)
                 results.append((name, True, evidence))
                 print(f"PASS {name}: {evidence}", flush=True)
             except (StepFailure, ToolError, TimeoutError) as err:
                 results.append((name, False, str(err)))
                 print(f"FAIL {name}: {err}", flush=True)
+
+        # The positive control for the counters step s asserts are silent.
+        # Its own demo and its own bridge, so it neither needs the scenario's
+        # app nor cares that the shutdown step just consumed it -- which is
+        # also why an earlier failure does not skip it.
+        name = "t dropped-input counter reports drops"
+        try:
+            evidence = step_t_dropped_counter(ctx)
+            results.append((name, True, evidence))
+            print(f"PASS {name}: {evidence}", flush=True)
+        except (StepFailure, ToolError, TimeoutError) as err:
+            results.append((name, False, str(err)))
+            print(f"FAIL {name}: {err}", flush=True)
     finally:
         failures = [r for r in results if not r[1]]
         if failures:
