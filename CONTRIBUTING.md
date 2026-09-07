@@ -17,15 +17,17 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace
-python3 scripts/e2e.py           # end-to-end: demo app + bridge + MCP scenario
-python3 scripts/adversarial.py   # edge-case probes (expects debug binaries built)
+python3 scripts/e2e.py           # end-to-end: 20 steps, demo app + bridge + MCP
+python3 scripts/adversarial.py   # 17 edge-case probes
 ```
 
-CI runs the first four; zero warnings is the bar. The two scripts are local
-only, use nothing outside the Python standard library, and are where a change
-that breaks the agent-facing contract shows up: several of their assertions
-are the bridge's error strings verbatim, so rewording one is a deliberate edit
-in both places.
+CI runs all six; zero warnings is the bar. The two scripts use nothing outside
+the Python standard library, and are where a change that breaks the
+agent-facing contract shows up: several of their assertions are the bridge's
+error strings verbatim, so rewording one is a deliberate edit in both places.
+Both build the debug binaries they test, because two reviews were once scored
+against stale ones without noticing. `--no-build` skips the build for a caller
+that has just built and still refuses a `target/debug` older than the sources.
 
 ## Ground rules
 
@@ -37,6 +39,14 @@ in both places.
   Removing a field, renaming one, making an optional field required, or
   changing what an existing field means bumps the version, and needs a written
   rationale first. `crates/taria/src/wire.rs` is the normative statement.
+- Additive on the wire is not automatically additive in Rust, so the ten types
+  a version-1 addition can reach are `#[non_exhaustive]`: the two wire message
+  enums, `InputStatus`, `AgentInput`, `Action`, `Role`, `Node`, `Snapshot`,
+  `key::Key` and `key::Modifiers`. Adding a variant, field, role or action
+  goes to one of those, and it stays a recompile for every peer that
+  integrated taria. A new type that can grow the same way gets the attribute
+  when it lands, not at its first addition, because marking one later is
+  itself breaking.
 - `crates/taria` is the shared protocol crate: the wire types plus the three
   pure modules both peers need to agree on strings (`key`, `id`, `socket`).
   One dependency (serde), no I/O, no framework deps. Anything that needs a

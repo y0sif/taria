@@ -135,6 +135,57 @@ is hardest to test.
 Either way the nodes are wrapped in an auto-generated `app` root, so the two
 produce the same tree.
 
+## Pick the role that says what the widget is
+
+The role is the first thing an agent reads about a node, so it decides how the
+node gets treated. There are 29, listed in `architecture.md`, and most map
+straight onto the widget you are wrapping. Three pairs do not, and one group
+needs a rule of its own. Every one of them turns on a role added after a
+census of 15 ratatui apps found a fifth of on-screen widgets with no
+defensible role.
+
+`status` against `progress_bar`. A progress bar reports a known fraction of a
+known total. A status says work is happening without saying how much of it is
+left: a spinner, a throbber, a "saving" line, a toast. Reach for `status`
+whenever there is no fraction to report, and publish it rather than treating
+it as decoration, because publishing is what makes a toast observable at all.
+One that appears and clears itself between two reads is invisible to an agent,
+which then reads the app as having done nothing.
+
+`tree` against `list`. Choose `tree` when an entry can own entries of its own,
+`list` when the rows are flat. Naming a flat list a tree sends an agent
+looking for structure to expand that is not there; naming a tree a list hides
+the nesting that decides what the agent has actually seen. A `tree_item`
+carries its own entries as children, so the node tree has the shape of the
+widget's.
+
+`select` and `option` against `list` and `list_item`. A list reports where a
+cursor sits; a select reports what the app will use. Choose `select` when the
+point is to commit to a value rather than to browse rows, and put the
+committed choice in the node's value, so an agent reads the current setting
+without walking the children. Activating an `option` sets its parent's value,
+which is what separates it from a `list_item`, where activating moves a
+cursor.
+
+Then the roles for things an agent cannot see. `image`, `chart`, `terminal`,
+`log` and `scrollbar` each wrap something whose rendering carries the meaning,
+and none of that rendering survives into a tree. Every one of them has
+somewhere to put the meaning instead. Say what the image is of in the label,
+not that it is an image. Put the numbers that matter in a chart's value: the
+latest sample, the peak, the unit. Put the position in a scrollbar's value,
+which is the only thing telling an agent that the pane it just read has more
+content past the edge. A `log` grows at the end, so the value an agent read is
+a prefix of what is there now rather than the whole of it; a `terminal` is a
+screen rather than a tree, so its value is opaque text and keys are how an
+agent drives it.
+
+`other` is the honest answer when nothing fits, and it is also what an agent
+built before your role sees, so it costs that agent the one fact it most needs
+about the node. Reaching for it often means the vocabulary is missing
+something. Say so rather than inventing a role name of your own: a role added
+to taria is additive and every peer learns it, while a role each app names for
+itself is one vocabulary per app.
+
 ## Drain agent input around the blocking call
 
 ```rust
@@ -243,12 +294,70 @@ fn drain_agent_input(app: &mut App, layer: &TariaLayer) {
 Last ack wins, so the `Ignored` refines the `Delivered` the dequeue already
 sent. That is why `apply_agent_input` returns a verdict instead of `()`.
 
+An act on a node that has since gone is one of these. The demo publishes
+`dialog`, `dialog-confirm` and `dialog-cancel` only while the confirm-delete
+dialog is open, so an agent planning from a snapshot taken just before a
+person pressed `n` sends an act against a node that is no longer there. Those
+handlers report `Ignored`, the same answer a deleted task id already got.
+Reporting `Handled` for a node that is gone tells an agent its input landed
+somewhere.
+
 One timing rule matters. Ack `Ignored` before you publish your next frame.
 Acks are flushed ahead of the pending snapshot in every writer pass, so an
 ack queued first arrives first, and the bridge reports the refinement. Publish
 first and the bridge sees a changed tree behind a plain `Delivered`, returns
 that tree, and the `Ignored` arrives after the answer has already gone out.
 Draining before drawing, as above, gives you this for free.
+
+## Advertise a way out of every state
+
+An agent moves through your app by acting on what the tree advertises. A state
+it can enter and cannot leave by any of those actions is a trap, and the only
+escape left is the raw-key fallback, which is exactly what should not be the
+main path.
+
+The demo had one. `set_value` on the text input moves focus there, and nothing
+advertised moved it back, so every `key` an agent sent afterwards was typed
+into the draft. The fix is one action, advertised conditionally:
+
+```rust
+let focused = app.focus == Focus::Input;
+let mut node = Node::new("input", Role::TextInput)
+    .label("New task")
+    .value(app.draft.clone())
+    .focused(focused)
+    .actions([Action::SetValue, Action::Activate]);
+// The way back out, advertised only while the input holds the keyboard,
+// because that is when there is something to hand back.
+if focused {
+    node = node.action(Action::Dismiss);
+}
+```
+
+`dismiss` is what Esc already did for a person: throw the draft away, hand the
+keyboard back to the list. Two rules keep the advertisement and the behaviour
+in step. The action is advertised only while the input has focus, and the
+handler returns `Ignored` when it does not, so an agent is never told the
+keyboard moved when it did not:
+
+```rust
+fn dismiss_input(app: &mut App) -> Applied {
+    if app.focus != Focus::Input {
+        return Applied::Ignored;
+    }
+    app.draft.clear();
+    app.focus = Focus::List;
+    Applied::Handled
+}
+```
+
+The second rule is that the list ignores Esc too, which is what makes
+`dismiss` Esc's exact counterpart rather than a second, agent-only meaning
+someone has to maintain separately.
+
+Walk your own states and ask the question of each: modal open, text field
+focused, menu down, filter applied, search active. Each needs a node with an
+action that ends it.
 
 ## Watch your publish rate
 
@@ -296,6 +405,9 @@ AgentInput::Key { key } => match to_crossterm_key(&key) {
         Applied::Handled
     }
     // The bridge parses the same grammar before sending, so this is rare.
+    // It also covers a key the grammar learned after this adapter was
+    // built: the string parses and there is no crossterm event for it, and
+    // reporting that beats lowering it to some near-miss keystroke.
     None => Applied::Ignored,
 },
 AgentInput::Text { text } => {
@@ -308,7 +420,20 @@ AgentInput::Text { text } => {
     }
     Applied::Handled
 }
+// `AgentInput` is `#[non_exhaustive]`, so this arm is required. A new way
+// for an agent to address an app is additive on the wire; the attribute is
+// what makes it additive for your build too.
+_ => Applied::Ignored,
 ```
+
+That last arm is not boilerplate to skip. Ten types in `taria` are
+`#[non_exhaustive]`: `AgentInput`, `Action`, `Role`, `Node`, `Snapshot`,
+`InputStatus`, the two wire message enums, `key::Key` and `key::Modifiers`.
+Each is somewhere a version-1 addition can land, and each is something an
+adapter matches on. Without the attribute, one new key or one new input kind
+would fail to compile every app that had integrated taria. With it, the cost
+is a wildcard arm apiece, or a `..` in a pattern, plus `Modifiers::NONE` and
+`Modifiers::new` in place of the struct literal it closes.
 
 Be honest about what that means: text is typing, not appending to a field. It
 lands wherever focus is. Sent while a list has focus it meets the list's
@@ -322,6 +447,24 @@ codes while ignoring modifiers, so `ctrl+q` hit the `q` binding and quit the
 app, and `ctrl+enter` confirmed a deletion in the dialog. Neither chord was
 a binding the app meant to have. If your handlers match on `KeyCode` alone,
 gate them on modifiers before you expose them to an agent.
+
+Gate on all of them, not on ctrl and alt. A first pass at the demo let shift
+through, so `shift+q` still quit and `shift+y` still confirmed a delete. The
+rule that holds is that a press is the plain binding only when it carries no
+modifiers at all, applied in every handler:
+
+```rust
+fn is_plain(key: KeyEvent) -> bool {
+    key.modifiers.is_empty()
+}
+```
+
+Typing is the one place that rule must not reach. A terminal reports an
+uppercase letter as `Char('A')` with shift set, so a text field that demanded
+no modifiers would stop a person typing capitals. Allow shift where a press
+becomes a character and nowhere else; the character already says which one it
+is. Ctrl and alt are never text, and `ctrl+c` landing in a draft as the letter
+`c` is the one reading an agent sending it cannot have meant.
 
 ## Report what the layer threw away
 
@@ -361,12 +504,26 @@ bridge derives its path from `--app`. A bridge started with `--socket <path>`
 takes that path and never reads the variable, so set the variable for both
 processes rather than mixing the two ways of saying it.
 
-Unix domain socket paths are capped at 107 bytes, because `sun_path` holds
-108 including the NUL. It is a low limit and a deep `$XDG_RUNTIME_DIR` or a
-long app label reaches it. taria checks before binding and its error names
-the path, its length, the limit, and the way out, rather than the kernel's
-`InvalidInput: path must be shorter than SUN_LEN`. The way out is one
-variable, set the same way for both processes:
+The label you pass to `bind_or_disabled` becomes that file name, so it has to
+be one: a label carrying `/`, or `.`, `..` or empty, is refused, on the app
+side and on the bridge's `--app` alike. That is not paranoia about the string,
+it is that the layer binds *and unlinks* whatever the label resolves to, and
+`/etc/cron.d/evil` as a label would discard the resolution and keep the
+absolute path. `bind` returns the error and `bind_or_disabled` comes back
+disabled with an empty `socket_path()`, because a refused label resolves to no
+path at all. If you want a path of your own, pass the path: `$TARIA_SOCK`, or
+`TariaLayer::bind_at`.
+
+Unix domain socket paths are capped at the platform's `sun_path` minus the
+terminating NUL, and the buffer is not the same size everywhere: 108 bytes on
+Linux, so 107, and 104 on macOS and the BSDs, so 103. It is a low limit either
+way, and a deep `$XDG_RUNTIME_DIR` or a long app label reaches it. Test on
+macOS if you ship there, because a path between the two sizes binds on Linux
+and fails there, and the macOS temp dir plus a long label is exactly where
+that band sits. taria checks before binding and its error names the path, its
+length, the limit, the platform the limit belongs to, and the way out, rather
+than the kernel's `InvalidInput: path must be shorter than SUN_LEN`. The way
+out is one variable, set the same way for both processes:
 
 ```bash
 TARIA_SOCK=/tmp/my-app.sock ./my-app

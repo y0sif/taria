@@ -85,16 +85,25 @@ tell an input the app acted on from one it never saw.
 +---------------+                +-----------+                  +---------------+
 ```
 
-`docs/architecture.md` covers the wire protocol, acknowledgement, socket
-lifecycle, and focus contract in detail. `docs/integration-guide.md` is the
-guide to retrofitting taria into a ratatui app you already have.
+What an app can say about a widget is a fixed vocabulary: 29 roles (`list`,
+`tree`, `table`, `text_input`, `select`, `dialog`, `log`, `chart`,
+`scrollbar`, `terminal` and the rest) and 7 actions (`activate`, `focus`,
+`select`, `toggle`, `scroll`, `set_value`, `dismiss`), plus a custom action
+for anything an app names itself. Both vocabularies are open: a peer that
+meets a role or an action it does not know degrades that one field instead of
+failing the tree, which is what lets either grow inside a frozen format.
+
+`docs/architecture.md` covers the wire protocol, the role and action
+vocabularies, acknowledgement, socket lifecycle, and focus contract in detail.
+`docs/integration-guide.md` is the guide to retrofitting taria into a ratatui
+app you already have, including which role to reach for.
 
 ## MCP tools
 
 | Tool | What it does |
 |---|---|
-| `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, and the actions each node advertises. |
-| `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`). The node id and the action are checked against the latest tree before anything is sent. |
+| `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, and the actions each node advertises. The app's own snapshot, relayed, so a role or field this bridge has never heard of arrives under its real name. |
+| `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`), up to 4096 characters. The node id and the action are checked against the latest tree before anything is sent. |
 | `key` | Sends a raw key press (`"q"`, `"enter"`, `"ctrl+c"`), up to 64 times with `repeat`. A key that does not match the grammar is rejected here rather than swallowed by the app. A fallback for parts of the UI without semantic coverage. |
 | `type_text` | Types a literal string in one call instead of one `key` call per character, up to 4096 characters. The text lands wherever the app currently sends typing, so focus the target first. |
 
@@ -127,6 +136,11 @@ app-side adapter does when binding:
 2. `$XDG_RUNTIME_DIR/taria/<label>.sock`;
 3. `<temp dir>/taria-<uid>/<label>.sock`.
 
+The label is interpolated into a file name, so it has to be one. Both sides
+refuse a label carrying a path separator, or `.`, `..` or empty, because the
+app-side adapter binds and unlinks whatever the label resolves to. `--socket`
+is how to name a path.
+
 ## Workspace layout
 
 ```text
@@ -145,12 +159,15 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-python3 scripts/e2e.py           # end-to-end: demo app + bridge + MCP scenario
-python3 scripts/adversarial.py   # edge-case probes (expects debug binaries built)
+python3 scripts/e2e.py           # end-to-end: 20 steps, demo app + bridge + MCP
+python3 scripts/adversarial.py   # 17 edge-case probes
 ```
 
-Both scripts use only the Python standard library. `e2e.py` builds the debug
-binaries first; pass `--no-build` to skip that.
+CI runs this gate, with `cargo build --workspace` in place of `cargo check`.
+Both scripts use only the Python standard library and both build the debug
+binaries they test. `--no-build` skips the build and keeps the freshness
+check: it refuses a `target/debug` older than the sources, because a stale
+binary makes every result a report about a build nobody asked for.
 
 ## Compatibility
 
@@ -161,6 +178,16 @@ message it cannot parse, and degrades an unknown role to `other` and an
 unknown action to a custom action keeping its name. So an app built against
 a later taria stays readable by an agent built against this one, at the cost
 of one degraded field rather than the whole tree.
+
+Reading through the bridge keeps more than that. It relays the app's own
+snapshot instead of re-serializing its parse of it, so an unknown role, action
+or field reaches the agent under its real name; the degraded parse is what the
+bridge validates and compares against, not what the agent reads.
+
+In Rust the same promise is `#[non_exhaustive]` on the ten types a version-1
+addition can reach, from `Role` and `Action` to the two wire message enums, so
+a new role, key or message variant costs an app that integrated taria a
+recompile rather than a repair.
 
 Removing a field, renaming one, making an optional field required, or
 changing what an existing field means bumps the version. `wire.rs` in
@@ -178,8 +205,9 @@ changing what an existing field means bumps the version. `wire.rs` in
   because the app cannot parse the input messages this bridge writes.
 - Unix only for now: the transport is a Unix domain socket. Linux is the
   tested platform.
-- Socket paths are capped at 107 bytes by AF_UNIX. Set `$TARIA_SOCK` to a
-  shorter path when the default is too long.
+- Socket paths are capped by AF_UNIX at the platform's `sun_path` minus the
+  terminating NUL: 107 bytes on Linux, 103 on macOS and the BSDs. Set
+  `$TARIA_SOCK` to a shorter path when the default is too long.
 
 ## License
 
