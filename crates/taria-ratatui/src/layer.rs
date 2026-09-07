@@ -106,10 +106,17 @@ impl TariaLayer {
     /// redirect the socket. A stale socket file at the path is removed before
     /// binding.
     ///
+    /// The label becomes the socket's file name, so it must be one: a label
+    /// carrying a path separator, or `.` or `..`, is refused here rather than
+    /// resolved into a path this layer would go on to bind and unlink. An app
+    /// that needs a path of its own passes it to
+    /// [`bind_at`](Self::bind_at).
+    ///
     /// Apps that would rather run without taria than not run at all should
     /// use [`bind_or_disabled`](Self::bind_or_disabled).
     pub fn bind(app_label: &str) -> io::Result<Self> {
-        Self::bind_at(app_label, resolve_socket_path(app_label))
+        let socket_path = resolve_socket_path(app_label).map_err(invalid_label)?;
+        Self::bind_at(app_label, socket_path)
     }
 
     /// Like [`bind`](Self::bind), but at an explicit socket path, skipping
@@ -191,7 +198,14 @@ impl TariaLayer {
     /// [`bind_error`](Self::bind_error) at the moment the app chooses, which
     /// is usually before entering the alternate screen or after leaving it.
     pub fn bind_or_disabled(app_label: &str) -> Self {
-        Self::bind_or_disabled_at(app_label, resolve_socket_path(app_label))
+        match resolve_socket_path(app_label) {
+            Ok(socket_path) => Self::bind_or_disabled_at(app_label, socket_path),
+            // A refused label resolves to no path at all, so the disabled
+            // layer carries an empty one: the error names the label, which is
+            // the thing that has to change, and an invented path would only
+            // look like somewhere the socket might be.
+            Err(err) => Self::disabled(app_label, PathBuf::new(), invalid_label(err)),
+        }
     }
 
     /// [`bind_or_disabled`](Self::bind_or_disabled) at an explicit path, so
@@ -200,12 +214,17 @@ impl TariaLayer {
     fn bind_or_disabled_at(app_label: &str, socket_path: PathBuf) -> Self {
         match Self::bind_at(app_label, socket_path.clone()) {
             Ok(layer) => layer,
-            Err(err) => Self {
-                app_label: app_label.to_string(),
-                socket_path,
-                inner: None,
-                bind_error: Some(err),
-            },
+            Err(err) => Self::disabled(app_label, socket_path, err),
+        }
+    }
+
+    /// An inert layer that answers every method and serves nothing.
+    fn disabled(app_label: &str, socket_path: PathBuf, err: io::Error) -> Self {
+        Self {
+            app_label: app_label.to_string(),
+            socket_path,
+            inner: None,
+            bind_error: Some(err),
         }
     }
 
@@ -919,9 +938,10 @@ fn current_uid() -> io::Result<u32> {
 /// Resolve the default socket path for `app_label` from the environment.
 ///
 /// The rule itself lives in [`taria::socket::resolve_path`], shared with the
-/// bridge so the two sides cannot look for the socket in different places.
-/// Reading the environment stays here, where the process actually is.
-fn resolve_socket_path(app_label: &str) -> PathBuf {
+/// bridge so the two sides cannot look for the socket in different places,
+/// including its refusal of a label that is not a plain file name. Reading the
+/// environment stays here, where the process actually is.
+fn resolve_socket_path(app_label: &str) -> Result<PathBuf, taria::socket::InvalidAppLabel> {
     taria::socket::resolve_path(
         env::var_os("TARIA_SOCK"),
         env::var_os("XDG_RUNTIME_DIR"),
@@ -929,6 +949,15 @@ fn resolve_socket_path(app_label: &str) -> PathBuf {
         &user_identity(),
         app_label,
     )
+}
+
+/// A refused app label as the `io::Error` every bind path already reports.
+///
+/// `InvalidInput` because the label is one: the same kind
+/// [`bind_at`](TariaLayer::bind_at) gives an over-long path, and the message
+/// is the label error's own, which names the label and what a label may be.
+fn invalid_label(err: taria::socket::InvalidAppLabel) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
 }
 
 /// Uid where available (via `/proc/self` on Linux), else `$USER`/`$LOGNAME`,
@@ -1065,9 +1094,42 @@ mod tests {
             panic!("over-long path must be refused, not bound");
         };
         let message = err.to_string();
-        assert!(message.contains("107 byte"), "err: {message}");
+        assert!(
+            message.contains(&format!("{} byte", taria::socket::MAX_SOCKET_PATH_BYTES)),
+            "err: {message}"
+        );
         assert!(message.contains("TARIA_SOCK"), "err: {message}");
         assert!(!path.exists(), "no socket file may be left behind");
+    }
+
+    /// The label names the socket file, and this layer binds and unlinks what
+    /// the resolution returns. A label that is a path instead of a file name
+    /// must therefore be refused before any of that, on both entry points:
+    /// `bind` cannot resolve one, and `bind_or_disabled`, which never fails,
+    /// has to come back disabled rather than pointed somewhere else.
+    #[test]
+    fn a_label_that_is_not_a_file_name_binds_nothing() {
+        for label in ["/etc/cron.d/evil", "../../../tmp/pwn", "sub/dir"] {
+            let Err(err) = TariaLayer::bind(label) else {
+                panic!("bind accepted the label {label:?}");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "label: {label}");
+            assert!(err.to_string().contains(label), "err: {err}");
+
+            let layer = TariaLayer::bind_or_disabled(label);
+            assert!(!layer.is_enabled(), "label: {label}");
+            assert_eq!(layer.app_label(), label, "the label is reported as given");
+            assert_eq!(
+                layer.socket_path(),
+                Path::new(""),
+                "a refused label resolves to no path"
+            );
+            let message = layer
+                .bind_error()
+                .expect("a disabled layer says why")
+                .to_string();
+            assert!(message.contains(label), "err: {message}");
+        }
     }
 
     /// The whole point of a disabled layer: every method still answers, and

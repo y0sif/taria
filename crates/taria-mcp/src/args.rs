@@ -71,7 +71,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let socket = match (socket, app) {
         (Some(_), Some(_)) => return Err("pass either --socket or --app, not both".to_string()),
         (Some(path), None) => PathBuf::from(path),
-        (None, Some(label)) => resolve_socket_path(&label),
+        // A label is a file name, not a path: `--app /etc/cron.d/evil` used
+        // to resolve to `/etc/cron.d/evil.sock`, which the app-side adapter
+        // would go on to unlink. Refused while the user is still reading
+        // argument errors, and `--socket` remains the way to name a path.
+        (None, Some(label)) => resolve_socket_path(&label).map_err(|err| err.to_string())?,
         (None, None) => {
             return Err("one of --socket <path> or --app <label> is required".to_string());
         }
@@ -86,8 +90,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
 /// Resolve the default socket path for `app_label` from the environment.
 ///
 /// The derivation itself lives in [`taria::socket::resolve_path`], shared with
-/// the app-side adapter: the two have to agree on the path or they never meet.
-pub fn resolve_socket_path(app_label: &str) -> PathBuf {
+/// the app-side adapter: the two have to agree on the path or they never meet,
+/// refusal of a label that is not a plain file name included.
+pub fn resolve_socket_path(app_label: &str) -> Result<PathBuf, taria::socket::InvalidAppLabel> {
     taria::socket::resolve_path(
         env::var_os("TARIA_SOCK"),
         env::var_os("XDG_RUNTIME_DIR"),
@@ -135,9 +140,24 @@ mod tests {
         };
         assert!(
             socket.to_string_lossy().ends_with("demo.sock")
-                || socket == resolve_socket_path("demo"),
+                || Ok(socket.clone()) == resolve_socket_path("demo"),
             "socket: {socket:?}"
         );
+    }
+
+    /// A label is interpolated into a file name, so one carrying a path is
+    /// refused here rather than resolved into a socket path the app-side
+    /// adapter would bind and unlink.
+    #[test]
+    fn app_labels_that_are_not_file_names_are_rejected() {
+        for label in ["/etc/cron.d/evil", "../../../tmp/pwn", "sub/dir", ".."] {
+            let err = parse_strs(&["--app", label]).unwrap_err();
+            assert!(err.contains(label), "err: {err}");
+            assert!(
+                err.contains("single path component"),
+                "error should say what a label may be: {err}"
+            );
+        }
     }
 
     #[test]

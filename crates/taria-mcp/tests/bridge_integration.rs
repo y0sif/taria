@@ -168,11 +168,9 @@ impl FakeApp {
 /// hand publish through this rather than inventing a line, so what they put in
 /// the watch is what a real connection would have put there.
 fn published(parsed: Snapshot) -> AppSnapshot {
-    AppSnapshot {
-        line: serde_json::to_string(&AppToBridge::Snapshot(parsed.clone()))
-            .expect("a snapshot serializes"),
-        parsed,
-    }
+    let line = serde_json::to_string(&AppToBridge::Snapshot(parsed.clone()))
+        .expect("a snapshot serializes");
+    AppSnapshot::from_line(&line, parsed)
 }
 
 /// Wait until the watch holds a connected snapshot with at least `min_seq`.
@@ -1460,8 +1458,31 @@ const NEWER_APP_LINE: &str = concat!(
     r#" "actions": ["zoom"], "sample_hz": 30}]}}"#
 );
 
-/// The bridge relays the app's snapshot line; it does not re-serialize its own
-/// parse of it.
+/// One tool result as information rather than bytes.
+fn as_json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text)
+        .unwrap_or_else(|err| panic!("a tool result must be json: {err}: {text}"))
+}
+
+/// What an app line must look like once it reaches the agent: everything the
+/// app sent, minus the `"type"` key that frames the message on the wire and is
+/// no part of the tree.
+fn without_envelope(line: &str) -> serde_json::Value {
+    let mut value = as_json(line);
+    let framing = value
+        .as_object_mut()
+        .expect("a snapshot line is a json object")
+        .remove("type");
+    assert_eq!(
+        framing,
+        Some(serde_json::json!("snapshot")),
+        "the app's line must carry the framing key these tests are about"
+    );
+    value
+}
+
+/// The bridge relays the app's snapshot; it does not re-serialize its own
+/// parse of it, and it does not pass on the envelope the message arrived in.
 ///
 /// Deserializing into `Snapshot` and serializing back is lossy by
 /// construction: it can only emit what this build's types can hold. An app
@@ -1470,8 +1491,12 @@ const NEWER_APP_LINE: &str = concat!(
 /// cannot spell went the same way, which made the format's promise that
 /// additive changes are safe true of the connection and false of the
 /// information travelling over it.
+///
+/// So the claim is about information, not bytes: every key the app sent still
+/// reaches the agent saying the same thing, the framing key does not, and key
+/// order and whitespace are nobody's contract.
 #[tokio::test]
-async fn read_tree_relays_the_apps_own_line_rather_than_its_parse() {
+async fn read_tree_relays_the_apps_tree_without_the_transport_envelope() {
     let (_dir, listener, mut handle, server) = setup("relay-verbatim").await;
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("first"))).await;
     wait_for_snapshot(&mut handle.state_rx, 1).await;
@@ -1481,22 +1506,31 @@ async fn read_tree_relays_the_apps_own_line_rather_than_its_parse() {
 
     let result = server.read_tree().await.expect("read_tree after snapshot");
     let text = result_text(&result);
+    let relayed = as_json(text);
     assert_eq!(
-        text, NEWER_APP_LINE,
-        "read_tree must hand back the app's line byte for byte"
+        relayed,
+        without_envelope(NEWER_APP_LINE),
+        "read_tree must hand back everything the app sent, and nothing it did not"
     );
+    assert!(
+        relayed.get("type").is_none(),
+        "the transport's framing key must not reach the agent: {text}"
+    );
+
     // Spelled out, because these three are the losses the relay exists to
     // prevent and an equality failure alone would not name them.
-    assert!(
-        text.contains(r#""role": "sparkline""#) && !text.contains("other"),
+    let chart = &relayed["root"]["children"][0];
+    assert_eq!(
+        chart["role"], "sparkline",
         "the role the app published must reach the agent by name: {text}"
     );
-    assert!(
-        text.contains(r#""actions": ["zoom"]"#),
+    assert_eq!(
+        chart["actions"],
+        serde_json::json!(["zoom"]),
         "the action the app published must reach the agent by name: {text}"
     );
-    assert!(
-        text.contains(r#""sample_hz": 30"#),
+    assert_eq!(
+        chart["sample_hz"], 30,
         "a field added after this build must survive the relay: {text}"
     );
 }
@@ -1559,7 +1593,7 @@ async fn the_parse_still_validates_acts_against_the_relayed_tree() {
 /// Anything that re-serialized here would put the agent back where it started
 /// one call later.
 #[tokio::test]
-async fn a_tool_result_relays_the_line_the_app_published() {
+async fn a_tool_result_relays_the_tree_the_app_published() {
     let (_dir, listener, mut handle, server) = setup("relay-tool-result").await;
     let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before"))).await;
     wait_for_snapshot(&mut handle.state_rx, 1).await;
@@ -1579,9 +1613,9 @@ async fn a_tool_result_relays_the_line_the_app_published() {
         .await
         .expect("key against a connected app");
     assert_eq!(
-        result_text(&result),
-        NEWER_APP_LINE,
-        "the tree a tool answers with must be the app's line"
+        as_json(result_text(&result)),
+        without_envelope(NEWER_APP_LINE),
+        "the tree a tool answers with must be the one the app published"
     );
 
     echo.await.expect("fake app task");

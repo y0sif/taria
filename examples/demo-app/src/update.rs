@@ -121,14 +121,15 @@ fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -
             None => Applied::Ignored,
         },
         ("input", Action::Activate) => submit_input(app),
-        ("dialog-confirm", Action::Activate) => {
-            confirm_delete(app);
-            Applied::Handled
-        }
-        ("dialog-cancel", Action::Activate) | ("dialog", Action::Dismiss) => {
-            app.dialog = None;
-            Applied::Handled
-        }
+        ("input", Action::Dismiss) => dismiss_input(app),
+        // The dialog's nodes exist only while it is open, so these three are
+        // acts on a node that may be gone: an agent planning from a snapshot
+        // it read just before the operator pressed `n` sends one against a
+        // tree that no longer has it. Reporting Handled for that would be the
+        // same lie the task arms already refuse to tell for an id that has
+        // been deleted, so the verdict is theirs too.
+        ("dialog-confirm", Action::Activate) => confirm_delete(app),
+        ("dialog-cancel", Action::Activate) | ("dialog", Action::Dismiss) => dismiss_dialog(app),
         (node, action) => apply_task_act(app, node, action),
     }
 }
@@ -289,14 +290,35 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
             submit_input(app);
         }
         KeyCode::Esc => {
-            app.input.clear();
-            app.focus = Focus::List;
+            dismiss_input(app);
         }
         KeyCode::Backspace => {
             app.input.pop();
         }
         _ => {}
     }
+}
+
+/// Throw the draft away and hand the keyboard back to the list: what Esc does
+/// for a person, and the input's `dismiss` for an agent.
+///
+/// The way out of the input is the reason this is a semantic action at all.
+/// `set_value` moves focus here, and until `dismiss` existed nothing
+/// advertised moved it back, so every later `key` an agent sent was typed into
+/// the draft and the only escape was the raw-key fallback the project's
+/// conventions keep off the main path.
+///
+/// Ignored when the input does not have the keyboard, because then there is
+/// nothing to hand back. That is also what keeps it Esc's exact counterpart:
+/// the list ignores Esc too, and the tree only advertises `dismiss` while the
+/// input is focused.
+fn dismiss_input(app: &mut App) -> Applied {
+    if app.focus != Focus::Input {
+        return Applied::Ignored;
+    }
+    app.input.clear();
+    app.focus = Focus::List;
+    Applied::Handled
 }
 
 /// Submit the input draft as a new task and hand focus back to the list with
@@ -328,17 +350,35 @@ fn handle_dialog_key(app: &mut App, key: KeyEvent) {
         return;
     }
     match key.code {
-        KeyCode::Char('y') | KeyCode::Enter => confirm_delete(app),
-        KeyCode::Char('n') | KeyCode::Esc => app.dialog = None,
+        KeyCode::Char('y') | KeyCode::Enter => {
+            confirm_delete(app);
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            dismiss_dialog(app);
+        }
         _ => {}
     }
 }
 
-fn confirm_delete(app: &mut App) {
-    if let Some(id) = app.dialog.take() {
-        app.remove_task(id);
-        app.clamp_selection();
+/// Delete the task the open dialog names. Ignored when no dialog is open:
+/// this handler is only ever reached that way by an agent acting on a tree
+/// the dialog has since left.
+fn confirm_delete(app: &mut App) -> Applied {
+    let Some(id) = app.dialog.take() else {
+        return Applied::Ignored;
+    };
+    app.remove_task(id);
+    app.clamp_selection();
+    Applied::Handled
+}
+
+/// Close the dialog without deleting anything, with the same verdict rule as
+/// [`confirm_delete`].
+fn dismiss_dialog(app: &mut App) -> Applied {
+    if app.dialog.take().is_none() {
+        return Applied::Ignored;
     }
+    Applied::Handled
 }
 
 #[cfg(test)]
@@ -637,6 +677,55 @@ mod tests {
             assert_eq!(app.dialog, None);
             assert_eq!(app.tasks.len(), before, "cancel must not delete");
         }
+    }
+
+    /// The dialog's nodes are published only while it is open, so an act on
+    /// one of them with no dialog up comes from an agent working off a
+    /// snapshot the operator has already moved past. It gets the same answer
+    /// a stale task id gets, rather than Handled for a node that is gone.
+    #[test]
+    fn dialog_acts_with_no_dialog_open_are_ignored() {
+        for input in [
+            act("dialog-confirm", Action::Activate),
+            act("dialog-cancel", Action::Activate),
+            act("dialog", Action::Dismiss),
+        ] {
+            let mut app = App::new();
+            let before = app.tasks.len();
+            assert_eq!(app.dialog, None);
+            assert_eq!(
+                apply_agent_input(&mut app, input.clone()),
+                Applied::Ignored,
+                "input: {input:?}"
+            );
+            assert_eq!(app.tasks.len(), before, "nothing may be deleted: {input:?}");
+        }
+    }
+
+    /// The counterpart of Esc, and the only advertised way out of the input.
+    /// Ignored where Esc does nothing either, so an agent is not told the
+    /// keyboard moved when it did not.
+    #[test]
+    fn dismiss_leaves_the_input_and_is_ignored_from_the_list() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act_value("input", Action::SetValue, "half typed"));
+        assert_eq!(app.focus, Focus::Input);
+
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Dismiss)),
+            Applied::Handled
+        );
+        assert_eq!(app.focus, Focus::List, "the keyboard goes back to the list");
+        assert!(
+            app.input.is_empty(),
+            "the draft is thrown away, as Esc does"
+        );
+
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Dismiss)),
+            Applied::Ignored,
+            "with the list focused there is nothing to hand back"
+        );
     }
 
     #[test]

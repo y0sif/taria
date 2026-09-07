@@ -511,18 +511,23 @@ fn text_result(text: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
-/// The JSON agents read the tree from: the app's own snapshot line, relayed.
+/// The JSON agents read the tree from: the app's own snapshot, relayed.
 ///
 /// Not `serde_json::to_string(&snapshot.parsed)`. Round-tripping through this
 /// build's types is what turned an app's `"role":"sparkline"` into
 /// `"role":"other"` on the way to the agent, and would do the same to every
-/// field a newer app adds. Two things follow from relaying instead. The output
-/// is no longer canonicalized by this bridge's serializer, so an
-/// odd-but-parseable line reaches the agent as the app wrote it. And there is
-/// nothing left to fail, so the result no longer carries a serialization error
-/// no peer could have provoked.
+/// field a newer app adds. Two things follow from relaying instead. The
+/// vocabulary is no longer this bridge's, so a role, an action or a field it
+/// has never heard of reaches the agent by name. And there is nothing left to
+/// fail, so the result no longer carries a serialization error no peer could
+/// have provoked.
+///
+/// What the agent gets is the tree, not the message carrying it: the
+/// `"type":"snapshot"` key that frames the line on the wire is dropped where
+/// the snapshot is stored (see [`AppSnapshot::from_line`]), because this tool
+/// promises the app's tree and that key was never part of one.
 fn snapshot_json(snapshot: &AppSnapshot) -> String {
-    snapshot.line.clone()
+    snapshot.tree_json.clone()
 }
 
 /// What the app said about one burst of inputs inside [`UPDATE_WAIT`].
@@ -980,16 +985,14 @@ mod tests {
         assert_eq!(resolve_action("archive", &neither), None);
     }
 
-    /// A published snapshot in both forms, with the line built the way an
-    /// app would send it: the tests below compare parses, and the results they
-    /// read back are the line.
+    /// A published snapshot in both forms, built from a line the way an app
+    /// would send it: the tests below compare parses, and the results they
+    /// read back are what the relay makes of that line.
     fn snapshot(marker: &str) -> AppSnapshot {
         let parsed = Snapshot::new(1, Node::new("app", Role::App).label(marker));
-        AppSnapshot {
-            line: serde_json::to_string(&taria::wire::AppToBridge::Snapshot(parsed.clone()))
-                .expect("a snapshot serializes"),
-            parsed,
-        }
+        let line = serde_json::to_string(&taria::wire::AppToBridge::Snapshot(parsed.clone()))
+            .expect("a snapshot serializes");
+        AppSnapshot::from_line(&line, parsed)
     }
 
     /// Acks published faster than the observer reads them are dropped oldest

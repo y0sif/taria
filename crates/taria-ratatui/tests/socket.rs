@@ -534,6 +534,82 @@ fn inputs_from_a_dead_connection_are_discarded_and_the_next_ones_are_not() {
     assert_eq!(layer.stale_inputs(), 1, "a live input is not a stale one");
 }
 
+/// One bridge at a time, which is the design and not an accident: the accept
+/// loop serves a client to completion before returning to `accept`, so a
+/// second one waits in the listen backlog.
+///
+/// Worth pinning because two agents attached at once is the likeliest way a
+/// user meets it, and from the second bridge's side it looks like a socket
+/// that connected and then said nothing. What must hold is that the wait is
+/// only a wait: the second client is served in full, handshake included, the
+/// moment the first goes away.
+#[test]
+fn a_second_client_waits_until_the_first_is_gone() {
+    let mut layer = bind_layer("oneatatime");
+    let mut first = Client::connect(&layer);
+    assert!(matches!(first.read_message(), AppToBridge::Hello { .. }));
+
+    // The kernel completes this connection into the backlog, so the client
+    // has a socket either way; whether it is being served is what differs.
+    let mut second = Client::connect(&layer);
+    second
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+
+    // The first client is live throughout: it gets the publish, and the
+    // second gets nothing, not even the handshake that opens every session.
+    publish_single_node(&mut layer, "while-first");
+    let AppToBridge::Snapshot(snapshot) = first.read_message() else {
+        panic!("the served client must still receive publishes");
+    };
+    assert_eq!(snapshot.root.children[0].id.0, "while-first");
+
+    let mut line = String::new();
+    let err = second
+        .reader
+        .read_line(&mut line)
+        .expect_err("a waiting client must receive nothing at all");
+    assert!(
+        matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ),
+        "expected the read to time out, got {err:?} with {line:?}"
+    );
+
+    // The first client goes away, which is the only thing the second was
+    // waiting for.
+    drop(first);
+    second
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(TIMEOUT))
+        .unwrap();
+    assert_eq!(
+        second.read_message(),
+        AppToBridge::Hello {
+            app_label: "oneatatime".into(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+        "the waiting client must be served in full once its turn comes"
+    );
+    let AppToBridge::Snapshot(snapshot) = second.read_message() else {
+        panic!("the newly served client must get the latest snapshot");
+    };
+    assert_eq!(
+        snapshot.root.children[0].id.0, "while-first",
+        "the tree published while it waited is the one it starts from"
+    );
+
+    // And it is a full session, not a leftover: its input reaches the app and
+    // is acked on the connection it arrived on.
+    second.send_input(1, key("j"));
+    assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("j")));
+    assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
+}
+
 #[test]
 fn drop_removes_the_socket_file() {
     let bound = bind_layer("cleanup");

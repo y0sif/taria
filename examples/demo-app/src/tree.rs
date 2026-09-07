@@ -101,12 +101,23 @@ fn list_node(app: &App) -> Node {
 
 fn input_node(app: &App) -> Node {
     let modal = app.dialog.is_some();
+    let focused = app.focus == Focus::Input && !modal;
     let mut node = Node::new("input", Role::TextInput)
         .label("New task")
         .value(app.input.clone())
-        .focused(app.focus == Focus::Input && !modal);
+        .focused(focused);
     if !modal {
         node = node.actions([Action::SetValue, Action::Activate]);
+        // The way back out, advertised only while the input holds the
+        // keyboard, because that is when there is something to hand back.
+        // Without it the input is a focus trap: `set_value` moves focus here
+        // and nothing semantic moves it away again, so every later key an
+        // agent sends is typed into the draft and only the raw-key fallback
+        // escapes. `dismiss` is Esc's counterpart, which the list ignores
+        // too, so the advertisement and the behaviour agree.
+        if focused {
+            node = node.action(Action::Dismiss);
+        }
     }
     node
 }
@@ -457,6 +468,50 @@ mod tests {
         // item claims focus and exactly one node in the tree does.
         assert_eq!(count_focused(&nodes), 1);
         assert_eq!(focused_id(&nodes).as_deref(), Some("input"));
+    }
+
+    /// An agent that focused the input has to be able to read its way out
+    /// again, or the input is a trap it can only leave through the raw-key
+    /// fallback. The advertisement tracks the keyboard, because `dismiss` is
+    /// Esc's counterpart and the list ignores Esc.
+    #[test]
+    fn the_input_advertises_the_way_out_while_it_holds_the_keyboard() {
+        let mut app = App::new();
+        assert_eq!(
+            find(&build_nodes(&app), "input").unwrap().actions,
+            vec![Action::SetValue, Action::Activate],
+            "with the list focused there is no keyboard to hand back"
+        );
+
+        // The move an agent actually makes: `set_value` takes the keyboard.
+        apply_agent_input(
+            &mut app,
+            AgentInput::Act {
+                node: taria::NodeId("input".into()),
+                action: Action::SetValue,
+                value: Some("draft".into()),
+            },
+        );
+        let nodes = build_nodes(&app);
+        assert_eq!(focused_id(&nodes).as_deref(), Some("input"));
+        assert_eq!(
+            find(&nodes, "input").unwrap().actions,
+            vec![Action::SetValue, Action::Activate, Action::Dismiss],
+            "the way out must be readable from the tree that trapped the focus"
+        );
+
+        // And it works: the draft is gone and the keyboard is the list's.
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Dismiss)),
+            crate::update::Applied::Handled
+        );
+        let nodes = build_nodes(&app);
+        assert_eq!(find(&nodes, "input").unwrap().value.as_deref(), Some(""));
+        assert_eq!(focused_id(&nodes).as_deref(), Some("task-1"));
+        assert_eq!(
+            find(&nodes, "input").unwrap().actions,
+            vec![Action::SetValue, Action::Activate]
+        );
     }
 
     #[test]

@@ -210,6 +210,19 @@ pub struct Node {
     /// Current value (input contents, selected item, checkbox state).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Whether a raw key would land on this node.
+    ///
+    /// `#[serde(default)]` and still always serialized, so nothing on the
+    /// wire moves today. What it buys is the other direction: a peer that
+    /// omits the field is accepted, which an older peer cannot tell from one
+    /// that sent `false`, so dropping it later stays an additive change
+    /// rather than a version bump. At most one node of a tree is focused, so
+    /// the field is `false` on every other node and costs a 500-node tree
+    /// around 8 KB of `"focused":false` per publish, against an agent's
+    /// output budget. Version 1 is frozen, which is why accepting absence has
+    /// to land now: relaxing what is accepted is only free while no peer yet
+    /// relies on it.
+    #[serde(default)]
     pub focused: bool,
     /// Actions an agent may invoke on this node right now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -377,6 +390,21 @@ mod tests {
                 .unwrap();
         assert_eq!(node.role, Role::Other);
         assert_eq!(node.label.as_deref(), Some("cpu"));
+    }
+
+    /// Absence reads as `false`, and the field is still written. The pairing
+    /// is the point: an omitted `focused` becomes possible for a later peer
+    /// without a version bump, and no peer sees the wire change today.
+    #[test]
+    fn focused_may_be_absent_and_is_still_serialized() {
+        let node: Node = serde_json::from_str(r#"{"id":"n","role":"text"}"#).unwrap();
+        assert!(!node.focused);
+
+        let json = serde_json::to_string(&Node::new("n", Role::Text)).unwrap();
+        assert!(
+            json.contains(r#""focused":false"#),
+            "the field still goes on the wire: {json}"
+        );
     }
 
     #[test]

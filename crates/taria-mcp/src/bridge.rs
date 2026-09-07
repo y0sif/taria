@@ -4,9 +4,10 @@
 //! reads `AppToBridge` ndjson lines into a [`watch`] channel holding the
 //! latest [`BridgeState`], and writes queued [`AgentInput`]s out as
 //! `BridgeToApp::Input` lines. A snapshot is stored as an [`AppSnapshot`],
-//! which keeps the app's line as it was sent alongside the parse of it, so the
-//! tool layer relays what the app wrote instead of re-serializing what this
-//! build could decode. On disconnect the watch flips to
+//! which keeps the app's line (minus the message framing) alongside the parse
+//! of it, so the tool layer relays what the app wrote instead of
+//! re-serializing what this build could decode. On disconnect the watch flips
+//! to
 //! [`BridgeState::Disconnected`] so tool calls fail fast (instead of acting
 //! on a stale tree) with an error that says which app went away.
 //!
@@ -59,31 +60,74 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// One snapshot as the app published it, in both the forms the bridge needs.
 ///
 /// They are kept together because neither can stand in for the other. The
-/// **raw line is authoritative for what the agent reads**: it is the app's own
-/// ndjson, forwarded verbatim, so a role, an action or a field this build has
-/// never heard of reaches the agent by name instead of being flattened into
+/// **app's own line is authoritative for what the agent reads**: it is
+/// forwarded as sent, so a role, an action or a field this build has never
+/// heard of reaches the agent by name instead of being flattened into
 /// whatever the typed struct could hold. Re-serializing
 /// [`parsed`](Self::parsed) destroyed exactly that information: an app
 /// publishing `"role":"sparkline"` had the agent read `"role":"other"`, and the
-/// real name had been on the wire all along for the bridge to pass on.
+/// real name had been on the wire all along for the bridge to pass on. The one
+/// thing dropped on the way is the message's own framing key, which belongs to
+/// the transport rather than to the tree; see
+/// [`from_line`](Self::from_line).
 ///
 /// The **parsed form is authoritative for what the bridge decides**: `act`
 /// validates node ids and advertised actions against it, and the tool layer
 /// compares it to tell a tree that changed from one that did not. Neither of
-/// those may read the raw line, which is untyped and, across a version
+/// those may read the relayed text, which is untyped and, across a version
 /// mismatch, not even shaped like this build's [`Snapshot`].
 ///
 /// A line reaches here only after it parsed, so a malformed line is still
 /// skipped rather than forwarded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSnapshot {
-    /// The app's `AppToBridge::Snapshot` line, exactly as it was sent, with
-    /// the framing newline stripped. What `read_tree` and every tool result
-    /// hand back.
-    pub line: String,
+    /// The app's snapshot as the agent reads it: its own line, minus the
+    /// message framing. What `read_tree` and every tool result hand back.
+    /// Built by [`from_line`](Self::from_line), which is the only thing that
+    /// removes anything.
+    pub tree_json: String,
     /// The same message decoded into this build's types. For validation and
     /// change detection only, never for output.
     pub parsed: Snapshot,
+}
+
+impl AppSnapshot {
+    /// Pair one app line with its parse, dropping the transport envelope from
+    /// the copy the agent reads.
+    ///
+    /// [`AppToBridge`] is internally tagged, so the line carries a
+    /// `"type":"snapshot"` key beside the snapshot's own fields. That key
+    /// frames the message on the wire and says nothing about the tree, while
+    /// `read_tree` promises the app's tree, so handing it on reads as a field
+    /// the app published.
+    ///
+    /// Removed through a `serde_json::Value`, which holds every key the line
+    /// has, including the roles, actions and fields this build has never
+    /// heard of. Only the one key goes; key order and whitespace become the
+    /// serializer's again, and neither is information the app was carrying.
+    pub fn from_line(line: &str, parsed: Snapshot) -> Self {
+        Self {
+            tree_json: strip_envelope(line),
+            parsed,
+        }
+    }
+}
+
+/// `line` without its `"type"` key.
+///
+/// Both fallbacks return the line untouched, and neither is reachable from a
+/// line that got here: it parsed as an `AppToBridge::Snapshot`, so it is a
+/// JSON object, and a `Value` built from JSON serializes back. Relaying the
+/// envelope is the wrong answer for both, but it is the one that keeps the
+/// tree, which is what an agent came for.
+fn strip_envelope(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.remove("type");
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
 }
 
 /// What the bridge currently knows about the app, as seen by the tool layer.
@@ -436,10 +480,7 @@ fn handle_app_line(
             // The line is kept beside the parsed form, not instead of it: the
             // agent reads the line and the bridge reasons about the parse.
             // See [`AppSnapshot`].
-            state_tx.send_replace(BridgeState::Connected(AppSnapshot {
-                line: line.to_string(),
-                parsed,
-            }));
+            state_tx.send_replace(BridgeState::Connected(AppSnapshot::from_line(line, parsed)));
         }
         Ok(AppToBridge::Ack { id, status }) => {
             tracing::debug!(id, ?status, "input ack received");
