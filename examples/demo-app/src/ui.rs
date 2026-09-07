@@ -109,10 +109,24 @@ fn render_input(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(app.input.as_str()).block(block), area);
 
     if input_focused && area.width > 2 {
-        let cursor = u16::try_from(app.input.chars().count()).unwrap_or(u16::MAX);
-        let x = (area.x + 1 + cursor).min(area.x + area.width - 2);
-        frame.set_cursor_position(Position::new(x, area.y + 1));
+        let x = cursor_x(area, app.input.chars().count());
+        frame.set_cursor_position(Position::new(x, area.y.saturating_add(1)));
     }
+}
+
+/// Column the text cursor sits at inside `area` for a draft of `len`
+/// characters, clamped to the last cell inside the border.
+///
+/// Saturating at every step, because `len` is agent-controlled and unbounded
+/// by the protocol: a draft longer than `u16::MAX` saturates the count, and
+/// then `area.x + 1 + count` overflows *before* the clamp can bite. That
+/// arithmetic panicked the demo on a single `set_value` carrying 65535
+/// characters, which is one semantic act killing the app an agent is driving.
+fn cursor_x(area: Rect, len: usize) -> u16 {
+    let cursor = u16::try_from(len).unwrap_or(u16::MAX);
+    // `width > 2` at the call site, so this last column is inside the border.
+    let last = area.x.saturating_add(area.width).saturating_sub(2);
+    area.x.saturating_add(1).saturating_add(cursor).min(last)
 }
 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
@@ -171,4 +185,51 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1]);
     horizontal[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The input box the layout hands `render_input`: three rows, full width.
+    fn input_area(width: u16) -> Rect {
+        Rect::new(0, 2, width, 3)
+    }
+
+    #[test]
+    fn the_cursor_follows_the_draft_and_stops_inside_the_border() {
+        let area = input_area(20);
+        assert_eq!(cursor_x(area, 0), 1, "an empty draft sits after the border");
+        assert_eq!(cursor_x(area, 5), 6);
+        assert_eq!(
+            cursor_x(area, 40),
+            18,
+            "a draft wider than the box parks on the last cell inside it"
+        );
+    }
+
+    /// The regression: a `set_value` long enough to saturate the `u16` count
+    /// used to overflow the sum before the clamp, panicking the demo. Any
+    /// length the protocol permits has to render.
+    #[test]
+    fn an_enormous_draft_clamps_instead_of_overflowing() {
+        let area = input_area(20);
+        for len in [
+            u16::MAX as usize - 1,
+            u16::MAX as usize,
+            u16::MAX as usize + 1,
+            usize::MAX,
+        ] {
+            assert_eq!(cursor_x(area, len), 18, "len {len}");
+        }
+    }
+
+    /// The other end of the coordinate space: a box against the right edge of
+    /// a full-width terminal, where `area.x + 1` is itself at the limit.
+    #[test]
+    fn a_box_at_the_edge_of_the_coordinate_space_clamps_too() {
+        let area = Rect::new(u16::MAX - 3, 0, 3, 3);
+        assert_eq!(cursor_x(area, 0), u16::MAX - 2);
+        assert_eq!(cursor_x(area, usize::MAX), u16::MAX - 2);
+    }
 }

@@ -172,25 +172,47 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Whether this press carries ctrl or alt, which makes it a chord rather than
-/// the plain key the demo's single-key bindings name.
+/// Whether this press is the plain key the demo's bindings name: one carrying
+/// no modifier at all.
 ///
-/// Shift is not a chord: it is how an uppercase character arrives, and the
-/// character already says which one it is.
-fn is_chord(key: KeyEvent) -> bool {
-    key.modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+/// Every modifier, not just ctrl and alt, and every key code, not just
+/// characters. `taria::key` parses `shift+q` into `Char('q')` with shift, a
+/// press no terminal produces, and a ctrl-or-alt-only rule let it quit the
+/// app; the same rule let `ctrl+enter` submit the draft and `ctrl+esc` throw
+/// it away, because the guard only ever sat on the `Char` arms. Naming the
+/// modifiers that disqualify a press is the shape that keeps growing holes,
+/// so this names the one combination that qualifies instead.
+///
+/// Typing is the one thing this rule must not decide: see [`typed_char`].
+fn is_plain(key: KeyEvent) -> bool {
+    key.modifiers.is_empty()
+}
+
+/// The character this press types, or `None` if it types nothing.
+///
+/// Shift is allowed here and nowhere else, because a terminal reports an
+/// uppercase letter as `Char('A')` with shift set (crossterm adds it for any
+/// uppercase character), so requiring no modifiers would stop a person typing
+/// capitals. The character itself already says which one it is, which is why
+/// shift can be ignored rather than checked against it. Ctrl and alt are not
+/// text: `ctrl+c` is not the letter `c`, and typing it into the draft is the
+/// one thing an agent sending it cannot have meant.
+fn typed_char(key: KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => Some(c),
+        _ => None,
+    }
 }
 
 // --- List focus ---
 
 fn handle_list_key(app: &mut App, key: KeyEvent) {
-    // A chord is not the plain key it is built from: `ctrl+q` must not quit
-    // and `ctrl+j` must not move the cursor, or an agent reaching for a
-    // control chord some other part of a UI wants closes this app by
-    // accident. Falling through here leaves it unhandled the way any unbound
-    // press is, which the caller still reports as received.
-    if is_chord(key) {
+    // A modified press is not the plain key it is built from: `ctrl+q` and
+    // `shift+q` must not quit, and `ctrl+j` must not move the cursor, or an
+    // agent reaching for a chord some other part of a UI wants closes this
+    // app by accident. Falling through here leaves it unhandled the way any
+    // unbound press is, which the caller still reports as received.
+    if !is_plain(key) {
         return;
     }
     match key.code {
@@ -243,6 +265,18 @@ fn toggle_selected(app: &mut App) {
 // --- Input focus ---
 
 fn handle_input_key(app: &mut App, key: KeyEvent) {
+    // Typing is decided first, because it is the one binding here that shift
+    // may reach: an uppercase letter arrives with shift set and is still text.
+    if let Some(c) = typed_char(key) {
+        app.input.push(c);
+        return;
+    }
+    // Everything else is the plain key or nothing: `ctrl+enter` is not Enter
+    // and must not submit the draft, and `ctrl+esc` is not Esc and must not
+    // throw it away.
+    if !is_plain(key) {
+        return;
+    }
     match key.code {
         KeyCode::Enter => {
             submit_input(app);
@@ -253,13 +287,6 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Backspace => {
             app.input.pop();
-        }
-        // The guard sits on this arm rather than at the top of the handler
-        // because this is the arm that would otherwise swallow the chord:
-        // `ctrl+c` is not the letter `c`, and typing it into the draft is
-        // the one thing an agent sending it cannot have meant.
-        KeyCode::Char(c) if !is_chord(key) => {
-            app.input.push(c);
         }
         _ => {}
     }
@@ -287,9 +314,10 @@ fn submit_input(app: &mut App) -> Applied {
 // --- Dialog ---
 
 fn handle_dialog_key(app: &mut App, key: KeyEvent) {
-    // The same rule as the list, and it matters more here: `ctrl+y` is not
-    // the `y` that deletes a task.
-    if is_chord(key) {
+    // The same rule as the list, and it matters more here: neither `ctrl+y`
+    // nor `shift+y` is the `y` that deletes a task, and `ctrl+enter` is not
+    // the Enter that confirms it.
+    if !is_plain(key) {
         return;
     }
     match key.code {
@@ -757,6 +785,118 @@ mod tests {
 
         apply_agent_input(&mut app, key("y"));
         assert_eq!(app.tasks.len(), before - 1, "plain y still confirms");
+    }
+
+    /// Shift is a modifier like any other. `taria::key` parses `shift+q` into
+    /// `Char('q')` with shift, a press no terminal produces, and a guard that
+    /// only knew ctrl and alt let it quit the app and let `shift+y` answer the
+    /// delete dialog.
+    #[test]
+    fn shift_is_not_the_plain_binding_either() {
+        let mut app = App::new();
+
+        assert_eq!(
+            apply_agent_input(&mut app, key("shift+q")),
+            Applied::Handled
+        );
+        assert!(app.running, "shift+q must not quit");
+
+        let selection = app.selection;
+        apply_agent_input(&mut app, key("shift+j"));
+        apply_agent_input(&mut app, key("shift+down"));
+        assert_eq!(app.selection, selection, "shift must not move the cursor");
+
+        apply_agent_input(&mut app, key("shift+i"));
+        assert_eq!(app.focus, Focus::List, "shift+i must not focus the input");
+        apply_agent_input(&mut app, key("shift+space"));
+        assert!(
+            !app.task(app.selected_id().unwrap()).unwrap().done,
+            "shift+space must not toggle a task"
+        );
+
+        let before = app.tasks.len();
+        apply_agent_input(&mut app, key("shift+d"));
+        assert_eq!(app.dialog, None, "shift+d must not open the delete dialog");
+
+        // And on the dialog, where the mistake deletes data.
+        apply_agent_input(&mut app, key("d"));
+        assert!(app.dialog.is_some());
+        apply_agent_input(&mut app, key("shift+y"));
+        assert!(app.dialog.is_some(), "shift+y must not confirm the delete");
+        assert_eq!(app.tasks.len(), before, "nothing was deleted");
+        apply_agent_input(&mut app, key("shift+n"));
+        assert!(app.dialog.is_some(), "shift+n must not cancel either");
+        apply_agent_input(&mut app, key("esc"));
+        assert_eq!(app.dialog, None, "plain esc still cancels");
+    }
+
+    /// The guard used to sit on the `Char` arms alone, so every named key was
+    /// the plain binding whatever it carried: `ctrl+enter` submitted the draft
+    /// and `ctrl+esc` threw it away.
+    #[test]
+    fn modified_named_keys_are_not_the_plain_bindings() {
+        let mut app = App::new();
+        let before = app.tasks.len();
+        apply_agent_input(&mut app, key("i"));
+        apply_agent_input(&mut app, text("draft"));
+        assert_eq!(app.input, "draft");
+
+        for chord in ["ctrl+enter", "alt+enter", "shift+enter"] {
+            apply_agent_input(&mut app, key(chord));
+            assert_eq!(app.tasks.len(), before, "{chord} must not submit the draft");
+            assert_eq!(app.input, "draft", "{chord} must not clear the draft");
+        }
+        for chord in ["ctrl+esc", "alt+esc", "shift+esc"] {
+            apply_agent_input(&mut app, key(chord));
+            assert_eq!(app.input, "draft", "{chord} must not discard the draft");
+            assert_eq!(app.focus, Focus::Input, "{chord} must not leave the input");
+        }
+        for chord in ["ctrl+backspace", "shift+backspace"] {
+            apply_agent_input(&mut app, key(chord));
+            assert_eq!(app.input, "draft", "{chord} must not edit the draft");
+        }
+
+        // The plain keys still do their jobs.
+        apply_agent_input(&mut app, key("backspace"));
+        assert_eq!(app.input, "draf");
+        apply_agent_input(&mut app, key("enter"));
+        assert_eq!(app.tasks.len(), before + 1, "plain enter still submits");
+        assert_eq!(app.tasks.last().unwrap().title, "draf");
+
+        // The dialog's Enter is the same binding with worse consequences.
+        apply_agent_input(&mut app, key("d"));
+        assert!(app.dialog.is_some());
+        apply_agent_input(&mut app, key("ctrl+enter"));
+        assert!(app.dialog.is_some(), "ctrl+enter must not confirm a delete");
+        apply_agent_input(&mut app, key("ctrl+esc"));
+        assert!(app.dialog.is_some(), "ctrl+esc must not cancel it either");
+        apply_agent_input(&mut app, key("esc"));
+        assert_eq!(app.dialog, None);
+    }
+
+    /// The reason [`typed_char`] lets shift through: a terminal reports an
+    /// uppercase letter as `Char('A')` with shift set, so a flat "no
+    /// modifiers" rule would stop a person typing capitals. The agent paths
+    /// send uppercase without shift and must keep working too.
+    #[test]
+    fn uppercase_still_types_however_it_arrives() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, key("i"));
+
+        // What a terminal delivers for shift+a.
+        update(
+            &mut app,
+            AppEvent::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+        );
+        // What `taria::key` and `text_to_keys` deliver for the same letter.
+        apply_agent_input(&mut app, key("B"));
+        apply_agent_input(&mut app, text("Cd"));
+        assert_eq!(app.input, "ABCd");
+
+        // A chord carrying a character is still not text.
+        apply_agent_input(&mut app, key("ctrl+e"));
+        apply_agent_input(&mut app, key("alt+f"));
+        assert_eq!(app.input, "ABCd", "ctrl and alt must not reach the draft");
     }
 
     #[test]

@@ -39,6 +39,18 @@ pub(crate) const MAX_KEY_REPEAT: u32 = 64;
 /// the adapter lowers the text into one key event per character.
 const MAX_TEXT_CHARS: usize = 4096;
 
+/// Longest `value` one `act` call may carry, in characters.
+///
+/// The same number as [`MAX_TEXT_CHARS`], because it answers the same
+/// question, how much text one call may push into the app, and an agent that
+/// learns one limit should not then meet a second. Generous for the text
+/// fields `set_value` addresses, and short enough that the value cannot be
+/// used as a weapon: it travels as one ndjson line, and both peers treat a
+/// line over 1 MiB as a broken connection, so an unbounded value was a way to
+/// cut an app off from its bridge. Bounded here rather than only in apps
+/// because every app would otherwise have to defend itself.
+const MAX_VALUE_CHARS: usize = MAX_TEXT_CHARS;
+
 /// Instructions surfaced to the agent on MCP initialize.
 const INSTRUCTIONS: &str = "Bridge to a live terminal (TUI) application. Call read_tree first: \
 it returns the app's current semantic tree, including every node id and the actions each node \
@@ -58,7 +70,9 @@ pub struct ActParams {
     /// Action name advertised by that node (e.g. "activate", "toggle",
     /// "set_value", or an app-specific custom action name).
     pub action: String,
-    /// Value for actions that take one (e.g. the text for "set_value").
+    /// Value for actions that take one (e.g. the text for "set_value"), up to
+    /// 4096 characters.
+    #[schemars(length(max = 4096))]
     pub value: Option<String>,
 }
 
@@ -231,8 +245,8 @@ impl TariaMcpServer {
     #[tool(
         description = "Invoke an advertised action on a node of the app's semantic tree. `node` \
                        is a node id and `action` an action name, both taken from read_tree; pass \
-                       `value` for actions that need one (e.g. set_value). Returns the updated \
-                       tree once the app reacts."
+                       `value` for actions that need one (e.g. set_value), up to 4096 \
+                       characters. Returns the updated tree once the app reacts."
     )]
     pub async fn act(
         &self,
@@ -245,6 +259,20 @@ impl TariaMcpServer {
         if action.is_empty() {
             return Err(McpError::invalid_params(
                 "action must be a non-empty action name",
+                None,
+            ));
+        }
+        // Bounded before anything is sent, for the reason on
+        // [`MAX_VALUE_CHARS`]: an oversized value is a line neither peer will
+        // read, so it would break the connection instead of setting a value.
+        if let Some(len) = value.as_ref().map(|value| value.chars().count())
+            && len > MAX_VALUE_CHARS
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "value is {len} characters, over the {MAX_VALUE_CHARS} character limit for \
+                     one act call; set a shorter value"
+                ),
                 None,
             ));
         }
@@ -472,8 +500,15 @@ fn snapshot_json(snapshot: &Snapshot) -> Result<String, McpError> {
 struct Observed {
     /// Newest ack naming the last input of the burst, if the app sent one.
     status: Option<InputStatus>,
-    /// How many inputs of the burst the app acked
+    /// How many inputs of the burst the app's newest ack for each calls
     /// [`Dropped`](InputStatus::Dropped).
+    ///
+    /// Per input rather than per ack, so it can never exceed the burst.
+    /// [`InputStatus`] lets an app ack one input more than once with the last
+    /// ack winning, so counting acks let a conforming app report more drops
+    /// than there were inputs, and the `sent - dropped` below then panicked
+    /// the bridge mid-call: the tool never answered and the agent waited on
+    /// it forever.
     dropped: usize,
     /// How many acks were published while this call was in flight and never
     /// read, because the observer fell behind the broadcast channel.
@@ -538,6 +573,10 @@ async fn observe(
     let mut acks_open = true;
     let mut state_open = true;
     let last = ids.last().copied();
+    // The newest status per input of the burst, which is what "the last ack
+    // wins" means for the drop tally: a re-ack replaces an input's fate
+    // instead of adding to a running count.
+    let mut fates: Vec<Option<InputStatus>> = vec![None; ids.len()];
     let deadline = tokio::time::sleep(UPDATE_WAIT);
     tokio::pin!(deadline);
     loop {
@@ -553,12 +592,18 @@ async fn observe(
                 Ok((acked, status)) => {
                     // An ack for another call's input says nothing about this
                     // burst, and needs no bookkeeping beyond being skipped.
-                    if !ids.contains(&acked) {
+                    let Some(pos) = ids.iter().position(|id| *id == acked) else {
                         continue;
-                    }
-                    if status == InputStatus::Dropped {
-                        seen.dropped += 1;
-                    }
+                    };
+                    // Record this input's newest fate and recount, rather than
+                    // adding to a tally: the wire format permits a second ack
+                    // for the same input, so a running count is a count of
+                    // acks, not of inputs, and can outgrow the burst.
+                    fates[pos] = Some(status);
+                    seen.dropped = fates
+                        .iter()
+                        .filter(|fate| **fate == Some(InputStatus::Dropped))
+                        .count();
                     // Every id counts towards the drop tally, but only the
                     // last one decides when there is nothing left to wait for.
                     if Some(acked) != last {
@@ -649,7 +694,12 @@ fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolRes
     // when the last press landed and the tree changed: reporting the tree
     // would tell the agent the burst arrived intact.
     if seen.dropped > 0 && sent > 1 {
-        let landed = sent - seen.dropped;
+        // Saturating even though the tally is now per input and so cannot
+        // exceed `sent`: this subtraction is fed by what a peer said, and a
+        // report is no place to panic. Overflowing it took the whole tool
+        // call down with it, leaving the agent waiting on a reply that could
+        // never come.
+        let landed = sent.saturating_sub(seen.dropped);
         return Err(McpError::internal_error(
             format!(
                 "the app dropped {} of the {sent} inputs this call sent because its input queue \
@@ -729,7 +779,10 @@ fn report(seen: Observed, fallback: Snapshot, sent: usize) -> Result<CallToolRes
 /// the part that landed, and a tree claims a burst that arrived intact. The
 /// agent needs both counts to know what is left to retry.
 fn partial_send_error(seen: &Observed, sent: usize, wanted: usize) -> McpError {
-    let unsent = wanted - sent;
+    // Saturating for the same reason as `report`: the counts that reach here
+    // are sound, and an error path that can panic is worse than one that
+    // under-reports.
+    let unsent = wanted.saturating_sub(sent);
     let dropped = if seen.dropped > 0 {
         format!(
             " Of the {sent} sent, the app dropped {} because its input queue was full.",
@@ -971,6 +1024,69 @@ mod tests {
         );
     }
 
+    /// [`InputStatus`] lets an app ack one input more than once with the last
+    /// ack winning, so a repeated `Dropped` is a conforming app's message.
+    /// Counting acks instead of inputs let the tally outgrow the burst, and
+    /// the `sent - dropped` in [`report`] then panicked the task serving the
+    /// call: the process survived, the tool never answered, and the agent
+    /// waited on that call forever.
+    #[tokio::test]
+    async fn a_duplicated_drop_ack_is_counted_once() {
+        let (ack_tx, acks) = broadcast::channel(8);
+        let pre = snapshot("before");
+        let (_state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
+        // A two-press burst, three acks: the first input is dropped and said
+        // so twice.
+        let _ = ack_tx.send((1, InputStatus::Dropped));
+        let _ = ack_tx.send((1, InputStatus::Dropped));
+        let _ = ack_tx.send((2, InputStatus::Dropped));
+
+        let seen = observe(acks, rx, &pre, &[1, 2]).await;
+        assert_eq!(
+            seen.dropped, 2,
+            "two inputs were dropped however many acks said so: {seen:?}"
+        );
+
+        let err = report(seen, pre, 2).expect_err("a dropped burst is not a success");
+        assert!(
+            err.message.contains("dropped 2 of the 2 inputs"),
+            "the burst report must not claim more drops than inputs: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("at most 0 landed"),
+            "the landed count must stay a real count: {}",
+            err.message
+        );
+    }
+
+    /// The other half of "the last ack wins": an input acked `Dropped` and
+    /// then `Delivered` is delivered, and must leave the drop tally.
+    #[tokio::test]
+    async fn a_drop_ack_the_app_takes_back_stops_counting() {
+        let (ack_tx, acks) = broadcast::channel(8);
+        let pre = snapshot("before");
+        let (_state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
+        let _ = ack_tx.send((1, InputStatus::Dropped));
+        let _ = ack_tx.send((1, InputStatus::Delivered));
+        // The last input's `Dropped` ends the window, so this stays fast.
+        let _ = ack_tx.send((2, InputStatus::Dropped));
+
+        let seen = observe(acks, rx, &pre, &[1, 2]).await;
+        assert_eq!(
+            seen.dropped, 1,
+            "only the input whose newest ack is a drop counts: {seen:?}"
+        );
+
+        let err = report(seen, pre, 2).expect_err("a partial burst is not a success");
+        assert!(
+            err.message.contains("dropped 1 of the 2 inputs")
+                && err.message.contains("at most 1 landed"),
+            "the report must follow the newest ack: {}",
+            err.message
+        );
+    }
+
     /// An input the app does not survive must not read as "nothing happened".
     /// The app is gone, `read_tree` would say so on the next call, and the
     /// tool that sent the input is the first place the agent can hear it.
@@ -1075,6 +1191,64 @@ mod tests {
                 .contains("the app dropped 1"),
             "drops in the sent part belong in the report"
         );
+    }
+
+    /// A server with no app behind it, which is all the value bound needs:
+    /// an oversized value is refused before the bridge is asked for anything.
+    fn detached_server() -> TariaMcpServer {
+        let (_state_tx, state_rx) = watch::channel(BridgeState::Never);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
+        let (ack_tx, _) = broadcast::channel(1);
+        let (_protocol_tx, protocol_rx) = watch::channel(None);
+        TariaMcpServer::new(BridgeHandle {
+            state_rx,
+            input_tx,
+            ack_tx,
+            protocol_rx,
+        })
+    }
+
+    fn act_params(value: String) -> Parameters<ActParams> {
+        Parameters(ActParams {
+            node: "input".to_string(),
+            action: "set_value".to_string(),
+            value: Some(value),
+        })
+    }
+
+    /// `act`'s value was the one payload the tool layer left unbounded, while
+    /// `key` bounds its repeat and `type_text` its text. It travels as one
+    /// ndjson line, and both peers treat a line over 1 MiB as a broken
+    /// connection, so an unbounded value was a way to cut an app off from its
+    /// bridge with a single legal call.
+    #[tokio::test]
+    async fn act_refuses_a_value_over_the_limit() {
+        let server = detached_server();
+
+        let err = server
+            .act(act_params("x".repeat(MAX_VALUE_CHARS + 1)))
+            .await
+            .expect_err("an oversized value is not a request the bridge can carry");
+        assert!(
+            err.message.contains(&MAX_VALUE_CHARS.to_string())
+                && err.message.contains(&(MAX_VALUE_CHARS + 1).to_string()),
+            "the refusal must name the limit and what was sent: {}",
+            err.message
+        );
+
+        // At the limit the value is not what stops the call: with no app
+        // connected it gets as far as asking for a tree, and fails there.
+        for value in ["x".repeat(MAX_VALUE_CHARS), "😀".repeat(MAX_VALUE_CHARS)] {
+            let err = server
+                .act(act_params(value))
+                .await
+                .expect_err("no app is connected");
+            assert!(
+                err.message.contains("no snapshot from the app yet"),
+                "the limit is a character count, not a byte count: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
