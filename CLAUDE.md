@@ -34,8 +34,15 @@ refuses a `target/debug` older than the sources.
   additive changes only (new optional fields, new message variants, new roles
   and actions, which peers degrade to `other` / `Custom` instead of failing
   the snapshot). The ten types such an addition can reach are
-  `#[non_exhaustive]`, so additive on the wire is additive in Rust too.
-  Anything else bumps `PROTOCOL_VERSION`.
+  `#[non_exhaustive]`, and so are the six struct-like variants inside them
+  (`AppToBridge::Hello`/`Ack`, `BridgeToApp::Input`, `AgentInput::Act`/`Key`/
+  `Text`), which is why peers build through constructors and destructure with
+  `..`; `AgentInput::Unknown` is the `#[serde(other)]` fallback that keeps an
+  unreadable input's id, so it can still be acked. So additive on the wire is
+  additive in Rust too. `MAX_NODE_DEPTH` is 32, against a measured ceiling of
+  63 nested nodes before a JSON parser refuses; `Node::check_depth` reports a
+  violation and names a node at the offending depth. Anything else bumps
+  `PROTOCOL_VERSION`.
 - `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket, refuses a
   label that is not a plain file name (it binds and unlinks what the label
   resolves to), vets the socket directory, and serves one bridge client at a
@@ -47,9 +54,17 @@ refuses a `target/debug` older than the sources.
   `drain`/`drain_with_ids`/`try_recv`/`recv_timeout`, acked `Delivered` on
   dequeue, `Dropped` when the queue is full, and
   `Ignored` when the app says so with `ack`. Acks are flushed before the
-  snapshot published after them. Inputs are tagged with their connection's
-  generation and discarded (not applied) once that connection ends; the two
-  silent discards are counted in `dropped_inputs()`/`stale_inputs()`.
+  snapshot published after them, from a bounded queue that drops its oldest.
+  Inputs are tagged with their connection's generation and discarded (not
+  applied) once that connection ends, and `ack` refuses an id whose connection
+  is gone. Four counters: `dropped_inputs()`, `stale_inputs()`,
+  `unknown_inputs()`, `dropped_acks()`. A tree over `MAX_NODE_DEPTH` is cut
+  branch-wise at publish rather than withheld (a withheld tree leaves the
+  agent on a stale one), reported via
+  `truncated_snapshots()`/`last_truncation()`. Binding unlinks only a socket
+  nothing is listening on, refuses a live one so a second instance cannot
+  steal it, and the listener polls a shutdown flag so exit never waits on a
+  connection.
 - `crates/taria-mcp`: rmcp stdio server exposing
   `read_tree`/`act`/`key`/`type_text`. A socket-manager task reconnects with
   capped backoff, holds the latest snapshot in a watch channel, and
@@ -62,17 +77,23 @@ refuses a `target/debug` older than the sources.
   chars). Results are anchored on the app's ack, not on whatever the tree
   did: dropped, ignored, delivered-and-changed,
   delivered-and-unchanged, no ack, partial burst, lost acks, and the app
-  disconnecting. A protocol mismatch keeps `read_tree` and refuses every
-  input tool.
+  disconnecting. A protocol mismatch keeps `read_tree` for as long as the
+  peer's snapshots parse, and refuses every input tool. When lines from the
+  app were rejected, `read_tree` says the socket path is right and quotes the
+  reason rather than sending an adopter back to check the path.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
   identities (`IdSpace`), stable across deletes and restarts; the list
   publishes its selection as its own value; chords are never treated as the
-  plain key they contain. The input advertises `Dismiss` while it holds the
-  keyboard, so every state an agent can enter has an advertised way out; acts
-  on nodes that are gone (the dialog's, a deleted task) report `Ignored`.
-  `tree.rs` and `update.rs` are pure and unit-tested, including the
-  one-focused-node and modal-dialog invariants.
+  plain key they contain. Typed text is routed to the new-task input and
+  `Ignored` elsewhere. The input advertises `Dismiss` while it holds the
+  keyboard and `Activate` only while the draft would submit, and a `quit` node
+  advertises the way out of the app, so every state an agent can enter has an
+  advertised way out; acts on nodes that are gone (the dialog's, a deleted
+  task) report `Ignored`. Submitting switches to the tab the new task landed
+  on, so the effect is in the next snapshot. `tree.rs` and `update.rs` are
+  pure and unit-tested, including the one-focused-node and modal-dialog
+  invariants.
 
 Details: docs/architecture.md. Retrofit guidance: docs/integration-guide.md.
 
@@ -84,12 +105,16 @@ Details: docs/architecture.md. Retrofit guidance: docs/integration-guide.md.
   ones in docs/architecture.md.
 - Never panic in library crates; return errors.
 - Conventional commits: feat:, fix:, docs:, chore:, refactor:.
-- The `Key` and `Text` raw-input fallbacks exist so partial semantic
-  coverage is still useful; never let them become the primary path in demos.
-  Both lower into the app's key handler, so they land wherever focus is.
-- Every state an agent can enter needs an advertised way out, or the fallbacks
-  become the only escape. Advertise the action only where it does something,
-  and report `Ignored` where it does not, so the tree and the verdict agree.
+- The `Key` and `Text` raw inputs exist so partial semantic coverage is still
+  useful; never let them become the primary path in demos. They are lowered
+  differently on purpose: `Key` goes into the app's key handler and lands
+  wherever focus is, `Text` goes to whatever the app puts typing into and is
+  reported `Ignored` when nothing is. Text through the bindings is a bug, not
+  a shortcut: one `type_text` containing `d` and `y` deleted a task.
+- Every state an agent can enter needs an advertised way out, or the raw `key`
+  fallback becomes the only escape. Advertise the action only where it does
+  something, and report `Ignored` where it does not, so the tree and the
+  verdict agree.
 
 ## Context
 

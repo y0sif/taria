@@ -42,11 +42,19 @@ that has just built and still refuses a `target/debug` older than the sources.
 - Additive on the wire is not automatically additive in Rust, so the ten types
   a version-1 addition can reach are `#[non_exhaustive]`: the two wire message
   enums, `InputStatus`, `AgentInput`, `Action`, `Role`, `Node`, `Snapshot`,
-  `key::Key` and `key::Modifiers`. Adding a variant, field, role or action
-  goes to one of those, and it stays a recompile for every peer that
-  integrated taria. A new type that can grow the same way gets the attribute
-  when it lands, not at its first addition, because marking one later is
-  itself breaking.
+  `key::Key` and `key::Modifiers`. So are the six struct-like variants where a
+  new optional field would land: `AppToBridge::Hello` and `Ack`,
+  `BridgeToApp::Input`, and `AgentInput`'s `Act`, `Key` and `Text`. Adding a
+  variant, field, role or action goes to one of those, and it stays a
+  recompile for every peer that integrated taria. A marked variant has no
+  struct literal outside the crate, so anything new that carries fields ships
+  with a constructor beside it. A new type that can grow the same way gets the
+  attribute when it lands, not at its first addition, because marking one
+  later is itself breaking.
+- A tree is capped at `MAX_NODE_DEPTH`, because a snapshot deeper than a JSON
+  parser will recurse into arrives as nothing at all rather than as an error.
+  Anything that adds nesting to the tree, in the core types or in an adapter,
+  is spending that budget.
 - `crates/taria` is the shared protocol crate: the wire types plus the three
   pure modules both peers need to agree on strings (`key`, `id`, `socket`).
   One dependency (serde), no I/O, no framework deps. Anything that needs a

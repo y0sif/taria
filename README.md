@@ -105,7 +105,7 @@ app you already have, including which role to reach for.
 | `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, and the actions each node advertises. The app's own snapshot, relayed, so a role or field this bridge has never heard of arrives under its real name. |
 | `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`), up to 4096 characters. The node id and the action are checked against the latest tree before anything is sent. |
 | `key` | Sends a raw key press (`"q"`, `"enter"`, `"ctrl+c"`), up to 64 times with `repeat`. A key that does not match the grammar is rejected here rather than swallowed by the app. A fallback for parts of the UI without semantic coverage. |
-| `type_text` | Types a literal string in one call instead of one `key` call per character, up to 4096 characters. The text lands wherever the app currently sends typing, so focus the target first. |
+| `type_text` | Types a literal string in one call instead of one `key` call per character, up to 4096 characters. It goes where the app puts typing, never through the app's key bindings, so focus the target first; an app accepting no typing reports it ignored rather than acting on the characters. |
 
 The three input tools wait up to 500 ms for the app's answer and report what
 actually happened: the updated tree, an input the app deliberately ignored
@@ -185,9 +185,14 @@ or field reaches the agent under its real name; the degraded parse is what the
 bridge validates and compares against, not what the agent reads.
 
 In Rust the same promise is `#[non_exhaustive]` on the ten types a version-1
-addition can reach, from `Role` and `Action` to the two wire message enums, so
-a new role, key or message variant costs an app that integrated taria a
-recompile rather than a repair.
+addition can reach, from `Role` and `Action` to the two wire message enums,
+and on the six struct-like variants inside them, where a new optional field
+would land. So a new role, key, field or message variant costs an app that
+integrated taria a recompile rather than a repair, in exchange for building
+messages through their constructors and ending a destructuring pattern with
+`..`. An input kind this build cannot read parses as `AgentInput::Unknown`,
+which keeps the input's id, so the app can still acknowledge it instead of
+leaving the agent waiting.
 
 Removing a field, renaming one, making an optional field required, or
 changing what an existing field means bumps the version. `wire.rs` in
@@ -207,7 +212,12 @@ changing what an existing field means bumps the version. `wire.rs` in
   tested platform.
 - Socket paths are capped by AF_UNIX at the platform's `sun_path` minus the
   terminating NUL: 107 bytes on Linux, 103 on macOS and the BSDs. Set
-  `$TARIA_SOCK` to a shorter path when the default is too long.
+  `$TARIA_SOCK` to a shorter path when the default is too long, inside a
+  directory only you can reach: the adapter binds only under a directory you
+  own that grants no group or other access, so `/tmp` is refused.
+- Trees are capped at `MAX_NODE_DEPTH`, 32 levels, because a snapshot past
+  that exceeds what a JSON parser will recurse into and would arrive as
+  nothing. The adapter cuts deeper branches at publish and tells the app.
 
 ## License
 

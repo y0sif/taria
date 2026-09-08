@@ -62,6 +62,41 @@ and an input the app deliberately dropped looks like a slow one.
   accepts is only free while no peer yet relies on it, which is why it lands
   under the freeze rather than when it is needed.
 
+### Tree depth
+
+A snapshot is one JSON object, so how deep a tree can be is decided by how far
+a JSON parser will recurse. `serde_json`, which both reference peers use,
+stops at 128 nested values, and every node costs two of them: its own object
+and its `children` array. Measured through a whole `{"type":"snapshot",...}`
+line rather than a bare node, 63 nested nodes parse and 64 fail.
+
+Crossing that reports nothing anywhere. The reader skips the line it cannot
+parse exactly as it skips a truncated one, so a deep first snapshot leaves the
+bridge saying it has no tree while the app is connected and healthy, and a
+deep later snapshot leaves it serving the last shallow tree with nothing
+marking it stale. Writing is worse than reading: serialization recurses per
+level too, and a tree thousands of levels deep exhausts the stack and aborts
+the process from inside a library thread.
+
+`MAX_NODE_DEPTH` is 32, a little under half the measured ceiling, and the
+slack pays for the transport envelope, for a root an adapter adds above the
+nodes an app hands it, and for a peer whose parser is stricter than
+`serde_json`. The core crate states the limit and offers `Node::check_depth`,
+which reports the depth measured and names a node found at it; it enforces
+nothing, because what to do about a deep tree belongs to the adapter.
+
+The ratatui adapter cuts. Over the limit, every node at the limit publishes
+without its children, per branch, and the app is told through
+`truncated_snapshots()` and `last_truncation()`. Cutting, because the other
+two answers are the same failure: publishing the tree as built puts a line on
+the wire the bridge cannot parse, so it skips it and goes on serving the last
+tree it read, and skipping the publish is that same stale tree chosen
+deliberately. Only the cut still delivers the part of the tree that is fine.
+The app is the peer told about it because the app is the only one that can fix
+it, and the fix is nearly always to publish what the widget draws rather than
+the data behind it: for a deep tree view, the expanded path and the rows on
+screen.
+
 ### Key strings
 
 `AgentInput::Key` carries the press as a plain string, so every adapter and
@@ -137,12 +172,22 @@ fields. So a new optional field, or a whole new message variant, reaches an
 older peer as something it quietly ignores.
 
 Neither property covers a value nested inside a message the peer does want,
-so the two open vocabularies carry their own fallbacks. An unknown `Role`
+so the open vocabularies carry their own fallbacks. An unknown `Role`
 reads as `Role::Other`. An unknown `Action` name reads as `Action::Custom`
 keeping that name, so an agent can still advertise it, echo it back, and
 have the app recognize it. Without those, one leaf node using a role added
 later makes the whole snapshot unparseable, the reader skips every line, and
 the app looks frozen with no error anywhere.
+
+An `AgentInput` whose `kind` this build does not know is the third, and it
+degrades for a sharper reason than the other two. The `InputId` sits on the
+message rather than inside the input, so a `kind` that failed the line would
+take the id with it, and an agent would wait out the bridge's window for an
+ack that was never possible. `AgentInput::Unknown` is a `#[serde(other)]`
+fallback carrying nothing at all, which is enough: the input arrives with its
+id intact, the adapter answers it `ignored` on the app's behalf without
+queueing it, and the agent learns in one round trip that this app can do
+nothing with what it asked for. An app never sees the variant.
 
 `InputStatus` has no fallback. A status this build does not know fails its
 ack and the reader skips that line, which leaves the input reading as
@@ -173,6 +218,18 @@ than at the first addition. Each costs an outside peer one wildcard arm, or
 one `..` in a pattern, and buys back that a new variant, field, role, action
 or key is a recompile rather than a repair. `Modifiers` gains `NONE` and a
 const `new` in exchange for the struct literal it closes.
+
+The same reasoning reaches one level in, to the variants. A new optional
+field on an existing message is the format's cheapest additive change and
+also the one that breaks an outside peer hardest, because it breaks
+everything that builds or destructures that message. So the six struct-like
+variants are marked too: `AppToBridge::Hello` and `Ack`,
+`BridgeToApp::Input`, and `AgentInput`'s `Act`, `Key` and `Text`. A marked
+variant has no struct literal from outside the crate, so each has a
+constructor beside it (`AppToBridge::hello` and `ack`, `BridgeToApp::input`,
+`AgentInput::act`, `key` and `text`), and a peer destructuring one ends the
+pattern with `..`. `AppToBridge::Snapshot` needs neither: it is a newtype
+around `Snapshot`, which is marked already and built by `Snapshot::new`.
 
 Anything else needs a version bump: removing a field, renaming one, making
 an optional field required, or changing what an existing field means. The
@@ -246,7 +303,7 @@ all.
 | `delivered`, tree changed | The new tree. |
 | `delivered`, tree unchanged | Text: received, no change within 500 ms. |
 | No ack, tree changed | The new tree. |
-| No ack, no change | Text: neither acknowledged nor changed; it may be an adapter that sends no acks. |
+| No ack, no change | Text: neither acknowledged nor changed; it may be an adapter that sends no acks. If a line was rejected inside the window, that line is quoted instead, because it may have been this input's ack. |
 
 The order matters. The two send failures come first: an input that never left
 the bridge has no ack to wait for, and a burst cut short still waits out the
@@ -277,8 +334,10 @@ and a silence.
 - `key` parses the key string with `taria::key`, the same parser the adapter
   lowers with, so a key the app would refuse is refused here with the
   grammar in the error. `repeat` is 1 to 64.
-- `type_text` takes up to 4096 characters. The adapter lowers it into one
-  key event per character.
+- `type_text` takes up to 4096 characters. The adapter's `text_to_keys`
+  lowers it into one key event per character; where those go is the app's,
+  and it is the app's text-entry surface rather than its key bindings. An app
+  accepting no typing at that moment answers `ignored`.
 - Every input tool refuses while no app is connected. A queued input would
   otherwise be delivered to the next app instance.
 
@@ -315,10 +374,29 @@ App side (`TariaLayer::bind`, or `bind_or_disabled`):
    directory (not a symlink), owned by the current user, no group or other
    permission bits. Binding is refused otherwise, so another local user
    cannot swap the socket.
-4. Remove a stale socket file, bind, and serve one client at a time from a
-   listener thread. Each connection gets the `hello` plus the latest
-   snapshot, then streams every new publish. Dropping the layer shuts the
-   threads down and removes the socket file.
+4. Free the path, but only where freeing it is safe. A socket nothing is
+   listening on is unlinked and the bind proceeds. A socket another instance
+   is serving is refused with `AddrInUse`, naming the path and saying to give
+   the second instance one of its own, because taking it over would leave the
+   first running with no way for a bridge to reach it. Anything that is not a
+   socket is refused with `AlreadyExists` and left untouched, since the path
+   can come verbatim from `$TARIA_SOCK` and a typo there is not a reason to
+   delete a file. The liveness probe is a `connect`, which the standard
+   library offers no timeout for, so it runs on a thread of its own and is
+   waited on for 250 ms; no answer in that time refuses the bind rather than
+   unlinking a socket that may still be serving. Nothing here can park an app
+   during startup, which is the one thing taria promises never to do.
+5. Bind, and serve one client at a time from a listener thread. Each
+   connection gets the `hello` plus the latest snapshot, then streams every
+   new publish. The listener socket is non-blocking and the thread polls a
+   shutdown flag every 50 ms rather than parking in `accept()`: waking a
+   parked `accept()` by connecting to the socket path fails exactly when it
+   matters, because by then the path may hold a socket another process bound,
+   whose listener takes the wake-up while this one stays parked forever.
+   Dropping the layer shuts the threads down and removes the socket file, but
+   only while that file is still the one this layer bound, compared by device
+   and inode: a second instance that took the path over is serving a socket of
+   its own there, and unlinking it would leave that instance unreachable.
 
 `bind_or_disabled` turns any of those failures into an inert layer instead
 of an error, so taria can never stop an app from starting. Every method
@@ -340,6 +418,22 @@ Bridge side (`taria-mcp`):
 3. On reconnect, inputs queued while disconnected are discarded, and the
    peer's `protocol_version` is forgotten so the next connection is not
    judged by the previous app's handshake.
+4. Lines it could not read are kept, one at a time, with the reason. That is
+   what separates two states a bridge otherwise reports identically: nothing
+   ever connected, and an app connected and sent lines this build threw away.
+
+The second of those used to be answered by asking whether the socket path was
+right, which is the first wrong turn a retrofit takes: an app whose lines were
+rejected has demonstrably found the socket. So `read_tree` now says the path
+is right and quotes the reason instead, and names the two things that produce
+it, a tree past `MAX_NODE_DEPTH` and an app built against a taria whose
+snapshot shape differs from this bridge's. The input tools carry the same note
+into the one outcome that needs it. An ack whose `status` this build cannot
+name fails its whole line, id included, so the app answering an input is
+indistinguishable at the bridge from the app saying nothing; a rejected line
+inside the window is the only trace left of the difference, and the "neither
+acknowledged nor changed" answer says so rather than letting the agent read
+silence as an app that does not ack.
 
 ### One connection owns its inputs
 
@@ -355,12 +449,35 @@ discard is deliberately not acked: the peer that would read the ack is the
 one that left. The bridge drops its own queue on reconnect for the
 mirror-image reason, so both sides agree.
 
+The same ownership decides who may still be answered. `ack` refuses an id
+whose connection has ended, because ids are unique only within a bridge
+process: a fresh bridge counts from the start again, so an id an app held
+across a disconnect can already name a live input of the next bridge's, and
+that bridge's waiter must not receive a verdict from a session it never saw.
+An id also stops being answerable once its own connection has delivered a
+queue's worth of newer inputs past it, which bounds what the layer remembers
+and costs at most a late ack the peer already has to survive.
+
 Guard rails on the app side: a 5 s write timeout drops a peer that stops
 reading, and a bounded input queue (256 entries) drops the newest input,
 acks it `dropped`, and counts it in `dropped_inputs()` instead of blocking
-the socket thread. On the bridge side, an input waits at most 500 ms for
-room in the queue to the app, so a stopped app fails a tool call instead of
-hanging it.
+the socket thread. The ack queue is bounded too, at 1024, and drops from the
+opposite end: the oldest, because an ack answers one specific input and the
+answers an agent is still waiting on are the newest, while the oldest name
+inputs whose waiter has long since timed out. It has to be bounded because a
+bridge that reads steadily but far slower than an agent sends never stalls
+long enough for the write timeout to fire, and would otherwise grow the app's
+memory until the process is killed. Drops are counted in `dropped_acks()`,
+which is a report about the bridge rather than the app: the input was applied
+and the caller was answered nowhere. On the bridge side, an input waits at
+most 500 ms for room in the queue to the app, so a stopped app fails a tool
+call instead of hanging it.
+
+Four counters in all record agent traffic that went nowhere:
+`dropped_inputs()`, `stale_inputs()`, `unknown_inputs()` and
+`dropped_acks()`. All are monotonic across reconnects, all are 0 on a
+disabled layer, and all are read after the terminal is restored, because the
+layer never prints.
 
 ## Focus contract
 
@@ -372,8 +489,10 @@ Every snapshot carries exactly one focused node.
   invariant in every state: list, input, modal dialog, and empty list (focus
   parks on the list node itself).
 
-Focus tells the agent where raw keys and typed text would land, which is
-what makes the `key` and `type_text` fallbacks usable.
+Focus tells the agent where a raw key would land, which is what makes the
+`key` fallback usable. It is also how an agent aims `type_text`, but only
+because an app that is accepting typing normally focuses the surface taking
+it. What decides where typed characters go is the app, not the protocol.
 
 Focus is not selection. Focus says where a key would go; a cursor sits on a
 row whether or not that list owns the keyboard. An app that publishes only

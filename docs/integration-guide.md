@@ -18,8 +18,9 @@ The work is five edits, in this order:
 5. Acknowledge the inputs you deliberately ignore.
 
 Nothing above touches your rendering or your state. Your key handling is
-touched only indirectly, by the raw-input fallbacks lowering into it, which is
-its own section below.
+touched only indirectly, by the raw `key` fallback lowering into it, which is
+its own section below. Typed text does not go there at all, for a reason that
+section spends most of its length on.
 
 ## Add the dependency
 
@@ -157,7 +158,8 @@ which then reads the app as having done nothing.
 looking for structure to expand that is not there; naming a tree a list hides
 the nesting that decides what the agent has actually seen. A `tree_item`
 carries its own entries as children, so the node tree has the shape of the
-widget's.
+widget's, which is also the one role with a depth limit worth reading before
+you build against it: see "Keep the tree shallow enough to arrive".
 
 `select` and `option` against `list` and `list_item`. A list reports where a
 cursor sits; a select reports what the app will use. Choose `select` when the
@@ -318,7 +320,9 @@ main path.
 
 The demo had one. `set_value` on the text input moves focus there, and nothing
 advertised moved it back, so every `key` an agent sent afterwards was typed
-into the draft. The fix is one action, advertised conditionally:
+into the draft. The fix is one action, advertised conditionally. Here is the
+`input` node from earlier with both of its conditions, since the same rule
+reaches the action it already had:
 
 ```rust
 let focused = app.focus == Focus::Input;
@@ -326,7 +330,14 @@ let mut node = Node::new("input", Role::TextInput)
     .label("New task")
     .value(app.draft.clone())
     .focused(focused)
-    .actions([Action::SetValue, Action::Activate]);
+    .action(Action::SetValue);
+// Advertised only when it would do something. `activate` submits the
+// draft, and an empty draft submits nothing, so offering it there was the
+// tree's one advertised-but-ignored pair. The condition is the submit
+// handler's own, whitespace included, so the two cannot drift.
+if !app.draft.trim().is_empty() {
+    node = node.action(Action::Activate);
+}
 // The way back out, advertised only while the input holds the keyboard,
 // because that is when there is something to hand back.
 if focused {
@@ -359,6 +370,33 @@ Walk your own states and ask the question of each: modal open, text field
 focused, menu down, filter applied, search active. Each needs a node with an
 action that ends it.
 
+The app itself is one of those states. The demo's footer told a person
+`[q] quit` from the start while the tree advertised no exit at all, so an
+agent's only way to close it was the raw key, which types the letter `q`
+whenever the input holds the keyboard. A `quit` button node with `activate`
+is the same affordance the footer already offered, and it takes the modal
+gate like every other node outside the dialog:
+
+```rust
+fn quit_node(app: &App) -> Node {
+    let mut node = Node::new("quit", Role::Button).label("Quit");
+    // A dialog asking whether to delete a task is not a moment to quit.
+    if app.dialog.is_none() {
+        node = node.action(Action::Activate);
+    }
+    node
+}
+```
+
+Then the mirror of the rule: an act that lands somewhere the tree does not
+show is as good as ignored. The demo added a task from the Done tab and left
+it on the Active tab, invisible: the draft cleared, the tree changed, so the
+bridge reported success, and the agent read the tree back, found nothing it
+had asked for, and could reasonably submit again. Switching to the tab the
+task landed on is what makes the addition readable, and it is what a person
+adding a task wants to see too. When an action's effect is not in the next
+snapshot, the agent has been told a truth it cannot check.
+
 ## Watch your publish rate
 
 Identical trees are deduped: a frame whose nodes match the previous publish
@@ -385,7 +423,50 @@ Round them, or leave them out of the tree entirely and let the agent read the
 underlying fact. An agent cannot use the fourth decimal place, and neither
 can the person reading the transcript.
 
-## The fallbacks, and what they are for
+## Keep the tree shallow enough to arrive
+
+A snapshot is one JSON object, and a JSON parser bounds how far it will
+recurse into one. Past that bound the tree does not arrive as an error, it
+does not arrive at all: the reader skips the line the way it skips a truncated
+one, and goes on serving the last tree it did read. The agent is then working
+from a stale tree, or being told no app has published yet, with nothing
+anywhere saying why.
+
+`taria::MAX_NODE_DEPTH` is 32. The measured ceiling is 63 nested nodes, taken
+through a whole snapshot line rather than a bare node, and the limit sits a
+little under half of it; the slack pays for the envelope a transport wraps
+around a snapshot and for a peer whose parser is stricter than `serde_json`.
+
+The adapter enforces it at publish, counting the root it adds above your
+nodes. A tree over the limit is cut rather than withheld: every node at the
+limit publishes without its children, per branch, so everything above the cut
+reaches the agent unchanged. Withholding is the failure this is preventing,
+not a safer version of it, because a publish that does not happen leaves the
+agent on the stale tree either way.
+
+You are told, because you are the only one who can fix it:
+
+```rust
+let cut = layer.truncated_snapshots();
+if let Some(branch) = layer.last_truncation() {
+    // Names the depth measured and a node found at it, which in a tree
+    // generated from data is the only way to find the branch that ran away.
+    eprintln!("my-app: {cut} snapshot(s) published with a branch cut: {branch}");
+}
+```
+
+`Node::check_depth` is the same check with the same error, callable on a tree
+of your own before you hand it over, for an app that would rather shorten the
+tree itself than have a branch cut for it.
+
+Nothing hand-built reaches this: an app, its tabs, a pane, a list and its rows
+is six levels. The trees that do are generated from data, and `Role::Tree`
+invites the obvious one, a browser over a deep directory. Publish the expanded
+path rather than the whole structure. That is what a tree widget draws anyway,
+the rows a person can currently see, and it makes the snapshot the size of the
+screen instead of the size of the data behind it.
+
+## The raw inputs, and what they are for
 
 `key` sends one raw key press, up to 64 times with `repeat`. `type_text`
 sends a literal string. Both exist so partial semantic coverage is still
@@ -396,10 +477,24 @@ Neither should be the primary path. An action a node advertises is stable
 under a UI change; a keystroke is a guess about a keymap. Cover what an agent
 needs to do with `act`, and let the keys handle the rest.
 
-Lower both through the same handler a keyboard event takes:
+The two are not lowered the same way, and that is the point of there being
+two. A key is a keypress, so it belongs in your key handler and lands wherever
+focus is. Text is typing, so it belongs wherever your app puts typed
+characters, which is a different place and is sometimes nowhere at all. The
+next section is entirely about the second half of that sentence.
+
+Lower `key` through the same handler a keyboard event takes:
 
 ```rust
-AgentInput::Key { key } => match to_crossterm_key(&key) {
+AgentInput::Act {
+    node,
+    action,
+    value,
+    ..
+} => apply_act(app, node.0.as_str(), action, value),
+// A key is a keypress: it lowers into the same handler a person's
+// keystroke takes and lands wherever focus is.
+AgentInput::Key { key, .. } => match to_crossterm_key(&key) {
     Some(key) => {
         handle_key(app, key);
         Applied::Handled
@@ -410,39 +505,42 @@ AgentInput::Key { key } => match to_crossterm_key(&key) {
     // reporting that beats lowering it to some near-miss keystroke.
     None => Applied::Ignored,
 },
-AgentInput::Text { text } => {
-    let keys = text_to_keys(&text);
-    if keys.is_empty() {
-        return Applied::Ignored;
-    }
-    for key in keys {
-        handle_key(app, key);
-    }
-    Applied::Handled
-}
+// Typing, routed by the app rather than lowered into its bindings.
+AgentInput::Text { text, .. } => apply_text(app, &text),
 // `AgentInput` is `#[non_exhaustive]`, so this arm is required. A new way
 // for an agent to address an app is additive on the wire; the attribute is
 // what makes it additive for your build too.
 _ => Applied::Ignored,
 ```
 
-That last arm is not boilerplate to skip. Ten types in `taria` are
-`#[non_exhaustive]`: `AgentInput`, `Action`, `Role`, `Node`, `Snapshot`,
-`InputStatus`, the two wire message enums, `key::Key` and `key::Modifiers`.
-Each is somewhere a version-1 addition can land, and each is something an
-adapter matches on. Without the attribute, one new key or one new input kind
-would fail to compile every app that had integrated taria. With it, the cost
-is a wildcard arm apiece, or a `..` in a pattern, plus `Modifiers::NONE` and
-`Modifiers::new` in place of the struct literal it closes.
+Neither the `..` nor the wildcard arm is boilerplate to skip, and they answer
+different additions. Ten types in `taria` are `#[non_exhaustive]`:
+`AgentInput`, `Action`, `Role`, `Node`, `Snapshot`, `InputStatus`, the two
+wire message enums, `key::Key` and `key::Modifiers`. So are six struct-like
+variants inside them: `AppToBridge::Hello` and `Ack`, `BridgeToApp::Input`,
+and `AgentInput`'s `Act`, `Key` and `Text`. The enums are where a new variant
+lands and the variants are where a new field lands, and both are things an
+adapter matches on. Without the attributes, one new key, one new field or one
+new input kind would fail to compile every app that had integrated taria.
+With them the cost is a `..` at the end of a pattern, a wildcard arm per enum
+matched on, `Modifiers::NONE` and `Modifiers::new` in place of the struct
+literal `Modifiers` closes, and a constructor in place of each marked
+variant's literal: `AgentInput::act`, `key` and `text`, `AppToBridge::hello`
+and `ack`, `BridgeToApp::input`.
 
-Be honest about what that means: text is typing, not appending to a field. It
-lands wherever focus is. Sent while a list has focus it meets the list's
-single-key bindings, where `q` may quit and `d` may delete. An agent that
-wants text in an input focuses the input first. Say so in the app's own docs
-if the distinction can bite.
+Through this adapter, the wildcard arm is not where an input kind you cannot
+read arrives. That is `AgentInput::Unknown`, the fallback a kind added after
+your build parses as, and the layer answers it `Ignored` on your behalf and
+never queues it, counting it in `unknown_inputs()`. The fallback exists
+because the `InputId` sits on the message rather than inside the input, so
+degrading the input is what keeps the id and makes an ack possible at all;
+without it the line fails whole and the agent waits out a timeout for an ack
+that was never going to come. What does reach your wildcard is the other
+case: your app rebuilt against a taria that added an input kind, before you
+have written the arm for it. The arm is what makes that a recompile.
 
-Lowering into the keyboard path also means an agent can reach every chord
-your app binds, and some it does not. The demo's list handler matched key
+Lowering `key` into the keyboard path also means an agent can reach every
+chord your app binds, and some it does not. The demo's list handler matched key
 codes while ignoring modifiers, so `ctrl+q` hit the `q` binding and quit the
 app, and `ctrl+enter` confirmed a deletion in the dialog. Neither chord was
 a binding the app meant to have. If your handlers match on `KeyCode` alone,
@@ -466,9 +564,69 @@ becomes a character and nowhere else; the character already says which one it
 is. Ctrl and alt are never text, and `ctrl+c` landing in a draft as the letter
 `c` is the one reading an agent sending it cannot have meant.
 
+## Typed text goes where your app puts typing
+
+The demo used to lower `Text` the way it lowers `Key`, one key event per
+character through `handle_key`. It is the obvious symmetry and it is a bug.
+With the list focused, `type_text("deploy")` met the list's single-key
+bindings: the `d` opened the confirm-delete dialog and the `y` later in the
+same word confirmed it. One call deleted a task, and the bridge reported
+plain success, because a task disappearing is a changed tree. An agent that
+asked to type a word was told it had typed it, and had destroyed something
+instead.
+
+Typed characters are not commands. Route them to whatever your app puts
+typing into, and report `Ignored` when nothing is:
+
+```rust
+/// Whether the app is accepting typed characters right now.
+fn accepts_typing(app: &App) -> bool {
+    app.dialog.is_none() && app.focus == Focus::Input
+}
+
+fn apply_text(app: &mut App, text: &str) -> Applied {
+    let mut typed = false;
+    for key in text_to_keys(text) {
+        if !accepts_typing(app) {
+            break;
+        }
+        // The text-entry handler, not the app's key bindings.
+        handle_input_key(app, key);
+        typed = true;
+    }
+    if typed {
+        Applied::Handled
+    } else {
+        Applied::Ignored
+    }
+}
+```
+
+The condition is re-checked per character, because typing can end the state
+that was accepting it. `text_to_keys` lowers a newline to Enter, Enter submits
+the draft and hands the keyboard back to the list, and the characters after it
+have nowhere left to go. Stopping there is the same judgement as the whole
+section: the alternative is those characters meeting the bindings of whatever
+inherited focus. Two tasks are two calls.
+
+The rule worth copying is not "text means the text field". It is that the app
+decides where typed characters go. An app whose typing surface is not a text
+field, a typing tutor scoring individual keystrokes for instance, routes
+`Text` to that surface instead, and reports `Ignored` only where it is
+accepting no typing at all. An app with several fields routes to the one that
+has the keyboard. What they share is the `Ignored`: an agent that types at the
+wrong moment hears about it in one round trip, rather than tripping bindings
+and being told it worked.
+
+`Key` keeps the raw lowering deliberately. An agent sending `key d` is asking
+for the `d` binding, and an app that routed keys into its draft too would have
+no fallback left for the parts of its UI with no semantic coverage. That
+difference is worth one line in your own README, because `type_text` is the
+one an agent has to aim: the tree's focused node is where it will land.
+
 ## Report what the layer threw away
 
-Two counters record input that never reached your state. Read them after the
+Four counters record agent traffic that went nowhere. Read them after the
 terminal is restored, never while the alternate screen is up.
 
 ```rust
@@ -487,13 +645,36 @@ let stale = layer.stale_inputs();
 if stale > 0 {
     eprintln!("my-app: discarded {stale} agent input(s): bridge went away");
 }
+// Inputs whose kind this build of taria cannot read. The layer acked each
+// one `Ignored` for you, so the agent was told; the version gap is yours.
+let unknown = layer.unknown_inputs();
+if unknown > 0 {
+    eprintln!("my-app: could not read {unknown} agent input(s): raise the taria dependency");
+}
+// Answers the bridge was too slow to collect. These inputs were applied;
+// it is the acks that were dropped, so the agent calls waiting on them
+// timed out instead of hearing what happened.
+let acks = layer.dropped_acks();
+if acks > 0 {
+    eprintln!("my-app: lost the answer to {acks} agent input(s): the bridge read too slowly");
+}
 ```
 
-Both are monotonic across reconnects and both are 0 on a disabled layer. The
-queue holds 256 inputs, so a nonzero `dropped_inputs` means an agent
+All four are monotonic across reconnects and all four are 0 on a disabled
+layer. The input queue holds 256, so a nonzero `dropped_inputs` means an agent
 outpaced the loop by a lot; a loop that only wakes on keyboard events gets
-there first. A nonzero `stale_inputs` means a bridge session ended with
-input still queued, which a harness restart mid-call will do.
+there first. A nonzero `stale_inputs` means a bridge session ended with input
+still queued, which a harness restart mid-call will do. A nonzero
+`unknown_inputs` means the bridge is built against a newer taria than the app,
+and the agent is asking for something this build has no way to do.
+
+`dropped_acks` is the one that points the other way. The ack queue holds 1024
+and drops the oldest, not the newest, because the answers an agent is still
+waiting on are the recent ones; the queue is bounded at all because a bridge
+that reads steadily but far slower than an agent sends never stalls long
+enough for the write timeout to disconnect it, and would otherwise grow the
+app out of memory. So a nonzero value is a report about the bridge, not about
+the app: the input landed and the caller was answered nowhere.
 
 ## Socket paths
 
@@ -526,13 +707,39 @@ than the kernel's `InvalidInput: path must be shorter than SUN_LEN`. The way
 out is one variable, set the same way for both processes:
 
 ```bash
-TARIA_SOCK=/tmp/my-app.sock ./my-app
-TARIA_SOCK=/tmp/my-app.sock taria-mcp --app my-app
+TARIA_SOCK=$XDG_RUNTIME_DIR/t.sock ./my-app
+TARIA_SOCK=$XDG_RUNTIME_DIR/t.sock taria-mcp --app my-app
 ```
 
 The parent directory is created with mode `0700` and vetted before binding: a
-real directory, owned by you, with no group or other permission bits. If you
-point `$TARIA_SOCK` somewhere shared, expect binding to be refused.
+real directory, owned by you, with no group or other permission bits. So the
+shorter path has to be somewhere private. `/tmp` is the reflex and it does not
+work: it is world-writable, the vetting refuses it, and the app comes up with
+taria disabled instead of with a shorter path. `$XDG_RUNTIME_DIR` is already
+private and already short; `~/.taria/` is the answer where that variable is
+unset.
+
+Binding is careful about what is already at the path, because it is a path the
+layer unlinks as well as binds:
+
+- Nothing there: bound.
+- A socket nothing is listening on, left by a run that was killed before it
+  could clean up: unlinked, then bound.
+- A socket another instance is serving: refused, with an error saying to give
+  the second instance a socket of its own. Taking it over would leave that
+  instance running with no way for a bridge to reach it, which is worse than
+  refusing, and the second app still starts because `bind_or_disabled` turns
+  the refusal into a disabled layer.
+- Anything that is not a socket: refused, and the file is left alone. The path
+  can come verbatim from `$TARIA_SOCK`, and a typo there is not a reason to
+  delete a file you meant to keep.
+
+Two copies of your app on one socket path is therefore a diagnosable state
+rather than a silent theft, and neither copy hangs at exit. The listener polls
+a shutdown flag rather than waiting to be woken by a connection to its own
+path, which is what used to hang the first copy: by the time the wake-up was
+sent, the path held the second copy's socket, whose listener took it while the
+first stayed parked.
 
 ## Checking your work
 
@@ -549,12 +756,15 @@ claude mcp add taria -- /path/to/taria/target/debug/taria-mcp --app my-app
 That registration line is Claude Code's; any MCP harness works, and the
 README's quick start walks the same steps against the demo app.
 
-The three things worth confirming by hand:
+The four things worth confirming by hand:
 
 - Exactly one node is focused in every state, including the empty ones.
 - Every id you publish still names the same thing after a delete.
 - An act your app deliberately refuses comes back as an ignored ack, not as
   silence.
+- `type_text` sent while nothing is accepting typing comes back ignored, and
+  changes nothing. Send a word carrying letters your app binds; the demo's was
+  "deploy".
 
 `scripts/e2e.py` and `scripts/adversarial.py` do this against the demo and
 are worth reading as a list of what can go wrong.
