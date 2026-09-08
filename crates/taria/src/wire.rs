@@ -40,6 +40,19 @@
 //! existing message, or an entirely new message variant, reaches an old peer as
 //! something it quietly ignores while the rest of the stream keeps working.
 //!
+//! Quietly ignoring the line is not the same as quietly ignoring the request,
+//! and in one direction the difference is the whole point. An ack answers an
+//! [`InputId`], and an id belongs to a [`BridgeToApp::Input`]: a variant that
+//! is not one cannot be acknowledged, so an old adapter skips it with nothing
+//! sent back and the agent that sent it waits out a timeout, which is exactly
+//! the failure [`AgentInput::Unknown`] exists to prevent one level down. So the
+//! rule for this direction is narrower than "additive": an addition that
+//! carries agent input must be a new [`AgentInput`] kind, never a new
+//! [`BridgeToApp`] variant. A new kind reaches an old app inside a message it
+//! already reads, degrades to [`AgentInput::Unknown`], and comes back as an ack
+//! the agent can act on. New [`BridgeToApp`] variants stay available for
+//! anything that is not input and wants no answer.
+//!
 //! Neither property covers a value nested inside a message the peer does want,
 //! which is why the vocabularies carry their own fallbacks: an unknown
 //! [`Role`](crate::Role) reads as [`Role::Other`](crate::Role::Other) and an
@@ -67,8 +80,11 @@
 //! [`AppToBridge`] and reading an [`InputStatus`]. So every type a version-1
 //! addition can reach is `#[non_exhaustive]`: those three, [`AgentInput`],
 //! [`Action`](crate::Action), [`Key`](crate::key::Key),
-//! [`Modifiers`](crate::key::Modifiers), [`Role`](crate::Role),
-//! [`Node`](crate::Node) and [`Snapshot`]. Marking them is itself a breaking
+//! [`Modifiers`](crate::key::Modifiers), [`KeyPress`](crate::key::KeyPress),
+//! [`Role`](crate::Role), [`Node`](crate::Node) and [`Snapshot`]. The key types
+//! are on that list even though a key travels as a string, because the string
+//! is parsed into them and an adapter takes the result by value. Marking them
+//! is itself a breaking
 //! change, which is why it is done before the first release rather than at the
 //! first addition. Each one costs an outside peer one wildcard arm (or one
 //! `..` in a pattern), and buys back that a new variant, field, role, action

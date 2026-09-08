@@ -33,6 +33,20 @@ const QUEUE_WAIT: Duration = Duration::from_millis(500);
 /// has to hold the acks a maximum burst draws.
 pub(crate) const MAX_KEY_REPEAT: u32 = 64;
 
+/// Longest string one `key` call may carry, in characters.
+///
+/// The grammar peels modifier prefixes without a limit, so `"ctrl+"` repeated
+/// enough times parses as the key it ends in and serializes to a line past the
+/// 1 MiB both peers treat as a broken connection: the app's reader finds no
+/// newline within its cap, drops the connection and discards every input still
+/// queued on it. One legal call cut the app off from its bridge, which is the
+/// hazard `act` and `type_text` already bound their payloads against.
+/// `ctrl+alt+shift+backspace`, the longest press this grammar spells, is 24
+/// characters, so this leaves room for longer aliases and for named keys the
+/// grammar has yet to learn while staying far short of a payload that costs the
+/// connection. It is also what makes the peeling loop's cost a constant.
+const MAX_KEY_CHARS: usize = 64;
+
 /// Longest string one `type_text` call may carry, in characters.
 ///
 /// A bounded payload keeps one call from monopolizing the app's input queue:
@@ -79,7 +93,8 @@ pub struct ActParams {
 /// Parameters for the `key` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct KeyParams {
-    /// Key to press, e.g. "q", "enter", "tab", "ctrl+c".
+    /// Key to press, e.g. "q", "enter", "tab", "ctrl+c", up to 64 characters.
+    #[schemars(length(min = 1, max = 64))]
     pub key: String,
     /// How many times to send this key, 1 to 64. Defaults to 1.
     #[schemars(range(min = 1, max = 64))]
@@ -335,8 +350,9 @@ impl TariaMcpServer {
                        times, so moving down five rows is one call. For literal text use \
                        type_text instead, which types a whole string in one call. Fallback for \
                        parts of the UI without semantic coverage; prefer act with an advertised \
-                       action. A key that does not match the accepted grammar is rejected, with \
-                       the grammar in the error. Returns the updated tree once the app reacts."
+                       action. The key string is one press, up to 64 characters. A key that does \
+                       not match the accepted grammar is rejected, with the grammar in the error. \
+                       Returns the updated tree once the app reacts."
     )]
     pub async fn key(
         &self,
@@ -344,6 +360,20 @@ impl TariaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         if key.is_empty() {
             return Err(McpError::invalid_params("key must be non-empty", None));
+        }
+        // Bounded before the parse, not only before the send, for the reason on
+        // [`MAX_KEY_CHARS`]: the string that costs the connection is one the
+        // parser accepts, and peeling a million modifiers to learn that is
+        // itself the wrong amount of work to do for one key.
+        let len = key.chars().count();
+        if len > MAX_KEY_CHARS {
+            return Err(McpError::invalid_params(
+                format!(
+                    "key is {len} characters, over the {MAX_KEY_CHARS} character limit for one \
+                     key call; a key is one press, so send it without the extra text"
+                ),
+                None,
+            ));
         }
         // Parse before sending: the app lowers keys with this same parser, so
         // a key it would refuse is refused here, where the agent sees why.
@@ -1418,6 +1448,48 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    /// The grammar peels modifier prefixes without a limit, so a key string of
+    /// repeated `ctrl+` parses fine and serializes to a line past the 1 MiB
+    /// cap both peers break the connection over. Bounding the string is what
+    /// keeps one legal call from cutting the app off from its bridge, and it
+    /// has to happen before the parse, which is the part that would spend a
+    /// million iterations on the same string.
+    #[tokio::test]
+    async fn key_refuses_a_string_over_the_limit() {
+        let server = detached_server();
+
+        let oversized = format!("{}a", "ctrl+".repeat(MAX_KEY_CHARS));
+        let len = oversized.chars().count();
+        let err = server
+            .key(Parameters(KeyParams {
+                key: oversized,
+                repeat: None,
+            }))
+            .await
+            .expect_err("a key string this long is not a key");
+        assert!(
+            err.message.contains(&MAX_KEY_CHARS.to_string())
+                && err.message.contains(&len.to_string()),
+            "the refusal must name the limit and what was sent: {}",
+            err.message
+        );
+
+        // At the limit the length is not what stops the call: a key that long
+        // still has to parse, and this one does not.
+        let err = server
+            .key(Parameters(KeyParams {
+                key: "x".repeat(MAX_KEY_CHARS),
+                repeat: None,
+            }))
+            .await
+            .expect_err("64 `x` characters are not a key");
+        assert!(
+            err.message.contains("unrecognized key"),
+            "the limit is a character count, not a second grammar: {}",
+            err.message
+        );
     }
 
     #[test]

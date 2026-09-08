@@ -210,14 +210,15 @@ message variant it cannot parse, but a peer rebuilt against the version that
 added one meets it in an exhaustive `match` and stops compiling, and the peers
 this format is written for are exactly the ones that match on these types: an
 adapter dispatching `BridgeToApp`, a bridge dispatching `AppToBridge`. So every
-type a version-1 addition can reach is `#[non_exhaustive]`. Ten of them:
+type a version-1 addition can reach is `#[non_exhaustive]`. Eleven of them:
 `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`, `Action`, `Role`,
-`Node`, `Snapshot`, `key::Key` and `key::Modifiers`. Marking a type is itself
-a breaking change, which is why it was done before the first release rather
-than at the first addition. Each costs an outside peer one wildcard arm, or
-one `..` in a pattern, and buys back that a new variant, field, role, action
-or key is a recompile rather than a repair. `Modifiers` gains `NONE` and a
-const `new` in exchange for the struct literal it closes.
+`Node`, `Snapshot`, `key::Key`, `key::Modifiers` and `key::KeyPress`. Marking a
+type is itself a breaking change, which is why it was done before the first
+release rather than at the first addition. Each costs an outside peer one
+wildcard arm, or one `..` in a pattern, and buys back that a new variant,
+field, role, action or key is a recompile rather than a repair. `Modifiers`
+gains `NONE` and a const `new` in exchange for the struct literal it closes,
+and `KeyPress` already had the const `new` its own marking needs.
 
 The same reasoning reaches one level in, to the variants. A new optional
 field on an existing message is the format's cheapest additive change and
@@ -333,7 +334,11 @@ and a silence.
   value was a single legal call that cut an app off from its bridge.
 - `key` parses the key string with `taria::key`, the same parser the adapter
   lowers with, so a key the app would refuse is refused here with the
-  grammar in the error. `repeat` is 1 to 64.
+  grammar in the error. `repeat` is 1 to 64, and the key string itself is 64
+  characters, checked before the parse: the grammar peels modifier prefixes
+  without a limit, so a megabyte of `ctrl+` parses to the key it ends in and
+  serializes to the line neither peer will read, the same single-legal-call
+  hole the `value` bound closes.
 - `type_text` takes up to 4096 characters. The adapter's `text_to_keys`
   lowers it into one key event per character; where those go is the app's,
   and it is the app's text-entry surface rather than its key bindings. An app

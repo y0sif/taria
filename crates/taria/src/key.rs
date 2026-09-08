@@ -98,7 +98,20 @@ impl Modifiers {
 }
 
 /// One key press: a [`Key`] plus the [`Modifiers`] held with it.
+///
+/// `#[non_exhaustive]` for the reason both of its field types carry it. A press
+/// is what an adapter takes by value ([`to_crossterm`] in `taria-ratatui` is
+/// the reference one), so the population that builds and destructures this
+/// struct is the same population a new field would break. The field this
+/// grammar is most likely to grow is the press/repeat/release distinction the
+/// Kitty protocol reports, which is additive on the wire because keys travel
+/// as strings, and would otherwise fail to compile every third-party adapter.
+/// [`new`](Self::new) is const and names both fields, so a peer keeps the one
+/// thing the attribute takes away.
+///
+/// [`to_crossterm`]: https://docs.rs/taria-ratatui/latest/taria_ratatui/key/fn.to_crossterm.html
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyPress {
     pub key: Key,
     pub modifiers: Modifiers,
@@ -217,7 +230,21 @@ fn parse(s: &str) -> Option<KeyPress> {
         "pagedown" => Key::PageDown,
         "space" => Key::Char(' '),
         other => {
-            let n: u8 = other.strip_prefix('f')?.parse().ok()?;
+            // Spelled out rather than handed to `parse`, whose integer grammar
+            // is wider than this one: it accepts a leading `+` and leading
+            // zeros, so `f+1`, `f01` and `f0000001` all reached `F(1)` while
+            // the grammar advertises `f1` through `f12` and nothing else. Each
+            // of them renders back as `f1`, leaving an agent comparing its
+            // request to the canonical form with a mismatch it cannot explain.
+            let digits = other.strip_prefix('f')?;
+            if digits.is_empty()
+                || digits.len() > 2
+                || !digits.bytes().all(|b| b.is_ascii_digit())
+                || digits.starts_with('0')
+            {
+                return None;
+            }
+            let n: u8 = digits.parse().ok()?;
             if (1..=12).contains(&n) {
                 Key::F(n)
             } else {
@@ -421,6 +448,16 @@ mod tests {
             "enterx",
             "ab",
             "ctrl+nope",
+            // Spellings Rust's integer parser would take for `f1`. The
+            // grammar advertises `f1` through `f12`, and all of these render
+            // back as `f1`, so accepting them hands an agent a canonical form
+            // it cannot derive from what it sent.
+            "f+1",
+            "f01",
+            "f0000001",
+            "ctrl+f+1",
+            "f 1",
+            "f１",
         ];
         for input in rejects {
             assert_eq!(press(input), None, "input: {input:?}");

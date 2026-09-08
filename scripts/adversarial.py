@@ -735,6 +735,70 @@ def probe_type_text_bounds(client, ctx):
     return "; ".join(info) + f"; 4096 accepted and all {len(payload)} typed"
 
 
+def probe_key_length_bound(client, ctx):
+    """The key string is bounded at 64 characters, and the app survives the
+    call that would have severed it.
+
+    The grammar peels modifier prefixes with no limit or dedup, so `ctrl+`
+    repeated enough times parses as the key it ends in and serializes to a line
+    past the 1 MiB cap the adapter breaks its connection over -- discarding
+    every input queued on that generation. `act` bounds its value against
+    exactly this and `type_text` its text; refusing the call is only half the
+    proof, so the app has to still take input afterwards.
+    """
+    before = client.read_tree()
+    severing = "ctrl+" * 300000 + "a"
+    try:
+        client.call_raw("key", {"key": severing})
+        raise StepFailure(f"key accepted a {len(severing)}-character string")
+    except ToolError as err:
+        require(
+            err.code == INVALID_PARAMS,
+            f"oversized key error code {err.code}, expected {INVALID_PARAMS}",
+        )
+        require(
+            "64" in err.message and str(len(severing)) in err.message,
+            f"oversized key error names neither the limit nor what was sent: "
+            f"{err.message[:120]}",
+        )
+
+    # The limit itself is not what stops a call: 64 characters reach the
+    # grammar, which is where a non-key is refused. A bound that refused its
+    # own limit would look identical from outside without this.
+    try:
+        client.call_raw("key", {"key": "x" * 64})
+        raise StepFailure("64 `x` characters were accepted as a key")
+    except ToolError as err:
+        require(
+            "unrecognized key" in err.message,
+            f"64 characters were refused for their length, not their grammar: "
+            f"{err.message[:120]}",
+        )
+
+    after = client.read_tree()
+    require(
+        after == before,
+        f"tree changed after rejected key calls: seq {before['seq']} -> "
+        f"{after['seq']}",
+    )
+
+    # The connection is what the bound defends, so the proof is that it still
+    # carries input. `select` rather than a key press, so this leaves the
+    # cursor somewhere the next probe can name.
+    rows = [item["id"] for item in task_items(before)]
+    require(len(rows) >= 1, f"need a row to park the cursor on, have {rows}")
+    tree = act(client, rows[0], "select", expect=EXPECT_ACK)
+    require(
+        one_focused(tree, "after the oversized key") == rows[0],
+        f"the app stopped taking input after the oversized key: select did not "
+        f"park the cursor on {rows[0]}",
+    )
+    return (
+        f"{len(severing)} chars rejected, 64 reached the grammar, app still "
+        f"took input ({rows[0]})"
+    )
+
+
 def probe_key_repeat_bounds(client, ctx):
     """repeat is 1 to 64: both out-of-range ends are refused, and the top of
     the range is accepted with every press landing."""
@@ -1440,6 +1504,7 @@ def main():
         ("rapid consecutive acts", probe_rapid_acts),
         ("empty key string", probe_empty_key),
         ("unparseable key string", probe_unparseable_key),
+        ("key length bound", probe_key_length_bound),
         ("key repeat bounds", probe_key_repeat_bounds),
         ("type_text bounds", probe_type_text_bounds),
         ("empty action string", probe_empty_action),
