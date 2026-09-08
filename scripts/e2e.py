@@ -1324,6 +1324,10 @@ def step_s_shutdown(client, ctx, app):
                 "taria-demo: could not read ",
                 "unreadable inputs (a taria version gap the demo cannot act across)",
             ),
+            (
+                "taria-demo: lost the answer to ",
+                "unanswered inputs (the bridge read the app's acks too slowly)",
+            ),
         )
         if marker in stderr
     ]
