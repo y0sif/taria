@@ -1,7 +1,9 @@
 //! taria-demo: a small task-manager TUI that an agent drives end to end
-//! through taria's semantic tree (lists, tabs, a text input, and a
-//! confirm-delete dialog), all reachable via semantic acts, with raw keys and
-//! typed text as fallbacks rather than as the way in.
+//! through taria's semantic tree (lists, tabs, a text input, a confirm-delete
+//! dialog, and the way out of the app), all reachable via semantic acts, with
+//! raw keys as a fallback rather than as the way in. Typed text is not a
+//! fallback: it goes to the field that accepts typing, and nowhere else (see
+//! [`mod@update`]).
 
 mod app;
 mod events;
@@ -66,6 +68,21 @@ fn main() -> io::Result<()> {
         eprintln!(
             "taria-demo: could not read {unknown} agent input(s): the bridge speaks a newer \
              taria than this app; raise the app's taria dependency"
+        );
+    }
+    // The fourth, and the one that points the other way: these inputs were
+    // applied, but the answers to them were dropped because the bridge was
+    // reading them slower than the app produced them. Every one of those is
+    // an agent call that was answered nowhere and waited out a timeout, so it
+    // belongs on this list even though the app itself lost nothing.
+    //
+    // Worded to start differently from the three above, because the e2e gate
+    // recognizes each of those lines by its opening words.
+    let acks = layer.dropped_acks();
+    if acks > 0 {
+        eprintln!(
+            "taria-demo: lost the answer to {acks} agent input(s): the bridge read them slower \
+             than the app answered them, so those agent calls waited out a timeout instead"
         );
     }
     result

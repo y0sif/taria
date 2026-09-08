@@ -749,16 +749,26 @@ def step_g_errors(client, ctx):
         )
         bogus_msg = err.message
 
+    # Which actions the input advertises depends on its state -- `activate`
+    # only while the draft would submit something, `dismiss` only while it
+    # holds the keyboard -- so the error is held against the tree's own list
+    # rather than a hard-coded one, and stays a real check whatever state the
+    # step before this one left behind.
+    advertised = [
+        action
+        for action in find(client.read_tree(), "input").get("actions", [])
+        if isinstance(action, str)
+    ]
+    require(advertised, "the input advertises nothing to be listed")
     try:
         client.call_raw("act", {"node": "input", "action": "toggle"})
         raise StepFailure("act with unadvertised action succeeded, expected an error")
     except ToolError as err:
+        missing = [name for name in advertised if name not in err.message]
         require(
-            "advertise" in err.message
-            and "set_value" in err.message
-            and "activate" in err.message,
-            f"unadvertised-action error does not list advertised ones: "
-            f"{err.message[:200]}",
+            "advertise" in err.message and not missing,
+            f"unadvertised-action error does not list advertised ones "
+            f"({missing} missing): {err.message[:200]}",
         )
     return (
         f"bogus id error lists ids ({bogus_msg[:40]}...), "

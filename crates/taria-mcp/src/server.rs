@@ -299,7 +299,7 @@ impl TariaMcpServer {
             return Err(McpError::invalid_params(
                 format!(
                     "unknown node id `{node}`; valid node ids: {}",
-                    ids.join(", ")
+                    id_list(&ids)
                 ),
                 None,
             ));
@@ -988,6 +988,32 @@ fn collect_node_ids(node: &Node, out: &mut Vec<String>) {
     }
 }
 
+/// How many node ids the unknown-node error names before it truncates.
+///
+/// Enough to be the whole tree for a normal screen, and small enough that a
+/// typo cannot cost an agent its context: uncapped, a 2001-node tree put
+/// nearly 21 KB of ids into a single error, and one wide table would put in
+/// far more.
+const MAX_LISTED_NODE_IDS: usize = 50;
+
+/// Render `ids` for an error message, capped at [`MAX_LISTED_NODE_IDS`].
+///
+/// A truncated list says how many it left out, because a list that merely
+/// stops reads as the complete set of ids, and an agent that believes that
+/// concludes the id it wants does not exist rather than reading the tree
+/// again.
+fn id_list(ids: &[String]) -> String {
+    if ids.len() <= MAX_LISTED_NODE_IDS {
+        return ids.join(", ");
+    }
+    format!(
+        "{}, and {} more not listed of {} in the tree; read_tree returns them all",
+        ids[..MAX_LISTED_NODE_IDS].join(", "),
+        ids.len() - MAX_LISTED_NODE_IDS,
+        ids.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1407,5 +1433,35 @@ mod tests {
         let mut ids = Vec::new();
         collect_node_ids(&root, &mut ids);
         assert_eq!(ids, vec!["app", "list", "item-1", "item-2"]);
+    }
+
+    /// The id list an unknown node id draws is bounded, and says so when it
+    /// is: uncapped it was 21 KB of an agent's context for a 2001-node tree,
+    /// and a list that just stops reads as the complete set of ids.
+    #[test]
+    fn the_id_list_is_capped_and_names_what_it_left_out() {
+        let ids: Vec<String> = (0..MAX_LISTED_NODE_IDS)
+            .map(|i| format!("node-{i}"))
+            .collect();
+        let listed = id_list(&ids);
+        assert!(listed.ends_with("node-49"), "listed: {listed}");
+        assert!(
+            !listed.contains("not listed"),
+            "a complete list must not claim to be partial: {listed}"
+        );
+
+        let ids: Vec<String> = (0..2001).map(|i| format!("node-{i}")).collect();
+        let listed = id_list(&ids);
+        assert!(listed.starts_with("node-0, node-1, "), "listed: {listed}");
+        assert!(!listed.contains("node-50"), "listed: {listed}");
+        assert!(
+            listed.contains("1951 more not listed of 2001 in the tree"),
+            "the truncation must name how many it left out: {listed}"
+        );
+        assert!(
+            listed.len() < 1024,
+            "a capped list is what keeps the error small, but it is {} bytes",
+            listed.len()
+        );
     }
 }

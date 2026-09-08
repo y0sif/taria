@@ -3,18 +3,29 @@
 //! Two entry points, both pure over [`App`]: [`update`] for terminal events
 //! and [`apply_agent_input`] for taria agent input. Semantic acts address
 //! nodes by the ids published in [`crate::tree::build_nodes`]; the raw-key
-//! and text fallbacks lower into the same key handler as the keyboard.
+//! fallback lowers into the same key handler as the keyboard.
 //!
-//! # Text is typing, not appending
+//! # Typed text goes where the app puts typing
 //!
-//! [`AgentInput::Text`] is lowered with [`text_to_keys`] and each event goes
-//! through the same [`handle_key`] path a person's keystroke takes. So text is
-//! literal typing into whatever currently has focus, not "append to the text
-//! field": sent while the list has focus it meets the list's single-key
-//! bindings, where `q` quits and `d` opens the delete dialog. That is the
-//! lowering doing its job. An agent that wants text in the input focuses the
-//! input first, by acting `set_value` on the `input` node or sending the `i`
-//! key, and only then types.
+//! [`AgentInput::Text`] is typing, so it is routed to this app's text-entry
+//! state, the new-task input, and never through [`handle_key`]. Lowered
+//! through the key handler instead, text sent while the list has focus meets
+//! the list's single-key bindings: one `type_text` of "deploy" opened the
+//! delete dialog on `d`, was answered `y` by its own last character, and cost
+//! a task, while the bridge reported plain success because a task vanishing is
+//! a changed tree. Text nothing is accepting is reported
+//! [`Ignored`](Applied::Ignored) instead, so an agent that types at the wrong
+//! moment hears about it rather than tripping bindings.
+//!
+//! The rule other apps should copy is not "text means the text field". It is
+//! that the app decides where typed characters go: an app whose typing surface
+//! is something else, a typing tutor scoring individual keystrokes for
+//! instance, routes [`AgentInput::Text`] to that surface and reports Ignored
+//! only where it is accepting no typing at all.
+//!
+//! [`AgentInput::Key`] keeps the raw lowering, deliberately. A key is a
+//! keypress and is supposed to reach the bindings, wherever focus happens to
+//! be; that is the difference between the two inputs.
 //!
 //! # Ignored input
 //!
@@ -58,8 +69,8 @@ pub fn update(app: &mut App, event: AppEvent) {
 /// A key that parses counts as handled even if nothing is bound to it, the
 /// same verdict a person gets for pressing an unbound key. What is ignored here
 /// is input this app cannot act on at all: a key the shared grammar rejects or
-/// the adapter cannot lower, and an input kind added to taria after this app
-/// was written.
+/// the adapter cannot lower, text sent while nothing here is accepting typing,
+/// and an input kind added to taria after this app was written.
 pub fn apply_agent_input(app: &mut App, input: AgentInput) -> Applied {
     match input {
         AgentInput::Act {
@@ -75,22 +86,53 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) -> Applied {
             }
             None => Applied::Ignored,
         },
-        AgentInput::Text { text, .. } => {
-            let keys = text_to_keys(&text);
-            if keys.is_empty() {
-                return Applied::Ignored;
-            }
-            for key in keys {
-                handle_key(app, key);
-            }
-            Applied::Handled
-        }
+        AgentInput::Text { text, .. } => apply_text(app, &text),
         // An input kind taria added after this app was written. Reported the
         // way the app reports every other input it looks at and does not act
         // on, so the agent hears "this app did nothing with it" rather than
         // waiting out the bridge's window for an effect that cannot come.
         _ => Applied::Ignored,
     }
+}
+
+/// Type `text` into this app's text-entry state, one character at a time.
+///
+/// Routed here rather than lowered through [`handle_key`] the way
+/// [`AgentInput::Key`] is: typing belongs wherever the app puts typed
+/// characters, and in this app that is the new-task input alone. So nothing is
+/// typed while the list has the keyboard or the modal dialog is up, and the
+/// caller reports [`Ignored`](Applied::Ignored), rather than the text meeting
+/// the list's `d` and `y` bindings and deleting a task.
+///
+/// A newline mid-string still submits the draft, because [`text_to_keys`]
+/// lowers it to Enter and that is what Enter does here. The characters after
+/// it are not typed: submitting hands the keyboard back to the list, and this
+/// app has nowhere else to put typing. Two tasks are two calls.
+fn apply_text(app: &mut App, text: &str) -> Applied {
+    let keys = text_to_keys(text);
+    let mut typed = false;
+    for key in keys {
+        if !accepts_typing(app) {
+            break;
+        }
+        handle_input_key(app, key);
+        typed = true;
+    }
+    if typed {
+        Applied::Handled
+    } else {
+        Applied::Ignored
+    }
+}
+
+/// Whether the app is accepting typed characters right now.
+///
+/// The one surface that takes typing is the new-task input, and only while it
+/// holds the keyboard: the modal dialog covers it, and the list's keys are
+/// commands rather than text. The tree says the same thing, since `input` is
+/// the focused node in exactly these states.
+fn accepts_typing(app: &App) -> bool {
+    app.dialog.is_none() && app.focus == Focus::Input
 }
 
 fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -> Applied {
@@ -123,6 +165,15 @@ fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -
         },
         ("input", Action::Activate) => submit_input(app),
         ("input", Action::Dismiss) => dismiss_input(app),
+        // The advertised way out. Until this existed, the only exit was the
+        // raw `q` key, which is the fallback the project's conventions keep
+        // off the primary path, and which types a letter rather than quitting
+        // whenever the input holds the keyboard. The footer has told a person
+        // `[q] quit` all along; this is the same affordance for an agent.
+        ("quit", Action::Activate) => {
+            app.running = false;
+            Applied::Handled
+        }
         // The dialog's nodes exist only while it is open, so these three are
         // acts on a node that may be gone: an agent planning from a snapshot
         // it read just before the operator pressed `n` sends one against a
@@ -325,6 +376,13 @@ fn dismiss_input(app: &mut App) -> Applied {
 /// Submit the input draft as a new task and hand focus back to the list with
 /// the new task selected. An empty draft adds nothing and is reported
 /// ignored, so an agent that activates too early hears about it.
+///
+/// A new task is active, so it lives on the Active tab, and submitting from
+/// the Done tab used to leave it in no published node at all: the draft
+/// cleared, the tree changed, the cursor stayed put, and an agent that then
+/// read the tree found nothing it had asked for and could reasonably submit
+/// again. Showing the tab the task landed on is what makes the addition
+/// observable, and it is what a person adding a task wants to see too.
 fn submit_input(app: &mut App) -> Applied {
     let title = app.input.trim().to_string();
     if title.is_empty() {
@@ -333,8 +391,7 @@ fn submit_input(app: &mut App) -> Applied {
     let id = app.add_task(title);
     app.input.clear();
     app.focus = Focus::List;
-    // A new task is active, so it appears only on the Active tab; select it
-    // there and leave the cursor alone on the Done tab.
+    switch_tab(app, Tab::Active);
     if let Some(pos) = app.visible_position(id) {
         app.selection = pos;
     }
@@ -463,6 +520,10 @@ mod tests {
         assert!(app.input.is_empty());
     }
 
+    /// The tree stops advertising `activate` on an empty draft (see
+    /// [`crate::tree`]), so this is now the answer to an act sent against a
+    /// tree read before the draft was cleared, not to one an agent could read
+    /// as available.
     #[test]
     fn activate_on_empty_input_adds_nothing() {
         let mut app = App::new();
@@ -474,6 +535,60 @@ mod tests {
             "an agent that activates an empty draft hears that nothing happened"
         );
         assert_eq!(app.tasks.len(), before);
+    }
+
+    /// Submitting while the Done tab was on screen used to create a task that
+    /// appeared in no published node: the draft cleared and the tree changed,
+    /// so the bridge reported success, while an agent reading the tree back
+    /// found nothing it had asked for and could reasonably submit again. A
+    /// new task is active, so the app shows the tab it landed on.
+    #[test]
+    fn submitting_from_the_done_tab_shows_the_task_it_created() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("tab-done", Action::Select));
+        assert_eq!(app.tab, Tab::Done);
+
+        apply_agent_input(&mut app, act_value("input", Action::SetValue, "Ship it"));
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Activate)),
+            Applied::Handled
+        );
+
+        let id = app.tasks.last().unwrap().id;
+        assert_eq!(app.task(id).unwrap().title, "Ship it");
+        assert_eq!(app.tab, Tab::Active, "the tab the new task lives on");
+        assert_eq!(
+            app.selected_id(),
+            Some(id),
+            "and the cursor names it, so the addition is readable"
+        );
+    }
+
+    /// The advertised exit. Without it the only way out is the raw `q` key,
+    /// which is the fallback the project keeps off the primary path, and
+    /// which types a letter while the input holds the keyboard.
+    #[test]
+    fn agent_can_quit_through_the_quit_node() {
+        let mut app = App::new();
+        assert!(app.running);
+        assert_eq!(
+            apply_agent_input(&mut app, act("quit", Action::Activate)),
+            Applied::Handled
+        );
+        assert!(!app.running);
+    }
+
+    /// And the modal gate covers it like every other node outside the dialog:
+    /// a dialog asking whether to delete a task is not a moment to quit.
+    #[test]
+    fn quit_is_blocked_while_the_dialog_is_open() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
+        assert_eq!(
+            apply_agent_input(&mut app, act("quit", Action::Activate)),
+            Applied::Ignored
+        );
+        assert!(app.running, "the dialog must stop the quit");
     }
 
     #[test]
@@ -626,34 +741,91 @@ mod tests {
         assert_eq!(app.focus, Focus::List);
     }
 
+    /// The bug this routing exists to end: `type_text("deploy")` with the
+    /// list focused used to lower to plain key events, where `d` opened the
+    /// delete dialog and the `y` in the same word confirmed it. One call
+    /// deleted a task and the bridge reported success, because a task
+    /// vanishing is a changed tree.
     #[test]
-    fn text_is_literal_typing_so_the_list_sees_its_own_bindings() {
-        // The consequence documented in the module header: text lowers to key
-        // events for whatever has focus, so text sent while the list has
-        // focus meets the list's single-key bindings instead of appending
-        // anywhere. Correct lowering, not a bug.
+    fn text_at_the_list_types_nothing_and_says_so() {
         let mut app = App::new();
         assert_eq!(app.focus, Focus::List);
+        let before = app.tasks.clone();
 
-        assert_eq!(apply_agent_input(&mut app, text("d")), Applied::Handled);
-        assert_eq!(app.dialog, Some(1), "d opened the delete dialog");
-        apply_agent_input(&mut app, text("n"));
-        assert_eq!(app.dialog, None, "n cancelled it");
+        assert_eq!(
+            apply_agent_input(&mut app, text("deploy")),
+            Applied::Ignored,
+            "the list accepts no typing, and the agent has to hear that"
+        );
+        assert_eq!(app.tasks, before, "not one task may be touched");
+        assert_eq!(app.dialog, None, "no `d` may reach the delete binding");
+        assert!(app.running, "no `q` may reach the quit binding");
+        assert!(app.input.is_empty(), "nothing was typed anywhere");
 
-        apply_agent_input(&mut app, text("q"));
-        assert!(!app.running, "q quit instead of typing a letter");
-        assert!(app.input.is_empty(), "nothing reached the input");
+        // The raw key fallback is unchanged: a keypress is a keypress and is
+        // supposed to reach the bindings.
+        assert_eq!(apply_agent_input(&mut app, key("d")), Applied::Handled);
+        assert_eq!(app.dialog, Some(1), "key d still opens the dialog");
+    }
+
+    /// The modal is the other state accepting no typing, and the one where
+    /// the old lowering cost a task: `y` inside the text confirmed the
+    /// delete.
+    #[test]
+    fn text_at_the_dialog_types_nothing_and_says_so() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
+        assert_eq!(app.dialog, Some(1));
+        let before = app.tasks.clone();
+
+        assert_eq!(
+            apply_agent_input(&mut app, text("yes please")),
+            Applied::Ignored
+        );
+        assert_eq!(app.dialog, Some(1), "the dialog is still asking");
+        assert_eq!(app.tasks, before, "nothing was deleted");
+        assert!(app.input.is_empty());
+    }
+
+    /// A newline mid-string submits, which hands the keyboard back to the
+    /// list, and this app has no second typing surface for the rest. It stops
+    /// there rather than typing the tail into a draft nothing is looking at.
+    #[test]
+    fn text_stops_where_the_app_stops_accepting_typing() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act_value("input", Action::SetValue, ""));
+        let before = app.tasks.len();
+
+        assert_eq!(
+            apply_agent_input(&mut app, text("first\nsecond")),
+            Applied::Handled
+        );
+        assert_eq!(app.tasks.len(), before + 1, "one task, not two");
+        assert_eq!(app.tasks.last().unwrap().title, "first");
+        assert_eq!(
+            app.focus,
+            Focus::List,
+            "the submit handed the keyboard back"
+        );
+        assert!(
+            app.input.is_empty(),
+            "the tail was not typed into a new draft"
+        );
     }
 
     #[test]
     fn empty_text_reports_ignored() {
         let mut app = App::new();
+        apply_agent_input(&mut app, act_value("input", Action::SetValue, "draft"));
+        assert_eq!(app.focus, Focus::Input, "the input is accepting typing");
+
         assert_eq!(apply_agent_input(&mut app, text("")), Applied::Ignored);
         assert_eq!(
             apply_agent_input(&mut app, text("\r")),
             Applied::Ignored,
             "a lone carriage return lowers to no key events"
         );
+        assert_eq!(app.input, "draft", "neither touched the draft");
     }
 
     #[test]

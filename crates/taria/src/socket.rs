@@ -181,7 +181,11 @@ impl fmt::Display for SocketPathTooLong {
         write!(
             f,
             "socket path {} is {} bytes, over the {MAX_SOCKET_PATH_BYTES} byte limit for Unix \
-             sockets on {}; set $TARIA_SOCK to a shorter path, for example /tmp/taria.sock",
+             sockets on {}; set $TARIA_SOCK to a shorter path inside a directory only you can \
+             reach, for example $XDG_RUNTIME_DIR/t.sock, or ~/.taria/t.sock where that variable \
+             is unset. A shared directory such as /tmp will not work: the adapter binds only \
+             under a directory you own that grants no group or other access, and creates a \
+             missing one with mode 0700",
             self.path.display(),
             self.len,
             std::env::consts::OS,

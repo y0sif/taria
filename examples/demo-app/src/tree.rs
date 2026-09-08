@@ -27,7 +27,12 @@ pub const TASK_IDS: IdSpace = IdSpace::new("task");
 /// the cursor sits on, and it is published in every state so moving the
 /// cursor is observable even when the keyboard belongs to the input.
 pub fn build_nodes(app: &App) -> Vec<Node> {
-    let mut nodes = vec![tabs_node(app), list_node(app), input_node(app)];
+    let mut nodes = vec![
+        tabs_node(app),
+        list_node(app),
+        input_node(app),
+        quit_node(app),
+    ];
     if let Some(dialog) = dialog_node(app) {
         nodes.push(dialog);
     }
@@ -107,7 +112,15 @@ fn input_node(app: &App) -> Node {
         .value(app.input.clone())
         .focused(focused);
     if !modal {
-        node = node.actions([Action::SetValue, Action::Activate]);
+        node = node.action(Action::SetValue);
+        // `activate` submits the draft, and an empty one submits nothing:
+        // advertising it there was the tree's only advertised-but-ignored
+        // pair, which teaches an agent that an advertised action may quietly
+        // do nothing. The condition is `submit_input`'s own, whitespace
+        // included, so the advertisement and the behaviour cannot drift.
+        if !app.input.trim().is_empty() {
+            node = node.action(Action::Activate);
+        }
         // The way back out, advertised only while the input holds the
         // keyboard, because that is when there is something to hand back.
         // Without it the input is a focus trap: `set_value` moves focus here
@@ -118,6 +131,23 @@ fn input_node(app: &App) -> Node {
         if focused {
             node = node.action(Action::Dismiss);
         }
+    }
+    node
+}
+
+/// The way out of the app, as a node rather than as a key an agent has to
+/// know about.
+///
+/// The footer has always told a person `[q] quit`, while the tree advertised
+/// no exit at all, so an agent's only way to close the demo was the raw-key
+/// fallback the project's conventions keep off the primary path (and which
+/// types the letter `q` whenever the input holds the keyboard). The modal
+/// strips its action like every other node's, because a dialog asking about a
+/// delete is not a moment to quit.
+fn quit_node(app: &App) -> Node {
+    let mut node = Node::new("quit", Role::Button).label("Quit");
+    if app.dialog.is_none() {
+        node = node.action(Action::Activate);
     }
     node
 }
@@ -212,6 +242,7 @@ mod tests {
                 "task-3",
                 "task-4",
                 "input",
+                "quit",
             ]
         );
         assert_eq!(
@@ -379,8 +410,67 @@ mod tests {
             ]
         );
         let input = find(&nodes, "input").unwrap();
-        assert_eq!(input.actions, vec![Action::SetValue, Action::Activate]);
+        assert_eq!(
+            input.actions,
+            vec![Action::SetValue],
+            "an empty draft has nothing to submit, so `activate` is not offered"
+        );
         assert_eq!(input.label.as_deref(), Some("New task"));
+        let quit = find(&nodes, "quit").unwrap();
+        assert_eq!(quit.actions, vec![Action::Activate]);
+        assert_eq!(quit.label.as_deref(), Some("Quit"));
+    }
+
+    /// `activate` on the input was the tree's one advertised-but-ignored
+    /// pair: offered whatever the draft held, and ignored whenever the draft
+    /// was empty, which teaches an agent that an advertised action may do
+    /// nothing. It now tracks `submit_input`'s own condition, whitespace
+    /// included.
+    #[test]
+    fn the_input_advertises_activate_only_when_there_is_something_to_submit() {
+        let mut app = App::new();
+        let input_actions = |app: &App| find(&build_nodes(app), "input").unwrap().actions.clone();
+
+        assert!(!input_actions(&app).contains(&Action::Activate));
+
+        app.input = "   ".into();
+        assert!(
+            !input_actions(&app).contains(&Action::Activate),
+            "a whitespace-only draft submits nothing, so it advertises nothing"
+        );
+
+        app.input = " real ".into();
+        assert!(
+            input_actions(&app).contains(&Action::Activate),
+            "a draft that would submit advertises the way to submit it"
+        );
+
+        // And what it advertises is what the app does with it.
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Activate)),
+            crate::update::Applied::Handled
+        );
+        assert!(!input_actions(&app).contains(&Action::Activate));
+    }
+
+    /// The footer has told a person `[q] quit` since the demo existed, while
+    /// the tree advertised no exit at all, leaving an agent the raw-key
+    /// fallback the project keeps off the primary path.
+    #[test]
+    fn the_tree_advertises_the_way_out_of_the_app() {
+        let mut app = App::new();
+        let quit = |app: &App| find(&build_nodes(app), "quit").unwrap().clone();
+        assert_eq!(quit(&app).actions, vec![Action::Activate]);
+
+        // Focus is unaffected: quitting is not where a keypress lands.
+        assert!(!quit(&app).focused);
+        assert_eq!(count_focused(&build_nodes(&app)), 1);
+
+        apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
+        assert!(
+            quit(&app).actions.is_empty(),
+            "the modal strips it like every other node outside the dialog"
+        );
     }
 
     #[test]
@@ -389,7 +479,7 @@ mod tests {
         apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
         let nodes = build_nodes(&app);
 
-        for id in ["tabs", "tab-active", "tab-done", "tasks", "input"] {
+        for id in ["tabs", "tab-active", "tab-done", "tasks", "input", "quit"] {
             assert!(
                 find(&nodes, id).unwrap().actions.is_empty(),
                 "{id} must advertise no actions while the dialog is open"
@@ -425,7 +515,12 @@ mod tests {
         let nodes = build_nodes(&app);
         assert_eq!(
             find(&nodes, "input").unwrap().actions,
-            vec![Action::SetValue, Action::Activate]
+            vec![Action::SetValue],
+            "the draft is empty, so `activate` stays unadvertised"
+        );
+        assert_eq!(
+            find(&nodes, "quit").unwrap().actions,
+            vec![Action::Activate]
         );
         assert_eq!(
             find(&nodes, "task-1").unwrap().actions,
@@ -475,7 +570,7 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             find(&build_nodes(&app), "input").unwrap().actions,
-            vec![Action::SetValue, Action::Activate],
+            vec![Action::SetValue],
             "with the list focused there is no keyboard to hand back"
         );
 
@@ -506,7 +601,8 @@ mod tests {
         assert_eq!(focused_id(&nodes).as_deref(), Some("task-1"));
         assert_eq!(
             find(&nodes, "input").unwrap().actions,
-            vec![Action::SetValue, Action::Activate]
+            vec![Action::SetValue],
+            "the draft went with the dismiss, and with it the way to submit it"
         );
     }
 
