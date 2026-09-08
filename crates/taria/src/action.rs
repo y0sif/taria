@@ -124,15 +124,22 @@ impl<'de> Deserialize<'de> for Action {
 /// Input submitted by an agent against a published snapshot.
 ///
 /// `#[non_exhaustive]` because a new way for an agent to address an app (a
-/// paste, a pointer event) is an additive message on the wire: an app skips a
-/// `kind` it cannot parse. Without the attribute the same addition breaks the
-/// build of every app that matches on this enum to apply agent input, which is
-/// every app using an adapter.
+/// paste, a pointer event) is an additive message on the wire: an app reads a
+/// `kind` it does not know as [`Unknown`](Self::Unknown). Without the
+/// attribute the same addition breaks the build of every app that matches on
+/// this enum to apply agent input, which is every app using an adapter.
+///
+/// Each variant carrying fields is marked too, so a field added to one of them
+/// is additive in Rust as well as on the wire. For a peer that means two
+/// things: build inputs with [`act`](Self::act), [`key`](Self::key) and
+/// [`text`](Self::text) rather than by struct literal, and end a destructuring
+/// pattern with `..`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 #[non_exhaustive]
 pub enum AgentInput {
     /// Invoke an advertised action on a node.
+    #[non_exhaustive]
     Act {
         node: NodeId,
         action: Action,
@@ -143,10 +150,69 @@ pub enum AgentInput {
     ///
     /// The string follows the grammar in [`key`](crate::key), which both peers
     /// parse with the same code.
+    #[non_exhaustive]
     Key { key: String },
     /// Literal text to type, lowered by the adapter into one key event per
     /// character. One message instead of one round trip per character.
+    #[non_exhaustive]
     Text { text: String },
+    /// An input whose `kind` this build does not recognize.
+    ///
+    /// It carries nothing beyond that fact. The tag it arrived under is gone
+    /// and so is whatever it asked for, because there is no field here to keep
+    /// them in. What survives is the [`InputId`](crate::wire::InputId) on the
+    /// [`BridgeToApp::Input`](crate::wire::BridgeToApp::Input) around it, and
+    /// that is the whole point of the variant: without it one input kind added
+    /// in a later version 1 release fails the entire line, an app built before
+    /// that kind skips the line, and the agent waits out a timeout for an ack
+    /// that was never possible.
+    ///
+    /// So the right answer to one is an
+    /// [`Ignored`](crate::wire::InputStatus::Ignored) ack, not a dropped line.
+    /// The app did do nothing with the input, which is exactly what `Ignored`
+    /// means, and the agent learns it in one round trip instead of a timeout.
+    ///
+    /// A sender never builds this deliberately, which is why it has no
+    /// constructor and no fields: it exists only as something a reader
+    /// produces.
+    #[serde(other)]
+    Unknown,
+}
+
+impl AgentInput {
+    /// Build an [`Act`](Self::Act) input.
+    ///
+    /// `value` is the argument of an action that takes one, the text for
+    /// [`Action::SetValue`] or the row for a select, and `None` for the
+    /// actions that do not. It is one constructor taking an option rather than
+    /// a pair of constructors because the only thing that builds an act is a
+    /// bridge relaying what an agent asked for, and an optional argument is
+    /// already what it holds: splitting this in two would make that caller
+    /// match on the option to rebuild the same value. It also keeps every
+    /// field of the variant reachable through one entry point, so a peer
+    /// author has nothing to discover.
+    pub fn act(node: NodeId, action: Action, value: Option<String>) -> Self {
+        Self::Act {
+            node,
+            action,
+            value,
+        }
+    }
+
+    /// Build a [`Key`](Self::Key) input.
+    ///
+    /// Nothing here parses the string. A key that does not match the grammar
+    /// in [`key`](crate::key) is worth rejecting before it costs a round trip,
+    /// but that is the bridge's call at the point it accepts the key from an
+    /// agent, not this constructor's.
+    pub fn key(key: impl Into<String>) -> Self {
+        Self::Key { key: key.into() }
+    }
+
+    /// Build a [`Text`](Self::Text) input.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
 }
 
 #[cfg(test)]
@@ -387,5 +453,77 @@ mod tests {
             let json = serde_json::to_string(&input).unwrap();
             assert_eq!(json, expected, "input: {input:?}");
         }
+    }
+
+    #[test]
+    fn the_constructors_reach_every_field() {
+        // The variants are `#[non_exhaustive]`, so outside this crate these
+        // are the only way to build one. Each must reach every field.
+        assert_eq!(
+            AgentInput::act(
+                NodeId("input-1".into()),
+                Action::SetValue,
+                Some("hello".into())
+            ),
+            AgentInput::Act {
+                node: NodeId("input-1".into()),
+                action: Action::SetValue,
+                value: Some("hello".into()),
+            }
+        );
+        assert_eq!(
+            AgentInput::act(NodeId("btn-1".into()), Action::Activate, None),
+            AgentInput::Act {
+                node: NodeId("btn-1".into()),
+                action: Action::Activate,
+                value: None,
+            }
+        );
+        assert_eq!(
+            AgentInput::key("ctrl+c"),
+            AgentInput::Key {
+                key: "ctrl+c".into()
+            }
+        );
+        assert_eq!(
+            AgentInput::text("buy milk"),
+            AgentInput::Text {
+                text: "buy milk".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_kind_reads_as_unknown() {
+        // Every shape a later version 1 release might send under a kind this
+        // build has never heard of, including one carrying nested objects.
+        for line in [
+            r#"{"kind":"paste","text":"hello"}"#,
+            r#"{"kind":"pointer","at":{"x":3,"y":9},"button":"left"}"#,
+            r#"{"kind":"unknown"}"#,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<AgentInput>(line).unwrap(),
+                AgentInput::Unknown,
+                "{line}"
+            );
+        }
+
+        // Its own spelling, which is all a round trip through this build can
+        // produce: the kind it stood for is not recoverable.
+        assert_eq!(
+            serde_json::to_string(&AgentInput::Unknown).unwrap(),
+            r#"{"kind":"unknown"}"#
+        );
+    }
+
+    #[test]
+    fn a_malformed_input_is_still_an_error() {
+        // The fallback must not turn into accepting anything: an input with no
+        // kind at all, or a known kind missing the field that kind is made of,
+        // is a real parse failure and not something to ack.
+        assert!(serde_json::from_str::<AgentInput>(r#"{"text":"hello"}"#).is_err());
+        assert!(serde_json::from_str::<AgentInput>(r#"{"kind":"key"}"#).is_err());
+        assert!(serde_json::from_str::<AgentInput>("7").is_err());
     }
 }

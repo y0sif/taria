@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fmt;
 
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
@@ -192,6 +193,79 @@ impl<'de> Deserialize<'de> for Role {
     }
 }
 
+/// Deepest node tree a peer is expected to parse, counting the snapshot root
+/// as level 1.
+///
+/// A [`Snapshot`](crate::Snapshot) travels as one JSON object, and JSON
+/// parsers bound how far they will recurse into one. `serde_json`, which both
+/// reference peers use, stops at 128 nested values, and every [`Node`] costs
+/// two of them: its own object and its `children` array. Measured through a
+/// whole `{"type":"snapshot",...}` line rather than a bare node, 63 nested
+/// nodes parse and 64 fail.
+///
+/// Nothing reports crossing that ceiling. The reader skips the line it cannot
+/// parse, exactly as it skips a truncated one, so a deep first snapshot leaves
+/// a bridge saying it has no tree yet while the app is connected and healthy,
+/// and a deep later snapshot leaves it serving the last shallow tree with
+/// nothing marking it stale. Writing is worse than reading: serialization
+/// recurses per level too, and a tree thousands of levels deep exhausts the
+/// stack and aborts the process from inside a library thread.
+///
+/// This limit is a little under half the measured ceiling. The slack pays for
+/// the envelope a transport wraps around a snapshot, for a root an adapter
+/// adds above the nodes an app hands it, and for a peer whose parser is
+/// stricter than `serde_json`. It is still far past any hand-built widget
+/// tree: an app, its tabs, a pane, a list and its rows is six levels.
+///
+/// The trees that reach it are generated from data rather than written out,
+/// and [`Role::Tree`] invites the obvious one, a browser over a deep
+/// directory. Such an app should publish the expanded path instead of the
+/// whole structure, which is what a tree widget draws anyway: the rows the
+/// user can currently see. That makes the snapshot the size of the screen
+/// rather than the size of the data behind it.
+///
+/// This crate states the limit and offers [`Node::check_depth`]. It enforces
+/// nothing, because what to do about a tree that is too deep, truncate it,
+/// skip the publish, or tell the app, is the adapter's to decide.
+pub const MAX_NODE_DEPTH: usize = 32;
+
+/// A node tree deeper than [`MAX_NODE_DEPTH`].
+///
+/// Keeps the depth measured and the id of a node found at it, because an app
+/// that built the tree out of data has no other way to tell which branch ran
+/// away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeTooDeep {
+    depth: usize,
+    deepest: NodeId,
+}
+
+impl TreeTooDeep {
+    /// Depth measured, counting the root as level 1.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Id of a node at that depth. Several nodes can share the deepest level;
+    /// this is whichever the walk reached first, which is enough to find the
+    /// branch.
+    pub fn deepest(&self) -> &NodeId {
+        &self.deepest
+    }
+}
+
+impl fmt::Display for TreeTooDeep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "node tree is {} levels deep at node `{}`, over the {MAX_NODE_DEPTH} level limit for a taria snapshot",
+            self.depth, self.deepest.0
+        )
+    }
+}
+
+impl Error for TreeTooDeep {}
+
 /// One widget in the semantic tree.
 ///
 /// `#[non_exhaustive]` because a node is where new optional fields land, and
@@ -286,6 +360,47 @@ impl Node {
     pub fn children(mut self, children: impl IntoIterator<Item = Node>) -> Self {
         self.children.extend(children);
         self
+    }
+
+    /// Depth of the tree rooted here, counting this node as level 1.
+    ///
+    /// Walks with a vector rather than by recursing, so the one input it has
+    /// to survive, a tree deeper than the call stack, is exactly the one it
+    /// was written for. Its memory is the tree's width, not its depth.
+    pub fn depth(&self) -> usize {
+        self.deepest().0
+    }
+
+    /// Check this tree against [`MAX_NODE_DEPTH`] before publishing it.
+    ///
+    /// The failure it catches is silent at the peer, so an adapter that
+    /// publishes a generated tree should call this and report the error to
+    /// the app rather than letting the snapshot go out and disappear.
+    pub fn check_depth(&self) -> Result<(), TreeTooDeep> {
+        let (depth, deepest) = self.deepest();
+        if depth > MAX_NODE_DEPTH {
+            return Err(TreeTooDeep {
+                depth,
+                deepest: deepest.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Depth of this tree paired with the id of a node found at it, measured
+    /// in one iterative walk so both callers above pay for only one.
+    fn deepest(&self) -> (usize, &NodeId) {
+        let mut deepest = (1, &self.id);
+        let mut pending = vec![(self, 1usize)];
+        while let Some((node, level)) = pending.pop() {
+            if level > deepest.0 {
+                deepest = (level, &node.id);
+            }
+            for child in &node.children {
+                pending.push((child, level + 1));
+            }
+        }
+        deepest
     }
 }
 
@@ -477,5 +592,92 @@ mod tests {
         assert!(!json.contains("value"), "json: {json}");
         assert!(!json.contains("actions"), "json: {json}");
         assert!(!json.contains("children"), "json: {json}");
+    }
+
+    /// A chain of `depth` nodes, one child each: the root is `n1` and the
+    /// deepest node is `n{depth}`.
+    fn chain(depth: usize) -> Node {
+        let mut node = Node::new(format!("n{depth}"), Role::TreeItem);
+        for level in (1..depth).rev() {
+            node = Node::new(format!("n{level}"), Role::TreeItem).child(node);
+        }
+        node
+    }
+
+    /// Drop a tree without recursing, so a test may build one deeper than the
+    /// call stack. `Node`'s own `Drop` walks the children recursively, which
+    /// is the second half of why deep trees are a hazard rather than merely a
+    /// parsing limit.
+    fn drop_iteratively(root: Node) {
+        let mut pending = vec![root];
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+        }
+    }
+
+    #[test]
+    fn depth_counts_the_root_and_follows_the_longest_branch() {
+        assert_eq!(Node::new("leaf", Role::Text).depth(), 1);
+        assert_eq!(chain(9).depth(), 9);
+
+        // Two branches of different lengths: the longer one is the depth.
+        let root = Node::new("root", Role::App)
+            .child(Node::new("shallow", Role::Text))
+            .child(chain(3));
+        assert_eq!(root.depth(), 4);
+    }
+
+    #[test]
+    fn check_depth_passes_at_the_limit_and_names_the_node_past_it() {
+        assert!(chain(MAX_NODE_DEPTH).check_depth().is_ok());
+
+        let err = chain(MAX_NODE_DEPTH + 1).check_depth().unwrap_err();
+        assert_eq!(err.depth(), MAX_NODE_DEPTH + 1);
+        assert_eq!(err.deepest(), &NodeId(format!("n{}", MAX_NODE_DEPTH + 1)));
+
+        let message = err.to_string();
+        assert!(message.contains(&MAX_NODE_DEPTH.to_string()), "{message}");
+        assert!(
+            message.contains(&format!("n{}", MAX_NODE_DEPTH + 1)),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_call_stack_is_still_measurable() {
+        // The checker guards against trees a recursive walk cannot survive, so
+        // it must survive one itself. A recursive `depth` overflows a test
+        // thread's stack well before this.
+        let deep = chain(100_000);
+        assert_eq!(deep.depth(), 100_000);
+        assert!(deep.check_depth().is_err());
+        drop_iteratively(deep);
+    }
+
+    /// Where [`MAX_NODE_DEPTH`] comes from. `serde_json` stops at 128 nested
+    /// values and each node costs two, so through a whole snapshot message 63
+    /// nested nodes parse and 64 fail. This asserts headroom rather than that
+    /// exact number: a `serde_json` that raises its limit must not fail the
+    /// build, and one that lowers it under the constant must.
+    #[test]
+    fn the_depth_limit_has_headroom_under_the_parser() {
+        use crate::Snapshot;
+        use crate::wire::AppToBridge;
+
+        let parses = |depth: usize| {
+            let msg = AppToBridge::Snapshot(Snapshot::new(1, chain(depth)));
+            let line = serde_json::to_string(&msg).unwrap();
+            serde_json::from_str::<AppToBridge>(&line).is_ok()
+        };
+
+        assert!(parses(MAX_NODE_DEPTH), "a tree at the limit must parse");
+
+        if let Some(ceiling) = (MAX_NODE_DEPTH..=256).find(|&depth| !parses(depth)) {
+            assert!(
+                ceiling >= MAX_NODE_DEPTH + 16,
+                "only {} levels between the limit and the parser, which stops at {ceiling}",
+                ceiling - MAX_NODE_DEPTH
+            );
+        }
     }
 }

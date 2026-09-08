@@ -9,6 +9,11 @@
 //! and the bridge cannot disagree about the same string: [`key`] parses the key
 //! grammar, [`id`] builds and reads back prefixed node ids, and [`socket`]
 //! resolves the socket path. All of them are pure; this crate performs no I/O.
+//!
+//! One bound applies to every transport rather than to any one of them:
+//! [`MAX_NODE_DEPTH`], the deepest tree a peer is expected to parse. Past it a
+//! snapshot does not arrive at all, and nothing says so, which is why
+//! [`Node::check_depth`] exists for an adapter to call before publishing.
 
 mod action;
 pub mod id;
@@ -19,7 +24,7 @@ pub mod socket;
 pub mod wire;
 
 pub use action::{Action, AgentInput};
-pub use node::{Node, NodeId, Role};
+pub use node::{MAX_NODE_DEPTH, Node, NodeId, Role, TreeTooDeep};
 pub use snapshot::Snapshot;
 
 /// Protocol version, bumped on breaking changes to the wire format.

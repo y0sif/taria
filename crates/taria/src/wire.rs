@@ -74,6 +74,37 @@
 //! `..` in a pattern), and buys back that a new variant, field, role, action
 //! or key is a recompile rather than a repair.
 //!
+//! The same reasoning reaches one level further in. A new optional field on an
+//! existing message is the format's cheapest additive change and is also the
+//! one that breaks an outside peer hardest, because it breaks everything that
+//! builds or destructures that message. So the struct-like variants carry the
+//! attribute as well: [`AppToBridge::Hello`], [`AppToBridge::Ack`],
+//! [`BridgeToApp::Input`], and [`Act`](AgentInput::Act),
+//! [`Key`](AgentInput::Key) and [`Text`](AgentInput::Text) on [`AgentInput`].
+//! For a peer that means two habits: build them with the constructor beside
+//! each one, since a marked variant has no struct literal from outside, and
+//! end a destructuring pattern with `..`.
+//! [`AppToBridge::Snapshot`] needs neither. It is a
+//! newtype around [`Snapshot`], which is marked already and built by
+//! [`Snapshot::new`](crate::Snapshot::new).
+//!
+//! An unknown [`AgentInput`] kind degrades the same way a role or an action
+//! does, to [`AgentInput::Unknown`], and for a sharper reason than either: the
+//! [`InputId`] sits outside the input, on the message, so the fallback is what
+//! turns "an input this build cannot read" into an ack the agent receives
+//! rather than a skipped line it waits out.
+//!
+//! # Tree depth
+//!
+//! A snapshot is one JSON object, and JSON parsers bound how far they recurse
+//! into one, so there is a depth past which a tree stops arriving at all. It
+//! arrives as nothing rather than as an error: the reader skips the line the
+//! way it skips a truncated one, and goes on serving its last good tree.
+//! [`MAX_NODE_DEPTH`](crate::MAX_NODE_DEPTH) is the bound both peers can state
+//! and rely on, with the measurement it comes from;
+//! [`Node::check_depth`](crate::Node::check_depth) is what an adapter calls
+//! before publishing.
+//!
 //! Anything else needs a [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) bump:
 //! removing a field, renaming one, making an optional field required, or
 //! changing what an existing field or variant means. The last is the dangerous
@@ -108,6 +139,11 @@ pub type InputId = u64;
 #[non_exhaustive]
 pub enum AppToBridge {
     /// Handshake, sent once as the app's first message.
+    ///
+    /// `#[non_exhaustive]`: build it with [`hello`](Self::hello) and
+    /// destructure it with `..`, so a field added later (a capability list, a
+    /// process id) does not break the peer reading it.
+    #[non_exhaustive]
     Hello {
         /// Human-readable app name shown to agents (typically the binary name).
         app_label: String,
@@ -120,11 +156,37 @@ pub enum AppToBridge {
     ///
     /// Sent for every input received, so an agent waiting on an effect can tell
     /// "the app ignored this" from "the app has not got to it yet".
+    ///
+    /// `#[non_exhaustive]`: build it with [`ack`](Self::ack) and destructure it
+    /// with `..`.
+    #[non_exhaustive]
     Ack {
         /// The [`InputId`] of the input being answered.
         id: InputId,
         status: InputStatus,
     },
+}
+
+impl AppToBridge {
+    /// Build the [`Hello`](Self::Hello) handshake.
+    ///
+    /// The version is a parameter rather than filled in from
+    /// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION), unlike
+    /// [`Snapshot::new`](crate::Snapshot::new), because the messages anyone
+    /// hand-writes are mostly the mismatched ones: a bridge's tests have to be
+    /// able to build the hello they are testing their mismatch handling
+    /// against.
+    pub fn hello(app_label: impl Into<String>, protocol_version: u32) -> Self {
+        Self::Hello {
+            app_label: app_label.into(),
+            protocol_version,
+        }
+    }
+
+    /// Build an [`Ack`](Self::Ack) answering one input.
+    pub fn ack(id: InputId, status: InputStatus) -> Self {
+        Self::Ack { id, status }
+    }
 }
 
 /// Fate of one input, reported back by the app.
@@ -172,11 +234,25 @@ pub enum InputStatus {
 #[non_exhaustive]
 pub enum BridgeToApp {
     /// Agent input to apply against the latest snapshot.
+    ///
+    /// `#[non_exhaustive]`: build it with [`input`](Self::input) and
+    /// destructure it with `..`.
+    #[non_exhaustive]
     Input {
         /// Identifier the app echoes in its [`AppToBridge::Ack`].
         id: InputId,
         input: AgentInput,
     },
+}
+
+impl BridgeToApp {
+    /// Build an [`Input`](Self::Input) message.
+    ///
+    /// The id must not repeat for the lifetime of the bridge process; see
+    /// [`InputId`] for what a reused one costs.
+    pub fn input(id: InputId, input: AgentInput) -> Self {
+        Self::Input { id, input }
+    }
 }
 
 #[cfg(test)]
@@ -324,6 +400,52 @@ mod tests {
         assert_eq!(button.label.as_deref(), Some("Save"));
         assert_eq!(button.actions, vec![Action::Activate]);
         assert!(button.focused);
+    }
+
+    #[test]
+    fn the_constructors_build_the_variants_they_name() {
+        // Outside this crate the marked variants have no struct literal, so
+        // these are the only way to build them and must reach every field.
+        assert_eq!(
+            AppToBridge::hello("demo-app", 7),
+            AppToBridge::Hello {
+                app_label: "demo-app".into(),
+                protocol_version: 7,
+            }
+        );
+        assert_eq!(
+            AppToBridge::ack(9, InputStatus::Dropped),
+            AppToBridge::Ack {
+                id: 9,
+                status: InputStatus::Dropped,
+            }
+        );
+        assert_eq!(
+            BridgeToApp::input(9, AgentInput::key("q")),
+            BridgeToApp::Input {
+                id: 9,
+                input: AgentInput::Key { key: "q".into() },
+            }
+        );
+    }
+
+    #[test]
+    fn an_input_kind_from_a_later_version_keeps_its_id() {
+        // The whole reason `AgentInput::Unknown` exists. A kind this build has
+        // never heard of used to fail the line it arrived on, so the app
+        // skipped it and the agent waited out a timeout with no ack at all.
+        // The id lives on the message rather than inside the input, so it
+        // survives, and an ack becomes possible.
+        let line = r#"{"type":"input","id":41,"input":{"kind":"paste","text":"hi","from":"clip"}}"#;
+        let BridgeToApp::Input { id, input, .. } = serde_json::from_str(line).unwrap();
+        assert_eq!(id, 41);
+        assert_eq!(input, AgentInput::Unknown);
+
+        // And that is the ack: the app truly did nothing with the input.
+        assert_eq!(
+            serde_json::to_string(&AppToBridge::ack(id, InputStatus::Ignored)).unwrap(),
+            r#"{"type":"ack","id":41,"status":"ignored"}"#
+        );
     }
 
     #[test]
