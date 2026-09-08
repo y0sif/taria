@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -38,6 +39,53 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// or queueing without bound.
 const INPUT_QUEUE: usize = 256;
 
+/// How many acks may wait for the writer before the oldest is dropped.
+///
+/// Every other queue in the layer is bounded already: inputs stop at
+/// [`INPUT_QUEUE`], snapshots coalesce into a single latest. An ack queue that
+/// is not would let a bridge which reads steadily but far slower than an agent
+/// sends input, never slowly enough for [`WRITE_TIMEOUT`] to fire, grow the
+/// app's memory until the process is killed.
+///
+/// The *oldest* ack is the one dropped, the opposite end from the input queue:
+/// an ack answers one specific input, and the answers an agent is still
+/// waiting on are the newest, while the oldest name inputs whose waiter has
+/// long since timed out. Drops are counted (see [`TariaLayer::dropped_acks`]).
+const ACK_QUEUE: usize = 1024;
+
+/// How many delivered inputs stay answerable with [`TariaLayer::ack`].
+///
+/// An id is remembered from the moment the app dequeues it until its
+/// connection ends, or until this many further inputs have been delivered on
+/// that same connection. Remembering them is what lets [`TariaLayer::ack`]
+/// tell an id the live bridge is waiting on from one an earlier bridge sent
+/// (ids restart with each bridge process). Forgetting one only loses a late
+/// ack, which the peer already has to survive; remembering them without bound
+/// would be a leak in an app that runs for days.
+const ACKABLE_INPUTS: usize = INPUT_QUEUE;
+
+/// How long the listener naps between accept attempts.
+///
+/// The listener socket is non-blocking, so the thread is never parked in
+/// `accept()` and shutdown is noticed without anything connecting: [`Drop`]
+/// sets the flag and the thread returns within one nap. Waking a blocking
+/// `accept()` by connecting to the socket path cannot do that, because the
+/// path may by then hold a socket another process bound, whose listener would
+/// take the wake-up while this one stayed parked forever.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// How long to wait for the "is anything listening there?" probe that runs
+/// before an existing socket file is replaced.
+///
+/// `connect` is the only liveness probe the standard library offers, and it
+/// blocks with no timeout: a socket whose owner stopped accepting with a full
+/// backlog would park the app inside `bind`, during startup, which is the one
+/// thing taria promises never to do. So the probe runs on a thread of its own
+/// and its answer is waited for only this long; no answer in time means
+/// "cannot tell", which refuses the bind rather than unlinking a socket that
+/// may still be serving.
+const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// The embeddable taria endpoint for a ratatui app.
 ///
 /// Binding a layer opens a Unix domain socket and spawns a listener thread
@@ -57,8 +105,10 @@ const INPUT_QUEUE: usize = 256;
 /// can never stop an app from starting. Every method stays callable on a
 /// disabled layer, which is what lets an app keep one code path.
 ///
-/// Dropping the layer shuts the threads down and removes the socket file
-/// (best-effort).
+/// Dropping the layer shuts the threads down and removes the socket file, but
+/// only while that file is still the one this layer bound: a second instance
+/// that took the path over is serving a socket of its own there, and unlinking
+/// it would leave that instance running and unreachable.
 pub struct TariaLayer {
     app_label: String,
     socket_path: PathBuf,
@@ -74,6 +124,10 @@ struct Inner {
     shared: Arc<Shared>,
     input_rx: Receiver<QueuedInput>,
     listener: Option<JoinHandle<()>>,
+    /// Device and inode of the socket file as bound, so [`Drop`] can tell it
+    /// from a file that replaced it. `None` when it could not be read, which
+    /// makes every comparison fail and leaves the path alone.
+    socket_ident: Option<(u64, u64)>,
     seq: u64,
     last_root: Option<Node>,
     /// Snapshots published with a branch cut for depth, and the failure
@@ -108,8 +162,13 @@ impl TariaLayer {
     /// be a private directory (a real directory, owned by the current user,
     /// with no group/other permission bits); binding is refused otherwise,
     /// because a directory another user controls would let them replace or
-    /// redirect the socket. A stale socket file at the path is removed before
-    /// binding.
+    /// redirect the socket.
+    ///
+    /// A socket file left at the path by a run that never got to clean up is
+    /// removed before binding. Nothing else is: a file that is not a socket
+    /// stays where it is, and so does a socket another instance is still
+    /// serving. Both refuse the bind instead, with an error saying which it
+    /// was; see [`bind_at`](Self::bind_at).
     ///
     /// The label becomes the socket's file name, so it must be one: a label
     /// carrying a path separator, or `.` or `..`, is refused here rather than
@@ -130,6 +189,23 @@ impl TariaLayer {
     /// [`bind`](Self::bind) apply: a relative path (including a bare
     /// filename) is resolved against the current directory first, so the
     /// parent directory that would hold the socket is always vetted.
+    ///
+    /// # What is already at the path
+    ///
+    /// Binding needs the path to be free, and only a dead socket is cleared
+    /// to make it so:
+    ///
+    /// * nothing there: bound;
+    /// * a socket nothing is listening on, left by a run that was killed
+    ///   before it could clean up: unlinked, then bound;
+    /// * a socket another instance is serving: refused with
+    ///   [`AddrInUse`](io::ErrorKind::AddrInUse), because taking it over
+    ///   would leave that instance running with no way for a bridge to reach
+    ///   it. Run the second instance on a socket of its own instead;
+    /// * anything that is not a socket: refused with
+    ///   [`AlreadyExists`](io::ErrorKind::AlreadyExists), the file untouched.
+    ///   The path can come verbatim from `$TARIA_SOCK`, and a typo there is
+    ///   not a reason to delete a file the user meant to keep.
     pub fn bind_at(app_label: &str, socket_path: impl Into<PathBuf>) -> io::Result<Self> {
         // Absolutize before looking at the parent: a bare filename like
         // "app.sock" has an empty parent, which must not bypass the privacy
@@ -148,11 +224,20 @@ impl TariaLayer {
         {
             ensure_private_dir(parent)?;
         }
-        // Remove a stale socket left by a previous run; if this fails for any
-        // reason other than the file being absent, bind reports the real error.
-        let _ = fs::remove_file(&socket_path);
+        // Free the path if a dead socket is holding it, and refuse the bind
+        // if anything else is.
+        clear_socket_path(&socket_path)?;
 
         let listener = UnixListener::bind(&socket_path)?;
+        // Polled rather than parked in `accept()`, so shutdown needs no
+        // connection to be noticed; see `ACCEPT_POLL`.
+        if let Err(err) = listener.set_nonblocking(true) {
+            drop(listener);
+            let _ = fs::remove_file(&socket_path);
+            return Err(err);
+        }
+        // Identify the socket just bound, before anyone else can replace it.
+        let socket_ident = socket_ident(&socket_path);
         let shared = Arc::new(Shared {
             app_label: app_label.to_string(),
             state: Mutex::new(State::default()),
@@ -160,6 +245,7 @@ impl TariaLayer {
             dropped_inputs: AtomicU64::new(0),
             stale_inputs: AtomicU64::new(0),
             unknown_inputs: AtomicU64::new(0),
+            dropped_acks: AtomicU64::new(0),
         });
         let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
 
@@ -182,6 +268,7 @@ impl TariaLayer {
                 shared,
                 input_rx,
                 listener: Some(handle),
+                socket_ident,
                 seq: 0,
                 last_root: None,
                 truncated: 0,
@@ -310,7 +397,10 @@ impl TariaLayer {
     ///
     /// A `timeout` so large that no clock can hold the deadline (near
     /// [`Duration::MAX`]) waits for an input for as long as the queue can
-    /// deliver one, which is what such a deadline asks for anyway.
+    /// deliver one, which is what such a deadline asks for anyway. On a
+    /// disabled layer that is no time at all: its queue can never deliver, so
+    /// the call returns at once rather than parking the app forever on a wait
+    /// with no end.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<AgentInput> {
         self.recv_timeout_with_id(timeout).map(|(_, input)| input)
     }
@@ -334,10 +424,22 @@ impl TariaLayer {
     /// app can answer the input again later with [`ack`](Self::ack).
     pub fn recv_timeout_with_id(&self, timeout: Duration) -> Option<(InputId, AgentInput)> {
         let Some(inner) = self.inner.as_ref() else {
-            // No socket, so no input will ever arrive. Sleep it out anyway: a
-            // caller using this as its clock must not spin because taria
-            // happened to be unavailable.
-            thread::sleep(timeout);
+            // No socket, so no input will ever arrive. Sleep the timeout out
+            // anyway: a caller using this as its clock must not spin because
+            // taria happened to be unavailable.
+            //
+            // Except for a timeout no clock can hold, which asks to wait
+            // until an input arrives. A disabled layer's queue can never
+            // deliver one, so that wait would have no end, and freezing
+            // because taria could not bind is the very failure
+            // `bind_or_disabled` exists to prevent: an app pacing its loop on
+            // this call would run bound and hang unbound. Returning at once
+            // is also what the enabled path does with a queue that can no
+            // longer deliver, where `recv` on a channel whose senders are
+            // gone returns immediately.
+            if Instant::now().checked_add(timeout).is_some() {
+                thread::sleep(timeout);
+            }
             return None;
         };
         // Discarding a stale input must not cut the wait short: an app that
@@ -392,9 +494,20 @@ impl TariaLayer {
     ///
     /// The ack travels the same path as snapshots, so it can never overtake
     /// the snapshot published after it. Does nothing on a disabled layer.
+    ///
+    /// An id whose bridge connection has since ended is answered nowhere.
+    /// Ids are unique only within a bridge process and a fresh bridge counts
+    /// from the start again, so an id an app kept across a disconnect can
+    /// already name a live input of the next bridge's, and that bridge's
+    /// waiter must not be handed a verdict from a session it never saw.
+    /// Holding an id across a disconnect is not a mistake, so the drop is
+    /// silent: the peer this ack was for is gone, and there is nobody left to
+    /// tell. An id also stops being answerable once its connection has
+    /// delivered a queue's worth of newer inputs past it, which costs at most
+    /// a late ack the peer already has to survive.
     pub fn ack(&self, id: InputId, status: InputStatus) {
         if let Some(inner) = self.inner.as_ref() {
-            inner.shared.queue_ack(id, status);
+            inner.shared.queue_app_ack(id, status);
         }
     }
 
@@ -459,6 +572,27 @@ impl TariaLayer {
         self.inner.as_ref().map_or(0, |inner| {
             inner.shared.unknown_inputs.load(Ordering::Relaxed)
         })
+    }
+
+    /// How many acks have been dropped so far because more answers were
+    /// waiting for the bridge than the queue holds. Always 0 on a disabled
+    /// layer.
+    ///
+    /// Acks queue for the writer thread, and a bridge that reads steadily but
+    /// far slower than an agent sends input never stalls long enough for the
+    /// write timeout to disconnect it. The queue is bounded so the app cannot
+    /// be grown out of memory by such a peer; the oldest answers go first,
+    /// because the ones an agent is still waiting on are the newest.
+    ///
+    /// A nonzero value means some agent requests were answered nowhere and
+    /// their callers waited out a timeout instead. The slow end is the bridge,
+    /// not the app. Monotonic across reconnects, and read like
+    /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
+    /// restored, never while the app owns the alternate screen.
+    pub fn dropped_acks(&self) -> u64 {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.shared.dropped_acks.load(Ordering::Relaxed))
     }
 
     /// How many published snapshots have had a branch cut for being deeper
@@ -571,6 +705,14 @@ impl TariaLayer {
 impl Drop for TariaLayer {
     /// Stop the threads and unlink the socket. A disabled layer has neither,
     /// so it touches no filesystem at all.
+    ///
+    /// How long this takes depends only on what the threads are doing, never
+    /// on what is at the socket path. The listener polls the shutdown flag
+    /// rather than waiting to be woken by a connection, so it returns whether
+    /// the socket file was replaced by a second instance, removed, or is
+    /// being served by some other process; the worst case is one
+    /// [`ACCEPT_POLL`] nap, plus one [`WRITE_TIMEOUT`] if a connected bridge
+    /// has stopped reading mid-write.
     fn drop(&mut self) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -580,22 +722,33 @@ impl Drop for TariaLayer {
             state.shutdown = true;
             inner.shared.cv.notify_all();
         }
-        // Wake the listener thread if it is blocked in accept(); the dummy
-        // connection is never served because the shutdown flag is checked
-        // right after accept returns.
-        let woke_listener = UnixStream::connect(&self.socket_path).is_ok();
-        let listener = inner.listener.take();
-        // Join only when the wake-up actually landed. If the connect failed,
-        // say because the socket file is already gone, nothing will ever
-        // return the listener from accept() and join() would block forever,
-        // hanging the app at exit. Dropping the handle detaches the thread
-        // instead: a leaked thread in a process that is on its way out is
-        // strictly better than an app that will not close.
-        if woke_listener && let Some(handle) = listener {
+        if let Some(handle) = inner.listener.take() {
             let _ = handle.join();
         }
-        let _ = fs::remove_file(&self.socket_path);
+        remove_own_socket(&self.socket_path, inner.socket_ident);
     }
+}
+
+/// Unlink the socket file, but only while it is still the one this layer
+/// bound.
+///
+/// A second instance that started later has a socket of its own at the same
+/// path, and unlinking that on the way out would leave it running with no way
+/// for a bridge to reach it (the mirror of the takeover `clear_socket_path`
+/// refuses). Device and inode are what separate the file this layer created
+/// from a file that merely has the same name.
+fn remove_own_socket(path: &Path, bound: Option<(u64, u64)>) {
+    if bound.is_some() && socket_ident(path) == bound {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Identify the file at `path` by device and inode, so a later look can tell
+/// the same file from a different one that took its place. `None` when it
+/// cannot be read, which fails every comparison and so leaves the path alone.
+fn socket_ident(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
 }
 
 /// State shared between the app thread and the connection threads.
@@ -614,6 +767,10 @@ struct Shared {
     /// without reaching the app, because their `kind` did not parse. Written
     /// by reader threads, read via [`TariaLayer::unknown_inputs`].
     unknown_inputs: AtomicU64,
+    /// Acks dropped because [`ACK_QUEUE`] answers were already waiting for a
+    /// bridge that is not reading them fast enough. Written by whichever
+    /// thread queues an ack, read via [`TariaLayer::dropped_acks`].
+    dropped_acks: AtomicU64,
 }
 
 #[derive(Default)]
@@ -626,7 +783,17 @@ struct State {
     /// Acks waiting to go out, oldest first. Queued for the writer rather
     /// than written where they are produced, so that one thread owns the
     /// stream and an ack can never overtake the snapshot published after it.
+    /// Bounded at [`ACK_QUEUE`]; see [`Shared::push_ack`].
     acks: VecDeque<(InputId, InputStatus)>,
+    /// Input ids handed to the app on `delivered_generation`, oldest first
+    /// and capped at [`ACKABLE_INPUTS`]. [`TariaLayer::ack`] answers only an
+    /// id in here, which is how a late ack for a bridge that is gone is told
+    /// from one the live bridge is waiting on.
+    delivered: VecDeque<InputId>,
+    /// The generation `delivered` belongs to. Compared with `generation`
+    /// rather than cleared wherever a connection ends, so no path that
+    /// retires a generation can forget to clear it.
+    delivered_generation: u64,
     /// Which bridge connection is live. Bumped when a connection starts and
     /// again when it ends, so the value between connections matches nothing.
     /// Every queued input carries the generation it arrived on, which is what
@@ -648,11 +815,45 @@ impl Shared {
     }
 
     /// Queue an ack for the writer and wake it.
+    ///
+    /// For acks the layer produces itself, about an input the app never saw:
+    /// a [`Dropped`](InputStatus::Dropped) for one the queue had no room for,
+    /// an [`Ignored`](InputStatus::Ignored) for one this build cannot read.
+    /// The app's own acks go through [`queue_app_ack`](Self::queue_app_ack),
+    /// which first checks the input still belongs to the live connection.
     fn queue_ack(&self, id: InputId, status: InputStatus) {
         let mut state = self.lock_state();
-        state.acks.push_back((id, status));
+        self.push_ack(&mut state, id, status);
         drop(state);
         self.cv.notify_all();
+    }
+
+    /// Queue an ack the app asked for, if the input it answers came from the
+    /// connection that is live now.
+    ///
+    /// See [`TariaLayer::ack`] for why an id from a connection that has ended
+    /// is dropped in silence rather than sent or reported.
+    fn queue_app_ack(&self, id: InputId, status: InputStatus) {
+        let mut state = self.lock_state();
+        if !state.was_delivered(id) {
+            return;
+        }
+        self.push_ack(&mut state, id, status);
+        drop(state);
+        self.cv.notify_all();
+    }
+
+    /// Append an ack, dropping the oldest one waiting when the queue is full.
+    ///
+    /// The caller holds the lock; waking the writer is the caller's job too,
+    /// because [`deliver`](Self::deliver) has more to do under the same lock.
+    /// See [`ACK_QUEUE`] for the bound and why it drops from this end.
+    fn push_ack(&self, state: &mut State, id: InputId, status: InputStatus) {
+        if state.acks.len() >= ACK_QUEUE {
+            state.acks.pop_front();
+            self.dropped_acks.fetch_add(1, Ordering::Relaxed);
+        }
+        state.acks.push_back((id, status));
     }
 
     /// Retire the generation of the connection being served, so anything
@@ -690,10 +891,38 @@ impl Shared {
             self.stale_inputs.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        state.acks.push_back((id, InputStatus::Delivered));
+        // Remembered before the ack so that an app which refines this ack
+        // straight away, inside the same drain closure, is answering an id
+        // the layer already knows it handed over.
+        state.record_delivered(generation, id);
+        self.push_ack(&mut state, id, InputStatus::Delivered);
         drop(state);
         self.cv.notify_all();
         true
+    }
+}
+
+impl State {
+    /// Remember `id` as one the app may answer again with
+    /// [`TariaLayer::ack`], for as long as its connection lives.
+    fn record_delivered(&mut self, generation: u64, id: InputId) {
+        if self.delivered_generation != generation {
+            self.delivered.clear();
+            self.delivered_generation = generation;
+        }
+        if self.delivered.len() >= ACKABLE_INPUTS {
+            self.delivered.pop_front();
+        }
+        self.delivered.push_back(id);
+    }
+
+    /// Was `id` handed to the app by the connection that is live now?
+    ///
+    /// False between connections and for anything the previous one delivered,
+    /// which is what keeps a late ack from answering a fresh bridge's input
+    /// that happens to carry the same id.
+    fn was_delivered(&self, id: InputId) -> bool {
+        self.delivered_generation == self.generation && self.delivered.contains(&id)
     }
 }
 
@@ -721,6 +950,10 @@ fn truncate_to_max_depth(root: &mut Node) {
 }
 
 /// Accept loop: serves one bridge client at a time until shutdown.
+///
+/// The listener is non-blocking, so this thread is never parked in `accept()`
+/// and the shutdown flag is checked on its own schedule; see [`ACCEPT_POLL`]
+/// for why exit cannot be left to depend on a connection arriving.
 fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender<QueuedInput>) {
     loop {
         if shared.is_shutdown() {
@@ -731,15 +964,27 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender
                 if shared.is_shutdown() {
                     return;
                 }
+                // Both halves of a session are read and written as blocking
+                // streams, and an accepted socket inherits the listener's
+                // non-blocking flag on some platforms. Say it outright rather
+                // than rely on which one this is.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 // Errors just drop this client; the loop keeps accepting.
                 let _ = serve_client(stream, &shared, &input_tx);
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                // Nothing waiting to be accepted: nap instead of spinning,
+                // then back to the shutdown check at the top.
+                thread::sleep(ACCEPT_POLL);
             }
             Err(_) => {
                 if shared.is_shutdown() {
                     return;
                 }
                 // Avoid a hot loop on a persistently failing listener.
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(ACCEPT_POLL);
             }
         }
     }
@@ -957,6 +1202,13 @@ fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut
             }
         };
         for (id, status) in acks {
+            // Rechecked per ack rather than once per pass: a full batch
+            // against a peer that stopped reading is a whole queue of write
+            // timeouts long, and `Drop` waits for this thread, so an exit
+            // during the flush would sit through every one of them.
+            if shared.is_shutdown() || !alive.load(Ordering::SeqCst) {
+                return;
+            }
             if write_line(stream, &AppToBridge::ack(id, status)).is_err() {
                 return;
             }
@@ -984,6 +1236,149 @@ fn absolutize(path: PathBuf) -> io::Result<PathBuf> {
         Ok(path)
     } else {
         Ok(env::current_dir()?.join(path))
+    }
+}
+
+/// Make `path` free for `bind`, or say why it cannot be.
+///
+/// Binding needs the path to be absent, so a socket left behind by a run that
+/// was killed before it could clean up has to be unlinked first. That unlink
+/// has to be earned. The path can come verbatim from `$TARIA_SOCK`, and a
+/// private directory passes the vetting whatever else is in it (`~/.ssh` is
+/// 0700 and user-owned), so removing whatever happens to be there would let a
+/// typo delete a file the user meant to keep. A socket another instance is
+/// still serving must survive too: unlinking it and binding a fresh one in its
+/// place leaves that instance running, believing it is reachable, while every
+/// bridge connects to the newcomer instead.
+///
+/// So: only a socket is ever removed, and only once a connection to it has
+/// been refused.
+fn clear_socket_path(path: &Path) -> io::Result<()> {
+    // symlink_metadata so a symlink is seen as itself: following one would
+    // decide about a socket somewhere else and unlink the link.
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(io::Error::new(
+                err.kind(),
+                format!("cannot inspect {}: {err}", path.display()),
+            ));
+        }
+    };
+    if !meta.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists and is not a socket (it is {}); refusing to delete it to \
+                 bind there. Point $TARIA_SOCK at a path taria may create.",
+                path.display(),
+                describe_file_type(&meta)
+            ),
+        ));
+    }
+    match probe_socket(path) {
+        // Nothing is listening: the socket outlived whatever bound it.
+        SocketProbe::Stale => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            // Someone else cleaned it up in the meantime, which is the state
+            // this call wanted anyway.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(io::Error::new(
+                err.kind(),
+                format!("cannot remove the stale socket {}: {err}", path.display()),
+            )),
+        },
+        SocketProbe::Live => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "another instance is already serving the taria socket {}; refusing to take it \
+                 over, because that would leave it running with no way for a bridge to reach \
+                 it. To run a second instance alongside it, give it a socket of its own: set \
+                 TARIA_SOCK to a different path.",
+                path.display()
+            ),
+        )),
+        SocketProbe::Unknown(why) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "cannot tell whether another instance is serving the taria socket {} ({why}); \
+                 refusing to remove a socket that may still be in use. Set TARIA_SOCK to a \
+                 different path to bind elsewhere.",
+                path.display()
+            ),
+        )),
+    }
+}
+
+/// What is at a socket path that is not a socket, for the error that refuses
+/// to delete it.
+fn describe_file_type(meta: &fs::Metadata) -> &'static str {
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        "a symlink"
+    } else if kind.is_dir() {
+        "a directory"
+    } else if kind.is_file() {
+        "a regular file"
+    } else {
+        "another kind of file"
+    }
+}
+
+/// The answer to "is anything serving the socket at this path?".
+enum SocketProbe {
+    /// The connection was accepted: something is listening.
+    Live,
+    /// The connection was refused, or the file went away: nothing is.
+    Stale,
+    /// The probe could not answer, carrying the reason for the error that
+    /// reports it.
+    Unknown(String),
+}
+
+/// Try to connect to the socket at `path`, briefly, to find out whether
+/// anything is listening on it.
+///
+/// The connect runs on a thread of its own because it blocks with no timeout;
+/// see [`SOCKET_PROBE_TIMEOUT`]. An answer that does not arrive in time is
+/// [`Unknown`](SocketProbe::Unknown), never a guess: the whole point is to
+/// avoid unlinking a socket that is still being served.
+fn probe_socket(path: &Path) -> SocketProbe {
+    let (tx, rx) = mpsc::channel();
+    let probe_path = path.to_path_buf();
+    let spawned = thread::Builder::new()
+        .name("taria-socket-probe".into())
+        .spawn(move || {
+            let outcome = UnixStream::connect(&probe_path).map(|stream| {
+                // Nothing is ever sent on it. A peer serving this path sees a
+                // connection that opens and closes, which is what it does
+                // with any client that goes away.
+                let _ = stream.shutdown(Shutdown::Both);
+            });
+            // The receiver is gone once the wait above times out; that is the
+            // `Unknown` case, and there is nothing to report to.
+            let _ = tx.send(outcome);
+        });
+    if let Err(err) = spawned {
+        return SocketProbe::Unknown(format!("the probe thread could not start: {err}"));
+    }
+    match rx.recv_timeout(SOCKET_PROBE_TIMEOUT) {
+        Ok(Ok(())) => SocketProbe::Live,
+        // Refused is what a socket with no listener answers; a socket that
+        // vanished between the look and the connect leaves the path free too.
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            SocketProbe::Stale
+        }
+        Ok(Err(err)) => SocketProbe::Unknown(format!("connecting to it failed: {err}")),
+        Err(_) => SocketProbe::Unknown(format!(
+            "connecting to it did not finish within {SOCKET_PROBE_TIMEOUT:?}"
+        )),
     }
 }
 
@@ -1120,6 +1515,20 @@ mod tests {
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()
             .expect("create test dir")
+    }
+
+    /// The shared state a connection's threads work on, without a socket, for
+    /// tests that drive those parts directly.
+    fn test_shared(app_label: &str) -> Arc<Shared> {
+        Arc::new(Shared {
+            app_label: app_label.to_string(),
+            state: Mutex::new(State::default()),
+            cv: Condvar::new(),
+            dropped_inputs: AtomicU64::new(0),
+            stale_inputs: AtomicU64::new(0),
+            unknown_inputs: AtomicU64::new(0),
+            dropped_acks: AtomicU64::new(0),
+        })
     }
 
     #[test]
@@ -1442,14 +1851,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
 
-        let shared = Arc::new(Shared {
-            app_label: "ackorder".into(),
-            state: Mutex::new(State::default()),
-            cv: Condvar::new(),
-            dropped_inputs: AtomicU64::new(0),
-            stale_inputs: AtomicU64::new(0),
-            unknown_inputs: AtomicU64::new(0),
-        });
+        let shared = test_shared("ackorder");
         {
             // Both are waiting before the loop runs, so it has to choose an
             // order: the app acked an input and published a new tree in
@@ -1512,6 +1914,256 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "drop must not join a listener that can no longer be woken"
         );
+    }
+
+    /// The case the wake-up-by-connecting exit never covered: not the socket
+    /// being gone, but a *different* socket at the same path. Running the app
+    /// twice does exactly that, and the old exit connected to the path, which
+    /// landed on the second instance's listener, counted as having woken this
+    /// one, and then joined a thread parked in `accept()` on a socket nothing
+    /// could reach. The app hung after restoring the terminal.
+    ///
+    /// Dropping must also leave that socket alone: it is the other instance's
+    /// way of being reached.
+    #[test]
+    fn drop_neither_hangs_nor_unlinks_when_the_socket_was_replaced() {
+        let dir = private_temp_dir("taria-replaced-");
+        let path = dir.path().join("replaced.sock");
+        let layer = TariaLayer::bind_at("replaced", &path).expect("bind the first layer");
+
+        // What a second instance used to do, done by hand because binding
+        // over a live socket is now refused.
+        fs::remove_file(&path).expect("remove this layer's socket");
+        let usurper = UnixListener::bind(&path).expect("bind another listener at the path");
+
+        // Off-thread so a regression fails this test instead of hanging the
+        // whole suite.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(layer);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "drop must not wait on a listener no connection can reach any more"
+        );
+        assert!(
+            path.exists(),
+            "the socket at the path belongs to another listener; drop must leave it"
+        );
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "and it must still be served"
+        );
+        drop(usurper);
+    }
+
+    /// `$TARIA_SOCK` is used verbatim, and a private directory passes the
+    /// vetting whatever else is inside it, so a typo in it (`~/.ssh/config`
+    /// is 0700 and user-owned) used to mean startup silently deleted a file
+    /// the user meant to keep.
+    #[test]
+    fn binding_never_deletes_something_that_is_not_a_socket() {
+        let dir = private_temp_dir("taria-notasocket-");
+        let path = dir.path().join("config");
+        let content = b"Host example\n  User me\n";
+        fs::write(&path, content).expect("create the file that must survive");
+
+        let Err(err) = TariaLayer::bind_at("notasocket", &path) else {
+            panic!("binding over a regular file must be refused");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let message = err.to_string();
+        assert!(message.contains("not a socket"), "err: {message}");
+        assert!(message.contains("a regular file"), "err: {message}");
+        assert_eq!(
+            fs::read(&path).expect("the file is still there").as_slice(),
+            content,
+            "the file at the socket path must be untouched"
+        );
+
+        // A symlink is judged as itself, not as whatever it points at.
+        let link = dir.path().join("config-link");
+        std::os::unix::fs::symlink(&path, &link).expect("create the symlink");
+        let Err(err) = TariaLayer::bind_at("notasocket", &link) else {
+            panic!("binding over a symlink must be refused");
+        };
+        assert!(err.to_string().contains("a symlink"), "err: {err}");
+        assert!(link.exists(), "the symlink must be left in place");
+    }
+
+    /// The case the pre-bind unlink exists for: a socket left behind by a run
+    /// that was killed before `Drop` could run. Nothing is listening on it,
+    /// and refusing it would leave the app unable to start until somebody
+    /// deleted the file by hand.
+    #[test]
+    fn a_socket_nothing_is_listening_on_is_replaced() {
+        let dir = private_temp_dir("taria-stalesock-");
+        let path = dir.path().join("stale.sock");
+        // Closing a listener does not unlink its socket, which is exactly
+        // what SIGKILL leaves behind.
+        drop(UnixListener::bind(&path).expect("bind a listener to abandon"));
+        assert!(path.exists(), "the abandoned socket file stays behind");
+
+        let layer = TariaLayer::bind_at("stale", &path).expect("a dead socket is replaced");
+        assert!(layer.is_enabled());
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the socket bound over the stale one must serve"
+        );
+    }
+
+    /// Two instances of the same app, which is an ordinary thing to do while
+    /// testing a TUI. The second used to unlink the first's socket and bind
+    /// its own there, leaving the first running, reporting itself enabled,
+    /// and reachable by nobody.
+    #[test]
+    fn binding_over_a_live_socket_is_refused_and_leaves_it_serving() {
+        let dir = private_temp_dir("taria-twice-");
+        let path = dir.path().join("twice.sock");
+        let first = TariaLayer::bind_at("twice", &path).expect("the first instance binds");
+
+        let Err(err) = TariaLayer::bind_at("twice", &path) else {
+            panic!("a second instance must not take over the first's socket");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        let message = err.to_string();
+        assert!(message.contains("already serving"), "err: {message}");
+        assert!(
+            message.contains("TARIA_SOCK"),
+            "the error must say how to run a second instance: {message}"
+        );
+
+        // `bind_or_disabled` never fails, so it has to come back disabled
+        // rather than pointed at a socket it does not own.
+        let second = TariaLayer::bind_or_disabled_at("twice", path.clone());
+        assert!(!second.is_enabled(), "the second instance must not be live");
+        assert_eq!(
+            second.bind_error().map(io::Error::kind),
+            Some(io::ErrorKind::AddrInUse),
+            "and it must say why"
+        );
+        drop(second);
+
+        // The first instance is untouched throughout: still bound, still
+        // serving, and still the owner of the socket file.
+        assert!(first.is_enabled());
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the first instance must still be reachable"
+        );
+        drop(first);
+        assert!(!path.exists(), "the first instance still owns its socket");
+    }
+
+    /// The one queue that could grow without bound: inputs are capped and
+    /// snapshots coalesce into one latest, but a bridge that reads steadily
+    /// and slowly never stalls long enough for the write timeout to
+    /// disconnect it while answers pile up behind it.
+    #[test]
+    fn the_ack_queue_is_bounded_and_drops_the_oldest_answers() {
+        let shared = test_shared("ackbound");
+        let overflow = 10;
+        for id in 0..(ACK_QUEUE + overflow) as InputId {
+            shared.queue_ack(id, InputStatus::Dropped);
+        }
+
+        let state = shared.lock_state();
+        assert_eq!(state.acks.len(), ACK_QUEUE, "the queue must stay bounded");
+        assert_eq!(
+            state.acks.front().map(|(id, _)| *id),
+            Some(overflow as InputId),
+            "the oldest answers are the ones given up; a waiter on those has \
+             long since timed out"
+        );
+        assert_eq!(
+            state.acks.back().map(|(id, _)| *id),
+            Some((ACK_QUEUE + overflow - 1) as InputId),
+            "the newest answer is the one an agent is still waiting on"
+        );
+        drop(state);
+        assert_eq!(
+            shared.dropped_acks.load(Ordering::Relaxed),
+            overflow as u64,
+            "each dropped answer must be counted once"
+        );
+    }
+
+    /// An id names an input only within the bridge process that sent it, and
+    /// a fresh bridge counts from the start again. So an ack the app makes
+    /// after a reconnect must not be sent: it would resolve the new bridge's
+    /// waiter on its own live id with a verdict from a session that never saw
+    /// it.
+    #[test]
+    fn an_app_ack_is_dropped_unless_its_input_belongs_to_the_live_connection() {
+        let shared = test_shared("appack");
+        shared.lock_state().generation = 7;
+        assert!(shared.deliver(7, 5), "the live connection's input delivers");
+        shared.lock_state().acks.clear();
+
+        shared.queue_app_ack(5, InputStatus::Ignored);
+        assert_eq!(
+            shared.lock_state().acks.pop_front(),
+            Some((5, InputStatus::Ignored)),
+            "refining the ack of a live input is the whole point of `ack`"
+        );
+
+        // The connection ends and the next one starts; its ids start over.
+        shared.retire_generation();
+        shared.lock_state().generation += 1;
+        shared.queue_app_ack(5, InputStatus::Ignored);
+        assert!(
+            shared.lock_state().acks.is_empty(),
+            "an id from a bridge that is gone must answer nobody"
+        );
+
+        // And an id falls out of reach once a queue's worth of newer inputs
+        // has been delivered past it, which costs a late ack rather than a
+        // wrong one.
+        // One delivery past what the layer remembers, so exactly the oldest
+        // id falls out.
+        let generation = shared.lock_state().generation;
+        for id in 100..=(100 + ACKABLE_INPUTS as InputId) {
+            assert!(shared.deliver(generation, id));
+        }
+        shared.lock_state().acks.clear();
+        shared.queue_app_ack(100, InputStatus::Ignored);
+        assert!(shared.lock_state().acks.is_empty(), "id 100 was forgotten");
+        shared.queue_app_ack(101, InputStatus::Ignored);
+        assert_eq!(
+            shared.lock_state().acks.pop_front(),
+            Some((101, InputStatus::Ignored)),
+            "everything still remembered stays answerable"
+        );
+    }
+
+    /// A disabled layer must not park an app forever. The enabled path turns
+    /// a deadline no clock can hold into a wait for as long as the queue can
+    /// deliver; a disabled layer's queue can never deliver, so that wait has
+    /// no end, and an app pacing its loop on this call would run bound and
+    /// freeze unbound.
+    #[test]
+    fn a_disabled_layer_does_not_block_forever_on_an_unholdable_timeout() {
+        let dir = private_temp_dir("taria-disabledwait-");
+        let blocker = dir.path().join("not-a-directory");
+        fs::write(&blocker, b"").expect("create blocker file");
+        let layer = TariaLayer::bind_or_disabled_at("disabledwait", blocker.join("app.sock"));
+        assert!(!layer.is_enabled());
+
+        let started = Instant::now();
+        assert_eq!(layer.recv_timeout(Duration::MAX), None);
+        assert_eq!(layer.recv_timeout_with_id(Duration::MAX), None);
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a disabled layer waited {waited:?} on a timeout it can never serve"
+        );
+
+        // A timeout the clock can hold is still waited out, so an app that
+        // paces its loop on this call keeps its timing.
+        let started = Instant::now();
+        assert_eq!(layer.recv_timeout(Duration::from_millis(50)), None);
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 
     #[test]

@@ -272,6 +272,67 @@ fn ack_can_be_refined_to_ignored() {
     assert_eq!(client.read_message(), ack(9, InputStatus::Ignored));
 }
 
+/// An ack belongs to the bridge whose input it answers.
+///
+/// Ids are unique only within a bridge process, and the next bridge is a new
+/// process whose ids start over, so an id the app kept across a disconnect can
+/// already name a live input of that bridge's. Sending the late ack there
+/// resolves a waiter that never saw the input, with a verdict from a session
+/// that is gone. This is not the accepted "a late `Ignored` ack can be lost":
+/// there the answer goes nowhere, here it goes to the wrong peer.
+#[test]
+fn a_late_ack_never_answers_the_next_bridge() {
+    let layer = bind_layer("lateack");
+    let mut first = Client::connect(&layer);
+    assert!(matches!(first.read_message(), AppToBridge::Hello { .. }));
+
+    first.send_input(5, key("q"));
+    let (id, _) = poll_try_recv_with_id(&layer).expect("the input reaches the app");
+    assert_eq!(id, 5);
+    assert_eq!(first.read_message(), ack(5, InputStatus::Delivered));
+
+    // The bridge dies with the app still holding id 5, then a new one
+    // connects. Its handshake is proof the layer finished with the first
+    // connection, because only one is served at a time.
+    drop(first);
+    let mut second = Client::connect(&layer);
+    assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
+
+    // The app answers the id it kept, a frame late.
+    layer.ack(5, InputStatus::Ignored);
+
+    second
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut line = String::new();
+    let err = second
+        .reader
+        .read_line(&mut line)
+        .expect_err("the new bridge must hear nothing about an input it never sent");
+    assert!(
+        matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ),
+        "expected the read to time out, got {err:?} with {line:?}"
+    );
+
+    // And its own id 5 still works, which is what the guard must not break.
+    second
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(TIMEOUT))
+        .unwrap();
+    second.send_input(5, key("j"));
+    let (id, input) = poll_try_recv_with_id(&layer).expect("the new bridge's input");
+    assert_eq!((id, input), (5, key("j")));
+    assert_eq!(second.read_message(), ack(5, InputStatus::Delivered));
+    layer.ack(5, InputStatus::Ignored);
+    assert_eq!(second.read_message(), ack(5, InputStatus::Ignored));
+}
+
 #[test]
 fn ack_precedes_the_snapshot_published_after_it() {
     let mut layer = bind_layer("ackorder");
