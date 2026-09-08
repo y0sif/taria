@@ -8,7 +8,7 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use taria::key::KeyPress;
 use taria::wire::{InputId, InputStatus};
-use taria::{Action, AgentInput, Node, NodeId, PROTOCOL_VERSION};
+use taria::{Action, AgentInput, MAX_NODE_DEPTH, Node, NodeId, PROTOCOL_VERSION};
 use tokio::sync::{broadcast, watch};
 
 use crate::bridge::{AppSnapshot, BridgeHandle, BridgeState};
@@ -139,6 +139,11 @@ impl TariaMcpServer {
         // Subscribe before anything is sent: an ack published before this
         // point is one the receiver would never see.
         let acks = self.bridge.subscribe_acks();
+        // Same, for lines the bridge could not read. Marked seen now so that
+        // only a rejection from this call's own window is reported against
+        // this input.
+        let mut rejected = self.bridge.rejected_rx.clone();
+        rejected.borrow_and_update();
         let wanted = repeat.max(1) as usize;
         let mut ids = Vec::with_capacity(wanted);
         // Carried past `observe` rather than returned on the spot: failing out
@@ -166,7 +171,10 @@ impl TariaMcpServer {
                 }
             }
         }
-        let seen = observe(acks, rx, &pre, &ids).await;
+        let mut seen = observe(acks, rx, &pre, &ids).await;
+        if rejected.has_changed().unwrap_or(false) {
+            seen.rejected = rejected.borrow_and_update().clone();
+        }
         if cut_short {
             return Err(partial_send_error(&seen, ids.len(), wanted));
         }
@@ -237,7 +245,10 @@ impl TariaMcpServer {
                        Call this first; act and key depend on ids and actions from this tree."
     )]
     pub async fn read_tree(&self) -> Result<CallToolResult, McpError> {
-        let snapshot = available_snapshot(self.bridge.state_rx.borrow().clone())?;
+        let snapshot = available_snapshot(
+            self.bridge.state_rx.borrow().clone(),
+            self.bridge.rejected_rx.borrow().clone(),
+        )?;
         tree_result(&snapshot)
     }
 
@@ -277,7 +288,10 @@ impl TariaMcpServer {
             ));
         }
         let mut rx = self.bridge.state_rx.clone();
-        let snapshot = available_snapshot(rx.borrow_and_update().clone())?;
+        let snapshot = available_snapshot(
+            rx.borrow_and_update().clone(),
+            self.bridge.rejected_rx.borrow().clone(),
+        )?;
 
         let Some(target) = find_node(&snapshot.parsed.root, &node) else {
             let mut ids = Vec::new();
@@ -310,11 +324,7 @@ impl TariaMcpServer {
             ));
         };
 
-        let input = AgentInput::Act {
-            node: NodeId(node),
-            action: parsed,
-            value,
-        };
+        let input = AgentInput::act(NodeId(node), parsed, value);
         self.send_and_report(rx, snapshot, input, 1).await
     }
 
@@ -352,8 +362,11 @@ impl TariaMcpServer {
         let mut rx = self.bridge.state_rx.clone();
         // Like `act`, refuse while no app is connected: a key queued now
         // would only be delivered to (and confuse) the *next* app instance.
-        let pre = available_snapshot(rx.borrow_and_update().clone())?;
-        self.send_and_report(rx, pre, AgentInput::Key { key }, repeat)
+        let pre = available_snapshot(
+            rx.borrow_and_update().clone(),
+            self.bridge.rejected_rx.borrow().clone(),
+        )?;
+        self.send_and_report(rx, pre, AgentInput::key(key), repeat)
             .await
     }
 
@@ -385,8 +398,11 @@ impl TariaMcpServer {
             ));
         }
         let mut rx = self.bridge.state_rx.clone();
-        let pre = available_snapshot(rx.borrow_and_update().clone())?;
-        self.send_and_report(rx, pre, AgentInput::Text { text }, 1)
+        let pre = available_snapshot(
+            rx.borrow_and_update().clone(),
+            self.bridge.rejected_rx.borrow().clone(),
+        )?;
+        self.send_and_report(rx, pre, AgentInput::text(text), 1)
             .await
     }
 }
@@ -475,16 +491,41 @@ pub fn action_name(action: &Action) -> String {
 }
 
 /// Extract the live snapshot from a [`BridgeState`], or the error explaining
-/// why none is available. The two failure modes call for different next
-/// steps, so they get distinct messages: an app that never connected (wrong
-/// socket path? not started?) versus an app that connected and then went
-/// away (it exited or crashed; waiting for it to come back is enough).
-fn available_snapshot(state: BridgeState) -> Result<AppSnapshot, McpError> {
+/// why none is available. The failure modes call for different next steps, so
+/// they get distinct messages: an app that never connected (wrong socket
+/// path? not started?), an app that connected and then went away (it exited
+/// or crashed; waiting for it to come back is enough), and an app that
+/// reached the socket and sent lines this bridge threw away.
+///
+/// `rejected` is [`BridgeHandle::rejected_rx`](crate::bridge::BridgeHandle),
+/// and it is what separates the first case from the third. Both leave the
+/// state at [`BridgeState::Never`], but only one of them is worth checking a
+/// socket path over: an app whose lines were rejected demonstrably found the
+/// socket. Sending an adopter to re-check the path there is the first wrong
+/// turn a retrofit takes, and the bridge knew the real reason all along.
+fn available_snapshot(
+    state: BridgeState,
+    rejected: Option<String>,
+) -> Result<AppSnapshot, McpError> {
     match state {
         BridgeState::Connected(snapshot) => Ok(snapshot),
         BridgeState::Never => Err(McpError::internal_error(
-            "no snapshot from the app yet - is the taria-enabled app running, and is the socket \
-             path correct? The bridge reconnects automatically; retry once the app is up.",
+            match rejected {
+                Some(err) => format!(
+                    "no snapshot from the app yet, but not because nothing is there: an app \
+                     reached this socket and sent lines, and this bridge could not read the \
+                     last one ({err}). The socket path is right, so the line is what is wrong. \
+                     A snapshot more than {MAX_NODE_DEPTH} levels deep exceeds what a JSON \
+                     parser will recurse into and fails exactly like this; so does an app built \
+                     against a taria whose snapshot shape differs from this bridge's. Fix the \
+                     tree the app publishes, or match its taria dependency to this bridge's; \
+                     the bridge keeps reading and needs no restart.",
+                ),
+                None => "no snapshot from the app yet - is the taria-enabled app running, and \
+                     is the socket path correct? The bridge reconnects automatically; retry \
+                     once the app is up."
+                    .to_string(),
+            },
             None,
         )),
         BridgeState::Disconnected {
@@ -561,6 +602,14 @@ struct Observed {
     /// triggered), and every other verdict here describes an app that is
     /// still there, so this one has to outrank them.
     gone: Option<BridgeState>,
+    /// Why a line the app sent inside the window was thrown away, if one was.
+    ///
+    /// Not filled in by [`observe`], which watches acks and trees; a rejected
+    /// line produced neither, which is the point. An ack carrying a status
+    /// this build cannot name fails its whole line, id and all, so the app
+    /// answering an input is indistinguishable here from the app saying
+    /// nothing. This is the one trace that is left of the difference.
+    rejected: Option<String>,
 }
 
 /// Watch the app's acks and snapshots for up to [`UPDATE_WAIT`], and report
@@ -804,25 +853,51 @@ fn report(seen: Observed, fallback: AppSnapshot, sent: usize) -> Result<CallTool
         // No ack at all is how an adapter that predates acks behaves. Its
         // changed tree is the only answer it can give, and answer enough.
         (None, Some(snapshot)) => tree_result(&snapshot),
-        (None, None) => Ok(text_result(format!(
-            "The app neither acknowledged this input nor changed its tree within {}ms. It may \
-             not report acknowledgements, or it may not have reacted yet; call read_tree to \
-             re-check.",
-            UPDATE_WAIT.as_millis()
-        ))),
-        // A status added to the protocol after this bridge was written. The
-        // app answered, so this is not the silence above, and none of the four
-        // verdicts can be claimed for it: an unreadable status is not a
-        // licence to guess `Delivered`. Said plainly, with the freshest tree,
-        // because the agent can still re-plan from a tree and cannot re-plan
-        // from an error.
+        // Silence, with the one thing that can turn out not to be silence
+        // at all: a line the app sent in this window that the bridge threw
+        // away. An ack whose status this build cannot name is exactly that,
+        // and it takes the id down with it, so the answer to this input can
+        // be sitting in `rejected` with nothing left to match it to.
+        (None, None) => Ok(text_result(match seen.rejected {
+            Some(err) => format!(
+                "The app neither acknowledged this input nor changed its tree within {}ms, but \
+                 it did send a line this bridge could not read ({err}). That line may have been \
+                 this input's acknowledgement: an acknowledgement whose status this bridge does \
+                 not know fails as a whole and takes the input id with it, so it arrives here \
+                 as silence. If it was, matching the app's taria dependency to this bridge's \
+                 makes it readable; call read_tree for the current tree either way.",
+                UPDATE_WAIT.as_millis()
+            ),
+            None => format!(
+                "The app neither acknowledged this input nor changed its tree within {}ms. It \
+                 may not report acknowledgements, or it may not have reacted yet; call \
+                 read_tree to re-check.",
+                UPDATE_WAIT.as_millis()
+            ),
+        })),
+        // A status this build can decode but has no case for above.
+        //
+        // Required, because [`InputStatus`] is `#[non_exhaustive]`, and not
+        // reachable from a newer *app*: a status name this build does not
+        // know fails the whole `Ack` line, so the ack never arrives and the
+        // input reads as unacknowledged in the arms above, which is where the
+        // `rejected` note exists to explain it. What reaches here is the
+        // other direction, this bridge rebuilt against a taria that added a
+        // status while this match was left alone. That makes the arm a guard
+        // on the bridge's own upgrade rather than on the app's, and the fix
+        // it names has to be the bridge.
+        //
+        // None of the four verdicts can be claimed for such a status: being
+        // unable to read an answer is not a licence to guess `Delivered`.
+        // Said plainly, with the freshest tree, because the agent can still
+        // re-plan from a tree and cannot re-plan from an error.
         (Some(_), changed) => {
             let snapshot = changed.unwrap_or(fallback);
             Ok(text_result(format!(
-                "The app acknowledged this input with a status this bridge does not recognize, \
-                 so whether it was applied cannot be reported. The app is built against a newer \
-                 taria than this bridge; matching their versions restores the full report. The \
-                 current tree follows.\n{}",
+                "The app acknowledged this input with a status this bridge has no report for, \
+                 so whether it was applied cannot be stated. This bridge is built against a \
+                 taria newer than its own handling of acknowledgements; upgrading the bridge \
+                 restores the full report. The current tree follows.\n{}",
                 snapshot_json(&snapshot)
             )))
         }
@@ -1041,6 +1116,7 @@ mod tests {
             lost: 1,
             changed: None,
             gone: None,
+            rejected: None,
         };
         let err = report(seen, snapshot("after"), 5).expect_err("lost acks are not a success");
         assert!(
@@ -1061,6 +1137,7 @@ mod tests {
             lost: 1,
             changed: None,
             gone: None,
+            rejected: None,
         };
         let err = report(seen, snapshot("after"), 1).expect_err("lost acks are not a success");
         assert!(
@@ -1264,11 +1341,13 @@ mod tests {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
         let (ack_tx, _) = broadcast::channel(1);
         let (_protocol_tx, protocol_rx) = watch::channel(None);
+        let (_rejected_tx, rejected_rx) = watch::channel(None);
         TariaMcpServer::new(BridgeHandle {
             state_rx,
             input_tx,
             ack_tx,
             protocol_rx,
+            rejected_rx,
         })
     }
 

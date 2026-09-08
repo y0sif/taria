@@ -86,24 +86,24 @@ impl Client {
 
     /// Send one input under `id`; every ack answering it carries that id.
     fn send_input(&mut self, id: InputId, input: AgentInput) {
-        self.send(&BridgeToApp::Input { id, input });
+        self.send(&BridgeToApp::input(id, input));
     }
 }
 
 /// Write one input straight to a stream, for tests that hand the read half to
 /// another thread and so cannot use [`Client`].
 fn write_input(stream: &mut UnixStream, id: InputId, input: AgentInput) {
-    let mut line = serde_json::to_string(&BridgeToApp::Input { id, input }).unwrap();
+    let mut line = serde_json::to_string(&BridgeToApp::input(id, input)).unwrap();
     line.push('\n');
     stream.write_all(line.as_bytes()).unwrap();
 }
 
 fn key(name: &str) -> AgentInput {
-    AgentInput::Key { key: name.into() }
+    AgentInput::key(name)
 }
 
 fn ack(id: InputId, status: InputStatus) -> AppToBridge {
-    AppToBridge::Ack { id, status }
+    AppToBridge::ack(id, status)
 }
 
 /// Poll `try_recv` until an input arrives or the timeout passes.
@@ -143,13 +143,7 @@ fn hello_then_snapshots_stream_to_client() {
 
     // First message is always the handshake.
     let hello = client.read_message();
-    assert_eq!(
-        hello,
-        AppToBridge::Hello {
-            app_label: "stream".into(),
-            protocol_version: PROTOCOL_VERSION,
-        }
-    );
+    assert_eq!(hello, AppToBridge::hello("stream", PROTOCOL_VERSION));
 
     // A publish after connect streams to the client.
     publish_single_node(&mut layer, "first");
@@ -201,14 +195,47 @@ fn inputs_reach_the_app_acked_delivered_and_malformed_lines_are_ignored() {
     // event loop took it, so the ack is the first thing the client sees.
     assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
 
-    let act = AgentInput::Act {
-        node: taria::NodeId("btn".into()),
-        action: taria::Action::Activate,
-        value: None,
-    };
+    let act = AgentInput::act(taria::NodeId("btn".into()), taria::Action::Activate, None);
     client.send_input(2, act.clone());
     assert_eq!(layer.recv_timeout(TIMEOUT), Some(act));
     assert_eq!(client.read_message(), ack(2, InputStatus::Delivered));
+}
+
+/// An input whose `kind` this build cannot read is answered here rather than
+/// handed to the app.
+///
+/// It parses as [`AgentInput::Unknown`], which keeps nothing but the fact
+/// that the kind was unreadable; the id survives on the message around it,
+/// which is what makes an ack possible at all. Before the fallback existed
+/// the whole line failed, the reader skipped it, and the agent waited out its
+/// timeout having learned nothing. `Ignored` is the truth, and the app never
+/// sees a value it could not have acted on.
+#[test]
+fn an_input_kind_this_build_cannot_read_is_acked_ignored_without_reaching_the_app() {
+    let layer = bind_layer("unknowninput");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    client.write_line(r#"{"type":"input","id":41,"input":{"kind":"paste","text":"hi"}}"#);
+    assert_eq!(client.read_message(), ack(41, InputStatus::Ignored));
+    assert_eq!(
+        poll_try_recv(&layer),
+        None,
+        "an unreadable input must not be queued for the app"
+    );
+    assert_eq!(layer.unknown_inputs(), 1);
+    assert_eq!(
+        layer.dropped_inputs(),
+        0,
+        "it was answered, not dropped for want of queue space"
+    );
+
+    // The connection is unharmed: a readable input right after it still works.
+    let sent = key("q");
+    client.send_input(42, sent.clone());
+    assert_eq!(poll_try_recv(&layer), Some(sent));
+    assert_eq!(client.read_message(), ack(42, InputStatus::Delivered));
+    assert_eq!(layer.unknown_inputs(), 1);
 }
 
 /// A timeout the clock cannot turn into a deadline must not abort the app:
@@ -441,6 +468,7 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
             AppToBridge::Ack {
                 id,
                 status: InputStatus::Dropped,
+                ..
             } => Some(*id),
             _ => None,
         })
@@ -589,10 +617,7 @@ fn a_second_client_waits_until_the_first_is_gone() {
         .unwrap();
     assert_eq!(
         second.read_message(),
-        AppToBridge::Hello {
-            app_label: "oneatatime".into(),
-            protocol_version: PROTOCOL_VERSION,
-        },
+        AppToBridge::hello("oneatatime", PROTOCOL_VERSION),
         "the waiting client must be served in full once its turn comes"
     );
     let AppToBridge::Snapshot(snapshot) = second.read_message() else {

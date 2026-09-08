@@ -66,15 +66,16 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) -> Applied {
             node,
             action,
             value,
+            ..
         } => apply_act(app, node.0.as_str(), action, value),
-        AgentInput::Key { key } => match to_crossterm_key(&key) {
+        AgentInput::Key { key, .. } => match to_crossterm_key(&key) {
             Some(key) => {
                 handle_key(app, key);
                 Applied::Handled
             }
             None => Applied::Ignored,
         },
-        AgentInput::Text { text } => {
+        AgentInput::Text { text, .. } => {
             let keys = text_to_keys(&text);
             if keys.is_empty() {
                 return Applied::Ignored;
@@ -391,27 +392,19 @@ mod tests {
     // shows task-1, task-3, task-4 and the Done tab task-2, task-5.
 
     fn act(node: &str, action: Action) -> AgentInput {
-        AgentInput::Act {
-            node: NodeId(node.into()),
-            action,
-            value: None,
-        }
+        AgentInput::act(NodeId(node.into()), action, None)
     }
 
     fn act_value(node: &str, action: Action, value: &str) -> AgentInput {
-        AgentInput::Act {
-            node: NodeId(node.into()),
-            action,
-            value: Some(value.into()),
-        }
+        AgentInput::act(NodeId(node.into()), action, Some(value.into()))
     }
 
     fn key(key: &str) -> AgentInput {
-        AgentInput::Key { key: key.into() }
+        AgentInput::key(key)
     }
 
     fn text(text: &str) -> AgentInput {
-        AgentInput::Text { text: text.into() }
+        AgentInput::text(text)
     }
 
     fn delete(app: &mut App, node: &str) {

@@ -57,6 +57,17 @@ fn main() -> io::Result<()> {
              ended first"
         );
     }
+    // The third: inputs the layer answered `Ignored` on this app's behalf
+    // because their kind is one this build of taria cannot read. The agent
+    // was told, so nothing is lost on that side, but the reason is a taria
+    // version gap that only whoever runs the app can close.
+    let unknown = layer.unknown_inputs();
+    if unknown > 0 {
+        eprintln!(
+            "taria-demo: could not read {unknown} agent input(s): the bridge speaks a newer \
+             taria than this app; raise the app's taria dependency"
+        );
+    }
     result
 }
 

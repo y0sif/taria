@@ -18,7 +18,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
-use taria::{AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
+use taria::{AgentInput, MAX_NODE_DEPTH, Node, PROTOCOL_VERSION, Role, Snapshot, TreeTooDeep};
 
 use crate::FrameRecorder;
 
@@ -76,6 +76,11 @@ struct Inner {
     listener: Option<JoinHandle<()>>,
     seq: u64,
     last_root: Option<Node>,
+    /// Snapshots published with a branch cut for depth, and the failure
+    /// behind the newest cut. Owned here rather than in [`Shared`] because
+    /// only the app thread publishes and only the app thread reads these.
+    truncated: u64,
+    last_truncation: Option<TreeTooDeep>,
 }
 
 /// One agent input on its way from a connection's reader thread to the app.
@@ -154,6 +159,7 @@ impl TariaLayer {
             cv: Condvar::new(),
             dropped_inputs: AtomicU64::new(0),
             stale_inputs: AtomicU64::new(0),
+            unknown_inputs: AtomicU64::new(0),
         });
         let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
 
@@ -178,6 +184,8 @@ impl TariaLayer {
                 listener: Some(handle),
                 seq: 0,
                 last_root: None,
+                truncated: 0,
+                last_truncation: None,
             }),
             bind_error: None,
         })
@@ -280,6 +288,11 @@ impl TariaLayer {
     /// Inputs left over from a bridge connection that has since ended are
     /// discarded here rather than handed over; see
     /// [`stale_inputs`](Self::stale_inputs).
+    ///
+    /// [`AgentInput::Unknown`] never arrives here either. An input whose
+    /// `kind` this build cannot read carries nothing to apply, so the layer
+    /// acks it [`Ignored`](InputStatus::Ignored) where it is parsed and never
+    /// queues it; see [`unknown_inputs`](Self::unknown_inputs).
     ///
     /// Always `None` on a disabled layer.
     pub fn try_recv(&self) -> Option<AgentInput> {
@@ -426,6 +439,51 @@ impl TariaLayer {
             .map_or(0, |inner| inner.shared.stale_inputs.load(Ordering::Relaxed))
     }
 
+    /// How many agent inputs have been answered without reaching the app
+    /// because their `kind` is one this build cannot read. Always 0 on a
+    /// disabled layer.
+    ///
+    /// An input like that parses as [`AgentInput::Unknown`], which carries
+    /// neither the kind it arrived under nor what it asked for, so there is
+    /// nothing for the app to apply. The layer acks it
+    /// [`Ignored`](InputStatus::Ignored) itself and never queues it; see
+    /// [`try_recv`](Self::try_recv), which is why an app never has to think
+    /// about the variant.
+    ///
+    /// A nonzero value means the bridge on the other end is built against a
+    /// newer taria than this app, and the agent is asking for things this app
+    /// cannot do yet. Raising the app's taria dependency is the fix. Read it
+    /// like [`dropped_inputs`](Self::dropped_inputs): after the terminal is
+    /// restored, never while the app owns the alternate screen.
+    pub fn unknown_inputs(&self) -> u64 {
+        self.inner.as_ref().map_or(0, |inner| {
+            inner.shared.unknown_inputs.load(Ordering::Relaxed)
+        })
+    }
+
+    /// How many published snapshots have had a branch cut for being deeper
+    /// than [`taria::MAX_NODE_DEPTH`]. Always 0 on a disabled layer.
+    ///
+    /// See [`publish`](Self::publish) for what the cut does and why.
+    /// [`last_truncation`](Self::last_truncation) names the branch. Monotonic
+    /// for the lifetime of the layer, and read like
+    /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
+    /// restored, never while the app owns the alternate screen.
+    pub fn truncated_snapshots(&self) -> u64 {
+        self.inner.as_ref().map_or(0, |inner| inner.truncated)
+    }
+
+    /// The depth failure behind the most recent truncation, or `None` if no
+    /// published tree has been cut.
+    ///
+    /// [`TreeTooDeep`](taria::TreeTooDeep) carries the depth measured and the
+    /// id of a node found at it. An app whose tree is generated from data has
+    /// no other way to tell which branch ran away, which is the whole reason
+    /// the counter alone is not enough here.
+    pub fn last_truncation(&self) -> Option<TreeTooDeep> {
+        self.inner.as_ref()?.last_truncation.clone()
+    }
+
     /// Publish `nodes` as a snapshot, without going through a
     /// [`FrameRecorder`].
     ///
@@ -433,6 +491,29 @@ impl TariaLayer {
     /// recorder's frame, push-loop and publish triplet is three lines saying
     /// one thing. The nodes are wrapped in the same auto-generated root, so
     /// both paths produce the same tree.
+    ///
+    /// # Trees too deep to send
+    ///
+    /// A tree deeper than [`taria::MAX_NODE_DEPTH`], counting the root this
+    /// method adds, is cut here: every node at the limit publishes without
+    /// its children. The cut is per branch, so everything above it reaches
+    /// the agent unchanged.
+    ///
+    /// Cutting rather than refusing, because the two alternatives are both
+    /// worse than losing the deep part. Publishing the tree as built is what
+    /// breaks the peer: a snapshot past the limit exceeds what a JSON parser
+    /// will recurse into, the bridge skips the line exactly as it skips a
+    /// truncated one, and the agent is left reading a stale tree or told no
+    /// app has published yet, with nothing anywhere saying why. Skipping the
+    /// publish is that same stale tree, chosen deliberately.
+    ///
+    /// The app is told instead of the agent, because the app is the only one
+    /// that can fix it: see
+    /// [`truncated_snapshots`](Self::truncated_snapshots) for the count and
+    /// [`last_truncation`](Self::last_truncation) for the branch. The fix is
+    /// almost always to publish what the widget draws rather than the data
+    /// behind it, which for a deep tree view is the expanded path and the
+    /// rows currently on screen.
     pub fn publish(&mut self, nodes: impl IntoIterator<Item = Node>) {
         self.publish_nodes(nodes.into_iter().collect());
     }
@@ -444,15 +525,27 @@ impl TariaLayer {
     /// thread. Skipped entirely when the tree is identical to the previous
     /// publish, and on a disabled layer. Never blocks the render path beyond
     /// a brief mutex hold.
+    ///
+    /// A tree over [`MAX_NODE_DEPTH`] is cut before any of that; see
+    /// [`publish`](Self::publish).
     pub(crate) fn publish_nodes(&mut self, nodes: Vec<Node>) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let focus_recorded = nodes.iter().any(subtree_has_focus);
-        let root = Node::new("app", Role::App)
+        // The root added here counts towards the depth, so the check has to
+        // run on the assembled tree rather than on the caller's nodes, and
+        // before focus is decided: cutting a branch can remove the only
+        // focused node, and a snapshot has to carry focus somewhere.
+        let mut root = Node::new("app", Role::App)
             .label(inner.shared.app_label.clone())
-            .focused(!focus_recorded)
             .children(nodes);
+        if let Err(too_deep) = root.check_depth() {
+            truncate_to_max_depth(&mut root);
+            inner.truncated += 1;
+            inner.last_truncation = Some(too_deep);
+        }
+        let focus_recorded = root.children.iter().any(subtree_has_focus);
+        let root = root.focused(!focus_recorded);
 
         if inner.last_root.as_ref() == Some(&root) {
             return;
@@ -517,6 +610,10 @@ struct Shared {
     /// on had ended. Written by the app thread, read via
     /// [`TariaLayer::stale_inputs`].
     stale_inputs: AtomicU64,
+    /// Agent inputs answered [`Ignored`](InputStatus::Ignored) by the reader
+    /// without reaching the app, because their `kind` did not parse. Written
+    /// by reader threads, read via [`TariaLayer::unknown_inputs`].
+    unknown_inputs: AtomicU64,
 }
 
 #[derive(Default)]
@@ -603,6 +700,24 @@ impl Shared {
 /// Does `node` or any of its descendants have focus?
 fn subtree_has_focus(node: &Node) -> bool {
     node.focused || node.children.iter().any(subtree_has_focus)
+}
+
+/// Drop the children of every node at [`MAX_NODE_DEPTH`], so no node of the
+/// tree rooted at `root` is deeper than the limit.
+///
+/// Walks with a vector for the reason [`Node::check_depth`] does: the input
+/// this exists for is a tree deeper than the call stack, and a recursive walk
+/// would overflow on exactly that. Only the branches that run over are
+/// touched; the rest of the tree keeps every node it had.
+fn truncate_to_max_depth(root: &mut Node) {
+    let mut pending = vec![(root, 1usize)];
+    while let Some((node, level)) = pending.pop() {
+        if level >= MAX_NODE_DEPTH {
+            node.children.clear();
+            continue;
+        }
+        pending.extend(node.children.iter_mut().map(|child| (child, level + 1)));
+    }
 }
 
 /// Accept loop: serves one bridge client at a time until shutdown.
@@ -703,10 +818,7 @@ fn start_connection(
 ) -> io::Result<JoinHandle<()>> {
     write_line(
         write_stream,
-        &AppToBridge::Hello {
-            app_label: shared.app_label.clone(),
-            protocol_version: PROTOCOL_VERSION,
-        },
+        &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION),
     )?;
     if let Some(snapshot) = initial_snapshot {
         write_line(write_stream, &AppToBridge::Snapshot(snapshot))?;
@@ -762,7 +874,7 @@ fn reader_loop(
         let Ok(msg) = serde_json::from_slice::<BridgeToApp>(&buf) else {
             continue;
         };
-        let BridgeToApp::Input { id, input } = msg else {
+        let BridgeToApp::Input { id, input, .. } = msg else {
             // A message variant added to the protocol after this adapter was
             // written. Skipped like a line that failed to parse, and for the
             // same reason: it asks for something this build cannot do. It
@@ -770,6 +882,20 @@ fn reader_loop(
             // this message is not an input.
             continue;
         };
+        if matches!(input, AgentInput::Unknown) {
+            // An input whose `kind` this build cannot read, which the parse
+            // kept only because the id lives on the message around it.
+            // Answered here rather than handed to the app: the variant
+            // carries nothing to act on, so every app would need an arm for a
+            // value that is unactionable by construction. Delivering it would
+            // also ack `Delivered` at the dequeue, a claim the app took the
+            // input, and leave the true answer to whether each app author
+            // remembers to refine it. `Ignored` is both true and already
+            // known here, so the agent learns in one round trip.
+            shared.unknown_inputs.fetch_add(1, Ordering::Relaxed);
+            shared.queue_ack(id, InputStatus::Ignored);
+            continue;
+        }
         let queued = QueuedInput {
             generation,
             id,
@@ -831,7 +957,7 @@ fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut
             }
         };
         for (id, status) in acks {
-            if write_line(stream, &AppToBridge::Ack { id, status }).is_err() {
+            if write_line(stream, &AppToBridge::ack(id, status)).is_err() {
                 return;
             }
         }
@@ -1150,6 +1276,10 @@ mod tests {
         assert_eq!(layer.socket_path(), socket_path);
         assert_eq!(layer.app_label(), "disabled");
         assert_eq!(layer.dropped_inputs(), 0);
+        assert_eq!(layer.stale_inputs(), 0);
+        assert_eq!(layer.unknown_inputs(), 0);
+        assert_eq!(layer.truncated_snapshots(), 0);
+        assert_eq!(layer.last_truncation(), None);
 
         assert_eq!(layer.try_recv(), None);
         assert_eq!(layer.try_recv_with_id(), None);
@@ -1172,6 +1302,115 @@ mod tests {
         drop(layer);
         assert!(!socket_path.exists(), "a disabled layer creates no socket");
         assert!(blocker.exists(), "dropping it must unlink nothing");
+    }
+
+    /// A chain of `depth` nodes, one child each: `n1` down to `n{depth}`.
+    fn chain(depth: usize) -> Node {
+        let mut node = Node::new(format!("n{depth}"), Role::TreeItem);
+        for level in (1..depth).rev() {
+            node = Node::new(format!("n{level}"), Role::TreeItem).child(node);
+        }
+        node
+    }
+
+    /// The auto root counts towards the depth, so a chain of
+    /// `MAX_NODE_DEPTH - 1` is exactly at the limit and nothing is cut.
+    /// Checked on its own, because it is the boundary the cut must not creep
+    /// past into trees that were always fine.
+    #[test]
+    fn a_tree_at_the_depth_limit_is_published_untouched() {
+        let mut layer = bind_test_layer("taria-layer-", "atlimit");
+        layer.publish([chain(MAX_NODE_DEPTH - 1)]);
+
+        let root = layer
+            .latest_snapshot()
+            .expect("a tree at the limit publishes")
+            .root;
+        assert_eq!(root.depth(), MAX_NODE_DEPTH);
+        assert!(root.check_depth().is_ok());
+        assert_eq!(layer.truncated_snapshots(), 0);
+        assert_eq!(layer.last_truncation(), None);
+    }
+
+    /// The failure this enforcement exists for: past the limit a snapshot
+    /// does not arrive at the peer at all, and nothing anywhere says so. So
+    /// the tree still goes out, cut to fit, rather than being held back (the
+    /// agent would keep reading a stale tree, which is the same failure) or
+    /// sent whole (which is the failure itself).
+    #[test]
+    fn a_tree_over_the_depth_limit_is_cut_rather_than_dropped() {
+        let mut layer = bind_test_layer("taria-layer-", "deep");
+        assert!(layer.latest_snapshot().is_none(), "nothing published yet");
+
+        // One node over the limit once the auto root is counted.
+        layer.publish([chain(MAX_NODE_DEPTH)]);
+        let snapshot = layer
+            .latest_snapshot()
+            .expect("a tree over the limit is published cut, never withheld");
+        assert_eq!(snapshot.seq, 1);
+        assert_eq!(snapshot.root.depth(), MAX_NODE_DEPTH);
+        assert!(snapshot.root.check_depth().is_ok());
+
+        // Everything above the cut is untouched: only the deepest node lost
+        // its children.
+        let mut node = &snapshot.root;
+        for level in 1..MAX_NODE_DEPTH {
+            assert_eq!(node.children.len(), 1, "level {level} lost a sibling");
+            node = &node.children[0];
+        }
+        assert_eq!(node.id.0, format!("n{}", MAX_NODE_DEPTH - 1));
+        assert!(node.children.is_empty(), "the node at the limit is a leaf");
+
+        // And the app can find out, with the branch named.
+        assert_eq!(layer.truncated_snapshots(), 1);
+        let too_deep = layer.last_truncation().expect("the cut is recorded");
+        assert_eq!(too_deep.depth(), MAX_NODE_DEPTH + 1);
+        assert_eq!(too_deep.deepest().0, format!("n{MAX_NODE_DEPTH}"));
+    }
+
+    /// Focus is decided after the cut, not before: a snapshot has to carry
+    /// focus somewhere, and the only focused node can be in the part removed.
+    #[test]
+    fn a_cut_that_removes_the_only_focused_node_leaves_focus_on_the_root() {
+        let mut layer = bind_test_layer("taria-layer-", "deepfocus");
+        let mut deep = Node::new("leaf", Role::TreeItem).focused(true);
+        for level in (1..MAX_NODE_DEPTH).rev() {
+            deep = Node::new(format!("n{level}"), Role::TreeItem).child(deep);
+        }
+        layer.publish([deep]);
+
+        let root = layer.latest_snapshot().expect("published").root;
+        assert_eq!(layer.truncated_snapshots(), 1);
+        assert!(
+            root.focused,
+            "the focused node was cut, so the root has to carry focus"
+        );
+        assert!(!subtree_has_focus_below_root(&root));
+    }
+
+    /// Focus anywhere under the root, which is what the root's own focus flag
+    /// is the negation of.
+    fn subtree_has_focus_below_root(root: &Node) -> bool {
+        root.children.iter().any(subtree_has_focus)
+    }
+
+    /// Only the branches that run over are cut. A wide tree with one runaway
+    /// branch keeps everything else, which is what makes cutting worth more
+    /// than refusing the publish.
+    #[test]
+    fn only_the_branch_that_runs_over_is_cut() {
+        let mut layer = bind_test_layer("taria-layer-", "deepwide");
+        layer.publish([
+            Node::new("shallow", Role::Text).label("kept"),
+            chain(MAX_NODE_DEPTH * 4),
+        ]);
+
+        let root = layer.latest_snapshot().expect("published").root;
+        assert_eq!(root.depth(), MAX_NODE_DEPTH);
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children[0].id.0, "shallow");
+        assert_eq!(root.children[0].label.as_deref(), Some("kept"));
+        assert_eq!(layer.truncated_snapshots(), 1);
     }
 
     #[test]
@@ -1209,6 +1448,7 @@ mod tests {
             cv: Condvar::new(),
             dropped_inputs: AtomicU64::new(0),
             stale_inputs: AtomicU64::new(0),
+            unknown_inputs: AtomicU64::new(0),
         });
         {
             // Both are waiting before the loop runs, so it has to choose an
@@ -1239,10 +1479,7 @@ mod tests {
         };
         assert_eq!(
             read_message(),
-            AppToBridge::Ack {
-                id: 7,
-                status: InputStatus::Delivered
-            },
+            AppToBridge::ack(7, InputStatus::Delivered),
             "an agent that saw the snapshot first could not tell whether it \
              already reflects its input"
         );

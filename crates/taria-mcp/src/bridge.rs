@@ -15,6 +15,14 @@
 //! `AppToBridge::Ack`. Acks are republished on a [`broadcast`] channel rather
 //! than kept here, because only the tool call that sent an input knows which
 //! id it is waiting for; the manager stays free of per-input bookkeeping.
+//!
+//! A line the reader cannot parse is skipped, so that a buggy app cannot kill
+//! the bridge, and the reason is kept in a third [`watch`] channel
+//! ([`BridgeHandle::rejected_rx`]) rather than only logged. Skipping is
+//! invisible from the tool surface: an app whose every line is rejected is
+//! indistinguishable from an app that never started, and telling those apart
+//! is the difference between an adopter fixing their tree and an adopter
+//! re-checking a socket path that was right all along.
 
 use std::io;
 use std::path::PathBuf;
@@ -186,6 +194,20 @@ pub struct BridgeHandle {
     /// inputs sent back to it, and reporting an input as sent to such a peer
     /// would be a lie.
     pub protocol_rx: watch::Receiver<Option<u32>>,
+    /// Why the most recent line from an app was thrown away, if one was.
+    ///
+    /// Set for every line the reader could not turn into an [`AppToBridge`],
+    /// and never cleared, because the question it answers outlives the
+    /// connection: an app that connects, publishes nothing this bridge can
+    /// read and dies leaves the state at [`BridgeState::Never`], which on its
+    /// own is indistinguishable from an app that never started. Reporting the
+    /// reason is what stops `read_tree` sending an adopter to check a socket
+    /// path the app plainly reached.
+    ///
+    /// Read only where no snapshot is available. Once a snapshot has arrived,
+    /// a later rejected line says nothing about the tree being served, and
+    /// the tools do not mention it.
+    pub rejected_rx: watch::Receiver<Option<String>>,
 }
 
 impl BridgeHandle {
@@ -215,18 +237,21 @@ pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
     let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
     let (ack_tx, _) = broadcast::channel(ACK_QUEUE);
     let (protocol_tx, protocol_rx) = watch::channel(None);
+    let (rejected_tx, rejected_rx) = watch::channel(None);
     tokio::spawn(manager_loop(
         socket_path,
         state_tx,
         input_rx,
         ack_tx.clone(),
         protocol_tx,
+        rejected_tx,
     ));
     BridgeHandle {
         state_rx,
         input_tx,
         ack_tx,
         protocol_rx,
+        rejected_rx,
     }
 }
 
@@ -246,6 +271,7 @@ async fn manager_loop(
     mut input_rx: mpsc::Receiver<(InputId, AgentInput)>,
     ack_tx: broadcast::Sender<(InputId, InputStatus)>,
     protocol_tx: watch::Sender<Option<u32>>,
+    rejected_tx: watch::Sender<Option<String>>,
 ) {
     let mut backoff = RETRY_MIN;
     loop {
@@ -261,6 +287,7 @@ async fn manager_loop(
                     &mut input_rx,
                     &ack_tx,
                     &protocol_tx,
+                    &rejected_tx,
                     &mut conn_label,
                 )
                 .await;
@@ -392,6 +419,7 @@ async fn run_connection(
     input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>,
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
     protocol_tx: &watch::Sender<Option<u32>>,
+    rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) -> ConnectionEnd {
     let (read_half, mut write_half) = stream.into_split();
@@ -401,7 +429,14 @@ async fn run_connection(
         tokio::select! {
             read = read_line_capped(&mut reader, &mut line_buf) => match read {
                 Ok(LineRead::Line) => {
-                    handle_app_line(&line_buf, state_tx, ack_tx, protocol_tx, conn_label);
+                    handle_app_line(
+                        &line_buf,
+                        state_tx,
+                        ack_tx,
+                        protocol_tx,
+                        rejected_tx,
+                        conn_label,
+                    );
                     line_buf.clear();
                 }
                 Ok(LineRead::Eof) => return ConnectionEnd::AppClosed,
@@ -421,7 +456,7 @@ async fn run_connection(
                 let Some((id, input)) = input else {
                     return ConnectionEnd::SessionClosed;
                 };
-                let msg = BridgeToApp::Input { id, input };
+                let msg = BridgeToApp::input(id, input);
                 let mut line = match serde_json::to_string(&msg) {
                     Ok(line) => line,
                     Err(err) => {
@@ -439,13 +474,16 @@ async fn run_connection(
     }
 }
 
-/// Handle one ndjson line from the app. Malformed lines are logged and
-/// skipped so a buggy app cannot kill the bridge.
+/// Handle one ndjson line from the app. Malformed lines are logged, recorded
+/// in `rejected_tx` and skipped, so a buggy app cannot kill the bridge and an
+/// agent asking for a tree is told what went wrong instead of being sent to
+/// check the socket path.
 fn handle_app_line(
     line: &[u8],
     state_tx: &watch::Sender<BridgeState>,
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
     protocol_tx: &watch::Sender<Option<u32>>,
+    rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) {
     // Decoded from `&str` rather than `&[u8]` because the snapshot arm keeps
@@ -454,12 +492,14 @@ fn handle_app_line(
     // borrowed `&str` rather than a lossy conversion of bytes.
     let Ok(line) = str::from_utf8(line) else {
         tracing::warn!("ignoring a line from app that is not valid UTF-8");
+        rejected_tx.send_replace(Some("the line is not valid UTF-8".to_string()));
         return;
     };
     match serde_json::from_str::<AppToBridge>(line) {
         Ok(AppToBridge::Hello {
             app_label,
             protocol_version,
+            ..
         }) => {
             if protocol_version == PROTOCOL_VERSION {
                 tracing::info!(app_label, protocol_version, "app handshake received");
@@ -482,7 +522,7 @@ fn handle_app_line(
             // See [`AppSnapshot`].
             state_tx.send_replace(BridgeState::Connected(AppSnapshot::from_line(line, parsed)));
         }
-        Ok(AppToBridge::Ack { id, status }) => {
+        Ok(AppToBridge::Ack { id, status, .. }) => {
             tracing::debug!(id, ?status, "input ack received");
             // An ack nobody is waiting for is the normal case (the tool call
             // that sent the input has already returned), so a send with no
@@ -499,6 +539,10 @@ fn handle_app_line(
         }
         Err(err) => {
             tracing::warn!(%err, "ignoring malformed line from app");
+            // Kept, not just logged. Nobody reads a bridge's log while
+            // retrofitting an app; they read the tool's error, and this is
+            // the only place that knows why the line was thrown away.
+            rejected_tx.send_replace(Some(err.to_string()));
         }
     }
 }

@@ -180,11 +180,7 @@ mod tests {
     }
 
     fn act(node: &str, action: Action) -> AgentInput {
-        AgentInput::Act {
-            node: taria::NodeId(node.into()),
-            action,
-            value: None,
-        }
+        AgentInput::act(taria::NodeId(node.into()), action, None)
     }
 
     fn delete(app: &mut App, node: &str) {
@@ -486,11 +482,11 @@ mod tests {
         // The move an agent actually makes: `set_value` takes the keyboard.
         apply_agent_input(
             &mut app,
-            AgentInput::Act {
-                node: taria::NodeId("input".into()),
-                action: Action::SetValue,
-                value: Some("draft".into()),
-            },
+            AgentInput::act(
+                taria::NodeId("input".into()),
+                Action::SetValue,
+                Some("draft".into()),
+            ),
         );
         let nodes = build_nodes(&app);
         assert_eq!(focused_id(&nodes).as_deref(), Some("input"));

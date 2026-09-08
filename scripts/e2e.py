@@ -1278,12 +1278,13 @@ def step_s_shutdown(client, ctx, app):
         time.sleep(0.05)
     require(not os.path.exists(app.sock_path), "socket file still exists after exit")
 
-    # Both counters the demo reports once the terminal is restored must be
-    # zero for a whole scenario. Either line means the run above silently lost
-    # agent input -- inputs the app's queue overflowed on, or inputs discarded
-    # because the bridge connection they arrived on ended first -- and every
-    # step that passed did so over a hole. Checked here because this is the
-    # only point where the demo has printed them and is done writing.
+    # Every counter the demo reports once the terminal is restored must be
+    # zero for a whole scenario. Any of these lines means the run above
+    # silently lost agent input -- inputs the app's queue overflowed on,
+    # inputs discarded because the bridge connection they arrived on ended
+    # first, or inputs whose kind this build of taria could not read -- and
+    # every step that passed did so over a hole. Checked here because this is
+    # the only point where the demo has printed them and is done writing.
     #
     # An absence proves nothing by itself: the demo prints each line only when
     # its count is above zero, so a deleted counter would satisfy this too.
@@ -1308,6 +1309,10 @@ def step_s_shutdown(client, ctx, app):
             (
                 "taria-demo: discarded ",
                 "discarded inputs (their bridge connection ended first)",
+            ),
+            (
+                "taria-demo: could not read ",
+                "unreadable inputs (a taria version gap the demo cannot act across)",
             ),
         )
         if marker in stderr

@@ -48,6 +48,13 @@ impl<'a> FrameRecorder<'a> {
     /// snapshot always carries focus somewhere. `seq` increments per
     /// published snapshot; a frame identical to the previous one is skipped
     /// entirely. This never blocks the render path.
+    ///
+    /// A tree deeper than [`taria::MAX_NODE_DEPTH`] is cut rather than sent
+    /// or skipped, because a snapshot past that depth does not arrive at the
+    /// bridge at all and nothing says so. See
+    /// [`TariaLayer::publish`](crate::TariaLayer::publish) for why, and
+    /// [`TariaLayer::last_truncation`](crate::TariaLayer::last_truncation)
+    /// for how an app finds out.
     pub fn publish(self) {
         let Self { layer, nodes } = self;
         layer.publish_nodes(nodes.into_inner());
