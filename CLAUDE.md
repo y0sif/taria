@@ -12,7 +12,7 @@ cargo test --workspace
 cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
 python3 scripts/e2e.py                      # end-to-end gate, 20 steps
-python3 scripts/adversarial.py              # edge-case probes, 17 of them
+python3 scripts/adversarial.py              # edge-case probes, 18 of them
 ```
 
 Run all six before pushing. CI runs the same gate with `cargo build

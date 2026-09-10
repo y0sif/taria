@@ -25,8 +25,9 @@ section spends most of its length on.
 ## Add the dependency
 
 Neither crate is published yet, so both come from the repository. They carry
-version `0.0.1` there, which is a placeholder rather than something to pin
-against; pin a git revision if you want the same build twice.
+version `0.1.0` there, the first release. A git dependency resolves to
+whatever the branch holds the day you build it, so pin a revision if you want
+the same build twice.
 
 ```toml
 [dependencies]

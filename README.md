@@ -11,10 +11,11 @@ terminals and guessing at structure. taria works on the other side of the
 terminal: the app publishes what is on screen semantically, the way
 accessibility trees transformed GUI automation.
 
-> Status: pre-alpha. The vertical slice works end to end: a ratatui adapter,
-> an MCP bridge, and a demo app an agent can drive today. The wire format is
-> frozen at `PROTOCOL_VERSION` 1. See `docs/landscape.md` for why this
-> project exists, `docs/architecture.md` for how the pieces fit, and
+> Status: pre-alpha, at version 0.1.0. The vertical slice works end to end: a
+> ratatui adapter, an MCP bridge, and a demo app an agent can drive today. The
+> wire format is frozen at `PROTOCOL_VERSION` 1. See `CHANGELOG.md` for what
+> this release changed and what the freeze promises, `docs/landscape.md` for
+> why this project exists, `docs/architecture.md` for how the pieces fit, and
 > `docs/integration-guide.md` for adding taria to an app you already have.
 
 ## Quick start
@@ -160,7 +161,7 @@ cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 python3 scripts/e2e.py           # end-to-end: 20 steps, demo app + bridge + MCP
-python3 scripts/adversarial.py   # 17 edge-case probes
+python3 scripts/adversarial.py   # 18 edge-case probes
 ```
 
 CI runs this gate, with `cargo build --workspace` in place of `cargo check`.
@@ -184,7 +185,7 @@ snapshot instead of re-serializing its parse of it, so an unknown role, action
 or field reaches the agent under its real name; the degraded parse is what the
 bridge validates and compares against, not what the agent reads.
 
-In Rust the same promise is `#[non_exhaustive]` on the ten types a version-1
+In Rust the same promise is `#[non_exhaustive]` on the eleven types a version-1
 addition can reach, from `Role` and `Action` to the two wire message enums,
 and on the six struct-like variants inside them, where a new optional field
 would land. So a new role, key, field or message variant costs an app that

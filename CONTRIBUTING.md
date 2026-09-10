@@ -18,7 +18,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace
 python3 scripts/e2e.py           # end-to-end: 20 steps, demo app + bridge + MCP
-python3 scripts/adversarial.py   # 17 edge-case probes
+python3 scripts/adversarial.py   # 18 edge-case probes
 ```
 
 CI runs all six; zero warnings is the bar. The two scripts use nothing outside
@@ -39,11 +39,12 @@ that has just built and still refuses a `target/debug` older than the sources.
   Removing a field, renaming one, making an optional field required, or
   changing what an existing field means bumps the version, and needs a written
   rationale first. `crates/taria/src/wire.rs` is the normative statement.
-- Additive on the wire is not automatically additive in Rust, so the ten types
-  a version-1 addition can reach are `#[non_exhaustive]`: the two wire message
-  enums, `InputStatus`, `AgentInput`, `Action`, `Role`, `Node`, `Snapshot`,
-  `key::Key` and `key::Modifiers`. So are the six struct-like variants where a
-  new optional field would land: `AppToBridge::Hello` and `Ack`,
+- Additive on the wire is not automatically additive in Rust, so the eleven
+  types a version-1 addition can reach are `#[non_exhaustive]`: the two wire
+  message enums, `InputStatus`, `AgentInput`, `Action`, `Role`, `Node`,
+  `Snapshot`, `key::Key`, `key::Modifiers` and `key::KeyPress`. So are the six
+  struct-like variants where a new optional field would land:
+  `AppToBridge::Hello` and `Ack`,
   `BridgeToApp::Input`, and `AgentInput`'s `Act`, `Key` and `Text`. Adding a
   variant, field, role or action goes to one of those, and it stays a
   recompile for every peer that integrated taria. A marked variant has no
