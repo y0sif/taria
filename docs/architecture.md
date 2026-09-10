@@ -163,6 +163,12 @@ custom, correctly, keeps it, and echoes it back in the only form it has, and
 the newer peer's own arm still fires instead of accepting the act and doing
 nothing.
 
+The envelope is a wire encoding, not an argument. `act` takes the name alone,
+so a node advertising `{"custom":"delete"}` is invoked with `"delete"`. An
+agent told never to guess an action name meets that difference on its first
+custom action, so the tool description and the server's instructions both
+state it rather than leaving it to be inferred.
+
 ### Version 1 is frozen
 
 `PROTOCOL_VERSION` is 1 and the format is fixed. Within version 1, changes
@@ -298,7 +304,8 @@ all.
 | A burst the bridge could not finish sending | Error: how many went out and may already have taken effect, how many did not, and that the effect is partial. |
 | Acks lost (the bridge fell behind its own ack channel) | Error: what became of the inputs cannot be reported in full; call `read_tree`, send fewer inputs per call. |
 | Any input of a multi-input burst `dropped` | Error: how many landed, and that the effect is partial. |
-| The app went away and did not come back | Error: it received the input and then disconnected, or disconnected before acknowledging it. |
+| The app acknowledged the input and then went away | Text: the app acknowledged it and disconnected, possibly because of it; no tree, because the app is gone. Not an error: the input's fate is known, and an advertised `quit` reaches this on purpose. |
+| The app went away without acknowledging the input | Error: it disconnected before acknowledging this input, so whether the input was applied is not known. |
 | `dropped` | Error: nothing was applied; send fewer inputs. |
 | `ignored` | Text saying the app deliberately did nothing, plus the current tree to re-plan from. |
 | `delivered`, tree changed | The new tree. |
@@ -315,6 +322,13 @@ departure, because "never applied" stays true whether or not the app is still
 there. A departure outranks a tree, because a tree would describe a UI that
 no longer exists. Lost acks outrank the rest, because any of them could have
 been a `dropped` this call was watching for.
+
+Which of the two departure rows applies is decided by the ack, not by the
+departure. That is where the error flag is drawn throughout: a call that was
+invalid, or an input whose fate nobody can state. An acknowledged input has a
+known fate, so an app that takes it and exits is reported and not raised.
+Raised, it made every caller that branches on the flag read a working `quit`
+as a failed call, and the prose saying otherwise did not help them.
 
 An adapter that sends no acks at all still works, which is what the last two
 rows are for.
@@ -423,22 +437,41 @@ Bridge side (`taria-mcp`):
 3. On reconnect, inputs queued while disconnected are discarded, and the
    peer's `protocol_version` is forgotten so the next connection is not
    judged by the previous app's handshake.
-4. Lines it could not read are kept, one at a time, with the reason. That is
-   what separates two states a bridge otherwise reports identically: nothing
-   ever connected, and an app connected and sent lines this build threw away.
+4. Lines it could not read are kept, one at a time, with the reason.
+5. Its own `connect` is published too: whether a connection is open, and
+   since when.
 
-The second of those used to be answered by asking whether the socket path was
-right, which is the first wrong turn a retrofit takes: an app whose lines were
-rejected has demonstrably found the socket. So `read_tree` now says the path
-is right and quotes the reason instead, and names the two things that produce
-it, a tree past `MAX_NODE_DEPTH` and an app built against a taria whose
-snapshot shape differs from this bridge's. The input tools carry the same note
-into the one outcome that needs it. An ack whose `status` this build cannot
-name fails its whole line, id included, so the app answering an input is
-indistinguishable at the bridge from the app saying nothing; a rejected line
-inside the window is the only trace left of the difference, and the "neither
-acknowledged nor changed" answer says so rather than letting the agent read
-silence as an app that does not ack.
+Those last two exist for the same reason. "No snapshot yet" is four states
+wearing one name, and the bridge holds the facts that separate them:
+
+| What is true | What `read_tree` says |
+|---|---|
+| A line arrived and could not be read | The app found the socket, so the line is what is wrong; the reason is quoted, and the two things that produce it named (a tree past `MAX_NODE_DEPTH`, an app built against a taria whose snapshot shape differs from this bridge's). |
+| The peer greeted this bridge and published nothing | The app is connected; what is missing is the tree. An app that binds the layer and never publishes nodes looks exactly like this. |
+| A connection is open and nobody has said a word on it (past a 500 ms grace) | The path is not what is wrong. An adapter greets a bridge the moment it accepts one and serves one at a time, so this is the second bridge's view of a socket another one is holding, usually a `taria-mcp` left running by an earlier session. |
+| Nothing is connected | Is the app running, and is the socket path correct? |
+
+All four used to be answered by asking whether the socket path was right,
+which is the first wrong turn a retrofit takes and the first wall a new agent
+hits: in both of the middle cases the bridge is connected to that path. The
+input tools ask for a tree before they send anything, so they carry whichever
+of these applies rather than a second vocabulary for it.
+
+An ack whose `status` this build cannot name fails its whole line, id
+included, so the app answering an input is indistinguishable at the bridge
+from the app saying nothing; a rejected line inside the window is the only
+trace left of the difference, and the "neither acknowledged nor changed"
+answer says so rather than letting the agent read silence as an app that does
+not ack.
+
+Diagnosing the held socket is bridge-side only. The adapter could accept a
+second connection and close it at once, turning the silence into a fast,
+legible disconnect, but the listener thread is the thread that serves a
+client, so accepting anything while a bridge is connected is the
+one-client-at-a-time change itself, which is deferred. A bridge-side answer
+also costs adapters nothing, works against adapters already shipped, and
+covers the other ways this silence happens: a peer wedged before its
+handshake, or a process at that path that does not speak taria at all.
 
 ### One connection owns its inputs
 

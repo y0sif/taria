@@ -110,8 +110,10 @@ app you already have, including which role to reach for.
 
 The three input tools wait up to 500 ms for the app's answer and report what
 actually happened: the updated tree, an input the app deliberately ignored
-(with the current tree to re-plan from), or an error for an input that was
-dropped, never applied, or aimed at an app that has gone away.
+(with the current tree to re-plan from), an input the app acknowledged and did
+not survive (an advertised `quit`, working), or an error for an input that was
+dropped, never applied, or left unaccounted for by an app that went away
+before acknowledging it.
 
 ## taria-mcp CLI
 

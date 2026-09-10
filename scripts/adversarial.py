@@ -100,6 +100,23 @@ QUEUE_FULL_ERROR = (
 )
 
 
+# The bridge connected and the peer never spoke. The age of the connection is
+# whatever the probe's polling caught, so it is captured; every other word is
+# verbatim. This is the answer that replaced "is the socket path correct?" for
+# a bridge that is demonstrably connected to that path.
+SILENT_PEER_RE = re.compile(
+    r"^no snapshot from the app yet, and the socket path is not what is wrong: this bridge "
+    r"is connected to it, and the connection has been open for (?P<open>\d+\.\d)s with no "
+    r"handshake and no snapshot on it\. A taria adapter greets a bridge the moment it accepts "
+    r"one, and serves one bridge at a time, so an open connection that says nothing is what a "
+    r"second bridge gets: the kernel completed it into the listen backlog and the app, still "
+    r"serving the first bridge, never accepted it\. The likely cause is another taria-mcp "
+    r"process holding this app, often one left running by an earlier session; stopping that one "
+    r"hands the app to this bridge, which needs no restart of its own\. Failing that, the peer "
+    r"at this path wedged before its handshake, or is not a taria adapter at all\.$"
+)
+
+
 def partial_drop_error(dropped, sent):
     landed = sent - dropped
     return (
@@ -147,17 +164,26 @@ class FakeApp:
     then does exactly what the probe tells it to: publish a snapshot, ack an
     input, or -- with `read_inputs=False` -- never read its socket at all.
 
-    It exists for the four states `taria-demo` cannot be put into on demand:
+    It exists for the five states `taria-demo` cannot be put into on demand:
     another protocol version, a snapshot using a role and an action this
-    build has never heard of, an app that drops part of one burst, and an app
-    that stops reading. In every one of them the bridge under test is the
-    real binary; only the peer is a stand-in.
+    build has never heard of, an app that drops part of one burst, an app
+    that stops reading, and -- with `accept=False` -- a socket that is bound
+    and listening and never accepts, which is what a second bridge meets
+    while another one holds the app. In every one of them the bridge under
+    test is the real binary; only the peer is a stand-in.
     """
 
-    def __init__(self, path, protocol_version=BRIDGE_PROTOCOL, read_inputs=True):
+    def __init__(
+        self,
+        path,
+        protocol_version=BRIDGE_PROTOCOL,
+        read_inputs=True,
+        accept=True,
+    ):
         self.path = path
         self.protocol_version = protocol_version
         self.read_inputs = read_inputs
+        self.accepts = accept
         self.conn = None
         self._lines = []
         self._malformed = []
@@ -171,6 +197,13 @@ class FakeApp:
         self._thread.start()
 
     def _serve(self):
+        if not self.accepts:
+            # Bound and listening, and that is all. The bridge's connect
+            # succeeds into the listen backlog and nothing is ever read from
+            # it or written to it: the adapter serving one bridge at a time
+            # does this to the second one, and there is no way to ask a real
+            # app for it without a second live bridge.
+            return
         try:
             conn, _ = self.srv.accept()
         except OSError:
@@ -372,7 +405,8 @@ def fake_session(**kwargs):
         client = McpClient(app.path)
         LIVE_CLIENTS.add(client)
         client.initialize()
-        require(app.wait_connected(), "the bridge never connected to the fake app")
+        if app.accepts:
+            require(app.wait_connected(), "the bridge never connected to the fake app")
         yield client, app
         # Only on the success path: a probe's own failure is the better
         # report, and this one would otherwise hide it.
@@ -1391,6 +1425,67 @@ def probe_lost_acks(client, ctx):
     return "; ".join(seen)
 
 
+def probe_socket_held_by_another_bridge(client, ctx):
+    """A bridge connected to a socket nobody will accept it from.
+
+    The adapter serves one bridge at a time, so a second bridge's connection
+    is completed by the kernel into the listen backlog and then left unread:
+    the connect succeeded, and no handshake and no snapshot will ever arrive
+    on it. That is what a `taria-mcp` left running by an earlier session does
+    to the next one, and it is the first thing a fresh agent meets, before any
+    feature of the release can be tried at all. The answer used to be "is the
+    taria-enabled app running, and is the socket path correct?"; both were
+    yes, and finding the real cause took nine shell calls of `ps`, `ss` and
+    `/proc/net/unix` forensics.
+
+    `client` is the shared demo's bridge and goes unused: this probe brings
+    its own bridge and its own peer, because the state needs a socket that
+    accepts nothing.
+    """
+    with fake_session(accept=False) as (silent, _app):
+        # Polled: the connection has to be open past the bridge's grace before
+        # its silence means anything, and until then the honest answer is the
+        # shorter "worth one retry" one.
+        deadline = time.monotonic() + READ_TIMEOUT
+        message = ""
+        while time.monotonic() < deadline:
+            try:
+                tree = silent.call_raw("read_tree")
+                raise StepFailure(
+                    f"read_tree answered with a tree from a peer that never spoke: "
+                    f"{tree[:200]}"
+                )
+            except ToolError as err:
+                message = err.message
+                if SILENT_PEER_RE.match(message):
+                    break
+            time.sleep(0.1)
+        matched = SILENT_PEER_RE.match(message)
+        require(
+            matched is not None,
+            f"read_tree never diagnosed the unaccepted connection: {message[:400]}",
+        )
+        require(
+            "is the socket path correct" not in message,
+            f"the bridge is connected to that path and must not ask about it: "
+            f"{message[:200]}",
+        )
+        # The input tools ask for a tree before they send anything, so they
+        # carry the same diagnosis instead of a second vocabulary for it.
+        try:
+            text = silent.call_raw("key", {"key": "down"})
+            raise StepFailure(f"key was answered with no app behind it: {text[:200]}")
+        except ToolError as err:
+            require(
+                SILENT_PEER_RE.match(err.message) is not None,
+                f"an input tool answered this state differently: {err.message[:400]}",
+            )
+    return (
+        f"connect succeeded and the peer never spoke; read_tree named the held socket "
+        f"after {matched.group('open')}s open, and key said the same"
+    )
+
+
 def probe_kill_and_restart(client, ctx, app, sock, launched):
     """SIGKILL the app mid-session; read_tree must error (not hang); then a
     restarted app must be picked up by the bridge's reconnect loop.
@@ -1519,6 +1614,7 @@ def main():
         ("partial burst drop", probe_partial_burst_drop),
         ("app stops reading its socket", probe_input_queue_full),
         ("acks lost to the bridge's channel", probe_lost_acks),
+        ("socket held by another bridge", probe_socket_held_by_another_bridge),
     ]
 
     def teardown():

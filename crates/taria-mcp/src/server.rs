@@ -11,7 +11,7 @@ use taria::wire::{InputId, InputStatus};
 use taria::{Action, AgentInput, MAX_NODE_DEPTH, Node, NodeId, PROTOCOL_VERSION};
 use tokio::sync::{broadcast, watch};
 
-use crate::bridge::{AppSnapshot, BridgeHandle, BridgeState};
+use crate::bridge::{AppSnapshot, BridgeHandle, BridgeState, LinkState};
 
 /// How long an input-sending tool waits for the app to answer, counting both
 /// the app's ack and any snapshot it publishes in response.
@@ -24,6 +24,17 @@ const UPDATE_WAIT: Duration = Duration::from_millis(500);
 /// nothing said to the agent meanwhile. Bounding it turns an indefinite hang
 /// into an error naming the cause.
 const QUEUE_WAIT: Duration = Duration::from_millis(500);
+
+/// How long an open connection may say nothing before the bridge reports it
+/// as a peer that is not reading rather than as a handshake still in flight.
+///
+/// A taria adapter writes its `Hello` as soon as it accepts a bridge, and its
+/// listener polls for a new connection every 50 ms, so a connection still
+/// silent this long after `connect` returned is not a slow app: it is a
+/// connection nobody has accepted, which is what serving one bridge at a time
+/// does to the second one. Ten times the adapter's poll, so a loaded machine's
+/// first handshake is not diagnosed as a socket somebody else is holding.
+const SILENT_LINK_GRACE: Duration = Duration::from_millis(500);
 
 /// Most presses one `key` call may send.
 ///
@@ -69,7 +80,9 @@ const MAX_VALUE_CHARS: usize = MAX_TEXT_CHARS;
 const INSTRUCTIONS: &str = "Bridge to a live terminal (TUI) application. Call read_tree first: \
 it returns the app's current semantic tree, including every node id and the actions each node \
 advertises. Prefer act with a node id and one of that node's advertised actions (pass value for \
-set_value); node ids and action names come from the tree, never guess them. type_text types a \
+set_value); node ids and action names come from the tree, never guess them. An action the tree \
+spells as an object, {\"custom\":\"delete\"}, is passed to act as the inner name alone, \
+\"delete\"; every other action is passed exactly as the tree spells it. type_text types a \
 literal string in one call instead of one call per character; use it for anything you would \
 otherwise spell out with key. key sends a single raw key press and is a fallback for parts of \
 the UI without semantic coverage; its repeat parameter sends the same key up to 64 times, so \
@@ -82,7 +95,9 @@ pub struct ActParams {
     /// Id of the target node, exactly as it appears in the tree from read_tree.
     pub node: String,
     /// Action name advertised by that node (e.g. "activate", "toggle",
-    /// "set_value", or an app-specific custom action name).
+    /// "set_value", or an app-specific custom action name). An action the
+    /// tree spells as an object, {"custom":"delete"}, is passed here as the
+    /// inner name alone: "delete".
     pub action: String,
     /// Value for actions that take one (e.g. the text for "set_value"), up to
     /// 4096 characters.
@@ -228,6 +243,19 @@ impl TariaMcpServer {
         ))
     }
 
+    /// The bridge's own view of the socket, for the calls that find no tree.
+    ///
+    /// Read here rather than inside [`available_snapshot`] so the state and
+    /// the facts explaining it are taken by the same caller: `act`, `key` and
+    /// `type_text` take the state through their own receiver, to mark it seen.
+    fn link_report(&self) -> LinkReport {
+        LinkReport {
+            rejected: self.bridge.rejected_rx.borrow().clone(),
+            link: *self.bridge.link_rx.borrow(),
+            peer_protocol: *self.bridge.protocol_rx.borrow(),
+        }
+    }
+
     /// Hand one input to the socket task, returning the id it was sent under.
     async fn send_input(&self, input: AgentInput) -> Result<InputId, McpError> {
         let id = self.bridge.next_input_id();
@@ -260,10 +288,8 @@ impl TariaMcpServer {
                        Call this first; act and key depend on ids and actions from this tree."
     )]
     pub async fn read_tree(&self) -> Result<CallToolResult, McpError> {
-        let snapshot = available_snapshot(
-            self.bridge.state_rx.borrow().clone(),
-            self.bridge.rejected_rx.borrow().clone(),
-        )?;
+        let snapshot =
+            available_snapshot(self.bridge.state_rx.borrow().clone(), self.link_report())?;
         tree_result(&snapshot)
     }
 
@@ -272,7 +298,10 @@ impl TariaMcpServer {
         description = "Invoke an advertised action on a node of the app's semantic tree. `node` \
                        is a node id and `action` an action name, both taken from read_tree; pass \
                        `value` for actions that need one (e.g. set_value), up to 4096 \
-                       characters. Returns the updated tree once the app reacts."
+                       characters. An app-specific action appears in the tree as an object, \
+                       {\"custom\":\"delete\"}, and is passed here as the inner name alone, \
+                       \"delete\"; every other action is passed exactly as the tree spells it. \
+                       Returns the updated tree once the app reacts."
     )]
     pub async fn act(
         &self,
@@ -303,10 +332,7 @@ impl TariaMcpServer {
             ));
         }
         let mut rx = self.bridge.state_rx.clone();
-        let snapshot = available_snapshot(
-            rx.borrow_and_update().clone(),
-            self.bridge.rejected_rx.borrow().clone(),
-        )?;
+        let snapshot = available_snapshot(rx.borrow_and_update().clone(), self.link_report())?;
 
         let Some(target) = find_node(&snapshot.parsed.root, &node) else {
             let mut ids = Vec::new();
@@ -392,10 +418,7 @@ impl TariaMcpServer {
         let mut rx = self.bridge.state_rx.clone();
         // Like `act`, refuse while no app is connected: a key queued now
         // would only be delivered to (and confuse) the *next* app instance.
-        let pre = available_snapshot(
-            rx.borrow_and_update().clone(),
-            self.bridge.rejected_rx.borrow().clone(),
-        )?;
+        let pre = available_snapshot(rx.borrow_and_update().clone(), self.link_report())?;
         self.send_and_report(rx, pre, AgentInput::key(key), repeat)
             .await
     }
@@ -428,10 +451,7 @@ impl TariaMcpServer {
             ));
         }
         let mut rx = self.bridge.state_rx.clone();
-        let pre = available_snapshot(
-            rx.borrow_and_update().clone(),
-            self.bridge.rejected_rx.borrow().clone(),
-        )?;
+        let pre = available_snapshot(rx.borrow_and_update().clone(), self.link_report())?;
         self.send_and_report(rx, pre, AgentInput::text(text), 1)
             .await
     }
@@ -520,44 +540,34 @@ pub fn action_name(action: &Action) -> String {
     }
 }
 
+/// What the bridge knows about its own end of the socket, for the calls that
+/// find no snapshot to work from.
+///
+/// Grouped rather than passed one by one because no field decides the answer
+/// alone: a rejected line, an open connection, and a completed handshake are
+/// three facts about the same silence, and which of them is the story depends
+/// on the others. Read nowhere else. Once a tree is being served, none of this
+/// is what an agent needs to hear about.
+struct LinkReport {
+    /// Why the most recent line from an app was thrown away, if one was.
+    rejected: Option<String>,
+    /// Whether a connection is open, and since when.
+    link: LinkState,
+    /// The `protocol_version` the peer declared, if it has said anything at
+    /// all. `Some` is the handshake, so this doubles as "the peer greeted us".
+    peer_protocol: Option<u32>,
+}
+
 /// Extract the live snapshot from a [`BridgeState`], or the error explaining
 /// why none is available. The failure modes call for different next steps, so
-/// they get distinct messages: an app that never connected (wrong socket
-/// path? not started?), an app that connected and then went away (it exited
-/// or crashed; waiting for it to come back is enough), and an app that
-/// reached the socket and sent lines this bridge threw away.
-///
-/// `rejected` is [`BridgeHandle::rejected_rx`](crate::bridge::BridgeHandle),
-/// and it is what separates the first case from the third. Both leave the
-/// state at [`BridgeState::Never`], but only one of them is worth checking a
-/// socket path over: an app whose lines were rejected demonstrably found the
-/// socket. Sending an adopter to re-check the path there is the first wrong
-/// turn a retrofit takes, and the bridge knew the real reason all along.
-fn available_snapshot(
-    state: BridgeState,
-    rejected: Option<String>,
-) -> Result<AppSnapshot, McpError> {
+/// they get distinct messages: an app that connected and then went away (it
+/// exited or crashed; waiting for it to come back is enough), and the four
+/// ways [`BridgeState::Never`] is reached, which [`no_snapshot_reason`] tells
+/// apart.
+fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnapshot, McpError> {
     match state {
         BridgeState::Connected(snapshot) => Ok(snapshot),
-        BridgeState::Never => Err(McpError::internal_error(
-            match rejected {
-                Some(err) => format!(
-                    "no snapshot from the app yet, but not because nothing is there: an app \
-                     reached this socket and sent lines, and this bridge could not read the \
-                     last one ({err}). The socket path is right, so the line is what is wrong. \
-                     A snapshot more than {MAX_NODE_DEPTH} levels deep exceeds what a JSON \
-                     parser will recurse into and fails exactly like this; so does an app built \
-                     against a taria whose snapshot shape differs from this bridge's. Fix the \
-                     tree the app publishes, or match its taria dependency to this bridge's; \
-                     the bridge keeps reading and needs no restart.",
-                ),
-                None => "no snapshot from the app yet - is the taria-enabled app running, and \
-                     is the socket path correct? The bridge reconnects automatically; retry \
-                     once the app is up."
-                    .to_string(),
-            },
-            None,
-        )),
+        BridgeState::Never => Err(McpError::internal_error(no_snapshot_reason(report), None)),
         BridgeState::Disconnected {
             app_label,
             last_seq,
@@ -570,6 +580,78 @@ fn available_snapshot(
             None,
         )),
     }
+}
+
+/// Why no app has published a tree yet, in the terms of whichever fact is the
+/// story.
+///
+/// [`BridgeState::Never`] is four states wearing one name, and they call for
+/// four different next steps. Only the last of them is worth checking a socket
+/// path over, and it used to be the answer given to all four. Sending an
+/// adopter to re-check a path the bridge is connected to is the first wrong
+/// turn a retrofit takes, and the bridge knew better every time:
+///
+/// - A line arrived and could not be read. The app found the socket, so the
+///   line is what is wrong.
+/// - The peer completed the handshake and has published nothing. The app is
+///   connected and is not publishing nodes.
+/// - A connection is open and nobody has said a word on it. An adapter greets
+///   a bridge the moment it accepts one, and serves one bridge at a time, so
+///   this is what the second bridge gets: a connection the kernel completed
+///   into the listen backlog and the app never accepted.
+/// - Nothing is connected. Here, and only here, the path and whether the app
+///   is running are the questions.
+fn no_snapshot_reason(report: LinkReport) -> String {
+    // A rejected line outranks the rest: it is the most specific thing that
+    // happened, and it happened on whatever connection the others describe.
+    if let Some(err) = report.rejected {
+        return format!(
+            "no snapshot from the app yet, but not because nothing is there: an app reached \
+             this socket and sent lines, and this bridge could not read the last one ({err}). \
+             The socket path is right, so the line is what is wrong. A snapshot more than \
+             {MAX_NODE_DEPTH} levels deep exceeds what a JSON parser will recurse into and \
+             fails exactly like this; so does an app built against a taria whose snapshot \
+             shape differs from this bridge's. Fix the tree the app publishes, or match its \
+             taria dependency to this bridge's; the bridge keeps reading and needs no restart.",
+        );
+    }
+    let Some(open_for) = report.link.open_for() else {
+        return "no snapshot from the app yet, and this bridge holds no connection to the \
+                socket: is the taria-enabled app running, and is the socket path correct? The \
+                bridge reconnects automatically; retry once the app is up."
+            .to_string();
+    };
+    if let Some(version) = report.peer_protocol {
+        return format!(
+            "no snapshot from the app yet, and the socket is not what is wrong: this bridge is \
+             connected to it and the app completed the taria handshake (protocol version \
+             {version}), so what is missing is the tree. An app that binds the layer and never \
+             publishes nodes looks exactly like this; publish once per draw, from \
+             `publish(nodes)` or a `FrameRecorder`. Nothing needs restarting: the first \
+             snapshot the app publishes is served."
+        );
+    }
+    if open_for < SILENT_LINK_GRACE {
+        return format!(
+            "no snapshot from the app yet: this bridge connected to the socket {}ms ago and no \
+             handshake has arrived yet. The path is right, so this is worth one retry; a \
+             connection that is still silent on the next call is diagnosed rather than waited \
+             on.",
+            open_for.as_millis()
+        );
+    }
+    format!(
+        "no snapshot from the app yet, and the socket path is not what is wrong: this bridge is \
+         connected to it, and the connection has been open for {:.1}s with no handshake and no \
+         snapshot on it. A taria adapter greets a bridge the moment it accepts one, and serves \
+         one bridge at a time, so an open connection that says nothing is what a second bridge \
+         gets: the kernel completed it into the listen backlog and the app, still serving the \
+         first bridge, never accepted it. The likely cause is another taria-mcp process holding \
+         this app, often one left running by an earlier session; stopping that one hands the app \
+         to this bridge, which needs no restart of its own. Failing that, the peer at this path \
+         wedged before its handshake, or is not a taria adapter at all.",
+        open_for.as_secs_f64()
+    )
 }
 
 /// Render a snapshot as the standard tool result: the app's own JSON.
@@ -839,20 +921,39 @@ fn report(seen: Observed, fallback: AppSnapshot, sent: usize) -> Result<CallTool
     // above: "the app never applied this input" is a fact about the input
     // that the app's exit does not change, and it would contradict the
     // "possibly because of this input" below.
+    //
+    // Which of the two answers it gets is decided by the ack, not by the
+    // departure. An acknowledged input has a known fate: the app took delivery
+    // of it and then left, which is exactly what invoking a quit action looks
+    // like from here, and what the app did next is a fact about the app rather
+    // than a failure of this call. Raising it made every caller that branches
+    // on the error flag read a working quit as a failed one, and left agents
+    // passing each other the workaround "treat this one as success". An input
+    // that was never acknowledged is the opposite case and stays an error: its
+    // fate is unknown, which is what this crate raises errors for, next to a
+    // call that was invalid.
     if let Some(state) = seen.gone
         && seen.status != Some(InputStatus::Dropped)
     {
-        // Said the way `read_tree` says it about the same condition, so an
+        // Both answers name the departure the way `read_tree` does, so an
         // agent meets one vocabulary for a missing app, not two.
-        let lead = if seen.status.is_some() {
-            "the app received this input and then disconnected"
-        } else {
-            "the app disconnected before acknowledging this input"
-        };
+        if seen.status.is_some() {
+            return Ok(text_result(format!(
+                "The app acknowledged this input and then disconnected: {} and may have exited, \
+                 possibly because of this input. An input that ends the app reads exactly like \
+                 this, and there is no tree to return because the app is gone. If you did not \
+                 mean to end it, it exited for its own reasons. The bridge reconnects \
+                 automatically; call read_tree once the app is back.",
+                gone_app(&state)
+            )));
+        }
         return Err(McpError::internal_error(
             format!(
-                "{lead}: {} and may have exited, possibly because of this input. The bridge \
-                 reconnects automatically; retry once the app is back.",
+                "the app disconnected before acknowledging this input: {} and may have exited, \
+                 possibly because of this input. Whether the input was applied before it went is \
+                 not known, which is what separates this from an input the app acknowledged on \
+                 its way out. The bridge reconnects automatically; call read_tree once the app \
+                 is back, then retry if the effect is missing.",
                 gone_app(&state)
             ),
             None,
@@ -1046,6 +1147,8 @@ fn id_list(ids: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use taria::{Role, Snapshot};
 
@@ -1114,6 +1217,120 @@ mod tests {
 
         // And a custom name nothing advertises stays a rejection too.
         assert_eq!(resolve_action("archive", &neither), None);
+    }
+
+    /// A [`LinkReport`] for a bridge that has heard nothing at all, which
+    /// every case below varies one fact of.
+    fn silent_link() -> LinkReport {
+        LinkReport {
+            rejected: None,
+            link: LinkState::Down,
+            peer_protocol: None,
+        }
+    }
+
+    /// A link that has been open for `ms`, however long ago that puts the
+    /// connect. Built by hand rather than by waiting: the grace is half a
+    /// second, and a test that sleeps through it buys nothing.
+    fn open_for(ms: u64) -> LinkState {
+        LinkState::Open {
+            since: Instant::now()
+                .checked_sub(Duration::from_millis(ms))
+                .expect("the test clock is not that young"),
+        }
+    }
+
+    /// The finding this whole channel exists for. A bridge whose `connect`
+    /// succeeded, against a peer that never speaks, is what the adapter's
+    /// one-bridge-at-a-time design does to the second bridge. Answering it
+    /// with "is the socket path correct?" sent the first agent to meet this
+    /// project through nine shell calls of socket forensics.
+    #[test]
+    fn a_connection_nobody_accepted_is_named_instead_of_blamed_on_the_path() {
+        let reason = no_snapshot_reason(LinkReport {
+            link: open_for(4_000),
+            ..silent_link()
+        });
+        assert!(
+            reason.contains("no snapshot from the app yet"),
+            "every no-tree answer keeps the same opening fact: {reason}"
+        );
+        assert!(
+            reason.contains("the socket path is not what is wrong")
+                && reason.contains("connected to it"),
+            "a connected bridge must not send anyone to check the path: {reason}"
+        );
+        assert!(
+            reason.contains("open for 4.0s"),
+            "the age of the connection is the evidence: {reason}"
+        );
+        assert!(
+            reason.contains("serves one bridge at a time")
+                && reason.contains("another taria-mcp process"),
+            "the message must name the cause and what to do about it: {reason}"
+        );
+    }
+
+    /// Below the grace the same silence is a handshake still arriving, and
+    /// the honest answer is "retry". The path is not in question here either:
+    /// the bridge is connected to it.
+    #[test]
+    fn a_connection_that_just_opened_is_worth_a_retry_not_a_diagnosis() {
+        let reason = no_snapshot_reason(LinkReport {
+            link: open_for(10),
+            ..silent_link()
+        });
+        assert!(
+            reason.contains("worth one retry"),
+            "a fresh connection is not yet evidence of anything: {reason}"
+        );
+        assert!(
+            !reason.contains("socket path correct"),
+            "a connected bridge must not send anyone to check the path: {reason}"
+        );
+    }
+
+    /// A peer that greeted this bridge and published nothing is a third
+    /// thing again: the app is there, and it is not publishing nodes.
+    #[test]
+    fn an_app_that_greeted_and_published_nothing_is_reported_as_itself() {
+        let reason = no_snapshot_reason(LinkReport {
+            link: open_for(4_000),
+            peer_protocol: Some(PROTOCOL_VERSION),
+            ..silent_link()
+        });
+        assert!(
+            reason.contains("completed the taria handshake")
+                && reason.contains("never publishes nodes"),
+            "the app is connected; what is missing is the tree: {reason}"
+        );
+        assert!(
+            !reason.contains("another taria-mcp process"),
+            "an app that greeted this bridge is not a socket somebody else holds: {reason}"
+        );
+    }
+
+    /// And with nothing connected, the old questions are the right ones.
+    #[test]
+    fn with_no_connection_the_path_and_the_app_are_the_questions() {
+        let reason = no_snapshot_reason(silent_link());
+        assert!(
+            reason.contains("holds no connection to the socket")
+                && reason.contains("is the socket path correct"),
+            "nothing connected is the one case the path is worth checking: {reason}"
+        );
+
+        // A rejected line still outranks all of it: something reached the
+        // socket, which is the most specific thing that happened.
+        let reason = no_snapshot_reason(LinkReport {
+            rejected: Some("expected value at line 1".to_string()),
+            link: open_for(4_000),
+            peer_protocol: None,
+        });
+        assert!(
+            reason.contains("could not read the last one (expected value at line 1)"),
+            "a rejected line is the story wherever there is one: {reason}"
+        );
     }
 
     /// A published snapshot in both forms, built from a line the way an app
@@ -1287,6 +1504,12 @@ mod tests {
     /// An input the app does not survive must not read as "nothing happened".
     /// The app is gone, `read_tree` would say so on the next call, and the
     /// tool that sent the input is the first place the agent can hear it.
+    ///
+    /// It is a result and not an error, because the input's fate is known:
+    /// the app took delivery of it and said so, then left. Raised, the most
+    /// ordinary way to reach this state, an agent invoking an advertised
+    /// `quit`, was reported as a failed call to every caller that reads the
+    /// error flag rather than the prose.
     #[tokio::test]
     async fn an_app_that_stays_gone_is_reported_gone_rather_than_unreactive() {
         let (ack_tx, acks) = broadcast::channel(4);
@@ -1304,21 +1527,54 @@ mod tests {
             "a departure must be recorded: {seen:?}"
         );
 
-        let err = report(seen, pre, 1).expect_err("an app that went away is not a success");
+        let result =
+            report(seen, pre, 1).expect("an acknowledged input is not a failed call, even here");
+        let text = result_text(&result);
+        assert!(
+            text.contains("acknowledged this input and then disconnected")
+                && text.contains("app 'demo' (last snapshot seq 7) is gone"),
+            "the report must name the app and its departure: {text}"
+        );
+        assert!(
+            !text.contains("did not change"),
+            "an app that exited must not be reported as one that ignored the input: {text}"
+        );
+    }
+
+    /// The other side of the same departure: no ack at all. Nobody can say
+    /// whether this input was applied before the app went, and an unknown
+    /// fate is what this crate raises errors for, beside a call that was
+    /// invalid. The two answers have to stay distinguishable by more than
+    /// their prose, because the flag is what a caller branches on.
+    #[test]
+    fn an_input_the_app_never_acknowledged_stays_an_error_when_it_goes() {
+        let seen = Observed {
+            status: None,
+            gone: Some(BridgeState::Disconnected {
+                app_label: Some("demo".to_string()),
+                last_seq: 7,
+            }),
+            ..Observed::default()
+        };
+        let err = report(seen, snapshot("after"), 1)
+            .expect_err("an input with no acknowledgement has no known fate");
         assert!(
             err.message
-                .contains("received this input and then disconnected")
+                .contains("disconnected before acknowledging this input")
                 && err
                     .message
                     .contains("app 'demo' (last snapshot seq 7) is gone"),
             "the report must name the app and its departure: {}",
             err.message
         );
-        assert!(
-            !err.message.contains("did not change"),
-            "an app that exited must not be reported as one that ignored the input: {}",
-            err.message
-        );
+    }
+
+    /// The text of a result, for the answers that are not errors.
+    fn result_text(result: &CallToolResult) -> &str {
+        match result.content.first() {
+            Some(ContentBlock::Text(text)) => &text.text,
+            other => panic!("expected text content, got {other:?}"),
+        }
     }
 
     /// The other half of the same window: an app that comes back is a real
@@ -1398,12 +1654,14 @@ mod tests {
         let (ack_tx, _) = broadcast::channel(1);
         let (_protocol_tx, protocol_rx) = watch::channel(None);
         let (_rejected_tx, rejected_rx) = watch::channel(None);
+        let (_link_tx, link_rx) = watch::channel(LinkState::Down);
         TariaMcpServer::new(BridgeHandle {
             state_rx,
             input_tx,
             ack_tx,
             protocol_rx,
             rejected_rx,
+            link_rx,
         })
     }
 

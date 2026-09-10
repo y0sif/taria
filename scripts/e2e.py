@@ -41,7 +41,7 @@ INVALID_PARAMS = -32602  # JSON-RPC code the bridge rejects bad arguments with
 SOURCE_ROOTS = ("crates", "examples", "Cargo.toml", "Cargo.lock")
 SOURCE_SUFFIXES = (".rs", ".toml", ".lock")
 
-# The four shapes an input-sending tool (act / key / type_text) can answer
+# The five shapes an input-sending tool (act / key / type_text) can answer
 # with, as of the v0.1 ack protocol. Matched by prefix, verbatim: an agent
 # reads these strings, so a reworded one is a behaviour change this script has
 # to notice rather than absorb.
@@ -52,6 +52,11 @@ IGNORED_PREFIX = (
 )
 NO_CHANGE_PREFIX = "The app received this input, and its tree did not change within"
 NO_ACK_PREFIX = "The app neither acknowledged this input nor changed its tree within"
+# An input the app took delivery of and did not survive. A result rather than
+# an error, because the input's fate is known and an advertised `quit` reaches
+# this state on purpose; the shape exists so a working quit is not reported as
+# a failed call.
+GONE_PREFIX = "The app acknowledged this input and then disconnected:"
 
 # The bridge's report for a burst the app dropped part of, and the demo's own
 # tally of the same event once the terminal is restored. The scenario's clean
@@ -93,6 +98,8 @@ def parse_result(text):
                   the note on the second line
       "no_change" the app acked Delivered but published nothing new
       "no_ack"    no ack and no new tree inside the bridge's window
+      "gone"      the app acked the input and then disconnected; no tree,
+                  because the app it would describe is gone
 
     Anything else is a failure, not a shape to absorb: an unrecognised
     result means the tool surface moved and this script is asserting on a
@@ -114,6 +121,8 @@ def parse_result(text):
         return "no_change", None
     if text.startswith(NO_ACK_PREFIX):
         return "no_ack", None
+    if text.startswith(GONE_PREFIX):
+        return "gone", None
     try:
         return "tree", json.loads(text)
     except json.JSONDecodeError:
@@ -1242,16 +1251,27 @@ def step_s_shutdown(client, ctx, app):
     # `q` quits, so the app is gone before this call can answer. The answer
     # has to say that: an input that ended the app reported as "the tree did
     # not change" tells the agent the app is idle while it is in fact gone.
+    #
+    # Two honest answers, decided by whether the app's ack for this key got
+    # out before it exited. An acknowledged input is a *result*: its fate is
+    # known, and quitting on purpose is the ordinary way to reach this state,
+    # so flagging it as an error made a working quit read as a failed call.
+    # An unacknowledged one stays an error, because nobody can say whether it
+    # landed. Neither may read as "the tree did not change".
     try:
-        text = client.call_raw("key", {"key": "q"})
-        raise StepFailure(
-            f"the key that quit the app answered as if it were still there: {text[:200]}"
+        kind, _ = client.call_outcome("key", {"key": "q"})
+        require(
+            kind == "gone",
+            f"the key that quit the app answered {kind!r}, as if it were still there",
         )
+        quit_answer = "result: acked, then gone"
     except ToolError as err:
         require(
-            "disconnected" in err.message and "may have exited" in err.message,
+            "disconnected before acknowledging this input" in err.message
+            and "may have exited" in err.message,
             f"unexpected report from the quitting key: {err.message[:200]}",
         )
+        quit_answer = "error: gone before acking"
 
     # The bridge must notice the disconnect and fail read_tree cleanly.
     deadline = time.monotonic() + READ_TIMEOUT
@@ -1340,7 +1360,7 @@ def step_s_shutdown(client, ctx, app):
     require(client.proc.poll() is not None, "taria-mcp did not exit on stdin EOF")
     return (
         f"app rc=0, socket removed, no dropped/discarded inputs, bridge exited "
-        f"({not_connected[:40]}...)"
+        f"({not_connected[:40]}...); quitting key answered {quit_answer}"
     )
 
 

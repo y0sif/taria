@@ -23,6 +23,14 @@
 //! indistinguishable from an app that never started, and telling those apart
 //! is the difference between an adopter fixing their tree and an adopter
 //! re-checking a socket path that was right all along.
+//!
+//! A fourth channel ([`BridgeHandle::link_rx`]) reports the manager's own
+//! `connect`, for the same reason one level down: a connect that keeps failing
+//! and a connection nobody ever writes on both leave the state at
+//! [`BridgeState::Never`], and only the first of them is about the socket
+//! path. The adapter serves one bridge at a time, so a second bridge's connect
+//! succeeds into the listen backlog and is then never accepted, which is
+//! precisely the second case and the one a new adopter meets first.
 
 use std::io;
 use std::path::PathBuf;
@@ -159,6 +167,38 @@ pub enum BridgeState {
     },
 }
 
+/// What this bridge's own end of the socket is doing, as distinct from what
+/// the peer has said on it.
+///
+/// [`BridgeState`] answers "has an app published a tree" and cannot answer
+/// "did this bridge reach the socket at all". Both a `connect` that keeps
+/// failing and a connection the app never accepted leave the state at
+/// [`BridgeState::Never`], and the two call for opposite next steps: check the
+/// path, or leave the path alone because the bridge is connected to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkState {
+    /// No connection is open: the last connect attempt failed, or the last
+    /// connection ended.
+    Down,
+    /// A connection is open, established at this instant.
+    Open {
+        /// When `connect` returned. The tool layer reads the age rather than
+        /// the instant: a connection open for a moment is a handshake still
+        /// arriving, and one open far longer is a socket nobody is reading.
+        since: Instant,
+    },
+}
+
+impl LinkState {
+    /// How long the open connection has been up, or `None` when none is.
+    pub fn open_for(self) -> Option<Duration> {
+        match self {
+            Self::Down => None,
+            Self::Open { since } => Some(since.elapsed()),
+        }
+    }
+}
+
 /// Source of the [`InputId`]s the tool layer stamps on outgoing inputs.
 ///
 /// Process-wide and monotonic, which is what the protocol asks for: an id must
@@ -208,6 +248,16 @@ pub struct BridgeHandle {
     /// a later rejected line says nothing about the tree being served, and
     /// the tools do not mention it.
     pub rejected_rx: watch::Receiver<Option<String>>,
+    /// Whether this bridge currently holds an open connection, and since when.
+    ///
+    /// The one fact that separates "nothing is there" from "this bridge is
+    /// connected and the peer has not said a word", which are the same
+    /// [`BridgeState::Never`] and want opposite answers. See [`LinkState`].
+    ///
+    /// Read only where no snapshot is available, like
+    /// [`rejected_rx`](Self::rejected_rx): once a tree is being served, the
+    /// connection carrying it is not what an agent needs to hear about.
+    pub link_rx: watch::Receiver<LinkState>,
 }
 
 impl BridgeHandle {
@@ -238,6 +288,7 @@ pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
     let (ack_tx, _) = broadcast::channel(ACK_QUEUE);
     let (protocol_tx, protocol_rx) = watch::channel(None);
     let (rejected_tx, rejected_rx) = watch::channel(None);
+    let (link_tx, link_rx) = watch::channel(LinkState::Down);
     tokio::spawn(manager_loop(
         socket_path,
         state_tx,
@@ -245,6 +296,7 @@ pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
         ack_tx.clone(),
         protocol_tx,
         rejected_tx,
+        link_tx,
     ));
     BridgeHandle {
         state_rx,
@@ -252,6 +304,7 @@ pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
         ack_tx,
         protocol_rx,
         rejected_rx,
+        link_rx,
     }
 }
 
@@ -272,6 +325,7 @@ async fn manager_loop(
     ack_tx: broadcast::Sender<(InputId, InputStatus)>,
     protocol_tx: watch::Sender<Option<u32>>,
     rejected_tx: watch::Sender<Option<String>>,
+    link_tx: watch::Sender<LinkState>,
 ) {
     let mut backoff = RETRY_MIN;
     loop {
@@ -280,6 +334,12 @@ async fn manager_loop(
                 tracing::info!(path = %path.display(), "connected to app socket");
                 drain_stale_inputs(&mut input_rx);
                 let connected_at = Instant::now();
+                // Published before the connection is served, not after it has
+                // said something: the whole point of this channel is the
+                // connection that never says anything.
+                link_tx.send_replace(LinkState::Open {
+                    since: connected_at,
+                });
                 let mut conn_label = None;
                 let end = run_connection(
                     stream,
@@ -291,6 +351,9 @@ async fn manager_loop(
                     &mut conn_label,
                 )
                 .await;
+                // The connection is over: nothing is open again until the next
+                // `connect` returns.
+                link_tx.send_replace(LinkState::Down);
                 // The peer's protocol version belongs to the connection that
                 // declared it; forget it here so the next connection is never
                 // judged by the previous app's handshake.

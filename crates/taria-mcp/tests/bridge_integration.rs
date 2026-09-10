@@ -3,13 +3,13 @@
 //! other. No MCP stdio transport involved.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ContentBlock;
 use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{Action, AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::bridge::{self, AppSnapshot, BridgeHandle, BridgeState};
+use taria_mcp::bridge::{self, AppSnapshot, BridgeHandle, BridgeState, LinkState};
 use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer, TypeTextParams};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -287,7 +287,11 @@ async fn read_tree_names_the_parse_failure_rather_than_the_socket_path() {
                 .read_tree()
                 .await
                 .expect_err("no snapshot ever became available");
-            if !err.message.contains("is the socket path correct") {
+            // Polled on the answer this test is about, not on the absence of
+            // the socket-path question: the handshake this app sent first
+            // already takes that question away, and stopping there would
+            // assert against the wrong one of the two answers.
+            if err.message.contains("reached this socket") {
                 return err;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -332,6 +336,71 @@ async fn read_tree_names_the_parse_failure_rather_than_the_socket_path() {
     assert!(
         format!("{tree:?}").contains("recovered"),
         "a readable snapshot after a rejected one is served as usual"
+    );
+}
+
+/// The state that stopped the first agent to meet this project before it
+/// could try anything: a bridge whose `connect` succeeded onto a socket
+/// nobody was ever going to accept it from.
+///
+/// The adapter serves one bridge at a time, so a second bridge's connection is
+/// completed by the kernel into the listen backlog and then left unread: no
+/// handshake, no snapshot, and the same "is the socket path correct?" an app
+/// that was never started gets. Both answers were yes, and the real cause was
+/// another session's `taria-mcp` still holding the app. The bridge knows its
+/// own connect succeeded, which is the whole difference.
+#[tokio::test]
+async fn read_tree_names_a_connection_the_app_never_accepted() {
+    let (_dir, path) = test_socket_path("never-accepted");
+    // Bound and listening, never accepted. Held for the whole test: dropping
+    // it would close the socket and turn this into an ordinary disconnect.
+    let _listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle);
+
+    // Polled: the connection has to be open past the bridge's grace before
+    // its silence means anything, and the manager opens it on its own
+    // schedule.
+    let err = timeout(WAIT, async {
+        loop {
+            let err = server
+                .read_tree()
+                .await
+                .expect_err("nothing will ever publish a tree here");
+            if err.message.contains("the socket path is not what is wrong") {
+                return err;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a connection nobody accepts should be diagnosed, not waited on forever");
+
+    assert!(
+        err.message.contains("serves one bridge at a time")
+            && err.message.contains("another taria-mcp process"),
+        "the answer has to name the cause and what to do about it: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("is the socket path correct"),
+        "the bridge is connected to that path: {}",
+        err.message
+    );
+
+    // The input tools ask for a tree before they send anything, so they carry
+    // the same diagnosis rather than a second vocabulary for it.
+    let err = server
+        .key(Parameters(KeyParams {
+            key: "q".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect_err("there is no app to send a key to");
+    assert!(
+        err.message.contains("another taria-mcp process"),
+        "an input tool must diagnose this as read_tree does: {}",
+        err.message
     );
 }
 
@@ -426,6 +495,11 @@ async fn act_reports_delivered_without_a_tree_change() {
 /// took the input and exited. "Its tree did not change" would tell the agent
 /// the app is sitting there having done nothing, when it is gone; the answer
 /// has to be the disconnect, in the words `read_tree` uses for it.
+///
+/// A result and not an error: the input was delivered and acknowledged, so
+/// its fate is known, and an agent invoking an advertised `quit` reaches this
+/// state on purpose. Raised, that working quit read as a failed call to
+/// anything branching on the error flag.
 #[tokio::test]
 async fn act_reports_an_app_that_went_away_after_taking_the_input() {
     let (_dir, path) = test_socket_path("act-then-exit");
@@ -444,30 +518,26 @@ async fn act_reports_an_app_that_went_away_after_taking_the_input() {
         drop(listener);
     });
 
-    let err = server
+    let result = server
         .act(Parameters(ActParams {
             node: "btn".to_string(),
             action: "activate".to_string(),
             value: None,
         }))
         .await
-        .expect_err("an app that exited is not a tool call that went fine");
+        .expect("an input the app acknowledged is not a failed call, even when it was the last");
+    let text = result_text(&result);
     assert!(
-        err.message
-            .contains("the app received this input and then disconnected"),
-        "the report must tie the departure to the input: {}",
-        err.message
+        text.contains("The app acknowledged this input and then disconnected"),
+        "the report must tie the departure to the input: {text}"
     );
     assert!(
-        err.message
-            .contains("app 'fake-app' (last snapshot seq 4) is gone"),
-        "the report must name which app went away, and when: {}",
-        err.message
+        text.contains("app 'fake-app' (last snapshot seq 4) is gone"),
+        "the report must name which app went away, and when: {text}"
     );
     assert!(
-        !err.message.contains("did not change"),
-        "an app that exited must not read as one that ignored the input: {}",
-        err.message
+        !text.contains("did not change"),
+        "an app that exited must not read as one that ignored the input: {text}"
     );
 
     exit.await.expect("fake app task");
@@ -1084,12 +1154,18 @@ async fn a_full_input_queue_fails_the_call_instead_of_hanging() {
     let (ack_tx, _ack_rx) = broadcast::channel(8);
     let (_protocol_tx, protocol_rx) = watch::channel(Some(PROTOCOL_VERSION));
     let (_rejected_tx, rejected_rx) = watch::channel(None);
+    // Connected, like the snapshot above says: the link channel describes the
+    // socket this hand-built handle is standing in for.
+    let (_link_tx, link_rx) = watch::channel(LinkState::Open {
+        since: Instant::now(),
+    });
     let handle = BridgeHandle {
         state_rx,
         input_tx,
         ack_tx,
         protocol_rx,
         rejected_rx,
+        link_rx,
     };
     // Occupy the only slot, so the tool's own send has nowhere to go.
     handle
@@ -1139,12 +1215,16 @@ async fn a_burst_cut_short_reports_how_much_of_it_was_sent() {
     let (ack_tx, _ack_rx) = broadcast::channel(8);
     let (_protocol_tx, protocol_rx) = watch::channel(Some(PROTOCOL_VERSION));
     let (_rejected_tx, rejected_rx) = watch::channel(None);
+    let (_link_tx, link_rx) = watch::channel(LinkState::Open {
+        since: Instant::now(),
+    });
     let server = TariaMcpServer::new(BridgeHandle {
         state_rx,
         input_tx,
         ack_tx,
         protocol_rx,
         rejected_rx,
+        link_rx,
     });
 
     let err = timeout(
