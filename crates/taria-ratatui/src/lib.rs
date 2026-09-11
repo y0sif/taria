@@ -11,7 +11,7 @@
 //! ```no_run
 //! use ratatui::widgets::Paragraph;
 //! use taria::{Node, Role};
-//! use taria_ratatui::{TariaLayer, sem};
+//! use taria_ratatui::{InputStatus, TariaLayer, sem};
 //!
 //! fn main() -> std::io::Result<()> {
 //!     // Never fails: if the socket cannot be bound the layer is inert and
@@ -29,10 +29,11 @@
 //!     rec.publish();
 //!
 //!     // Drain agent input alongside terminal events. Each input is acked
-//!     // `Delivered` as it is handed over; use `drain_with_ids` and
-//!     // `ack(id, InputStatus::Ignored)` for the ones you decide to skip.
-//!     layer.drain(|_input| {
+//!     // `Delivered` as it is handed over; return `Ignored` for one you
+//!     // looked at and deliberately did nothing with, and the layer sends it.
+//!     layer.drain_acking(|_input| {
 //!         // Apply to app state exactly like a keyboard event.
+//!         InputStatus::Delivered
 //!     });
 //!
 //!     ratatui::restore();

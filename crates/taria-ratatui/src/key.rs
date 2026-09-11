@@ -79,12 +79,22 @@ fn to_crossterm_modifiers(modifiers: Modifiers) -> KeyModifiers {
     out
 }
 
-/// Lower literal text into one key event per character, the app side of
-/// [`taria::AgentInput::Text`].
+/// Lower literal text into one key event per character, for an app whose
+/// typing surface consumes key events, such as a text field.
 ///
 /// Typing a string as one message instead of one round trip per character is
-/// the reason that variant exists, so the expansion belongs here, next to an
-/// app that already knows how to handle key events.
+/// the reason [`taria::AgentInput::Text`] exists, so the expansion belongs
+/// here, next to an app that already knows how to handle key events.
+///
+/// It is not the way to handle that variant in every app. Enter and Tab are
+/// control keys, which a text field reads as "submit" and "next field", and a
+/// surface with no control-key vocabulary receives them from here anyway. A
+/// typing tutor whose typing screen grades characters, and binds Tab to a
+/// setting it saves to the user's config file, is where this surfaced:
+/// lowered through this function, a tab in an agent's text would flip that
+/// setting, the very binding trip that routing text away from the key handler
+/// is meant to prevent. An app like that iterates `text.chars()` itself and
+/// decides what a newline or a tab means on its own surface.
 ///
 /// The rules:
 ///

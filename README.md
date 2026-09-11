@@ -197,6 +197,13 @@ messages through their constructors and ending a destructuring pattern with
 which keeps the input's id, so the app can still acknowledge it instead of
 leaving the agent waiting.
 
+Migrating from v0, that same recompile hides the one step that matters: the
+wildcard arm it asks for on `AgentInput` is the arm that swallows
+`AgentInput::Text`, so check every wildcard you add for `Text` before you
+trust a green build. The
+[integration guide](docs/integration-guide.md#the-arm-the-compiler-asks-for-hides-text)
+has a lint that catches it.
+
 Removing a field, renaming one, making an optional field required, or
 changing what an existing field means bumps the version. `wire.rs` in
 `crates/taria` is the normative statement of the rule, and

@@ -25,7 +25,8 @@ refuses a `target/debug` older than the sources.
 - `crates/taria`: wire types (`Snapshot`, `Node`, `Role`, `Action`,
   `AgentInput`), the `wire` module (`AppToBridge`/`BridgeToApp` ndjson
   messages, `InputId`, `InputStatus`), and three modules both peers share:
-  `key` (the key-string grammar), `id::IdSpace` (prefixed node ids),
+  `key` (the key-string grammar), `IdSpace` (prefixed node ids, re-exported
+  at the root),
   `socket` (path resolution, plus the per-platform AF_UNIX path limit: 107
   bytes on Linux, 103 on macOS and the BSDs, and a label that is not a plain
   file name is refused). No I/O, no framework deps, exactly one dependency
@@ -51,9 +52,12 @@ refuses a `target/debug` older than the sources.
   never prints (the app reports `bind_error()` outside the alternate screen).
   Nodes come from `publish(nodes)` or `FrameRecorder`/`sem`; identical trees
   are deduped. Input arrives via
-  `drain`/`drain_with_ids`/`try_recv`/`recv_timeout`, acked `Delivered` on
-  dequeue, `Dropped` when the queue is full, and
-  `Ignored` when the app says so with `ack`. Acks are flushed before the
+  `drain_acking`/`drain`/`drain_with_ids`/`try_recv`/`recv_timeout`, acked
+  `Delivered` on dequeue, `Dropped` when the queue is full, and `Ignored`
+  when the app says so, by returning it from `drain_acking` or calling `ack`.
+  The wildcard arm `#[non_exhaustive]` forces on a `match` over `AgentInput`
+  is the arm that swallows `Text`; the demo carries
+  `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are flushed before the
   snapshot published after them, from a bounded queue that drops its oldest.
   Inputs are tagged with their connection's generation and discarded (not
   applied) once that connection ends, and `ack` refuses an id whose connection

@@ -14,7 +14,7 @@
 //! delete dialog on `d`, was answered `y` by its own last character, and cost
 //! a task, while the bridge reported plain success because a task vanishing is
 //! a changed tree. Text nothing is accepting is reported
-//! [`Ignored`](Applied::Ignored) instead, so an agent that types at the wrong
+//! [`Ignored`](InputStatus::Ignored) instead, so an agent that types at the wrong
 //! moment hears about it rather than tripping bindings.
 //!
 //! The rule other apps should copy is not "text means the text field". It is
@@ -29,31 +29,22 @@
 //!
 //! # Ignored input
 //!
-//! [`apply_agent_input`] returns [`Applied`], because some inputs are
-//! deliberately dropped (the modal gate, an unknown node id, an action a node
-//! does not handle, a `set_value` carrying no value) and the caller acks those
-//! [`Ignored`](taria_ratatui::InputStatus::Ignored) so an agent waiting on an
-//! effect stops waiting.
+//! [`apply_agent_input`] returns the [`InputStatus`] each input has earned,
+//! because some inputs are deliberately dropped (the modal gate, an unknown
+//! node id, an action a node does not handle, a `set_value` carrying no value)
+//! and an agent waiting on an effect from one of those should stop waiting.
+//! [`TariaLayer::drain_acking`](taria_ratatui::TariaLayer::drain_acking) sends
+//! the [`Ignored`](InputStatus::Ignored) ones; a
+//! [`Delivered`](InputStatus::Delivered) adds nothing to the ack the layer
+//! already sent when it handed the input over.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use taria::{Action, AgentInput};
-use taria_ratatui::{text_to_keys, to_crossterm_key};
+use taria_ratatui::{InputStatus, text_to_keys, to_crossterm_key};
 
 use crate::app::{App, Focus, Tab, TaskId};
 use crate::events::AppEvent;
 use crate::tree::TASK_IDS;
-
-/// What the app did with one agent input.
-///
-/// Coarse on purpose: it answers the one question an agent has after sending
-/// an input, which is whether waiting for an effect is worth it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Applied {
-    /// The input reached a handler that could act on it.
-    Handled,
-    /// The app looked at the input and deliberately did nothing.
-    Ignored,
-}
 
 pub fn update(app: &mut App, event: AppEvent) {
     match event {
@@ -63,15 +54,24 @@ pub fn update(app: &mut App, event: AppEvent) {
     }
 }
 
-/// Apply one agent input received through the taria layer, reporting whether
-/// it changed anything.
+/// Apply one agent input received through the taria layer, returning the ack
+/// it has earned: [`Delivered`](InputStatus::Delivered) for one that reached a
+/// handler able to act on it, [`Ignored`](InputStatus::Ignored) for one this
+/// app looked at and deliberately did nothing with.
 ///
-/// A key that parses counts as handled even if nothing is bound to it, the
+/// A key that parses counts as delivered even if nothing is bound to it, the
 /// same verdict a person gets for pressing an unbound key. What is ignored here
 /// is input this app cannot act on at all: a key the shared grammar rejects or
 /// the adapter cannot lower, text sent while nothing here is accepting typing,
 /// and an input kind added to taria after this app was written.
-pub fn apply_agent_input(app: &mut App, input: AgentInput) -> Applied {
+///
+/// The lint is scoped to this one function on purpose. Neither `rustc` nor
+/// default `clippy` can tell the wildcard arm `#[non_exhaustive]` demands from
+/// one swallowing a variant this app should handle. This restriction lint
+/// names every known variant a wildcard covers, and works on stable, where
+/// rustc's own `non_exhaustive_omitted_patterns` does not yet.
+#[warn(clippy::wildcard_enum_match_arm)]
+pub fn apply_agent_input(app: &mut App, input: AgentInput) -> InputStatus {
     match input {
         AgentInput::Act {
             node,
@@ -82,16 +82,28 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) -> Applied {
         AgentInput::Key { key, .. } => match to_crossterm_key(&key) {
             Some(key) => {
                 handle_key(app, key);
-                Applied::Handled
+                InputStatus::Delivered
             }
-            None => Applied::Ignored,
+            None => InputStatus::Ignored,
         },
         AgentInput::Text { text, .. } => apply_text(app, &text),
+        // The layer answers this variant itself and never hands it over. It
+        // is named here, as an arm of its own, only so the lint above stays
+        // able to see the wildcard: folded into it as `Unknown | _`, the lint
+        // skips the arm and goes quiet even with `Text` missing.
+        AgentInput::Unknown => InputStatus::Ignored,
         // An input kind taria added after this app was written. Reported the
         // way the app reports every other input it looks at and does not act
         // on, so the agent hears "this app did nothing with it" rather than
         // waiting out the bridge's window for an effect that cannot come.
-        _ => Applied::Ignored,
+        //
+        // This is the arm the compiler demands, and it would swallow `Text`
+        // just as quietly: delete the `Text` arm and the build and default
+        // clippy stay green while each `type_text` is answered Ignored. That
+        // is how an app migrating from v0, where `Text` did not exist, loses
+        // it. Here the typing tests would notice; an app without them has
+        // only the lint on this function.
+        _ => InputStatus::Ignored,
     }
 }
 
@@ -101,14 +113,14 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) -> Applied {
 /// [`AgentInput::Key`] is: typing belongs wherever the app puts typed
 /// characters, and in this app that is the new-task input alone. So nothing is
 /// typed while the list has the keyboard or the modal dialog is up, and the
-/// caller reports [`Ignored`](Applied::Ignored), rather than the text meeting
+/// caller reports [`Ignored`](InputStatus::Ignored), rather than the text meeting
 /// the list's `d` and `y` bindings and deleting a task.
 ///
 /// A newline mid-string still submits the draft, because [`text_to_keys`]
 /// lowers it to Enter and that is what Enter does here. The characters after
 /// it are not typed: submitting hands the keyboard back to the list, and this
 /// app has nowhere else to put typing. Two tasks are two calls.
-fn apply_text(app: &mut App, text: &str) -> Applied {
+fn apply_text(app: &mut App, text: &str) -> InputStatus {
     let keys = text_to_keys(text);
     let mut typed = false;
     for key in keys {
@@ -119,9 +131,9 @@ fn apply_text(app: &mut App, text: &str) -> Applied {
         typed = true;
     }
     if typed {
-        Applied::Handled
+        InputStatus::Delivered
     } else {
-        Applied::Ignored
+        InputStatus::Ignored
     }
 }
 
@@ -135,33 +147,33 @@ fn accepts_typing(app: &App) -> bool {
     app.dialog.is_none() && app.focus == Focus::Input
 }
 
-fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -> Applied {
+fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -> InputStatus {
     // The delete dialog is modal: mirror `handle_key` by ignoring any act
     // that targets a node outside the dialog while it is open. The tree
     // stops advertising those actions too (see `crate::tree::build_nodes`),
     // so behavior and advertisement agree.
     if app.dialog.is_some() && !matches!(node, "dialog" | "dialog-confirm" | "dialog-cancel") {
-        return Applied::Ignored;
+        return InputStatus::Ignored;
     }
     match (node, action) {
         ("tab-active", Action::Select) => {
             switch_tab(app, Tab::Active);
-            Applied::Handled
+            InputStatus::Delivered
         }
         ("tab-done", Action::Select) => {
             switch_tab(app, Tab::Done);
-            Applied::Handled
+            InputStatus::Delivered
         }
         // `set_value` with no value asks for nothing. Treating a missing
         // value as the empty string would clear the draft, an edit the agent
-        // never asked for, and report it as Handled.
+        // never asked for, and report it as Delivered.
         ("input", Action::SetValue) => match value {
             Some(value) => {
                 app.input = value;
                 app.focus = Focus::Input;
-                Applied::Handled
+                InputStatus::Delivered
             }
-            None => Applied::Ignored,
+            None => InputStatus::Ignored,
         },
         ("input", Action::Activate) => submit_input(app),
         ("input", Action::Dismiss) => dismiss_input(app),
@@ -172,12 +184,12 @@ fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -
         // `[q] quit` all along; this is the same affordance for an agent.
         ("quit", Action::Activate) => {
             app.running = false;
-            Applied::Handled
+            InputStatus::Delivered
         }
         // The dialog's nodes exist only while it is open, so these three are
         // acts on a node that may be gone: an agent planning from a snapshot
         // it read just before the operator pressed `n` sends one against a
-        // tree that no longer has it. Reporting Handled for that would be the
+        // tree that no longer has it. Reporting Delivered for that would be the
         // same lie the task arms already refuse to tell for an id that has
         // been deleted, so the verdict is theirs too.
         ("dialog-confirm", Action::Activate) => confirm_delete(app),
@@ -186,7 +198,7 @@ fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -
     }
 }
 
-fn apply_task_act(app: &mut App, node: &str, action: Action) -> Applied {
+fn apply_task_act(app: &mut App, node: &str, action: Action) -> InputStatus {
     // Ids are parsed through the same space that built them, and the task is
     // looked up by identity: an id an agent read before an unrelated delete
     // still names the task it named then, or nothing at all.
@@ -194,30 +206,30 @@ fn apply_task_act(app: &mut App, node: &str, action: Action) -> Applied {
         .parse::<TaskId>(node)
         .filter(|id| app.task(*id).is_some())
     else {
-        return Applied::Ignored;
+        return InputStatus::Ignored;
     };
     match action {
         Action::Select => match app.visible_position(id) {
             Some(pos) => {
                 app.selection = pos;
-                Applied::Handled
+                InputStatus::Delivered
             }
             // The task exists but sits on the other tab, so there is no
             // position on screen to move the cursor to.
-            None => Applied::Ignored,
+            None => InputStatus::Ignored,
         },
         Action::Toggle => {
             if let Some(task) = app.task_mut(id) {
                 task.done = !task.done;
             }
             app.clamp_selection();
-            Applied::Handled
+            InputStatus::Delivered
         }
         Action::Custom(name) if name == "delete" => {
             app.dialog = Some(id);
-            Applied::Handled
+            InputStatus::Delivered
         }
-        _ => Applied::Ignored,
+        _ => InputStatus::Ignored,
     }
 }
 
@@ -364,13 +376,13 @@ fn handle_input_key(app: &mut App, key: KeyEvent) {
 /// nothing to hand back. That is also what keeps it Esc's exact counterpart:
 /// the list ignores Esc too, and the tree only advertises `dismiss` while the
 /// input is focused.
-fn dismiss_input(app: &mut App) -> Applied {
+fn dismiss_input(app: &mut App) -> InputStatus {
     if app.focus != Focus::Input {
-        return Applied::Ignored;
+        return InputStatus::Ignored;
     }
     app.input.clear();
     app.focus = Focus::List;
-    Applied::Handled
+    InputStatus::Delivered
 }
 
 /// Submit the input draft as a new task and hand focus back to the list with
@@ -383,10 +395,10 @@ fn dismiss_input(app: &mut App) -> Applied {
 /// read the tree found nothing it had asked for and could reasonably submit
 /// again. Showing the tab the task landed on is what makes the addition
 /// observable, and it is what a person adding a task wants to see too.
-fn submit_input(app: &mut App) -> Applied {
+fn submit_input(app: &mut App) -> InputStatus {
     let title = app.input.trim().to_string();
     if title.is_empty() {
-        return Applied::Ignored;
+        return InputStatus::Ignored;
     }
     let id = app.add_task(title);
     app.input.clear();
@@ -395,7 +407,7 @@ fn submit_input(app: &mut App) -> Applied {
     if let Some(pos) = app.visible_position(id) {
         app.selection = pos;
     }
-    Applied::Handled
+    InputStatus::Delivered
 }
 
 // --- Dialog ---
@@ -421,22 +433,22 @@ fn handle_dialog_key(app: &mut App, key: KeyEvent) {
 /// Delete the task the open dialog names. Ignored when no dialog is open:
 /// this handler is only ever reached that way by an agent acting on a tree
 /// the dialog has since left.
-fn confirm_delete(app: &mut App) -> Applied {
+fn confirm_delete(app: &mut App) -> InputStatus {
     let Some(id) = app.dialog.take() else {
-        return Applied::Ignored;
+        return InputStatus::Ignored;
     };
     app.remove_task(id);
     app.clamp_selection();
-    Applied::Handled
+    InputStatus::Delivered
 }
 
 /// Close the dialog without deleting anything, with the same verdict rule as
 /// [`confirm_delete`].
-fn dismiss_dialog(app: &mut App) -> Applied {
+fn dismiss_dialog(app: &mut App) -> InputStatus {
     if app.dialog.take().is_none() {
-        return Applied::Ignored;
+        return InputStatus::Ignored;
     }
-    Applied::Handled
+    InputStatus::Delivered
 }
 
 #[cfg(test)]
@@ -479,14 +491,14 @@ mod tests {
                 &mut app,
                 act_value("input", Action::SetValue, "Ship the demo")
             ),
-            Applied::Handled
+            InputStatus::Delivered
         );
         assert_eq!(app.focus, Focus::Input);
         assert_eq!(app.input, "Ship the demo");
 
         assert_eq!(
             apply_agent_input(&mut app, act("input", Action::Activate)),
-            Applied::Handled
+            InputStatus::Delivered
         );
         assert_eq!(app.tasks.len(), before + 1);
         let task = app.tasks.last().unwrap();
@@ -500,7 +512,7 @@ mod tests {
     }
 
     /// `set_value` with no value asks for nothing, so it must leave the draft
-    /// alone and say so, rather than clearing it and reporting Handled.
+    /// alone and say so, rather than clearing it and reporting Delivered.
     #[test]
     fn set_value_without_a_value_leaves_the_draft_alone() {
         let mut app = App::new();
@@ -508,14 +520,14 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, act("input", Action::SetValue)),
-            Applied::Ignored
+            InputStatus::Ignored
         );
         assert_eq!(app.input, "half typed", "the draft must survive");
 
         // An explicit empty value is a different request, and still clears it.
         assert_eq!(
             apply_agent_input(&mut app, act_value("input", Action::SetValue, "")),
-            Applied::Handled
+            InputStatus::Delivered
         );
         assert!(app.input.is_empty());
     }
@@ -531,7 +543,7 @@ mod tests {
         apply_agent_input(&mut app, act_value("input", Action::SetValue, "   "));
         assert_eq!(
             apply_agent_input(&mut app, act("input", Action::Activate)),
-            Applied::Ignored,
+            InputStatus::Ignored,
             "an agent that activates an empty draft hears that nothing happened"
         );
         assert_eq!(app.tasks.len(), before);
@@ -551,7 +563,7 @@ mod tests {
         apply_agent_input(&mut app, act_value("input", Action::SetValue, "Ship it"));
         assert_eq!(
             apply_agent_input(&mut app, act("input", Action::Activate)),
-            Applied::Handled
+            InputStatus::Delivered
         );
 
         let id = app.tasks.last().unwrap().id;
@@ -573,7 +585,7 @@ mod tests {
         assert!(app.running);
         assert_eq!(
             apply_agent_input(&mut app, act("quit", Action::Activate)),
-            Applied::Handled
+            InputStatus::Delivered
         );
         assert!(!app.running);
     }
@@ -586,7 +598,7 @@ mod tests {
         apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
         assert_eq!(
             apply_agent_input(&mut app, act("quit", Action::Activate)),
-            Applied::Ignored
+            InputStatus::Ignored
         );
         assert!(app.running, "the dialog must stop the quit");
     }
@@ -641,7 +653,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, act("task-4", Action::Toggle)),
-            Applied::Handled
+            InputStatus::Delivered
         );
         let task = app.task(4).unwrap();
         assert_eq!(task.title, title, "the id still names the same task");
@@ -657,7 +669,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, act("task-1", Action::Toggle)),
-            Applied::Ignored
+            InputStatus::Ignored
         );
         assert_eq!(app.tasks, before, "a stale id must move nothing");
     }
@@ -667,7 +679,7 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             apply_agent_input(&mut app, act("task-1", Action::Toggle)),
-            Applied::Handled,
+            InputStatus::Delivered,
             "a real act on a real node is handled"
         );
         let ignored = [
@@ -680,7 +692,7 @@ mod tests {
         for input in ignored {
             assert_eq!(
                 apply_agent_input(&mut app, input.clone()),
-                Applied::Ignored,
+                InputStatus::Ignored,
                 "{input:?}"
             );
         }
@@ -691,7 +703,7 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into()))),
-            Applied::Handled
+            InputStatus::Delivered
         );
         let blocked = [
             act("tab-done", Action::Select),
@@ -701,13 +713,13 @@ mod tests {
         for input in blocked {
             assert_eq!(
                 apply_agent_input(&mut app, input.clone()),
-                Applied::Ignored,
+                InputStatus::Ignored,
                 "{input:?}"
             );
         }
         assert_eq!(
             apply_agent_input(&mut app, act("dialog-cancel", Action::Activate)),
-            Applied::Handled,
+            InputStatus::Delivered,
             "the dialog's own nodes still answer"
         );
     }
@@ -717,9 +729,12 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             apply_agent_input(&mut app, key("not-a-key")),
-            Applied::Ignored
+            InputStatus::Ignored
         );
-        assert_eq!(apply_agent_input(&mut app, key("j")), Applied::Handled);
+        assert_eq!(
+            apply_agent_input(&mut app, key("j")),
+            InputStatus::Delivered
+        );
     }
 
     #[test]
@@ -731,7 +746,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, text("buy milk")),
-            Applied::Handled
+            InputStatus::Delivered
         );
         assert_eq!(app.input, "buy milk");
 
@@ -754,7 +769,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, text("deploy")),
-            Applied::Ignored,
+            InputStatus::Ignored,
             "the list accepts no typing, and the agent has to hear that"
         );
         assert_eq!(app.tasks, before, "not one task may be touched");
@@ -764,7 +779,10 @@ mod tests {
 
         // The raw key fallback is unchanged: a keypress is a keypress and is
         // supposed to reach the bindings.
-        assert_eq!(apply_agent_input(&mut app, key("d")), Applied::Handled);
+        assert_eq!(
+            apply_agent_input(&mut app, key("d")),
+            InputStatus::Delivered
+        );
         assert_eq!(app.dialog, Some(1), "key d still opens the dialog");
     }
 
@@ -780,7 +798,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, text("yes please")),
-            Applied::Ignored
+            InputStatus::Ignored
         );
         assert_eq!(app.dialog, Some(1), "the dialog is still asking");
         assert_eq!(app.tasks, before, "nothing was deleted");
@@ -798,7 +816,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, text("first\nsecond")),
-            Applied::Handled
+            InputStatus::Delivered
         );
         assert_eq!(app.tasks.len(), before + 1, "one task, not two");
         assert_eq!(app.tasks.last().unwrap().title, "first");
@@ -819,10 +837,10 @@ mod tests {
         apply_agent_input(&mut app, act_value("input", Action::SetValue, "draft"));
         assert_eq!(app.focus, Focus::Input, "the input is accepting typing");
 
-        assert_eq!(apply_agent_input(&mut app, text("")), Applied::Ignored);
+        assert_eq!(apply_agent_input(&mut app, text("")), InputStatus::Ignored);
         assert_eq!(
             apply_agent_input(&mut app, text("\r")),
-            Applied::Ignored,
+            InputStatus::Ignored,
             "a lone carriage return lowers to no key events"
         );
         assert_eq!(app.input, "draft", "neither touched the draft");
@@ -847,7 +865,7 @@ mod tests {
     /// The dialog's nodes are published only while it is open, so an act on
     /// one of them with no dialog up comes from an agent working off a
     /// snapshot the operator has already moved past. It gets the same answer
-    /// a stale task id gets, rather than Handled for a node that is gone.
+    /// a stale task id gets, rather than Delivered for a node that is gone.
     #[test]
     fn dialog_acts_with_no_dialog_open_are_ignored() {
         for input in [
@@ -860,7 +878,7 @@ mod tests {
             assert_eq!(app.dialog, None);
             assert_eq!(
                 apply_agent_input(&mut app, input.clone()),
-                Applied::Ignored,
+                InputStatus::Ignored,
                 "input: {input:?}"
             );
             assert_eq!(app.tasks.len(), before, "nothing may be deleted: {input:?}");
@@ -878,7 +896,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, act("input", Action::Dismiss)),
-            Applied::Handled
+            InputStatus::Delivered
         );
         assert_eq!(app.focus, Focus::List, "the keyboard goes back to the list");
         assert!(
@@ -888,7 +906,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, act("input", Action::Dismiss)),
-            Applied::Ignored,
+            InputStatus::Ignored,
             "with the list focused there is nothing to hand back"
         );
     }
@@ -1005,7 +1023,10 @@ mod tests {
     fn control_chords_are_not_the_plain_bindings() {
         let mut app = App::new();
 
-        assert_eq!(apply_agent_input(&mut app, key("ctrl+q")), Applied::Handled);
+        assert_eq!(
+            apply_agent_input(&mut app, key("ctrl+q")),
+            InputStatus::Delivered
+        );
         assert!(app.running, "ctrl+q must not quit");
 
         let selection = app.selection;
@@ -1058,7 +1079,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, key("shift+q")),
-            Applied::Handled
+            InputStatus::Delivered
         );
         assert!(app.running, "shift+q must not quit");
 

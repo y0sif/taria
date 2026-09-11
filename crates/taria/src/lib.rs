@@ -24,6 +24,10 @@ pub mod socket;
 pub mod wire;
 
 pub use action::{Action, AgentInput};
+// Re-exported at the root because an app declaring a node id space imports it
+// beside `Node`, `NodeId` and `Role`, and reaching one of those four through a
+// module path is a difference an adopter has to remember for no reason.
+pub use id::IdSpace;
 pub use node::{MAX_NODE_DEPTH, Node, NodeId, Role, TreeTooDeep};
 pub use snapshot::Snapshot;
 

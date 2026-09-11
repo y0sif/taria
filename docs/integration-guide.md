@@ -22,6 +22,14 @@ touched only indirectly, by the raw `key` fallback lowering into it, which is
 its own section below. Typed text does not go there at all, for a reason that
 section spends most of its length on.
 
+Migrating an app from v0 instead: the compiler walks you through most of it
+and stays silent on the one step that fails. **The wildcard arm it makes you
+add to every `match` over `AgentInput` is the arm that swallows
+`AgentInput::Text`, so check every wildcard you add for `Text` before you
+trust a green build.**
+[The arm the compiler asks for hides `Text`](#the-arm-the-compiler-asks-for-hides-text)
+has the details and a lint that catches it.
+
 ## Add the dependency
 
 Neither crate is published yet, so both come from the repository. They carry
@@ -35,10 +43,10 @@ taria-ratatui = { git = "https://github.com/y0sif/taria" }
 ```
 
 One line is enough. `taria-ratatui` re-exports the protocol crate, so the
-`taria::{Action, Node, Role}` and `taria::id::IdSpace` the samples below
-import are reachable as `taria_ratatui::taria::{Action, Node, Role}` and
-`taria_ratatui::taria::id::IdSpace`. Add `taria` as a dependency of its own
-if you would rather write them under the name they are spelled here:
+`taria::{Action, IdSpace, Node, Role}` the samples below import are reachable
+as `taria_ratatui::taria::{Action, IdSpace, Node, Role}`. Add `taria` as a
+dependency of its own if you would rather write them under the name they are
+spelled here:
 
 ```toml
 taria = { git = "https://github.com/y0sif/taria" }
@@ -225,10 +233,12 @@ It waits out the timeout even on a disabled layer, so an app that paces itself
 on it keeps its timing whether or not taria bound.
 
 Pace on that variant rather than `recv_timeout`. The plain one drops the
-`InputId`, and without the id you cannot ack `Ignored`, which the next section
-makes mandatory. The same pairing runs through the rest of the API:
-`try_recv_with_id` to `try_recv`, and `drain_with_ids` to `drain`, which is
-that loop already written for you.
+`InputId`, and without the id you cannot ack `Ignored`, which
+[Acknowledge what you ignore](#acknowledge-what-you-ignore) makes mandatory.
+The same pairing runs through the rest of the API: `try_recv_with_id` to
+`try_recv`, and `drain_with_ids` to `drain`, which is that loop already
+written for you. A loop that drains needs no id at all: `drain_acking` takes
+the status your handler returns and sends the ack itself.
 
 ## Give things identities, not positions
 
@@ -246,7 +256,7 @@ The fix is an identity assigned at creation and never reused, with `IdSpace`
 holding the one spelling that builds and parses it:
 
 ```rust
-use taria::id::IdSpace;
+use taria::IdSpace;
 
 pub const TASK_IDS: IdSpace = IdSpace::new("task");
 
@@ -259,7 +269,7 @@ let Some(id) = TASK_IDS
     .parse::<TaskId>(node)
     .filter(|id| app.task(*id).is_some())
 else {
-    return Applied::Ignored;
+    return InputStatus::Ignored;
 };
 ```
 
@@ -283,26 +293,30 @@ Say so, or the agent waits out the bridge's window and is told the tree did
 not change, which reads as "it may not have reacted yet".
 
 ```rust
-use taria_ratatui::{InputStatus, TariaLayer};
+use taria_ratatui::TariaLayer;
 
 fn drain_agent_input(app: &mut App, layer: &TariaLayer) {
-    layer.drain_with_ids(|id, input| {
-        if apply_agent_input(app, input) == Applied::Ignored {
-            layer.ack(id, InputStatus::Ignored);
-        }
-    });
+    layer.drain_acking(|input| apply_agent_input(app, input));
 }
 ```
 
-Last ack wins, so the `Ignored` refines the `Delivered` the dequeue already
-sent. That is why `apply_agent_input` returns a verdict instead of `()`.
+`apply_agent_input` returns an `InputStatus`: `Ignored` for an input it
+deliberately did nothing with, `Delivered` for the rest. `drain_acking` sends
+the `Ignored` ones, and last ack wins, so each refines the `Delivered` the
+dequeue already sent. A returned `Delivered` sends nothing, since it would only
+repeat that. That is why `apply_agent_input` returns a verdict instead of `()`,
+and the verdict is taria's own type rather than one you define: the demo and
+the typing tutor each wrote the same two-variant enum, and the same loop around
+`drain_with_ids` and `ack`, before `drain_acking` existed. Keep those two for
+an input you need the id of for something else, such as one you can only
+answer a frame later.
 
 An act on a node that has since gone is one of these. The demo publishes
 `dialog`, `dialog-confirm` and `dialog-cancel` only while the confirm-delete
 dialog is open, so an agent planning from a snapshot taken just before a
 person pressed `n` sends an act against a node that is no longer there. Those
 handlers report `Ignored`, the same answer a deleted task id already got.
-Reporting `Handled` for a node that is gone tells an agent its input landed
+Reporting `Delivered` for a node that is gone tells an agent its input landed
 somewhere.
 
 One timing rule matters. Ack `Ignored` before you publish your next frame.
@@ -353,13 +367,13 @@ handler returns `Ignored` when it does not, so an agent is never told the
 keyboard moved when it did not:
 
 ```rust
-fn dismiss_input(app: &mut App) -> Applied {
+fn dismiss_input(app: &mut App) -> InputStatus {
     if app.focus != Focus::Input {
-        return Applied::Ignored;
+        return InputStatus::Ignored;
     }
     app.draft.clear();
     app.focus = Focus::List;
-    Applied::Handled
+    InputStatus::Delivered
 }
 ```
 
@@ -487,47 +501,58 @@ next section is entirely about the second half of that sentence.
 Lower `key` through the same handler a keyboard event takes:
 
 ```rust
-AgentInput::Act {
-    node,
-    action,
-    value,
-    ..
-} => apply_act(app, node.0.as_str(), action, value),
-// A key is a keypress: it lowers into the same handler a person's
-// keystroke takes and lands wherever focus is.
-AgentInput::Key { key, .. } => match to_crossterm_key(&key) {
-    Some(key) => {
-        handle_key(app, key);
-        Applied::Handled
+// See "The arm the compiler asks for hides `Text`" below for this lint.
+#[warn(clippy::wildcard_enum_match_arm)]
+pub fn apply_agent_input(app: &mut App, input: AgentInput) -> InputStatus {
+    match input {
+        AgentInput::Act {
+            node,
+            action,
+            value,
+            ..
+        } => apply_act(app, node.0.as_str(), action, value),
+        // A key is a keypress: it lowers into the same handler a person's
+        // keystroke takes and lands wherever focus is.
+        AgentInput::Key { key, .. } => match to_crossterm_key(&key) {
+            Some(key) => {
+                handle_key(app, key);
+                InputStatus::Delivered
+            }
+            // The bridge parses the same grammar before sending, so this is
+            // rare. It also covers a key the grammar learned after this
+            // adapter was built: the string parses and there is no crossterm
+            // event for it, and reporting that beats lowering it to some
+            // near-miss keystroke.
+            None => InputStatus::Ignored,
+        },
+        // Typing, routed by the app rather than lowered into its bindings.
+        // Without this arm, the wildcard below takes every `type_text`.
+        AgentInput::Text { text, .. } => apply_text(app, &text),
+        // The layer never hands this one over. It gets an arm of its own,
+        // not `Unknown | _`, so the lint can still see the wildcard.
+        AgentInput::Unknown => InputStatus::Ignored,
+        // `AgentInput` is `#[non_exhaustive]`, so this arm is required. A new
+        // way for an agent to address an app is additive on the wire; the
+        // attribute is what makes it additive for your build too.
+        _ => InputStatus::Ignored,
     }
-    // The bridge parses the same grammar before sending, so this is rare.
-    // It also covers a key the grammar learned after this adapter was
-    // built: the string parses and there is no crossterm event for it, and
-    // reporting that beats lowering it to some near-miss keystroke.
-    None => Applied::Ignored,
-},
-// Typing, routed by the app rather than lowered into its bindings.
-AgentInput::Text { text, .. } => apply_text(app, &text),
-// `AgentInput` is `#[non_exhaustive]`, so this arm is required. A new way
-// for an agent to address an app is additive on the wire; the attribute is
-// what makes it additive for your build too.
-_ => Applied::Ignored,
+}
 ```
 
 Neither the `..` nor the wildcard arm is boilerplate to skip, and they answer
-different additions. Ten types in `taria` are `#[non_exhaustive]`:
+different additions. Eleven types in `taria` are `#[non_exhaustive]`:
 `AgentInput`, `Action`, `Role`, `Node`, `Snapshot`, `InputStatus`, the two
-wire message enums, `key::Key` and `key::Modifiers`. So are six struct-like
-variants inside them: `AppToBridge::Hello` and `Ack`, `BridgeToApp::Input`,
-and `AgentInput`'s `Act`, `Key` and `Text`. The enums are where a new variant
-lands and the variants are where a new field lands, and both are things an
-adapter matches on. Without the attributes, one new key, one new field or one
-new input kind would fail to compile every app that had integrated taria.
-With them the cost is a `..` at the end of a pattern, a wildcard arm per enum
-matched on, `Modifiers::NONE` and `Modifiers::new` in place of the struct
-literal `Modifiers` closes, and a constructor in place of each marked
-variant's literal: `AgentInput::act`, `key` and `text`, `AppToBridge::hello`
-and `ack`, `BridgeToApp::input`.
+wire message enums, `key::Key`, `key::Modifiers` and `key::KeyPress`. So are
+six struct-like variants inside them: `AppToBridge::Hello` and `Ack`,
+`BridgeToApp::Input`, and `AgentInput`'s `Act`, `Key` and `Text`. The enums
+are where a new variant lands and the variants are where a new field lands,
+and both are things an adapter matches on. Without the attributes, one new
+key, one new field or one new input kind would fail to compile every app that
+had integrated taria. With them the cost is a `..` at the end of a pattern, a
+wildcard arm per enum matched on, `Modifiers::NONE` and `Modifiers::new` in
+place of the struct literal `Modifiers` closes, and a constructor in place of
+each marked variant's literal: `AgentInput::act`, `key` and `text`,
+`AppToBridge::hello` and `ack`, `BridgeToApp::input`.
 
 Through this adapter, the wildcard arm is not where an input kind you cannot
 read arrives. That is `AgentInput::Unknown`, the fallback a kind added after
@@ -538,7 +563,46 @@ degrading the input is what keeps the id and makes an ack possible at all;
 without it the line fails whole and the agent waits out a timeout for an ack
 that was never going to come. What does reach your wildcard is the other
 case: your app rebuilt against a taria that added an input kind, before you
-have written the arm for it. The arm is what makes that a recompile.
+have written the arm for it. The arm is what makes that a recompile, and an
+app migrating from v0 is exactly that case, with `Text` as the kind.
+
+### The arm the compiler asks for hides `Text`
+
+**The wildcard arm you add to satisfy the compiler is the arm that hides
+`AgentInput::Text`, the variant you now have to handle, so check every
+wildcard you add for `Text` before you trust a green build.**
+
+v0 had no `Text` and no attribute, so a v0 `match` naming `Act` and `Key` was
+exhaustive. Rebuilt against v0.1 it fails with
+``non-exhaustive patterns: `_` not covered``, and the fix `rustc` suggests is
+`_ => todo!()`. The error never names `Text`. Write the arm it asks for and
+every `type_text` lands in it. The typing tutor this guide opens with went
+through exactly this: the four edits the compiler asked for gave a clean
+build, a clean `clippy -D warnings`, 181 passing tests, and a `type_text` that
+did nothing at all.
+
+Two things help beyond reading every wildcard by eye:
+
+- Scope clippy's `wildcard_enum_match_arm` to the function that matches on
+  `AgentInput`, as the sample above does. It is a restriction lint, off by
+  default and stable, and it flags a wildcard covering a variant the enum
+  already has, by name: ``help: try: `AgentInput::Text { .. } | _` ``. Give
+  `AgentInput::Unknown` an arm of its own rather than writing
+  `AgentInput::Unknown | _`, because the lint does not look inside an
+  or-pattern, and that spelling silences it with `Text` still missing.
+  `rustc`'s own check for this, `non_exhaustive_omitted_patterns`, is still
+  unstable.
+- Make the wildcard answer `Ignored`. The layer acks `Delivered` as it hands
+  an input over, so `Text` swallowed by a wildcard that answers nothing
+  reaches the agent as "delivered, and the tree did not change", which is also
+  what an input still taking effect looks like. A wildcard answering `Ignored`
+  makes the same mistake an explicit refusal of every `type_text`, which an
+  agent reports rather than waits on.
+
+Neither is a guarantee. The lint only sees the functions you put it on, and
+an ignored ack only tells the agent. The check that does not depend on either
+is the one in [Checking your work](#checking-your-work): type into your app
+through the bridge and watch the tree change.
 
 Lowering `key` into the keyboard path also means an agent can reach every
 chord your app binds, and some it does not. The demo's list handler matched key
@@ -585,7 +649,7 @@ fn accepts_typing(app: &App) -> bool {
     app.dialog.is_none() && app.focus == Focus::Input
 }
 
-fn apply_text(app: &mut App, text: &str) -> Applied {
+fn apply_text(app: &mut App, text: &str) -> InputStatus {
     let mut typed = false;
     for key in text_to_keys(text) {
         if !accepts_typing(app) {
@@ -596,9 +660,9 @@ fn apply_text(app: &mut App, text: &str) -> Applied {
         typed = true;
     }
     if typed {
-        Applied::Handled
+        InputStatus::Delivered
     } else {
-        Applied::Ignored
+        InputStatus::Ignored
     }
 }
 ```
@@ -618,6 +682,16 @@ accepting no typing at all. An app with several fields routes to the one that
 has the keyboard. What they share is the `Ignored`: an agent that types at the
 wrong moment hears about it in one round trip, rather than tripping bindings
 and being told it worked.
+
+`text_to_keys` is for a typing surface that consumes key events, like the
+demo's text field. It lowers `'\n'` to Enter and `'\t'` to Tab, which a text
+field reads as "submit" and "next field". A surface that grades characters
+rather than handling keys has no such vocabulary, and the helper gives it one
+anyway: the typing tutor's typing screen binds Tab to a setting that writes
+the user's config file, so a tab inside a typed string lowered through
+`text_to_keys` changes a setting, the very binding trip this section exists to
+prevent. An app like that iterates `text.chars()` itself and hands each
+character to its grader, deciding there what a newline or a tab means.
 
 `Key` keeps the raw lowering deliberately. An agent sending `key d` is asking
 for the `d` binding, and an app that routed keys into its draft too would have
@@ -757,12 +831,16 @@ claude mcp add taria -- /path/to/taria/target/debug/taria-mcp --app my-app
 That registration line is Claude Code's; any MCP harness works, and the
 README's quick start walks the same steps against the demo app.
 
-The four things worth confirming by hand:
+The five things worth confirming by hand:
 
 - Exactly one node is focused in every state, including the empty ones.
 - Every id you publish still names the same thing after a delete.
 - An act your app deliberately refuses comes back as an ignored ack, not as
   silence.
+- `type_text` sent where your app accepts typing changes the tree. This is the
+  one a green build cannot vouch for: a wildcard arm swallowing `Text` builds,
+  passes default clippy, and passes every test that does not type; see
+  [The arm the compiler asks for hides `Text`](#the-arm-the-compiler-asks-for-hides-text).
 - `type_text` sent while nothing is accepting typing comes back ignored, and
   changes nothing. Send a word carrying letters your app binds; the demo's was
   "deploy".

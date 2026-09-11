@@ -477,9 +477,42 @@ impl TariaLayer {
 
     /// [`drain`](Self::drain), passing each input's [`InputId`] alongside it
     /// so the handler can [`ack`](Self::ack) whatever it chose to ignore.
+    ///
+    /// Reach for [`drain_acking`](Self::drain_acking) first: an app that only
+    /// wants to refine an ack needs the id for nothing else, and every
+    /// integration that wrote this loop by hand wrote the same four lines
+    /// around it.
     pub fn drain_with_ids(&self, mut f: impl FnMut(InputId, AgentInput)) {
         while let Some((id, input)) = self.try_recv_with_id() {
             f(id, input);
+        }
+    }
+
+    /// [`drain`](Self::drain) where the handler returns each input's status
+    /// and the layer sends the ones that say something new.
+    ///
+    /// Answering an input the app looked at and deliberately did nothing with
+    /// is the whole reason [`drain_with_ids`](Self::drain_with_ids) hands out
+    /// an [`InputId`], and two independent apps wrote the same
+    /// dequeue-compare-[`ack`](Self::ack) loop around it, each with its own
+    /// two-variant verdict enum in front. Returning
+    /// [`Ignored`](InputStatus::Ignored) says the same thing with no id in the
+    /// app's hands and no enum of its own.
+    ///
+    /// Return [`Delivered`](InputStatus::Delivered) for an input the app
+    /// acted on. It sends nothing: the dequeue already acked it, and
+    /// re-sending would double this layer's ack traffic, which on a bridge
+    /// reading slower than the app answers costs the refinements queued
+    /// behind it (see [`dropped_acks`](Self::dropped_acks)).
+    ///
+    /// `drain_with_ids` stays for an app that needs the id for something
+    /// else, such as an input it can only answer after a later frame.
+    pub fn drain_acking(&self, mut f: impl FnMut(AgentInput) -> InputStatus) {
+        while let Some((id, input)) = self.try_recv_with_id() {
+            let status = f(input);
+            if status != InputStatus::Delivered {
+                self.ack(id, status);
+            }
         }
     }
 
@@ -1699,6 +1732,10 @@ mod tests {
         let mut drained = 0;
         layer.drain(|_| drained += 1);
         layer.drain_with_ids(|_, _| drained += 1);
+        layer.drain_acking(|_| {
+            drained += 1;
+            InputStatus::Ignored
+        });
         assert_eq!(drained, 0, "a disabled layer has nothing to drain");
 
         // The render path works unchanged; it just publishes nowhere.

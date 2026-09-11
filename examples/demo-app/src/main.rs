@@ -14,12 +14,12 @@ mod update;
 use std::io;
 
 use ratatui::DefaultTerminal;
-use taria_ratatui::{InputStatus, TariaLayer};
+use taria_ratatui::TariaLayer;
 
 use app::App;
 use events::setup_event_channel;
 use ui::view;
-use update::{Applied, apply_agent_input, update};
+use update::{apply_agent_input, update};
 
 fn main() -> io::Result<()> {
     // Binding never fails the app: taria being unavailable is a reason to run
@@ -123,10 +123,8 @@ fn run(terminal: &mut DefaultTerminal, layer: &mut TariaLayer) -> io::Result<()>
 /// The layer acks `Delivered` as it hands an input over, which only says the
 /// event loop dequeued it. `Ignored` is the follow-up that tells an agent
 /// waiting on an effect that no effect is coming, and last ack wins.
+/// `apply_agent_input` returns the status and `drain_acking` sends the ones
+/// that refine it, so no input id passes through this app at all.
 fn drain_agent_input(app: &mut App, layer: &TariaLayer) {
-    layer.drain_with_ids(|id, input| {
-        if apply_agent_input(app, input) == Applied::Ignored {
-            layer.ack(id, InputStatus::Ignored);
-        }
-    });
+    layer.drain_acking(|input| apply_agent_input(app, input));
 }

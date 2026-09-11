@@ -381,6 +381,55 @@ fn drain_hands_over_every_queued_input_and_acks_each() {
     }
 }
 
+/// `drain_acking` sends what the handler returns only where it says something
+/// the dequeue did not: an `Ignored` refines the `Delivered` ack, and a
+/// `Delivered` sends no second copy of it.
+#[test]
+fn drain_acking_sends_the_refinements_and_nothing_else() {
+    let mut layer = bind_layer("drainacking");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    for id in 0..3 {
+        client.send_input(id, key(&format!("k{id}")));
+    }
+
+    // The handler never sees an id: it answers from the input alone, which is
+    // the whole point of the method.
+    let mut got = Vec::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while got.len() < 3 && Instant::now() < deadline {
+        layer.drain_acking(|input| {
+            let status = if input == key("k1") {
+                InputStatus::Ignored
+            } else {
+                InputStatus::Delivered
+            };
+            got.push(input);
+            status
+        });
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(got, vec![key("k0"), key("k1"), key("k2")]);
+
+    // Acks are flushed ahead of a snapshot published after them, so any
+    // extra ack the drain queued would arrive before this tree does.
+    publish_single_node(&mut layer, "after");
+
+    assert_eq!(client.read_message(), ack(0, InputStatus::Delivered));
+    assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
+    assert_eq!(
+        client.read_message(),
+        ack(1, InputStatus::Ignored),
+        "the refinement follows its own input's dequeue ack, before the next input's"
+    );
+    assert_eq!(client.read_message(), ack(2, InputStatus::Delivered));
+    let AppToBridge::Snapshot(snapshot) = client.read_message() else {
+        panic!("a returned Delivered must not send a second ack ahead of the snapshot");
+    };
+    assert_eq!(snapshot.root.children[0].id.0, "after");
+}
+
 #[test]
 fn client_can_reconnect_after_disconnect() {
     let mut layer = bind_layer("reconnect");

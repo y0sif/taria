@@ -353,10 +353,12 @@ and a silence.
   without a limit, so a megabyte of `ctrl+` parses to the key it ends in and
   serializes to the line neither peer will read, the same single-legal-call
   hole the `value` bound closes.
-- `type_text` takes up to 4096 characters. The adapter's `text_to_keys`
-  lowers it into one key event per character; where those go is the app's,
-  and it is the app's text-entry surface rather than its key bindings. An app
-  accepting no typing at that moment answers `ignored`.
+- `type_text` takes up to 4096 characters. Where they go is the app's, and it
+  is the app's typing surface rather than its key bindings. A surface that
+  consumes key events can lower the text with the adapter's `text_to_keys`,
+  one key event per character with `\n` as Enter and `\t` as Tab; one that
+  grades characters iterates them itself, since those two are keys it may
+  bind. An app accepting no typing at that moment answers `ignored`.
 - Every input tool refuses while no app is connected. A queued input would
   otherwise be delivered to the next app instance.
 
@@ -551,3 +553,28 @@ id in the list node's `value`.
   hierarchy comes only from explicitly built children.
 - Multiple simultaneous bridge clients per app.
 - Adapters for other frameworks (Bubble Tea, Textual, Ink).
+
+Three more, found migrating a released typing tutor (keybr-tui) to v0.1. All
+are additive, so they are v0.2 work and not a `PROTOCOL_VERSION` bump.
+
+- A partially applied input. An agent sends 100 characters, the typing
+  surface ends its lesson after 20, and the other 80 go nowhere. The app can
+  ack `Delivered`, which is true and useless, or `Ignored`, which is false.
+  A status carrying a count closes it. `InputStatus` is `#[non_exhaustive]`,
+  and a bridge that cannot read the new status skips that ack and keeps the
+  `Delivered` before it, which is exactly today's answer.
+- A role for a bounded numeric stepper. keybr renders three (target WPM,
+  fragment length, alphabet size); `select` is a stretch, since there are no
+  options to pick from, and `list_item` says nothing about a number with
+  bounds. Most config screens have some. A peer that does not know the role
+  reads `other`. The bounds themselves belong with node attributes, which are
+  deferred on their own.
+- A bad `IdSpace` prefix fails at a lookup that may never run. `new` is const
+  and infallible so a space can stand in a `const`, so a prefix carrying the
+  separator builds a space that owns nothing, including the ids it builds
+  itself. keybr's natural spelling, `IdSpace::new("progress-key")`, compiled,
+  sat in a const, and would have answered `None` to every parse. `try_new`
+  exists and is const, but nothing steers an adopter to it. A constructor that
+  fails const evaluation, such as a macro wrapping `try_new` in an inline
+  `const` block, fails the build instead of the app, and never panics at run
+  time.

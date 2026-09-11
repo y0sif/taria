@@ -448,7 +448,7 @@ mod tests {
         // And what it advertises is what the app does with it.
         assert_eq!(
             apply_agent_input(&mut app, act("input", Action::Activate)),
-            crate::update::Applied::Handled
+            taria_ratatui::InputStatus::Delivered
         );
         assert!(!input_actions(&app).contains(&Action::Activate));
     }
@@ -594,7 +594,7 @@ mod tests {
         // And it works: the draft is gone and the keyboard is the list's.
         assert_eq!(
             apply_agent_input(&mut app, act("input", Action::Dismiss)),
-            crate::update::Applied::Handled
+            taria_ratatui::InputStatus::Delivered
         );
         let nodes = build_nodes(&app);
         assert_eq!(find(&nodes, "input").unwrap().value.as_deref(), Some(""));
@@ -614,7 +614,7 @@ mod tests {
 
         assert_eq!(
             apply_agent_input(&mut app, act("task-4", Action::Select)),
-            crate::update::Applied::Handled
+            taria_ratatui::InputStatus::Delivered
         );
 
         let after = build_nodes(&app);

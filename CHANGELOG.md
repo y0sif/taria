@@ -58,6 +58,19 @@ implementer should read in full; `docs/architecture.md` explains it and
 
 Anything built against the v0 slice needs these.
 
+**The wildcard arm the compiler makes you add to every `match` over
+`AgentInput` is the arm that swallows `AgentInput::Text`, so check every
+wildcard you add for `Text` before you trust a green build.** The two changes
+below that cause this sit in different lists: `Text` is a wire change and
+`#[non_exhaustive]` a Rust one, and it is their product that bites. A v0
+`match` named `Act` and `Key`; rebuilt, it fails with
+``non-exhaustive patterns: `_` not covered``, an error that never names
+`Text`, and the arm that silences it takes every `type_text`. On the first
+real app migrated, the four edits the compiler asked for left a clean build,
+a clean `clippy -D warnings`, 181 passing tests, and a `type_text` that did
+nothing at all. `docs/integration-guide.md` names a clippy lint that catches
+it.
+
 On the wire:
 
 - `BridgeToApp::Input` carries an `InputId`, and the app answers it with
@@ -85,7 +98,9 @@ In Rust:
   why all of it happens before the first release rather than at the first
   addition. It costs an outside peer one wildcard arm per match, or a trailing
   `..` in a pattern, and buys back that a new variant, field, role, action or
-  key is a recompile rather than a repair.
+  key is a recompile rather than a repair. On `AgentInput` the wildcard costs
+  more than that for anyone coming from v0: it is where `Text` goes missing,
+  as the warning at the top of this section says.
 - A marked variant has no struct literal outside the crate, so each ships with
   a constructor beside it: `AppToBridge::hello` and `ack`,
   `BridgeToApp::input`, and `AgentInput::act`, `key` and `text`. `Modifiers`
@@ -147,11 +162,18 @@ are joined by `type_text`.
 - `publish(nodes)`, `drain` and `drain_with_ids` absorb boilerplate every
   integration was writing by hand, and `ack(id, InputStatus::Ignored)` is how
   an app says it looked at an input and deliberately did nothing.
-- `taria::id::IdSpace` gives nodes ids that are identities rather than
-  positions, which is the difference between an agent acting on the row it read
-  and acting on whatever moved into that slot. `new` stays const and infallible
-  for the usual case of a prefix declared in a const; `try_new` is for one
-  built at runtime.
+- `drain_acking` takes the `InputStatus` the handler returns and sends the
+  `Ignored` ones itself, so saying "I looked at that and did nothing" needs no
+  input id and no enum of the app's own. The demo and the typing tutor each
+  wrote the same two-variant enum, and the same loop around `drain_with_ids`
+  and `ack`, before it existed. `drain_with_ids` stays for an app that needs
+  the id for something else.
+- `taria::IdSpace` gives nodes ids that are identities rather than positions,
+  which is the difference between an agent acting on the row it read and
+  acting on whatever moved into that slot. It sits at the crate root beside
+  `Node` and `Role`, as well as in `taria::id`. `new` stays const and
+  infallible for the usual case of a prefix declared in a const; `try_new` is
+  for one built at runtime.
 - Socket failures have names and say what to do about themselves.
   `SocketPathTooLong` carries the path, its length and the platform's limit,
   in place of the bare "path must be shorter than SUN_LEN" that std reports,

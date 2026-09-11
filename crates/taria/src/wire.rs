@@ -31,6 +31,17 @@
 //! [`AppToBridge::Ack`] naming the same id, so the bridge can tell an input the
 //! app acted on from one it never saw.
 //!
+//! Two acks for one input is the normal case, not an edge. The app acks
+//! [`Delivered`](InputStatus::Delivered) as its event loop dequeues the input,
+//! before it has decided anything, and follows with
+//! [`Ignored`](InputStatus::Ignored) once it has looked and done nothing. The
+//! last ack wins, so a bridge must not resolve a waiter on the first ack that
+//! matches an id: a test bridge that did reported `Delivered` for four inputs
+//! its app had refused. The reference bridge keeps listening after a
+//! `Delivered` until the tree changes or its window closes, reading acks and
+//! snapshots in wire order, because an app writes an ack ahead of the snapshot
+//! it publishes next. [`InputStatus`] states the rule in full.
+//!
 //! # Compatibility
 //!
 //! Version 1 is the frozen format. Within version 1, changes must be additive,
