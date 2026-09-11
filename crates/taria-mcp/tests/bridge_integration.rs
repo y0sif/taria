@@ -339,6 +339,70 @@ async fn read_tree_names_the_parse_failure_rather_than_the_socket_path() {
     );
 }
 
+/// A message whose `type` this bridge has no variant for is additive under the
+/// freeze, so it must be ignored like an unknown enum variant, not reported as
+/// a malformed line. Regression for the v0.1 review: an internally tagged enum
+/// fails to parse such a line, so it used to land in the rejected-line path and
+/// misdiagnose a conforming newer app to the agent.
+#[tokio::test]
+async fn read_tree_ignores_an_unknown_future_message_type() {
+    let (_dir, path) = test_socket_path("future-msg");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle);
+
+    let (stream, _addr) = timeout(WAIT, listener.accept())
+        .await
+        .expect("bridge should connect")
+        .expect("accept");
+    let mut app = FakeApp::from_stream(stream);
+    app.send(&AppToBridge::hello("future-app", PROTOCOL_VERSION))
+        .await;
+    // Well-formed, and its `type` is one a later version 1 app added that this
+    // bridge does not know. Sent raw because this build has no variant to
+    // serialize it from, which is exactly how the situation arises.
+    app.send_raw(r#"{"type":"capability","features":["paste"]}"#)
+        .await;
+
+    // The lines are processed in order on the one stream, so once the manager
+    // has had a moment the unknown line has been seen. The app sent no
+    // snapshot, so read_tree still errors, but with the plain "no snapshot yet"
+    // answer, never the "reached this socket ... malformed" one an unknown
+    // message used to trigger.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let err = server
+        .read_tree()
+        .await
+        .expect_err("no snapshot was ever sent");
+    assert!(
+        !err.message.contains("reached this socket"),
+        "an unknown future message must not surface as a rejected line: {}",
+        err.message
+    );
+
+    // And a real snapshot after the unknown line is served normally: ignoring
+    // it did not break the stream.
+    app.send(&AppToBridge::Snapshot(Snapshot::new(
+        1,
+        demo_root("after-unknown"),
+    )))
+    .await;
+    let tree = timeout(WAIT, async {
+        loop {
+            if let Ok(result) = server.read_tree().await {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the app's snapshot after an unknown line should be served");
+    assert!(
+        format!("{tree:?}").contains("after-unknown"),
+        "an unknown line must not block a later snapshot"
+    );
+}
+
 /// The state that stopped the first agent to meet this project before it
 /// could try anything: a bridge whose `connect` succeeded onto a socket
 /// nobody was ever going to accept it from.

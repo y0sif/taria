@@ -600,6 +600,18 @@ fn handle_app_line(
         Ok(_) => {
             tracing::debug!("ignoring an app message this bridge has no handler for");
         }
+        // An unknown `type` is a message variant added in a later version 1
+        // release. That is additive on the wire, so it is ignored exactly like
+        // the `Ok(_)` arm above rather than reported as malformed: an
+        // internally tagged enum with no catch-all fails to parse such a line,
+        // so it arrives here as an error, but it is a conforming newer app, not
+        // a broken one. Reporting it would put a false "malformed line" reason
+        // in front of an agent (see `no_snapshot_reason`) for an app doing
+        // nothing wrong, and contradict this module's own "quietly ignored"
+        // guarantee for unknown messages.
+        Err(_) if is_unknown_message_type(line) => {
+            tracing::debug!("ignoring an app message type this bridge has no handler for");
+        }
         Err(err) => {
             tracing::warn!(%err, "ignoring malformed line from app");
             // Kept, not just logged. Nobody reads a bridge's log while
@@ -607,5 +619,54 @@ fn handle_app_line(
             // the only place that knows why the line was thrown away.
             rejected_tx.send_replace(Some(err.to_string()));
         }
+    }
+}
+
+/// True when `line` is a JSON object whose `type` names a message this bridge
+/// has no variant for: an additive future message to ignore, not a malformed
+/// line to report. A known `type` whose fields did not parse is malformed and
+/// returns `false`, as does anything that is not a JSON object with a string
+/// `type`.
+fn is_unknown_message_type(line: &str) -> bool {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    match map.get("type").and_then(serde_json::Value::as_str) {
+        // Keep in step with the `AppToBridge` variants this build handles; the
+        // `classifies_*` tests guard the pairing.
+        Some(ty) => !matches!(ty, "hello" | "snapshot" | "ack"),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unknown_message_type;
+
+    #[test]
+    fn classifies_unknown_type_as_ignorable() {
+        // A well-formed message a later version 1 release added.
+        assert!(is_unknown_message_type(r#"{"type":"capability"}"#));
+        assert!(is_unknown_message_type(r#"{"type":"paste","data":"x"}"#));
+    }
+
+    #[test]
+    fn classifies_known_types_as_not_ignorable() {
+        // A known `type` reaching the error path failed on its fields, which is
+        // malformed, not additive, so it must still be reported.
+        for ty in ["hello", "snapshot", "ack"] {
+            assert!(
+                !is_unknown_message_type(&format!(r#"{{"type":"{ty}"}}"#)),
+                "{ty} is a known message type"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_non_messages_as_not_ignorable() {
+        assert!(!is_unknown_message_type("not json at all"));
+        assert!(!is_unknown_message_type(r#"["an","array"]"#));
+        assert!(!is_unknown_message_type(r#"{"no":"type field"}"#));
+        assert!(!is_unknown_message_type(r#"{"type":42}"#));
     }
 }
