@@ -464,6 +464,51 @@ mod tests {
         assert!(!input_actions(&app).contains(&Action::Activate));
     }
 
+    /// `focus` is the way in, so it is advertised exactly where it is a move:
+    /// while the keyboard is somewhere else. Advertised while the input
+    /// already holds it, it would be the same advertised-but-ignored pair
+    /// `activate` used to be, and an agent would learn that an advertised
+    /// action may do nothing.
+    #[test]
+    fn the_input_advertises_focus_only_while_the_keyboard_is_elsewhere() {
+        let mut app = App::new();
+        let input_actions = |app: &App| find(&build_nodes(app), "input").unwrap().actions.clone();
+
+        assert!(
+            input_actions(&app).contains(&Action::Focus),
+            "the keyboard starts on the list, so there is a move to offer"
+        );
+
+        // And what it advertises is what the app does with it.
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            taria_ratatui::InputStatus::Delivered
+        );
+        assert_eq!(focused_id(&build_nodes(&app)).as_deref(), Some("input"));
+        assert!(
+            !input_actions(&app).contains(&Action::Focus),
+            "the keyboard is here now, so the move is no longer offered"
+        );
+
+        // The pair the other way round: not advertised, and not honoured.
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            taria_ratatui::InputStatus::Ignored
+        );
+
+        // The dialog withdraws it like every other action on the input.
+        apply_agent_input(&mut app, act("input", Action::Dismiss));
+        apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
+        assert!(
+            !input_actions(&app).contains(&Action::Focus),
+            "a modal dialog withdraws the way in with everything else"
+        );
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            taria_ratatui::InputStatus::Ignored
+        );
+    }
+
     /// The footer has told a person `[q] quit` since the demo existed, while
     /// the tree advertised no exit at all, leaving an agent the raw-key
     /// fallback the project keeps off the primary path.

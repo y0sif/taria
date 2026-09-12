@@ -610,6 +610,17 @@ mod tests {
 
     /// And the modal gate covers it like every other node outside the dialog:
     /// a dialog asking whether to delete a task is not a moment to quit.
+    #[test]
+    fn quit_is_blocked_while_the_dialog_is_open() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
+        assert_eq!(
+            apply_agent_input(&mut app, act("quit", Action::Activate)),
+            InputStatus::Ignored
+        );
+        assert!(app.running, "the dialog must stop the quit");
+    }
+
     /// The path `focus` exists for: take the keyboard without touching the
     /// draft, then type into it.
     ///
@@ -665,17 +676,6 @@ mod tests {
             InputStatus::Ignored
         );
         assert_eq!(app.focus, Focus::List, "the dialog must stop the move");
-    }
-
-    #[test]
-    fn quit_is_blocked_while_the_dialog_is_open() {
-        let mut app = App::new();
-        apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
-        assert_eq!(
-            apply_agent_input(&mut app, act("quit", Action::Activate)),
-            InputStatus::Ignored
-        );
-        assert!(app.running, "the dialog must stop the quit");
     }
 
     #[test]

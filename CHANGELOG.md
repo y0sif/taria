@@ -31,8 +31,9 @@ release, so driving an app does not require a Rust toolchain.
 
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1, no message or type
 gained or lost a field, and no crate's Rust API changed. Everything below is a
-specification, a description an agent reads, a test that was missing, or
-packaging.
+specification, a description an agent reads, a test that was missing,
+packaging, or one action the demo app now advertises, which `Action::Focus`
+already existed to carry.
 
 ### The wire format is specified, message by message
 
