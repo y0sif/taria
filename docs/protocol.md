@@ -1208,7 +1208,8 @@ the app that went away, rather than acting on a stale tree.
 
 ## 15. Focus contract
 
-**Every snapshot carries exactly one focused node.**
+**Every snapshot should carry exactly one focused node, and this is the
+app's obligation rather than anything either peer enforces.**
 
 - An app **MUST** publish at most one node with `focused: true`.
 - An app **SHOULD** publish at least one. A tree with no focus tells an agent

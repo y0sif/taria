@@ -334,8 +334,8 @@ Five edits: bind a layer in `main`, write a function that turns your state
 into nodes, publish it after each draw, drain agent input around the blocking
 call in your event loop, and acknowledge the inputs you deliberately ignore.
 It touches neither your rendering nor your state, and it is one direct
-dependency: `taria-ratatui` pulls in the core crate, `serde_json`, and the
-ratatui you already had. If the socket cannot be bound the layer is inert and
+dependency: `taria-ratatui` pulls in the core crate and its one dependency
+`serde`, plus `serde_json` and the ratatui you already had. If the socket cannot be bound the layer is inert and
 the app runs exactly as it did before, so taria cannot keep your app from
 starting. `docs/integration-guide.md` is the walkthrough, with the mistakes
 two real retrofits made.
