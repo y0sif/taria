@@ -520,10 +520,14 @@ impl TariaLayer {
     ///
     /// Last ack wins. An app that dequeued an input (acked
     /// [`Delivered`](InputStatus::Delivered) by that dequeue) and then
-    /// deliberately did nothing with it, say an act blocked by a modal dialog
-    /// or naming a node it does not know, can refine that to
+    /// deliberately did nothing with it can refine that to
     /// [`Ignored`](InputStatus::Ignored) so an agent waiting on an effect
-    /// stops waiting.
+    /// stops waiting. That is every input kind, not only an act a modal dialog
+    /// blocks or naming a node this app does not know: a `set_value` carrying
+    /// no value, an [`AgentInput::Text`] sent while nothing here is accepting
+    /// typing, an [`AgentInput::Key`] this app could not lower, and an input
+    /// kind this build has never heard of. [`InputStatus::Ignored`] draws the
+    /// line, including why a key bound to nothing is still delivered.
     ///
     /// The ack travels the same path as snapshots, so it can never overtake
     /// the snapshot published after it. Does nothing on a disabled layer.

@@ -246,8 +246,22 @@ pub enum InputStatus {
     Delivered,
     /// Dropped before reaching the app: its input queue was full.
     Dropped,
-    /// The app looked at the input and deliberately did nothing (for
-    /// example an act blocked by a modal dialog, or an unknown node id).
+    /// The app looked at the input and deliberately did nothing with it.
+    ///
+    /// Every input kind can earn this, not only an act: an act a modal dialog
+    /// blocks or naming a node the app does not know, a
+    /// [`SetValue`](crate::Action::SetValue) act carrying no value, an
+    /// [`AgentInput::Text`] sent while nothing is accepting typing, an
+    /// [`AgentInput::Key`] the grammar in [`key`](crate::key) rejects or the
+    /// adapter cannot lower into its framework, and an input kind this build
+    /// has never heard of, which arrives as [`AgentInput::Unknown`].
+    ///
+    /// The line is what the app could act on, not what it did. A key that
+    /// parses but is bound to nothing is [`Delivered`](Self::Delivered), the
+    /// same verdict a person gets for pressing an unbound key: the app
+    /// received it and doing nothing was the answer. `Ignored` is for input
+    /// the app could not act on at all, which is what makes it worth reporting
+    /// to an agent waiting on an effect.
     Ignored,
 }
 

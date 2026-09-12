@@ -6,6 +6,12 @@
 //! [`taria::AgentInput`] values your event loop handles like any other input
 //! source.
 //!
+//! [`taria::AgentInput::Text`] is the one that needs aiming rather than
+//! handling: typed text belongs wherever your app puts typing, not in your key
+//! handler, or an agent's two characters meet your bindings instead of your
+//! text field. Route it to that surface yourself, and use [`text_to_keys`] to
+//! lower it if the surface is made of key events.
+//!
 //! # Usage
 //!
 //! ```no_run

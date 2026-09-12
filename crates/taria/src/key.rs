@@ -109,7 +109,7 @@ impl Modifiers {
 /// [`new`](Self::new) is const and names both fields, so a peer keeps the one
 /// thing the attribute takes away.
 ///
-/// [`to_crossterm`]: https://docs.rs/taria-ratatui/latest/taria_ratatui/key/fn.to_crossterm.html
+/// [`to_crossterm`]: https://docs.rs/taria-ratatui/latest/taria_ratatui/fn.to_crossterm.html
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KeyPress {
