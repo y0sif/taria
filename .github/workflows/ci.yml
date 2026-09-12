@@ -39,3 +39,20 @@ jobs:
       - name: Adversarial probes
         run: python3 scripts/adversarial.py
         timeout-minutes: 10
+
+  # The MSRV is a promise on the crates.io page, not a comment: `rust-version
+  # = "1.88"` is what tells cargo to refuse the crate on an older toolchain,
+  # and nothing here checked it until the crates were published. A check is
+  # enough, since what an older compiler rejects is syntax and library items,
+  # not test outcomes, and the stable job above already runs the suites.
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
