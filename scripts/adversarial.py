@@ -1029,6 +1029,101 @@ def probe_set_value_without_value(client, ctx):
     return f"ignored ack, draft {draft!r} untouched; focus restored to {back_on}"
 
 
+def probe_text_with_nothing_typing(client, ctx):
+    """Text sent while nothing is accepting typing is ignored, not lowered.
+
+    This is one of the claims the bridge's ignored note now makes to every
+    agent -- "or text sent while nothing is accepting typing" -- and the demo
+    is where it has to be true. Two regressions would be invisible without
+    this probe, and both are ones the project's conventions name outright. If
+    `Text` were lowered through the key bindings, the list would read this
+    payload as commands: `d` opens the delete dialog and `y` confirms it, so
+    one type_text would destroy a task and the call would still read as a
+    success because the tree changed. If the typing guard were dropped
+    instead, the characters would land in a draft the tree does not show as
+    focused, and the call would report the edit as applied.
+
+    The answer has to be the ignored ack carrying a tree: a result, not an
+    error, because the input's fate is known. An agent that typed at the
+    wrong moment has to hear that nothing happened and re-plan from the tree
+    it is handed, rather than be told its call was malformed.
+    """
+    # `d` then `y` is the demo's delete-and-confirm pair, and the exact
+    # payload the conventions cite: one type_text containing `d` and `y`
+    # deleted a task.
+    payload = "dy"
+
+    def state(snapshot):
+        return {
+            n["id"]: (n.get("label"), n.get("value"), bool(n.get("focused")))
+            for n in flatten(snapshot["root"])
+        }
+
+    try:
+        # The keyboard has to be off the input, or the claim is not under
+        # test at all. `esc` reaches that state from either side: it clears
+        # the draft and hands focus back when the input holds it, and is
+        # merely acknowledged when the list already does.
+        tree = key(client, "esc", expect=EXPECT_ACK)
+        require(
+            find(tree, "dialog") is None,
+            "a modal dialog was open before the probe, so the text would be "
+            "ignored for the wrong reason",
+        )
+        holder = one_focused(tree, "before typing at nothing")
+        require(
+            holder != "input",
+            f"the input still holds the keyboard (focus is {holder!r}), so "
+            "this text would be accepted",
+        )
+        before = state(tree)
+
+        try:
+            kind, ignored = client.call_outcome("type_text", {"text": payload})
+        except ToolError as err:
+            raise StepFailure(
+                f"type_text with nothing accepting typing was refused as an "
+                f"error (code {err.code}): {err.message[:120]}; expected the "
+                "ignored result and a tree to re-plan from"
+            )
+        require(
+            kind == "ignored",
+            f"type_text({payload!r}) with nothing accepting typing came back "
+            f"as {kind!r}, expected the ignored ack",
+        )
+        require(ignored is not None, "ignored result carried no tree")
+        # The tree an agent is told to re-plan from has to show the state
+        # that caused the ignore, the same way the modal probe's does.
+        require(
+            one_focused(ignored, "in the ignored ack") != "input",
+            "the ignored ack's tree shows the input focused, so it does not "
+            "explain why the text went nowhere",
+        )
+
+        live = client.read_tree()
+        after = state(live)
+        gone = sorted(set(before) - set(after))
+        added = sorted(set(after) - set(before))
+        shared = before.keys() & after.keys()
+        edited = sorted(k for k in shared if before[k] != after[k])
+        require(
+            not (gone or added or edited),
+            f"type_text({payload!r}) changed the app it was ignored by: nodes "
+            f"gone {gone}, added {added}, edited "
+            f"{[(k, before[k], after[k]) for k in edited]}",
+        )
+    finally:
+        # Only reachable with a dialog up if the payload really did reach the
+        # list's bindings, which is this probe failing; the failure's own
+        # message wins, but later probes should not inherit the modal.
+        close_any_dialog(client)
+
+    return (
+        f"type_text({payload!r}) acked Ignored with a tree; {len(before)} "
+        f"nodes untouched, keyboard still on {holder}"
+    )
+
+
 def probe_version_mismatch(client, ctx):
     """A peer on another protocol version: reads work, input does not.
 
@@ -1596,6 +1691,7 @@ def main():
     probes = [
         ("acts while dialog open", probe_act_while_dialog_open),
         ("set_value without a value", probe_set_value_without_value),
+        ("text with nothing accepting typing", probe_text_with_nothing_typing),
         ("rapid consecutive acts", probe_rapid_acts),
         ("empty key string", probe_empty_key),
         ("unparseable key string", probe_unparseable_key),

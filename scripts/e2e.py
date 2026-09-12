@@ -47,8 +47,9 @@ SOURCE_SUFFIXES = (".rs", ".toml", ".lock")
 # to notice rather than absorb.
 IGNORED_PREFIX = (
     "The app received this input and deliberately did nothing with it "
-    "(for example an action a modal dialog blocks, or a node it no longer "
-    "knows). Re-plan from the current tree below."
+    "(for example an act a modal dialog blocks or naming a node it no "
+    "longer knows, a set_value carrying no value, or text sent while "
+    "nothing is accepting typing). Re-plan from the current tree below."
 )
 NO_CHANGE_PREFIX = "The app received this input, and its tree did not change within"
 NO_ACK_PREFIX = "The app neither acknowledged this input nor changed its tree within"
