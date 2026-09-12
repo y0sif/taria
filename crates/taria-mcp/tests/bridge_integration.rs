@@ -3,18 +3,18 @@
 //! other. No MCP stdio transport involved.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ContentBlock;
-use taria::wire::{AppToBridge, BridgeToApp};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{Action, AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::bridge::{self, BridgeHandle, BridgeState};
-use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer};
+use taria_mcp::bridge::{self, AppSnapshot, BridgeHandle, BridgeState, LinkState};
+use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer, TypeTextParams};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::timeout;
 
 /// Generous bound for local socket round trips.
@@ -55,22 +55,36 @@ fn demo_root(marker: &str) -> Node {
 struct FakeApp {
     lines: Lines<BufReader<OwnedReadHalf>>,
     write: OwnedWriteHalf,
+    /// Status every input read through [`FakeApp::recv_input`] is acked with,
+    /// or `None` for an app that implements no acks at all (an adapter older
+    /// than the ack contract, which the bridge still has to serve).
+    ack_with: Option<InputStatus>,
 }
 
 impl FakeApp {
     /// Accept the bridge's connection and perform the app-side handshake:
     /// Hello, then the given initial snapshot.
+    ///
+    /// Acks `Delivered` by default, like the real adapter does the moment its
+    /// event loop dequeues an input.
     async fn accept(listener: &UnixListener, initial: Snapshot) -> Self {
+        Self::accept_speaking(listener, initial, PROTOCOL_VERSION).await
+    }
+
+    /// Accept, but declare `protocol_version` in the handshake: the peer the
+    /// bridge can read snapshots from and cannot send input to.
+    async fn accept_speaking(
+        listener: &UnixListener,
+        initial: Snapshot,
+        protocol_version: u32,
+    ) -> Self {
         let (stream, _addr) = timeout(WAIT, listener.accept())
             .await
             .expect("bridge should connect")
             .expect("accept");
         let mut app = Self::from_stream(stream);
-        app.send(&AppToBridge::Hello {
-            app_label: "fake-app".to_string(),
-            protocol_version: PROTOCOL_VERSION,
-        })
-        .await;
+        app.send(&AppToBridge::hello("fake-app", protocol_version))
+            .await;
         app.send(&AppToBridge::Snapshot(initial)).await;
         app
     }
@@ -80,11 +94,34 @@ impl FakeApp {
         Self {
             lines: BufReader::new(read).lines(),
             write,
+            ack_with: Some(InputStatus::Delivered),
         }
     }
 
+    /// Ack every input read from now on with `status`.
+    fn acking(mut self, status: InputStatus) -> Self {
+        self.ack_with = Some(status);
+        self
+    }
+
+    /// Ack nothing at all: the compatibility path, where the changed tree is
+    /// the only answer the bridge can get.
+    fn never_acking(mut self) -> Self {
+        self.ack_with = None;
+        self
+    }
+
     async fn send(&mut self, msg: &AppToBridge) {
-        let mut line = serde_json::to_string(msg).expect("serialize app message");
+        let line = serde_json::to_string(msg).expect("serialize app message");
+        self.send_raw(&line).await;
+    }
+
+    /// Send one line exactly as given, without going through this build's
+    /// types. The only way to play an app whose format this build cannot
+    /// spell: a newer vocabulary, a field added later, or simply a serializer
+    /// that lays its keys out differently.
+    async fn send_raw(&mut self, line: &str) {
+        let mut line = line.to_string();
         line.push('\n');
         self.write
             .write_all(line.as_bytes())
@@ -92,24 +129,53 @@ impl FakeApp {
             .expect("write to bridge");
     }
 
-    /// Read the next `BridgeToApp::Input` line from the bridge.
-    async fn recv_input(&mut self) -> AgentInput {
+    /// Answer an input, naming the id it was sent under.
+    async fn ack(&mut self, id: InputId, status: InputStatus) {
+        self.send(&AppToBridge::ack(id, status)).await;
+    }
+
+    /// Read the next `BridgeToApp::Input` line from the bridge, acking it as
+    /// this app was configured to.
+    async fn recv_input(&mut self) -> (InputId, AgentInput) {
         let line = timeout(WAIT, self.lines.next_line())
             .await
             .expect("input should arrive")
             .expect("read from bridge")
             .expect("bridge closed the socket");
-        let BridgeToApp::Input(input) = serde_json::from_str(&line).expect("parse bridge message");
-        input
+        let BridgeToApp::Input { id, input, .. } =
+            serde_json::from_str(&line).expect("parse bridge message")
+        else {
+            panic!("expected an input message, got: {line}");
+        };
+        if let Some(status) = self.ack_with {
+            self.ack(id, status).await;
+        }
+        (id, input)
+    }
+
+    /// Assert the bridge sends nothing more within `window`.
+    async fn expect_no_input(&mut self, window: Duration) {
+        let extra = timeout(window, self.lines.next_line()).await;
+        assert!(extra.is_err(), "no further input expected, got {extra:?}");
     }
 }
 
+/// One snapshot in the form the watch holds it: the line an app would have
+/// sent, beside the parse of that line. Tests that wire a `BridgeHandle` by
+/// hand publish through this rather than inventing a line, so what they put in
+/// the watch is what a real connection would have put there.
+fn published(parsed: Snapshot) -> AppSnapshot {
+    let line = serde_json::to_string(&AppToBridge::Snapshot(parsed.clone()))
+        .expect("a snapshot serializes");
+    AppSnapshot::from_line(&line, parsed)
+}
+
 /// Wait until the watch holds a connected snapshot with at least `min_seq`.
-async fn wait_for_snapshot(rx: &mut watch::Receiver<BridgeState>, min_seq: u64) -> Snapshot {
+async fn wait_for_snapshot(rx: &mut watch::Receiver<BridgeState>, min_seq: u64) -> AppSnapshot {
     timeout(WAIT, async {
         loop {
             let hit = match &*rx.borrow_and_update() {
-                BridgeState::Connected(s) if s.seq >= min_seq => Some(s.clone()),
+                BridgeState::Connected(s) if s.parsed.seq >= min_seq => Some(s.clone()),
                 _ => None,
             };
             if let Some(snapshot) = hit {
@@ -180,14 +246,236 @@ async fn read_tree_errors_before_any_connection() {
     );
 }
 
+/// The first error a retrofitting adopter meets must not send them after a
+/// socket path the app plainly found.
+///
+/// An app whose snapshots the bridge rejects leaves the state at
+/// `BridgeState::Never`, exactly like an app that never started, and the old
+/// message asked whether the app was running and the path correct. Both were
+/// yes. The bridge knew why it threw the line away and said so only to its
+/// own log, which nobody retrofitting an app is reading.
+#[tokio::test]
+async fn read_tree_names_the_parse_failure_rather_than_the_socket_path() {
+    let (_dir, path) = test_socket_path("unreadable");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle);
+
+    let (stream, _addr) = timeout(WAIT, listener.accept())
+        .await
+        .expect("bridge should connect")
+        .expect("accept");
+    let mut app = FakeApp::from_stream(stream);
+    app.send(&AppToBridge::hello("deep-app", PROTOCOL_VERSION))
+        .await;
+    // The failure `MAX_NODE_DEPTH` exists to keep off the wire: a tree past
+    // what a JSON parser will recurse into. It is sent raw, because this
+    // build's own serializer is happy to write a line its reader cannot read,
+    // which is precisely how an app gets into this state.
+    let mut deep = Node::new("leaf", Role::TreeItem);
+    for level in (0..200).rev() {
+        deep = Node::new(format!("n{level}"), Role::TreeItem).child(deep);
+    }
+    let line = serde_json::to_string(&AppToBridge::Snapshot(Snapshot::new(1, deep)))
+        .expect("a deep snapshot serializes even though it will not parse");
+    app.send_raw(&line).await;
+
+    // Poll: the reject is recorded by the manager task, not by this one.
+    let err = timeout(WAIT, async {
+        loop {
+            let err = server
+                .read_tree()
+                .await
+                .expect_err("no snapshot ever became available");
+            // Polled on the answer this test is about, not on the absence of
+            // the socket-path question: the handshake this app sent first
+            // already takes that question away, and stopping there would
+            // assert against the wrong one of the two answers.
+            if err.message.contains("reached this socket") {
+                return err;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the rejected line should reach the tool surface");
+
+    assert!(
+        err.message.contains("reached this socket"),
+        "the app was there, and the error has to say so: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("recursion limit"),
+        "the reason the line was thrown away is the whole point: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("is the socket path correct"),
+        "the socket path is the one thing already proven fine: {}",
+        err.message
+    );
+
+    // An app that then publishes something readable is served normally: the
+    // rejection is an explanation for having no tree, never a sticky failure.
+    app.send(&AppToBridge::Snapshot(Snapshot::new(
+        2,
+        demo_root("recovered"),
+    )))
+    .await;
+    let tree = timeout(WAIT, async {
+        loop {
+            if let Ok(result) = server.read_tree().await {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the app's next readable snapshot should be served");
+    assert!(
+        format!("{tree:?}").contains("recovered"),
+        "a readable snapshot after a rejected one is served as usual"
+    );
+}
+
+/// A message whose `type` this bridge has no variant for is additive under the
+/// freeze, so it must be ignored like an unknown enum variant, not reported as
+/// a malformed line. Regression for the v0.1 review: an internally tagged enum
+/// fails to parse such a line, so it used to land in the rejected-line path and
+/// misdiagnose a conforming newer app to the agent.
+#[tokio::test]
+async fn read_tree_ignores_an_unknown_future_message_type() {
+    let (_dir, path) = test_socket_path("future-msg");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle);
+
+    let (stream, _addr) = timeout(WAIT, listener.accept())
+        .await
+        .expect("bridge should connect")
+        .expect("accept");
+    let mut app = FakeApp::from_stream(stream);
+    app.send(&AppToBridge::hello("future-app", PROTOCOL_VERSION))
+        .await;
+    // Well-formed, and its `type` is one a later version 1 app added that this
+    // bridge does not know. Sent raw because this build has no variant to
+    // serialize it from, which is exactly how the situation arises.
+    app.send_raw(r#"{"type":"capability","features":["paste"]}"#)
+        .await;
+
+    // The lines are processed in order on the one stream, so once the manager
+    // has had a moment the unknown line has been seen. The app sent no
+    // snapshot, so read_tree still errors, but with the plain "no snapshot yet"
+    // answer, never the "reached this socket ... malformed" one an unknown
+    // message used to trigger.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let err = server
+        .read_tree()
+        .await
+        .expect_err("no snapshot was ever sent");
+    assert!(
+        !err.message.contains("reached this socket"),
+        "an unknown future message must not surface as a rejected line: {}",
+        err.message
+    );
+
+    // And a real snapshot after the unknown line is served normally: ignoring
+    // it did not break the stream.
+    app.send(&AppToBridge::Snapshot(Snapshot::new(
+        1,
+        demo_root("after-unknown"),
+    )))
+    .await;
+    let tree = timeout(WAIT, async {
+        loop {
+            if let Ok(result) = server.read_tree().await {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the app's snapshot after an unknown line should be served");
+    assert!(
+        format!("{tree:?}").contains("after-unknown"),
+        "an unknown line must not block a later snapshot"
+    );
+}
+
+/// The state that stopped the first agent to meet this project before it
+/// could try anything: a bridge whose `connect` succeeded onto a socket
+/// nobody was ever going to accept it from.
+///
+/// The adapter serves one bridge at a time, so a second bridge's connection is
+/// completed by the kernel into the listen backlog and then left unread: no
+/// handshake, no snapshot, and the same "is the socket path correct?" an app
+/// that was never started gets. Both answers were yes, and the real cause was
+/// another session's `taria-mcp` still holding the app. The bridge knows its
+/// own connect succeeded, which is the whole difference.
+#[tokio::test]
+async fn read_tree_names_a_connection_the_app_never_accepted() {
+    let (_dir, path) = test_socket_path("never-accepted");
+    // Bound and listening, never accepted. Held for the whole test: dropping
+    // it would close the socket and turn this into an ordinary disconnect.
+    let _listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle);
+
+    // Polled: the connection has to be open past the bridge's grace before
+    // its silence means anything, and the manager opens it on its own
+    // schedule.
+    let err = timeout(WAIT, async {
+        loop {
+            let err = server
+                .read_tree()
+                .await
+                .expect_err("nothing will ever publish a tree here");
+            if err.message.contains("the socket path is not what is wrong") {
+                return err;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a connection nobody accepts should be diagnosed, not waited on forever");
+
+    assert!(
+        err.message.contains("serves one bridge at a time")
+            && err.message.contains("another taria-mcp process"),
+        "the answer has to name the cause and what to do about it: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("is the socket path correct"),
+        "the bridge is connected to that path: {}",
+        err.message
+    );
+
+    // The input tools ask for a tree before they send anything, so they carry
+    // the same diagnosis rather than a second vocabulary for it.
+    let err = server
+        .key(Parameters(KeyParams {
+            key: "q".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect_err("there is no app to send a key to");
+    assert!(
+        err.message.contains("another taria-mcp process"),
+        "an input tool must diagnose this as read_tree does: {}",
+        err.message
+    );
+}
+
 #[tokio::test]
 async fn manager_connects_and_watch_gets_snapshot() {
     let (_dir, listener, mut handle, server) = setup("connects").await;
     let _app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("hello-tree"))).await;
 
     let snapshot = wait_for_snapshot(&mut handle.state_rx, 1).await;
-    assert_eq!(snapshot.seq, 1);
-    assert_eq!(snapshot.root.id.0, "app");
+    assert_eq!(snapshot.parsed.seq, 1);
+    assert_eq!(snapshot.parsed.root.id.0, "app");
 
     let result = server.read_tree().await.expect("read_tree after snapshot");
     let text = result_text(&result);
@@ -201,16 +489,13 @@ async fn act_forwards_input_and_returns_updated_tree() {
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before"))).await;
     wait_for_snapshot(&mut handle.state_rx, 1).await;
 
-    // Fake app: apply the input by publishing seq 2 with a marker change.
+    // Fake app: ack Delivered, then apply the input by publishing seq 2 with
+    // a marker change.
     let echo = tokio::spawn(async move {
-        let input = app.recv_input().await;
+        let (_id, input) = app.recv_input().await;
         assert_eq!(
             input,
-            AgentInput::Act {
-                node: taria::NodeId("btn".to_string()),
-                action: Action::Activate,
-                value: None,
-            }
+            AgentInput::act(taria::NodeId("btn".to_string()), Action::Activate, None)
         );
         app.send(&AppToBridge::Snapshot(Snapshot::new(
             2,
@@ -235,13 +520,23 @@ async fn act_forwards_input_and_returns_updated_tree() {
     echo.await.expect("fake app task");
 }
 
+/// An app that takes the input and does nothing visible with it: the ack is
+/// the only evidence it arrived, and the result must say exactly that instead
+/// of implying the app never saw it.
 #[tokio::test]
-async fn act_reports_when_tree_does_not_change() {
+async fn act_reports_delivered_without_a_tree_change() {
     let (_dir, listener, mut handle, server) = setup("act-no-change").await;
-    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("static"))).await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("static"))).await;
     wait_for_snapshot(&mut handle.state_rx, 1).await;
 
-    // The fake app swallows the input and never publishes a new snapshot.
+    // Acks Delivered, publishes nothing.
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let (_id, input) = app.recv_input().await;
+        assert!(matches!(input, AgentInput::Act { .. }));
+        app
+    });
+
     let result = server
         .act(Parameters(ActParams {
             node: "btn".to_string(),
@@ -251,11 +546,296 @@ async fn act_reports_when_tree_does_not_change() {
         .await
         .expect("act itself succeeds");
     let text = result_text(&result);
-    assert!(text.contains("did not change"), "note: {text}");
+    assert!(
+        text.contains("The app received this input, and its tree did not change"),
+        "note: {text}"
+    );
+    assert!(text.contains("read_tree"), "note: {text}");
 
-    // The input still reached the app.
-    let input = app.recv_input().await;
+    echo.await.expect("fake app task");
+}
+
+/// The same shape from the outside - an ack and no new tree - but the app
+/// took the input and exited. "Its tree did not change" would tell the agent
+/// the app is sitting there having done nothing, when it is gone; the answer
+/// has to be the disconnect, in the words `read_tree` uses for it.
+///
+/// A result and not an error: the input was delivered and acknowledged, so
+/// its fate is known, and an agent invoking an advertised `quit` reaches this
+/// state on purpose. Raised, that working quit read as a failed call to
+/// anything branching on the error flag.
+#[tokio::test]
+async fn act_reports_an_app_that_went_away_after_taking_the_input() {
+    let (_dir, path) = test_socket_path("act-then-exit");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+
+    let app = FakeApp::accept(&listener, Snapshot::new(4, demo_root("about-to-exit"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 4).await;
+
+    // Acks, then exits without drawing again, taking its socket with it.
+    let exit = tokio::spawn(async move {
+        let mut app = app;
+        app.recv_input().await;
+        drop(app);
+        drop(listener);
+    });
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("an input the app acknowledged is not a failed call, even when it was the last");
+    let text = result_text(&result);
+    assert!(
+        text.contains("The app acknowledged this input and then disconnected"),
+        "the report must tie the departure to the input: {text}"
+    );
+    assert!(
+        text.contains("app 'fake-app' (last snapshot seq 4) is gone"),
+        "the report must name which app went away, and when: {text}"
+    );
+    assert!(
+        !text.contains("did not change"),
+        "an app that exited must not read as one that ignored the input: {text}"
+    );
+
+    exit.await.expect("fake app task");
+}
+
+/// An app that never reads its socket: no ack, no snapshot. The result must
+/// not claim the app received anything.
+#[tokio::test]
+async fn act_reports_when_the_app_neither_acks_nor_changes() {
+    let (_dir, listener, mut handle, server) = setup("act-silent").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("static"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("act itself succeeds");
+    let text = result_text(&result);
+    assert!(
+        text.contains("neither acknowledged this input nor changed its tree"),
+        "note: {text}"
+    );
+
+    // The input still reached the app; it simply had not been read yet.
+    let (_id, input) = app.recv_input().await;
     assert!(matches!(input, AgentInput::Act { .. }));
+}
+
+/// A full input queue on the app side must surface as an error naming the
+/// cause, not as a cheerful "the tree did not change".
+#[tokio::test]
+async fn dropped_ack_surfaces_as_an_error() {
+    let (_dir, listener, mut handle, server) = setup("ack-dropped").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("full-queue")))
+        .await
+        .acking(InputStatus::Dropped);
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        app.recv_input().await;
+        app
+    });
+
+    let err = server
+        .key(Parameters(KeyParams {
+            key: "j".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect_err("a dropped input must not read as success");
+    assert!(
+        err.message.contains("input queue was full"),
+        "err: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("fewer") || err.message.contains("slower"),
+        "error should say what to do about it: {}",
+        err.message
+    );
+
+    echo.await.expect("fake app task");
+}
+
+/// The app looked at the input and chose to do nothing (a modal dialog, say).
+/// The agent needs to hear that, plus the tree to re-plan from - and that has
+/// to be the tree that caused the ignore, not the one the input was aimed at.
+/// The adapter flushes queued acks ahead of the pending snapshot in every
+/// writer pass, so the causing frame always arrives *after* the ack reporting
+/// the ignore; returning at the ack hands back a tree without the dialog in
+/// it, under text telling the agent to re-plan from exactly that tree.
+#[tokio::test]
+async fn ignored_ack_reports_the_app_did_nothing_and_returns_the_fresh_tree() {
+    let (_dir, listener, mut handle, server) = setup("ack-ignored").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("pre-input"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    // Delivered first, then refined to Ignored, and only then the frame that
+    // explains the ignore: the order the real adapter produces.
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let (id, _input) = app.recv_input().await;
+        app.ack(id, InputStatus::Ignored).await;
+        app.send(&AppToBridge::Snapshot(Snapshot::new(
+            2,
+            demo_root("modal-open"),
+        )))
+        .await;
+        app
+    });
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("an ignored input is not a failure");
+    let text = result_text(&result);
+    assert!(
+        text.contains("deliberately did nothing with it"),
+        "note: {text}"
+    );
+    assert!(
+        text.contains("modal-open") && text.contains("\"seq\":2"),
+        "the tree after the note must be the one that caused the ignore: {text}"
+    );
+    assert!(
+        !text.contains("pre-input"),
+        "re-planning from the pre-input tree is the bug this guards: {text}"
+    );
+
+    echo.await.expect("fake app task");
+}
+
+/// The other half of the ignored path: an app that publishes nothing after the
+/// ignore still owes the agent a tree, and the freshest one the bridge holds
+/// is the tree the input was aimed at.
+#[tokio::test]
+async fn ignored_ack_without_a_newer_tree_falls_back_to_the_current_one() {
+    let (_dir, listener, mut handle, server) = setup("ack-ignored-static").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("unchanged"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let (id, _input) = app.recv_input().await;
+        app.ack(id, InputStatus::Ignored).await;
+        app
+    });
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("an ignored input is not a failure");
+    let text = result_text(&result);
+    assert!(
+        text.contains("deliberately did nothing with it"),
+        "note: {text}"
+    );
+    assert!(
+        text.contains("unchanged") && text.contains("\"seq\":1"),
+        "the note must still be followed by a tree: {text}"
+    );
+
+    echo.await.expect("fake app task");
+}
+
+/// An adapter that predates acks still has to work: a changed tree is the
+/// only answer it can give, and the bridge must report it as success rather
+/// than complain about the missing ack.
+#[tokio::test]
+async fn unacked_change_still_returns_the_tree() {
+    let (_dir, listener, mut handle, server) = setup("no-acks").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before")))
+        .await
+        .never_acking();
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        app.recv_input().await;
+        app.send(&AppToBridge::Snapshot(Snapshot::new(
+            2,
+            demo_root("after-no-ack"),
+        )))
+        .await;
+        app
+    });
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("an app without acks still works");
+    let text = result_text(&result);
+    assert!(text.contains("after-no-ack"), "tree json: {text}");
+    assert!(
+        !text.contains("acknowledg"),
+        "a missing ack is not a problem worth reporting: {text}"
+    );
+
+    echo.await.expect("fake app task");
+}
+
+/// Acks name an id; one for a different input says nothing about this one and
+/// must not be mistaken for the answer.
+#[tokio::test]
+async fn acks_for_other_inputs_are_ignored() {
+    let (_dir, listener, mut handle, server) = setup("ack-other-id").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before")))
+        .await
+        .never_acking();
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    // Answer an id nobody is waiting for with the harshest status there is,
+    // then react to the real input normally.
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let (id, _input) = app.recv_input().await;
+        app.ack(id.wrapping_add(1000), InputStatus::Dropped).await;
+        app.send(&AppToBridge::Snapshot(Snapshot::new(
+            2,
+            demo_root("after-stray-ack"),
+        )))
+        .await;
+        app
+    });
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("a stray ack must not fail the call");
+    let text = result_text(&result);
+    assert!(text.contains("after-stray-ack"), "tree json: {text}");
+
+    echo.await.expect("fake app task");
 }
 
 #[tokio::test]
@@ -311,13 +891,8 @@ async fn key_forwards_input_and_returns_updated_tree() {
     wait_for_snapshot(&mut handle.state_rx, 1).await;
 
     let echo = tokio::spawn(async move {
-        let input = app.recv_input().await;
-        assert_eq!(
-            input,
-            AgentInput::Key {
-                key: "ctrl+s".to_string(),
-            }
-        );
+        let (_id, input) = app.recv_input().await;
+        assert_eq!(input, AgentInput::key("ctrl+s"));
         app.send(&AppToBridge::Snapshot(Snapshot::new(
             2,
             demo_root("after-key"),
@@ -329,6 +904,7 @@ async fn key_forwards_input_and_returns_updated_tree() {
     let result = server
         .key(Parameters(KeyParams {
             key: "ctrl+s".to_string(),
+            repeat: None,
         }))
         .await
         .expect("key tool");
@@ -338,14 +914,488 @@ async fn key_forwards_input_and_returns_updated_tree() {
     echo.await.expect("fake app task");
 }
 
+/// An acknowledgement this bridge cannot read arrives as silence, and the
+/// report has to say so rather than let it pass for an unreactive app.
+///
+/// `InputStatus` has no fallback variant by design, so a status name added
+/// later fails the whole `Ack` line and takes the input id down with it. The
+/// bridge therefore never sees an ack, and the burst looks exactly like an
+/// app that answers nothing. The rejected line is the only trace left of the
+/// difference.
+#[tokio::test]
+async fn an_acknowledgement_this_bridge_cannot_read_is_reported_as_more_than_silence() {
+    let (_dir, listener, mut handle, server) = setup("unknown-status").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before")))
+        .await
+        .never_acking();
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    // Answer the input with a status from a taria newer than this bridge, and
+    // change nothing else: no ack the bridge can read, and no new tree.
+    let echo = tokio::spawn(async move {
+        let (id, _input) = app.recv_input().await;
+        app.send_raw(&format!(
+            r#"{{"type":"ack","id":{id},"status":"coalesced"}}"#
+        ))
+        .await;
+        app
+    });
+
+    let result = server
+        .key(Parameters(KeyParams {
+            key: "x".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect("key tool answers even when the ack is unreadable");
+    let text = result_text(&result);
+    assert!(
+        text.contains("could not read"),
+        "silence that was really a rejected line has to say so: {text}"
+    );
+    assert!(
+        text.contains("acknowledgement"),
+        "the report should name what the unreadable line probably was: {text}"
+    );
+
+    echo.await.expect("fake app task");
+}
+
 #[tokio::test]
 async fn key_rejects_empty_key() {
     let (_dir, _listener, _handle, server) = setup("key-empty").await;
     let err = server
-        .key(Parameters(KeyParams { key: String::new() }))
+        .key(Parameters(KeyParams {
+            key: String::new(),
+            repeat: None,
+        }))
         .await
         .expect_err("empty key must be rejected");
     assert!(err.message.contains("non-empty"), "err: {}", err.message);
+}
+
+/// The incident this guards: an agent sent "inx", the bridge forwarded it, the
+/// app's parser returned nothing, and the input vanished with no signal. The
+/// bridge parses with the same grammar the app does, so it can refuse first.
+#[tokio::test]
+async fn key_rejects_an_unparseable_key_without_sending_it() {
+    let (_dir, listener, mut handle, server) = setup("key-unparseable").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("tree"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let err = server
+        .key(Parameters(KeyParams {
+            key: "inx".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect_err("an unparseable key must be rejected");
+    assert!(
+        err.message.contains("inx"),
+        "error should name the rejected key: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("ctrl+c") && err.message.contains("enter"),
+        "error should describe the grammar: {}",
+        err.message
+    );
+
+    app.expect_no_input(Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn key_rejects_out_of_range_repeat() {
+    let (_dir, _listener, _handle, server) = setup("key-bad-repeat").await;
+    for repeat in [0, 65] {
+        let err = server
+            .key(Parameters(KeyParams {
+                key: "j".to_string(),
+                repeat: Some(repeat),
+            }))
+            .await
+            .expect_err("repeat outside 1..=64 must be rejected");
+        assert!(
+            err.message.contains("repeat must be between 1 and 64"),
+            "err: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(&repeat.to_string()),
+            "error should name the rejected count: {}",
+            err.message
+        );
+    }
+}
+
+/// "Move down five rows" is one call: five presses, five ids, one report.
+#[tokio::test]
+async fn key_repeat_sends_exactly_that_many_inputs() {
+    let (_dir, listener, mut handle, server) = setup("key-repeat").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("list"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let (id, input) = app.recv_input().await;
+            assert_eq!(input, AgentInput::key("down"));
+            ids.push(id);
+        }
+        (app, ids)
+    });
+
+    let result = server
+        .key(Parameters(KeyParams {
+            key: "down".to_string(),
+            repeat: Some(5),
+        }))
+        .await
+        .expect("repeated key");
+    // The app acked every press and published nothing, so the report is about
+    // the last press.
+    assert!(
+        result_text(&result).contains("did not change"),
+        "note: {}",
+        result_text(&result)
+    );
+
+    let (mut app, ids) = echo.await.expect("fake app task");
+    assert!(
+        ids.windows(2).all(|w| w[0] < w[1]),
+        "each press needs its own id, got {ids:?}"
+    );
+    app.expect_no_input(Duration::from_millis(300)).await;
+}
+
+/// A burst where the last press landed hides every press dropped before it if
+/// only the last id is watched. The agent has to hear how much of the call
+/// actually arrived, even when the tree changed.
+#[tokio::test]
+async fn key_repeat_reports_presses_dropped_mid_burst() {
+    let (_dir, listener, mut handle, server) = setup("key-repeat-dropped").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("list")))
+        .await
+        .never_acking();
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    // Three of the five presses overflow the app's queue; the first and last
+    // land, and the tree even changes, which is exactly what hid the drops.
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let (id, _input) = app.recv_input().await;
+            ids.push(id);
+        }
+        for id in &ids[1..4] {
+            app.ack(*id, InputStatus::Dropped).await;
+        }
+        app.ack(ids[0], InputStatus::Delivered).await;
+        app.ack(ids[4], InputStatus::Delivered).await;
+        app.send(&AppToBridge::Snapshot(Snapshot::new(
+            2,
+            demo_root("moved-twice"),
+        )))
+        .await;
+        app
+    });
+
+    let err = server
+        .key(Parameters(KeyParams {
+            key: "down".to_string(),
+            repeat: Some(5),
+        }))
+        .await
+        .expect_err("a burst with drops in it must not read as success");
+    assert!(
+        err.message.contains("dropped 3 of the 5 inputs"),
+        "error should count the drops: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("at most 2 landed"),
+        "error should say how much of the burst arrived: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("input queue was full"),
+        "error should name the cause: {}",
+        err.message
+    );
+
+    echo.await.expect("fake app task");
+}
+
+/// A peer on another protocol version cannot parse the `Input` messages this
+/// bridge writes, so every input it receives is skipped on its side and the
+/// whole session silently does nothing. Snapshots still parse across the
+/// mismatch, so `read_tree` keeps working; every input tool must fail fast,
+/// name both versions, and send nothing.
+#[tokio::test]
+async fn protocol_mismatch_keeps_read_tree_and_refuses_every_input_tool() {
+    let (_dir, listener, mut handle, server) = setup("protocol-mismatch").await;
+    let other = PROTOCOL_VERSION + 1;
+    let mut app = FakeApp::accept_speaking(
+        &listener,
+        Snapshot::new(1, demo_root("other-version")),
+        other,
+    )
+    .await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let result = server
+        .read_tree()
+        .await
+        .expect("a readable tree survives the mismatch");
+    assert!(
+        result_text(&result).contains("other-version"),
+        "tree json: {}",
+        result_text(&result)
+    );
+
+    let act_err = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect_err("act must refuse a peer that cannot receive input");
+    let key_err = server
+        .key(Parameters(KeyParams {
+            key: "q".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect_err("key must refuse a peer that cannot receive input");
+    let text_err = server
+        .type_text(Parameters(TypeTextParams {
+            text: "hello".to_string(),
+        }))
+        .await
+        .expect_err("type_text must refuse a peer that cannot receive input");
+    for err in [&act_err, &key_err, &text_err] {
+        assert!(
+            err.message.contains(&format!("protocol version {other}")),
+            "error should name the app's version: {}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains(&format!("bridge speaks {PROTOCOL_VERSION}")),
+            "error should name the bridge's version: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("taria dependency"),
+            "error should say what to change: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("may not have reacted"),
+            "a peer that cannot receive input must not read as a slow one: {}",
+            err.message
+        );
+    }
+
+    // And nothing was put on the wire for it to fail to parse.
+    app.expect_no_input(Duration::from_millis(300)).await;
+}
+
+/// A full input queue with the app not draining it must not park the tool call
+/// until the app comes back. The handle is wired by hand because a real
+/// connection drains the queue faster than a test can fill it: a connected
+/// snapshot to get past the liveness check, and a one-slot queue nobody reads.
+#[tokio::test]
+async fn a_full_input_queue_fails_the_call_instead_of_hanging() {
+    let (_state_tx, state_rx) = watch::channel(BridgeState::Connected(published(Snapshot::new(
+        1,
+        demo_root("not-draining"),
+    ))));
+    let (input_tx, _input_rx) = mpsc::channel(1);
+    let (ack_tx, _ack_rx) = broadcast::channel(8);
+    let (_protocol_tx, protocol_rx) = watch::channel(Some(PROTOCOL_VERSION));
+    let (_rejected_tx, rejected_rx) = watch::channel(None);
+    // Connected, like the snapshot above says: the link channel describes the
+    // socket this hand-built handle is standing in for.
+    let (_link_tx, link_rx) = watch::channel(LinkState::Open {
+        since: Instant::now(),
+    });
+    let handle = BridgeHandle {
+        state_rx,
+        input_tx,
+        ack_tx,
+        protocol_rx,
+        rejected_rx,
+        link_rx,
+    };
+    // Occupy the only slot, so the tool's own send has nowhere to go.
+    handle
+        .input_tx
+        .send((handle.next_input_id(), AgentInput::key("x")))
+        .await
+        .expect("fill the queue");
+    let server = TariaMcpServer::new(handle);
+
+    let err = timeout(
+        WAIT,
+        server.key(Parameters(KeyParams {
+            key: "q".to_string(),
+            repeat: None,
+        })),
+    )
+    .await
+    .expect("the call must not park on a full queue")
+    .expect_err("a call that could not be sent is not a success");
+    assert!(
+        err.message.contains("the app is not accepting input"),
+        "error should say the app is not taking input: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("this input was not sent"),
+        "error should say nothing was sent: {}",
+        err.message
+    );
+}
+
+/// The same jam, but partway through a burst: presses 1 and 2 are already on
+/// the wire when press 3 finds no room. Failing out with the single-input
+/// error would tell the agent nothing was sent and invite a retry of a burst
+/// that partly landed, so the call has to report both halves. Wired by hand
+/// for the same reason as the test above: a real app drains the queue faster
+/// than a test can fill it.
+#[tokio::test]
+async fn a_burst_cut_short_reports_how_much_of_it_was_sent() {
+    let (_state_tx, state_rx) = watch::channel(BridgeState::Connected(published(Snapshot::new(
+        1,
+        demo_root("stops-draining"),
+    ))));
+    // Two slots and nobody reading them: the third press onwards has nowhere
+    // to go.
+    let (input_tx, mut input_rx) = mpsc::channel(2);
+    let (ack_tx, _ack_rx) = broadcast::channel(8);
+    let (_protocol_tx, protocol_rx) = watch::channel(Some(PROTOCOL_VERSION));
+    let (_rejected_tx, rejected_rx) = watch::channel(None);
+    let (_link_tx, link_rx) = watch::channel(LinkState::Open {
+        since: Instant::now(),
+    });
+    let server = TariaMcpServer::new(BridgeHandle {
+        state_rx,
+        input_tx,
+        ack_tx,
+        protocol_rx,
+        rejected_rx,
+        link_rx,
+    });
+
+    let err = timeout(
+        WAIT,
+        server.key(Parameters(KeyParams {
+            key: "down".to_string(),
+            repeat: Some(5),
+        })),
+    )
+    .await
+    .expect("the call must not park on a full queue")
+    .expect_err("a burst that could not be finished is not a success");
+    assert!(
+        err.message.contains("2 of the 5 inputs were sent"),
+        "error should count what went out: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("remaining 3 were not sent"),
+        "error should count what did not: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("may already have taken effect"),
+        "error should warn that the effect is partial: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("this input was not sent"),
+        "a partial burst must not read like nothing was sent: {}",
+        err.message
+    );
+
+    // The claim has to be true: those two really are queued for the app.
+    let mut queued = Vec::new();
+    while let Ok((_id, input)) = input_rx.try_recv() {
+        queued.push(input);
+    }
+    assert_eq!(
+        queued.len(),
+        2,
+        "the error names 2 sent; the queue must hold exactly those: {queued:?}"
+    );
+}
+
+#[tokio::test]
+async fn type_text_forwards_the_whole_string_in_one_input() {
+    let (_dir, listener, mut handle, server) = setup("type-text").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("empty-input"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let (_id, input) = app.recv_input().await;
+        assert_eq!(input, AgentInput::text("buy milk"));
+        app.send(&AppToBridge::Snapshot(Snapshot::new(2, demo_root("typed"))))
+            .await;
+        app
+    });
+
+    let result = server
+        .type_text(Parameters(TypeTextParams {
+            text: "buy milk".to_string(),
+        }))
+        .await
+        .expect("type_text tool");
+    assert!(
+        result_text(&result).contains("typed"),
+        "tree json: {}",
+        result_text(&result)
+    );
+
+    let mut app = echo.await.expect("fake app task");
+    app.expect_no_input(Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn type_text_rejects_empty_text() {
+    let (_dir, _listener, _handle, server) = setup("type-text-empty").await;
+    let err = server
+        .type_text(Parameters(TypeTextParams {
+            text: String::new(),
+        }))
+        .await
+        .expect_err("empty text must be rejected");
+    assert!(err.message.contains("non-empty"), "err: {}", err.message);
+}
+
+#[tokio::test]
+async fn type_text_rejects_oversized_text() {
+    let (_dir, listener, mut handle, server) = setup("type-text-huge").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("tree"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let err = server
+        .type_text(Parameters(TypeTextParams {
+            text: "x".repeat(4097),
+        }))
+        .await
+        .expect_err("oversized text must be rejected");
+    assert!(
+        err.message.contains("4097") && err.message.contains("4096"),
+        "error should name the size and the limit: {}",
+        err.message
+    );
+
+    app.expect_no_input(Duration::from_millis(300)).await;
 }
 
 #[tokio::test]
@@ -358,6 +1408,7 @@ async fn key_errors_before_any_connection() {
     let err = server
         .key(Parameters(KeyParams {
             key: "q".to_string(),
+            repeat: None,
         }))
         .await
         .expect_err("key with no app connected must error");
@@ -417,6 +1468,7 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
     let err = server
         .key(Parameters(KeyParams {
             key: "q".to_string(),
+            repeat: None,
         }))
         .await
         .expect_err("key while disconnected must refuse");
@@ -425,11 +1477,10 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
     // ...so queue stale inputs directly; the listener is still unbound, so
     // these sit in the channel until the next successful connect.
     for key in ["q", "y"] {
+        let id = handle.next_input_id();
         handle
             .input_tx
-            .send(AgentInput::Key {
-                key: key.to_string(),
-            })
+            .send((id, AgentInput::key(key)))
             .await
             .expect("queue input while down");
     }
@@ -444,21 +1495,19 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
     server
         .key(Parameters(KeyParams {
             key: "enter".to_string(),
+            repeat: None,
         }))
         .await
         .expect("key against the restarted app");
-    let input = app.recv_input().await;
+    let (_id, input) = app.recv_input().await;
     assert_eq!(
         input,
-        AgentInput::Key {
-            key: "enter".to_string(),
-        },
+        AgentInput::key("enter"),
         "stale inputs leaked into the new app instance"
     );
 
     // And nothing stale trails behind it.
-    let extra = timeout(Duration::from_millis(300), app.lines.next_line()).await;
-    assert!(extra.is_err(), "no further input expected, got {extra:?}");
+    app.expect_no_input(Duration::from_millis(300)).await;
 }
 
 #[tokio::test]
@@ -489,7 +1538,7 @@ async fn restart_app_on_input(
     mut app: FakeApp,
     fresh: Snapshot,
 ) -> FakeApp {
-    let input = app.recv_input().await;
+    let (_id, input) = app.recv_input().await;
     assert!(matches!(input, AgentInput::Act { .. }));
     drop(listener);
     std::fs::remove_file(&path).expect("remove old socket file");
@@ -569,9 +1618,9 @@ async fn act_detects_restart_even_when_seq_matches() {
     restart.await.expect("fake app restart task");
 }
 
-/// After the app dies, all three tools must say WHICH app went away and at
-/// what seq (not the generic never-connected message), and once the app is
-/// back the bridge must serve trees again.
+/// After the app dies, every tool must say WHICH app went away and at what
+/// seq (not the generic never-connected message), and once the app is back
+/// the bridge must serve trees again.
 #[tokio::test]
 async fn disconnect_reports_app_label_and_last_seq_then_recovers() {
     let (_dir, path) = test_socket_path("disconnect");
@@ -589,7 +1638,7 @@ async fn disconnect_reports_app_label_and_last_seq_then_recovers() {
     std::fs::remove_file(&path).expect("remove old socket file");
     wait_for_disconnect(&mut handle.state_rx).await;
 
-    // All three tools refuse, naming the dead app and its last snapshot seq.
+    // Every tool refuses, naming the dead app and its last snapshot seq.
     let read_err = server
         .read_tree()
         .await
@@ -605,10 +1654,17 @@ async fn disconnect_reports_app_label_and_last_seq_then_recovers() {
     let key_err = server
         .key(Parameters(KeyParams {
             key: "q".to_string(),
+            repeat: None,
         }))
         .await
         .expect_err("key must refuse after disconnect");
-    for err in [&read_err, &act_err, &key_err] {
+    let text_err = server
+        .type_text(Parameters(TypeTextParams {
+            text: "hello".to_string(),
+        }))
+        .await
+        .expect_err("type_text must refuse after disconnect");
+    for err in [&read_err, &act_err, &key_err, &text_err] {
         assert!(
             err.message.contains("'fake-app' disconnected"),
             "error should name the dead app: {}",
@@ -638,5 +1694,204 @@ async fn disconnect_reports_app_label_and_last_seq_then_recovers() {
         result_text(&result).contains("back-again"),
         "tree json: {}",
         result_text(&result)
+    );
+}
+
+/// One line from an app on a later version of the format: a role and an action
+/// this build has never heard of, a node field it has no place for, and a key
+/// order and spacing no serializer here would produce. Every one of those is
+/// information the bridge is relaying, not information it owns.
+const NEWER_APP_LINE: &str = concat!(
+    r#"{"seq": 2, "type": "snapshot", "protocol_version": 1, "root":"#,
+    r#" {"id": "app", "role": "app", "focused": false, "children": ["#,
+    r#"{"id": "chart", "role": "sparkline", "label": "cpu", "focused": true,"#,
+    r#" "actions": ["zoom"], "sample_hz": 30}]}}"#
+);
+
+/// One tool result as information rather than bytes.
+fn as_json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text)
+        .unwrap_or_else(|err| panic!("a tool result must be json: {err}: {text}"))
+}
+
+/// What an app line must look like once it reaches the agent: everything the
+/// app sent, minus the `"type"` key that frames the message on the wire and is
+/// no part of the tree.
+fn without_envelope(line: &str) -> serde_json::Value {
+    let mut value = as_json(line);
+    let framing = value
+        .as_object_mut()
+        .expect("a snapshot line is a json object")
+        .remove("type");
+    assert_eq!(
+        framing,
+        Some(serde_json::json!("snapshot")),
+        "the app's line must carry the framing key these tests are about"
+    );
+    value
+}
+
+/// The bridge relays the app's snapshot; it does not re-serialize its own
+/// parse of it, and it does not pass on the envelope the message arrived in.
+///
+/// Deserializing into `Snapshot` and serializing back is lossy by
+/// construction: it can only emit what this build's types can hold. An app
+/// publishing `"role":"sparkline"` had the agent read `"role":"other"`, and the
+/// real name had been on the wire the whole time. Everything the typed struct
+/// cannot spell went the same way, which made the format's promise that
+/// additive changes are safe true of the connection and false of the
+/// information travelling over it.
+///
+/// So the claim is about information, not bytes: every key the app sent still
+/// reaches the agent saying the same thing, the framing key does not, and key
+/// order and whitespace are nobody's contract.
+#[tokio::test]
+async fn read_tree_relays_the_apps_tree_without_the_transport_envelope() {
+    let (_dir, listener, mut handle, server) = setup("relay-verbatim").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("first"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    app.send_raw(NEWER_APP_LINE).await;
+    wait_for_snapshot(&mut handle.state_rx, 2).await;
+
+    let result = server.read_tree().await.expect("read_tree after snapshot");
+    let text = result_text(&result);
+    let relayed = as_json(text);
+    assert_eq!(
+        relayed,
+        without_envelope(NEWER_APP_LINE),
+        "read_tree must hand back everything the app sent, and nothing it did not"
+    );
+    assert!(
+        relayed.get("type").is_none(),
+        "the transport's framing key must not reach the agent: {text}"
+    );
+
+    // Spelled out, because these three are the losses the relay exists to
+    // prevent and an equality failure alone would not name them.
+    let chart = &relayed["root"]["children"][0];
+    assert_eq!(
+        chart["role"], "sparkline",
+        "the role the app published must reach the agent by name: {text}"
+    );
+    assert_eq!(
+        chart["actions"],
+        serde_json::json!(["zoom"]),
+        "the action the app published must reach the agent by name: {text}"
+    );
+    assert_eq!(
+        chart["sample_hz"], 30,
+        "a field added after this build must survive the relay: {text}"
+    );
+}
+
+/// The parse stays authoritative for what the bridge decides. The line the
+/// agent reads is untyped, so `act` cannot validate against it: node ids and
+/// advertised actions still come from the parse, where the unknown action is
+/// `Custom("zoom")` and reaches the app under the name the tree showed.
+#[tokio::test]
+async fn the_parse_still_validates_acts_against_the_relayed_tree() {
+    let (_dir, listener, mut handle, server) = setup("relay-validate").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("first"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+    app.send_raw(NEWER_APP_LINE).await;
+    wait_for_snapshot(&mut handle.state_rx, 2).await;
+
+    // The app is handed back rather than dropped: a closed socket would end
+    // the connection and turn the second act below into a disconnect report.
+    let echo = tokio::spawn(async move {
+        let (_id, input) = app.recv_input().await;
+        (app, input)
+    });
+
+    server
+        .act(Parameters(ActParams {
+            node: "chart".to_string(),
+            action: "zoom".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("an action the relayed tree advertises");
+    let (_app, input) = echo.await.expect("fake app task");
+    assert_eq!(
+        input,
+        AgentInput::act(
+            taria::NodeId("chart".to_string()),
+            Action::Custom("zoom".to_string()),
+            None
+        )
+    );
+
+    // And a node the relayed line does not carry is still refused, from the
+    // same parse.
+    let err = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect_err("the newer tree has no `btn`");
+    assert!(
+        err.message.contains("unknown node id `btn`"),
+        "validation must follow the current tree: {}",
+        err.message
+    );
+}
+
+/// The tools that answer with a tree relay it too, not just `read_tree`.
+/// Anything that re-serialized here would put the agent back where it started
+/// one call later.
+#[tokio::test]
+async fn a_tool_result_relays_the_tree_the_app_published() {
+    let (_dir, listener, mut handle, server) = setup("relay-tool-result").await;
+    let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let (_id, _input) = app.recv_input().await;
+        app.send_raw(NEWER_APP_LINE).await;
+        app
+    });
+
+    let result = server
+        .key(Parameters(KeyParams {
+            key: "z".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect("key against a connected app");
+    assert_eq!(
+        as_json(result_text(&result)),
+        without_envelope(NEWER_APP_LINE),
+        "the tree a tool answers with must be the one the app published"
+    );
+
+    echo.await.expect("fake app task");
+}
+
+/// A line that failed to parse is still skipped, not relayed. The raw line is
+/// the agent's view of the app, and forwarding one the bridge could not read
+/// would hand the agent something no peer has vouched for; the last good tree
+/// is the honest answer until a readable one arrives.
+#[tokio::test]
+async fn a_line_that_does_not_parse_is_never_relayed() {
+    let (_dir, listener, mut handle, server) = setup("relay-skips-junk").await;
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("good-tree"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    app.send_raw(r#"{"type":"snapshot","protocol_version":1,"seq":2"#)
+        .await;
+    app.send_raw(r#"{"type":"snapshot","protocol_version":1,"seq":3,"root":42}"#)
+        .await;
+    // Nothing to wait for, so give the manager a window to have relayed them
+    // if it were going to.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let text = result_text(&server.read_tree().await.expect("read_tree")).to_string();
+    assert!(
+        text.contains("good-tree") && text.contains(r#""seq":1"#),
+        "a malformed line must leave the last good tree standing: {text}"
     );
 }

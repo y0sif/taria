@@ -14,4 +14,9 @@ readme = "../../README.md"
 
 [dependencies]
 serde.workspace = true
+
+# Only the tests serialize anything here: the crate defines the wire types and
+# leaves the encoding to whoever transports them, so adopters do not inherit a
+# JSON dependency from the core crate.
+[dev-dependencies]
 serde_json.workspace = true

@@ -22,7 +22,9 @@ use crate::FrameRecorder;
 /// # use taria::{Node, Role};
 /// # use taria_ratatui::{TariaLayer, sem};
 /// # fn main() -> std::io::Result<()> {
-/// let mut layer = TariaLayer::bind("demo")?;
+/// // Never fails: without a socket the layer is inert and this code path
+/// // is unchanged.
+/// let mut layer = TariaLayer::bind_or_disabled("demo");
 /// let mut terminal = ratatui::init();
 /// let rec = layer.frame();
 /// terminal.draw(|frame| {

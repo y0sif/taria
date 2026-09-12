@@ -3,10 +3,25 @@ use serde::{Deserialize, Serialize};
 use crate::{Node, PROTOCOL_VERSION};
 
 /// One published state of the app's semantic tree.
+///
+/// `#[non_exhaustive]` for the same reason as [`Node`]: new optional fields
+/// are the format's cheapest additive change, and [`new`](Self::new) already
+/// builds one, so closing the struct literal costs a caller nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Snapshot {
     pub protocol_version: u32,
-    /// Monotonic sequence number so agents can detect staleness.
+    /// Sequence number, incremented once per published snapshot within one run
+    /// of the app.
+    ///
+    /// It tells which of two snapshots from the same run is the newer one, and
+    /// nothing beyond that. A restarted app starts counting again, so a lower
+    /// `seq` with different content is still a change and not a stale tree,
+    /// and a reader that orders on `seq` across connections orders a fresh
+    /// app's first tree before the previous app's last. A frame an adapter
+    /// deduplicates, because its tree is identical to the one already
+    /// published, does not move it either: it counts publishes, not frames.
+    /// Compare whole snapshots to detect change.
     pub seq: u64,
     pub root: Node,
 }

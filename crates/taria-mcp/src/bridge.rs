@@ -3,20 +3,48 @@
 //! A single background task connects (retrying forever with capped backoff),
 //! reads `AppToBridge` ndjson lines into a [`watch`] channel holding the
 //! latest [`BridgeState`], and writes queued [`AgentInput`]s out as
-//! `BridgeToApp::Input` lines. On disconnect the watch flips to
+//! `BridgeToApp::Input` lines. A snapshot is stored as an [`AppSnapshot`],
+//! which keeps the app's line (minus the message framing) alongside the parse
+//! of it, so the tool layer relays what the app wrote instead of
+//! re-serializing what this build could decode. On disconnect the watch flips
+//! to
 //! [`BridgeState::Disconnected`] so tool calls fail fast (instead of acting
 //! on a stale tree) with an error that says which app went away.
+//!
+//! Every outgoing input carries an [`InputId`] and the app answers it with an
+//! `AppToBridge::Ack`. Acks are republished on a [`broadcast`] channel rather
+//! than kept here, because only the tool call that sent an input knows which
+//! id it is waiting for; the manager stays free of per-input bookkeeping.
+//!
+//! A line the reader cannot parse is skipped, so that a buggy app cannot kill
+//! the bridge, and the reason is kept in a third [`watch`] channel
+//! ([`BridgeHandle::rejected_rx`]) rather than only logged. Skipping is
+//! invisible from the tool surface: an app whose every line is rejected is
+//! indistinguishable from an app that never started, and telling those apart
+//! is the difference between an adopter fixing their tree and an adopter
+//! re-checking a socket path that was right all along.
+//!
+//! A fourth channel ([`BridgeHandle::link_rx`]) reports the manager's own
+//! `connect`, for the same reason one level down: a connect that keeps failing
+//! and a connection nobody ever writes on both leave the state at
+//! [`BridgeState::Never`], and only the first of them is about the socket
+//! path. The adapter serves one bridge at a time, so a second bridge's connect
+//! succeeds into the listen backlog and is then never accepted, which is
+//! precisely the second case and the one a new adopter meets first.
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use taria::wire::{AppToBridge, BridgeToApp};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{AgentInput, PROTOCOL_VERSION, Snapshot};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedReadHalf;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
+
+use crate::server::MAX_KEY_REPEAT;
 
 /// First reconnect delay after a failed connect attempt.
 const RETRY_MIN: Duration = Duration::from_millis(250);
@@ -30,10 +58,93 @@ const RETRY_MAX: Duration = Duration::from_secs(2);
 const HEALTHY_CONNECTION_MIN: Duration = Duration::from_secs(2);
 /// Queued agent inputs awaiting the socket writer.
 const INPUT_QUEUE: usize = 32;
+/// Acks buffered per subscriber.
+///
+/// A waiter only needs the acks published while its own input is in flight,
+/// but that is not one ack: an input draws up to two (a `Delivered` later
+/// refined to `Ignored`), and one `key` call sends up to [`MAX_KEY_REPEAT`]
+/// of them, so a single maximum burst can publish twice that many acks by
+/// itself. Sized for four such bursts at once, because falling behind is not
+/// a slow read that catches up: the broadcast channel drops the oldest acks,
+/// and the oldest are exactly the `Dropped` answers a burst is watching for.
+const ACK_QUEUE: usize = 8 * MAX_KEY_REPEAT as usize;
 /// Longest accepted ndjson line from the app. A peer that streams more than
 /// this without a newline is treated as a broken connection (disconnect and
 /// reconnect) so the bridge never buffers a line unboundedly.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// One snapshot as the app published it, in both the forms the bridge needs.
+///
+/// They are kept together because neither can stand in for the other. The
+/// **app's own line is authoritative for what the agent reads**: it is
+/// forwarded as sent, so a role, an action or a field this build has never
+/// heard of reaches the agent by name instead of being flattened into
+/// whatever the typed struct could hold. Re-serializing
+/// [`parsed`](Self::parsed) destroyed exactly that information: an app
+/// publishing `"role":"sparkline"` had the agent read `"role":"other"`, and the
+/// real name had been on the wire all along for the bridge to pass on. The one
+/// thing dropped on the way is the message's own framing key, which belongs to
+/// the transport rather than to the tree; see
+/// [`from_line`](Self::from_line).
+///
+/// The **parsed form is authoritative for what the bridge decides**: `act`
+/// validates node ids and advertised actions against it, and the tool layer
+/// compares it to tell a tree that changed from one that did not. Neither of
+/// those may read the relayed text, which is untyped and, across a version
+/// mismatch, not even shaped like this build's [`Snapshot`].
+///
+/// A line reaches here only after it parsed, so a malformed line is still
+/// skipped rather than forwarded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppSnapshot {
+    /// The app's snapshot as the agent reads it: its own line, minus the
+    /// message framing. What `read_tree` and every tool result hand back.
+    /// Built by [`from_line`](Self::from_line), which is the only thing that
+    /// removes anything.
+    pub tree_json: String,
+    /// The same message decoded into this build's types. For validation and
+    /// change detection only, never for output.
+    pub parsed: Snapshot,
+}
+
+impl AppSnapshot {
+    /// Pair one app line with its parse, dropping the transport envelope from
+    /// the copy the agent reads.
+    ///
+    /// [`AppToBridge`] is internally tagged, so the line carries a
+    /// `"type":"snapshot"` key beside the snapshot's own fields. That key
+    /// frames the message on the wire and says nothing about the tree, while
+    /// `read_tree` promises the app's tree, so handing it on reads as a field
+    /// the app published.
+    ///
+    /// Removed through a `serde_json::Value`, which holds every key the line
+    /// has, including the roles, actions and fields this build has never
+    /// heard of. Only the one key goes; key order and whitespace become the
+    /// serializer's again, and neither is information the app was carrying.
+    pub fn from_line(line: &str, parsed: Snapshot) -> Self {
+        Self {
+            tree_json: strip_envelope(line),
+            parsed,
+        }
+    }
+}
+
+/// `line` without its `"type"` key.
+///
+/// Both fallbacks return the line untouched, and neither is reachable from a
+/// line that got here: it parsed as an `AppToBridge::Snapshot`, so it is a
+/// JSON object, and a `Value` built from JSON serializes back. Relaying the
+/// envelope is the wrong answer for both, but it is the one that keeps the
+/// tree, which is what an agent came for.
+fn strip_envelope(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_string();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.remove("type");
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
+}
 
 /// What the bridge currently knows about the app, as seen by the tool layer.
 ///
@@ -46,7 +157,7 @@ pub enum BridgeState {
     /// No app has delivered a snapshot since the bridge started.
     Never,
     /// An app is connected; its latest snapshot is available.
-    Connected(Snapshot),
+    Connected(AppSnapshot),
     /// A previously connected app went away after delivering snapshots.
     Disconnected {
         /// Label from the app's handshake, if one was received.
@@ -56,22 +167,145 @@ pub enum BridgeState {
     },
 }
 
+/// What this bridge's own end of the socket is doing, as distinct from what
+/// the peer has said on it.
+///
+/// [`BridgeState`] answers "has an app published a tree" and cannot answer
+/// "did this bridge reach the socket at all". Both a `connect` that keeps
+/// failing and a connection the app never accepted leave the state at
+/// [`BridgeState::Never`], and the two call for opposite next steps: check the
+/// path, or leave the path alone because the bridge is connected to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkState {
+    /// No connection is open: the last connect attempt failed, or the last
+    /// connection ended.
+    Down,
+    /// A connection is open, established at this instant.
+    Open {
+        /// When `connect` returned. The tool layer reads the age rather than
+        /// the instant: a connection open for a moment is a handshake still
+        /// arriving, and one open far longer is a socket nobody is reading.
+        since: Instant,
+    },
+}
+
+impl LinkState {
+    /// How long the open connection has been up, or `None` when none is.
+    pub fn open_for(self) -> Option<Duration> {
+        match self {
+            Self::Down => None,
+            Self::Open { since } => Some(since.elapsed()),
+        }
+    }
+}
+
+/// Source of the [`InputId`]s the tool layer stamps on outgoing inputs.
+///
+/// Process-wide and monotonic, which is what the protocol asks for: an id must
+/// not repeat for the lifetime of the bridge process, not merely for the
+/// lifetime of one connection. Acks outlive the connection they were sent on,
+/// so a scheme that restarts its ids per connection lets a dead app's in-flight
+/// ack answer a live waiter holding the same id. Counting up across every
+/// connection makes a leftover ack trivially non-matching, since no waiter is
+/// ever looking for an id that low again. [`InputId`] is the normative
+/// statement of the rule.
+static NEXT_INPUT_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Handles the MCP tool layer uses to talk to the socket-manager task.
 #[derive(Clone)]
 pub struct BridgeHandle {
     /// Latest connection state; holds the current [`Snapshot`] while an app
     /// is connected.
     pub state_rx: watch::Receiver<BridgeState>,
-    /// Queue of agent inputs to forward to the app.
-    pub input_tx: mpsc::Sender<AgentInput>,
+    /// Queue of identified agent inputs to forward to the app.
+    pub input_tx: mpsc::Sender<(InputId, AgentInput)>,
+    /// Every ack the app sends, republished for whoever is waiting on one.
+    pub ack_tx: broadcast::Sender<(InputId, InputStatus)>,
+    /// The `protocol_version` the connected app declared in its handshake.
+    ///
+    /// `None` before any handshake, and again once the app goes away, so a
+    /// stale version is never read as the current peer's. An app that sends
+    /// no `Hello` at all leaves it `None`, which reads as "no mismatch
+    /// known": the compatibility path for adapters that predate the
+    /// handshake.
+    ///
+    /// The tool layer needs this because a peer on another protocol version
+    /// still delivers parseable snapshots while being unable to parse the
+    /// inputs sent back to it, and reporting an input as sent to such a peer
+    /// would be a lie.
+    pub protocol_rx: watch::Receiver<Option<u32>>,
+    /// Why the most recent line from an app was thrown away, if one was.
+    ///
+    /// Set for every line the reader could not turn into an [`AppToBridge`],
+    /// and never cleared, because the question it answers outlives the
+    /// connection: an app that connects, publishes nothing this bridge can
+    /// read and dies leaves the state at [`BridgeState::Never`], which on its
+    /// own is indistinguishable from an app that never started. Reporting the
+    /// reason is what stops `read_tree` sending an adopter to check a socket
+    /// path the app plainly reached.
+    ///
+    /// Read only where no snapshot is available. Once a snapshot has arrived,
+    /// a later rejected line says nothing about the tree being served, and
+    /// the tools do not mention it.
+    pub rejected_rx: watch::Receiver<Option<String>>,
+    /// Whether this bridge currently holds an open connection, and since when.
+    ///
+    /// The one fact that separates "nothing is there" from "this bridge is
+    /// connected and the peer has not said a word", which are the same
+    /// [`BridgeState::Never`] and want opposite answers. See [`LinkState`].
+    ///
+    /// Read only where no snapshot is available, like
+    /// [`rejected_rx`](Self::rejected_rx): once a tree is being served, the
+    /// connection carrying it is not what an agent needs to hear about.
+    pub link_rx: watch::Receiver<LinkState>,
+}
+
+impl BridgeHandle {
+    /// Claim the id for the next input to send.
+    ///
+    /// Takes `&self` so the id source stays an implementation detail of the
+    /// handle: callers ask the bridge for an id rather than reaching for a
+    /// counter of their own, and two tool calls racing still get different
+    /// ids.
+    pub fn next_input_id(&self) -> InputId {
+        NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Start receiving acks from now on.
+    ///
+    /// A broadcast receiver only sees what is published after it subscribes,
+    /// so a caller that waits on an input must subscribe *before* sending it:
+    /// the app can ack before the sending task is scheduled again.
+    pub fn subscribe_acks(&self) -> broadcast::Receiver<(InputId, InputStatus)> {
+        self.ack_tx.subscribe()
+    }
 }
 
 /// Spawn the socket-manager task for `socket_path` on the current runtime.
 pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
     let (state_tx, state_rx) = watch::channel(BridgeState::Never);
     let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
-    tokio::spawn(manager_loop(socket_path, state_tx, input_rx));
-    BridgeHandle { state_rx, input_tx }
+    let (ack_tx, _) = broadcast::channel(ACK_QUEUE);
+    let (protocol_tx, protocol_rx) = watch::channel(None);
+    let (rejected_tx, rejected_rx) = watch::channel(None);
+    let (link_tx, link_rx) = watch::channel(LinkState::Down);
+    tokio::spawn(manager_loop(
+        socket_path,
+        state_tx,
+        input_rx,
+        ack_tx.clone(),
+        protocol_tx,
+        rejected_tx,
+        link_tx,
+    ));
+    BridgeHandle {
+        state_rx,
+        input_tx,
+        ack_tx,
+        protocol_rx,
+        rejected_rx,
+        link_rx,
+    }
 }
 
 /// Why one served connection ended.
@@ -87,7 +321,11 @@ enum ConnectionEnd {
 async fn manager_loop(
     path: PathBuf,
     state_tx: watch::Sender<BridgeState>,
-    mut input_rx: mpsc::Receiver<AgentInput>,
+    mut input_rx: mpsc::Receiver<(InputId, AgentInput)>,
+    ack_tx: broadcast::Sender<(InputId, InputStatus)>,
+    protocol_tx: watch::Sender<Option<u32>>,
+    rejected_tx: watch::Sender<Option<String>>,
+    link_tx: watch::Sender<LinkState>,
 ) {
     let mut backoff = RETRY_MIN;
     loop {
@@ -96,8 +334,30 @@ async fn manager_loop(
                 tracing::info!(path = %path.display(), "connected to app socket");
                 drain_stale_inputs(&mut input_rx);
                 let connected_at = Instant::now();
+                // Published before the connection is served, not after it has
+                // said something: the whole point of this channel is the
+                // connection that never says anything.
+                link_tx.send_replace(LinkState::Open {
+                    since: connected_at,
+                });
                 let mut conn_label = None;
-                let end = run_connection(stream, &state_tx, &mut input_rx, &mut conn_label).await;
+                let end = run_connection(
+                    stream,
+                    &state_tx,
+                    &mut input_rx,
+                    &ack_tx,
+                    &protocol_tx,
+                    &rejected_tx,
+                    &mut conn_label,
+                )
+                .await;
+                // The connection is over: nothing is open again until the next
+                // `connect` returns.
+                link_tx.send_replace(LinkState::Down);
+                // The peer's protocol version belongs to the connection that
+                // declared it; forget it here so the next connection is never
+                // judged by the previous app's handshake.
+                protocol_tx.send_replace(None);
                 // The watch only ever holds `Connected` while this connection
                 // was being served (it is demoted below after every
                 // connection), so `Connected` here means this connection
@@ -111,7 +371,7 @@ async fn manager_loop(
                     if let BridgeState::Connected(snapshot) = state {
                         *state = BridgeState::Disconnected {
                             app_label: conn_label.take(),
-                            last_seq: snapshot.seq,
+                            last_seq: snapshot.parsed.seq,
                         };
                         true
                     } else {
@@ -163,7 +423,7 @@ async fn manager_loop(
 /// direct [`BridgeHandle::input_tx`] sender). Replaying them into a freshly
 /// connected app instance would deliver keystrokes ("q", "y", ...) the agent
 /// aimed at a UI that no longer exists, so they are discarded instead.
-fn drain_stale_inputs(input_rx: &mut mpsc::Receiver<AgentInput>) {
+fn drain_stale_inputs(input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>) {
     let mut drained = 0usize;
     while input_rx.try_recv().is_ok() {
         drained += 1;
@@ -219,7 +479,10 @@ async fn read_line_capped(
 async fn run_connection(
     stream: UnixStream,
     state_tx: &watch::Sender<BridgeState>,
-    input_rx: &mut mpsc::Receiver<AgentInput>,
+    input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>,
+    ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
+    protocol_tx: &watch::Sender<Option<u32>>,
+    rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) -> ConnectionEnd {
     let (read_half, mut write_half) = stream.into_split();
@@ -229,7 +492,14 @@ async fn run_connection(
         tokio::select! {
             read = read_line_capped(&mut reader, &mut line_buf) => match read {
                 Ok(LineRead::Line) => {
-                    handle_app_line(&line_buf, state_tx, conn_label);
+                    handle_app_line(
+                        &line_buf,
+                        state_tx,
+                        ack_tx,
+                        protocol_tx,
+                        rejected_tx,
+                        conn_label,
+                    );
                     line_buf.clear();
                 }
                 Ok(LineRead::Eof) => return ConnectionEnd::AppClosed,
@@ -246,10 +516,10 @@ async fn run_connection(
                 }
             },
             input = input_rx.recv() => {
-                let Some(input) = input else {
+                let Some((id, input)) = input else {
                     return ConnectionEnd::SessionClosed;
                 };
-                let msg = BridgeToApp::Input(input);
+                let msg = BridgeToApp::input(id, input);
                 let mut line = match serde_json::to_string(&msg) {
                     Ok(line) => line,
                     Err(err) => {
@@ -267,17 +537,32 @@ async fn run_connection(
     }
 }
 
-/// Handle one ndjson line from the app. Malformed lines are logged and
-/// skipped so a buggy app cannot kill the bridge.
+/// Handle one ndjson line from the app. Malformed lines are logged, recorded
+/// in `rejected_tx` and skipped, so a buggy app cannot kill the bridge and an
+/// agent asking for a tree is told what went wrong instead of being sent to
+/// check the socket path.
 fn handle_app_line(
     line: &[u8],
     state_tx: &watch::Sender<BridgeState>,
+    ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
+    protocol_tx: &watch::Sender<Option<u32>>,
+    rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) {
-    match serde_json::from_slice::<AppToBridge>(line) {
+    // Decoded from `&str` rather than `&[u8]` because the snapshot arm keeps
+    // the line: JSON is defined over UTF-8, so a line that parses is valid
+    // UTF-8 anyway, and taking the check first means the kept line is a
+    // borrowed `&str` rather than a lossy conversion of bytes.
+    let Ok(line) = str::from_utf8(line) else {
+        tracing::warn!("ignoring a line from app that is not valid UTF-8");
+        rejected_tx.send_replace(Some("the line is not valid UTF-8".to_string()));
+        return;
+    };
+    match serde_json::from_str::<AppToBridge>(line) {
         Ok(AppToBridge::Hello {
             app_label,
             protocol_version,
+            ..
         }) => {
             if protocol_version == PROTOCOL_VERSION {
                 tracing::info!(app_label, protocol_version, "app handshake received");
@@ -286,17 +571,102 @@ fn handle_app_line(
                     app_label,
                     app_protocol = protocol_version,
                     bridge_protocol = PROTOCOL_VERSION,
-                    "protocol version mismatch; continuing, but messages may misparse"
+                    "protocol version mismatch; the app cannot receive input from this bridge, \
+                     and its snapshots parse only for as long as their shape has not moved"
                 );
             }
+            protocol_tx.send_replace(Some(protocol_version));
             *conn_label = Some(app_label);
         }
-        Ok(AppToBridge::Snapshot(snapshot)) => {
-            tracing::debug!(seq = snapshot.seq, "snapshot received");
-            state_tx.send_replace(BridgeState::Connected(snapshot));
+        Ok(AppToBridge::Snapshot(parsed)) => {
+            tracing::debug!(seq = parsed.seq, "snapshot received");
+            // The line is kept beside the parsed form, not instead of it: the
+            // agent reads the line and the bridge reasons about the parse.
+            // See [`AppSnapshot`].
+            state_tx.send_replace(BridgeState::Connected(AppSnapshot::from_line(line, parsed)));
+        }
+        Ok(AppToBridge::Ack { id, status, .. }) => {
+            tracing::debug!(id, ?status, "input ack received");
+            // An ack nobody is waiting for is the normal case (the tool call
+            // that sent the input has already returned), so a send with no
+            // subscribers is not an error worth reporting.
+            let _ = ack_tx.send((id, status));
+        }
+        // A message variant added to the protocol after this bridge was
+        // written. Not a warning like a malformed line: the app is conforming
+        // and merely newer, which the wire format calls an additive change, so
+        // the bridge ignores what it has no handler for and keeps serving the
+        // rest of the stream.
+        Ok(_) => {
+            tracing::debug!("ignoring an app message this bridge has no handler for");
+        }
+        // An unknown `type` is a message variant added in a later version 1
+        // release. That is additive on the wire, so it is ignored exactly like
+        // the `Ok(_)` arm above rather than reported as malformed: an
+        // internally tagged enum with no catch-all fails to parse such a line,
+        // so it arrives here as an error, but it is a conforming newer app, not
+        // a broken one. Reporting it would put a false "malformed line" reason
+        // in front of an agent (see `no_snapshot_reason`) for an app doing
+        // nothing wrong, and contradict this module's own "quietly ignored"
+        // guarantee for unknown messages.
+        Err(_) if is_unknown_message_type(line) => {
+            tracing::debug!("ignoring an app message type this bridge has no handler for");
         }
         Err(err) => {
             tracing::warn!(%err, "ignoring malformed line from app");
+            // Kept, not just logged. Nobody reads a bridge's log while
+            // retrofitting an app; they read the tool's error, and this is
+            // the only place that knows why the line was thrown away.
+            rejected_tx.send_replace(Some(err.to_string()));
         }
+    }
+}
+
+/// True when `line` is a JSON object whose `type` names a message this bridge
+/// has no variant for: an additive future message to ignore, not a malformed
+/// line to report. A known `type` whose fields did not parse is malformed and
+/// returns `false`, as does anything that is not a JSON object with a string
+/// `type`.
+fn is_unknown_message_type(line: &str) -> bool {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    match map.get("type").and_then(serde_json::Value::as_str) {
+        // Keep in step with the `AppToBridge` variants this build handles; the
+        // `classifies_*` tests guard the pairing.
+        Some(ty) => !matches!(ty, "hello" | "snapshot" | "ack"),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unknown_message_type;
+
+    #[test]
+    fn classifies_unknown_type_as_ignorable() {
+        // A well-formed message a later version 1 release added.
+        assert!(is_unknown_message_type(r#"{"type":"capability"}"#));
+        assert!(is_unknown_message_type(r#"{"type":"paste","data":"x"}"#));
+    }
+
+    #[test]
+    fn classifies_known_types_as_not_ignorable() {
+        // A known `type` reaching the error path failed on its fields, which is
+        // malformed, not additive, so it must still be reported.
+        for ty in ["hello", "snapshot", "ack"] {
+            assert!(
+                !is_unknown_message_type(&format!(r#"{{"type":"{ty}"}}"#)),
+                "{ty} is a known message type"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_non_messages_as_not_ignorable() {
+        assert!(!is_unknown_message_type("not json at all"));
+        assert!(!is_unknown_message_type(r#"["an","array"]"#));
+        assert!(!is_unknown_message_type(r#"{"no":"type field"}"#));
+        assert!(!is_unknown_message_type(r#"{"type":42}"#));
     }
 }
