@@ -12,7 +12,7 @@ cargo test --workspace
 cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
 python3 scripts/e2e.py                      # end-to-end gate, 20 steps
-python3 scripts/adversarial.py              # edge-case probes, 18 of them
+python3 scripts/adversarial.py              # edge-case probes, 20 of them
 ```
 
 Run all six before pushing. CI runs the same gate with `cargo build
@@ -34,7 +34,7 @@ refuses a `target/debug` older than the sources.
   envelope folds back onto the built-ins on the way in. Version 1 is frozen:
   additive changes only (new optional fields, new message variants, new roles
   and actions, which peers degrade to `other` / `Custom` instead of failing
-  the snapshot). The ten types such an addition can reach are
+  the snapshot). The eleven types such an addition can reach are
   `#[non_exhaustive]`, and so are the six struct-like variants inside them
   (`AppToBridge::Hello`/`Ack`, `BridgeToApp::Input`, `AgentInput::Act`/`Key`/
   `Text`), which is why peers build through constructors and destructure with
@@ -99,7 +99,9 @@ refuses a `target/debug` older than the sources.
   pure and unit-tested, including the one-focused-node and modal-dialog
   invariants.
 
-Details: docs/architecture.md. Retrofit guidance: docs/integration-guide.md.
+Details: docs/architecture.md. Normative per-message wire spec:
+docs/protocol.md. Retrofit guidance: docs/integration-guide.md. How taria
+differs from the screen-level tools: docs/comparison.md.
 
 ## Conventions
 

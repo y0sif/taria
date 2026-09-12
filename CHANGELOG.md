@@ -13,6 +13,146 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [0.2.0] - 2026-09-12
+
+**The crates are on crates.io.** 0.1.0 froze the wire format and never left
+this repository, so 0.2.0 is the first version cargo can resolve, and the
+0.1.0 section below, which says nothing is published yet, is now a statement
+about that release rather than about the project.
+
+```bash
+cargo add taria-ratatui   # in a TUI app that agents should be able to use
+cargo install taria-mcp   # the bridge, for driving one
+```
+
+A tag also builds `taria-mcp` for x86_64 and aarch64 Linux and for both macOS
+architectures and attaches the tarballs, each with its sha256, to a GitHub
+release, so driving an app does not require a Rust toolchain.
+
+Nothing on the wire moved. `PROTOCOL_VERSION` stays 1, no message or type
+gained or lost a field, and no crate's Rust API changed. Everything below is a
+specification, a description an agent reads, a test that was missing, or
+packaging.
+
+### The wire format is specified, message by message
+
+`docs/protocol.md` is the normative per-message specification of version 1,
+written for someone implementing a peer from that document alone: an adapter
+for a framework that is not ratatui, in a language that is not Rust. Until now
+`docs/architecture.md` said the per-message spec was deferred and that the
+rustdoc on `crates/taria` was normative until it existed, which is a fine
+answer for a Rust adopter and no answer at all for anyone else.
+
+It covers framing, the handshake, every message with a literal line, both
+vocabularies with their degrade rules, the ack model, connection ownership,
+the key grammar, the limits with their units, socket discovery and lifecycle,
+the focus contract, and what a version bump costs. Rationale stays in
+`architecture.md`. Behaviour the reference peers add beyond what the protocol
+requires is marked as convention and is not binding on a conforming peer, and
+Rust-specific obligations are confined to one section.
+
+Several normative facts existed only in code and are written down for the
+first time: that `AgentInput` is tagged on `kind` while the message envelope
+is tagged on `type`, one level apart in the same line, so a peer that
+conflates them fails every input; that the 1 MiB line cap counts bytes,
+excludes the newline, and closes the connection rather than skipping a line;
+that depth counts the root as level one; and that an input id is a `u64`.
+Every literal line in the document is real output, either lifted from the
+frozen test vectors or captured from a live session against the demo. What is
+genuinely undecided is listed as undecided rather than invented.
+
+### What an agent is told about typing
+
+The agent-facing text still carried the v0 model, in which the adapter lowered
+`Text` into one key event per character. The MCP instructions said to use
+`type_text` "for anything you would otherwise spell out with `key`", which is
+exactly the conflation that once deleted a task, offered to every agent on
+connect.
+
+- **`type_text` now says where the characters go.** To whatever surface the
+  app puts typing into, never through its key bindings. A newline arrives as
+  Enter and submits, a tab arrives as Tab, carriage returns are dropped,
+  characters after a submit usually have nowhere left to go, and an app
+  accepting no typing answers ignored, which reaches the agent as a result
+  carrying the tree rather than as an error. The lowering is named as an
+  adapter convention, not a protocol rule, since the core crate does not
+  dictate how an app consumes characters.
+- **The server instructions describe `key` and `type_text` as the two
+  different lowerings they are**, rather than as a slow path and a fast one.
+- **`act` says that an action needing a value and arriving without one is
+  answered ignored.**
+- **The ignored result names every kind of input that can earn it.** It was
+  written act-first, so it covered neither text sent into a surface taking
+  none nor a key the grammar refuses.
+- **`InputStatus::Ignored` documents the same list**, and the line the demo
+  was alone in knowing: a key that parses but is bound to nothing is
+  `Delivered`, the same verdict a person gets for pressing an unbound key.
+  `Ignored` is for input the app could not act on at all, which is what makes
+  it worth reporting to an agent waiting on an effect.
+- **`Action::Focus` had no documentation at all**, which left "focus the
+  target first" as advice with no way to follow it. It now states what
+  advertising focus promises: an act with it puts the keyboard on that node,
+  and the next snapshot shows that node as the focused one, so an agent can
+  check the move landed rather than assume it. That is what makes it the
+  advertised way to aim typing. `set_value` is not a focus call, even in an
+  app that moves the keyboard as a side effect of one.
+- A docs.rs link that pointed through a private module is fixed.
+
+### The ignore path is gated
+
+The claim that new wording makes to an agent, that text sent while nothing is
+accepting typing comes back ignored with a tree rather than as an error, was
+the one claim neither suite tested. `scripts/adversarial.py` gains a probe
+that types `dy` at the list: the pair that opens the confirm-delete dialog and
+confirms it. Lowered through the key bindings it would destroy a task and
+still look like success, because the tree would change. The probe asserts that
+the ack is `Ignored`, that a tree came with it, that the tree does not show
+the input focused, and that every node is untouched either side of the call.
+
+The gate is 20 end-to-end steps and 20 adversarial probes.
+
+### Packaging and CI
+
+- **All three crates carry a `readme`.** `taria-ratatui` and `taria-mcp` had
+  none, so their crates.io pages would have rendered empty next to `taria`'s.
+- **The workspace dependency on `taria` carries its own version**, so it moves
+  with the workspace version. Bumping `workspace.package` alone would have
+  published 0.2.0 crates depending on a 0.1.0 that does not exist.
+- **A tag releases binaries.** `taria-mcp` is what a person installs, so a tag
+  builds it for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `x86_64-apple-darwin` and `aarch64-apple-darwin`, and attaches a tarball and
+  its sha256 for each to a GitHub release. Windows is absent on purpose: the
+  transport is a Unix domain socket. Publishing the crates themselves stays
+  manual and in dependency order.
+- **CI checks the MSRV.** The crates promise `rust-version = "1.88"` on their
+  crates.io pages and nothing verified it. A `cargo check` on a pinned 1.88
+  does, cheaply: what an old compiler rejects is syntax and library items, not
+  test outcomes.
+
+### Docs for someone deciding whether to adopt this
+
+- **`docs/comparison.md`** places taria beside ht, tmux with `send-keys`, the
+  tmux and PTY MCP servers, agent-tui, tui-use and agent-terminal: what each
+  does, why working inside the app rather than outside it changes what an
+  agent can know, and the cases where the right answer is one of the others.
+  The first of those is the largest: taria reaches only apps whose authors
+  adopted it, so anything you did not write and cannot patch is screen-level
+  territory.
+- **The README has an FAQ**, in the words people search with: ARIA for
+  terminals, an MCP server for a TUI, ht and tmux `send-keys`, whether the app
+  has to be ratatui, what adoption costs an author, Windows, two agents at
+  once, whether the protocol is stable, and what happens to the widgets you
+  have not annotated.
+- **The README has install instructions**, split by which side of the socket
+  the reader is on: a dependency for an app author, a binary for whoever
+  drives the app.
+- Three claims in the docs were wrong and are corrected: the temp-dir fallback
+  path is namespaced by the effective uid, else `$USER`, else `$LOGNAME`, else
+  the literal `default`, rather than by the uid alone; "exactly one focused
+  node" is the app's obligation rather than something either peer enforces,
+  since the adapter guarantees at least one and the bridge never reads the
+  field; and eleven types are `#[non_exhaustive]`, not ten.
+
 ## [0.1.0] - 2026-09-10
 
 The first release, and the one the wire format freezes in. Nothing is
@@ -251,4 +391,5 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[0.2.0]: https://github.com/y0sif/taria/releases/tag/v0.2.0
 [0.1.0]: https://github.com/y0sif/taria/releases/tag/v0.1.0
