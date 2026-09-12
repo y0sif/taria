@@ -130,6 +130,16 @@ fn input_node(app: &App) -> Node {
         // too, so the advertisement and the behaviour agree.
         if focused {
             node = node.action(Action::Dismiss);
+        } else {
+            // And the way in, for the same reason read from the other side:
+            // acting on it moves the keyboard here, which is only a move
+            // while the keyboard is elsewhere. `i` is what a person presses;
+            // this is the same affordance for an agent, and it exists
+            // because the alternative was `set_value`, which moves focus
+            // only as a side effect of replacing the draft. An agent that
+            // wants the keyboard and nothing else should not have to
+            // overwrite a draft to get it.
+            node = node.action(Action::Focus);
         }
     }
     node
@@ -412,8 +422,9 @@ mod tests {
         let input = find(&nodes, "input").unwrap();
         assert_eq!(
             input.actions,
-            vec![Action::SetValue],
-            "an empty draft has nothing to submit, so `activate` is not offered"
+            vec![Action::SetValue, Action::Focus],
+            "an empty draft has nothing to submit, so `activate` is not \
+             offered, and the keyboard is on the list, so `focus` is"
         );
         assert_eq!(input.label.as_deref(), Some("New task"));
         let quit = find(&nodes, "quit").unwrap();
@@ -515,8 +526,9 @@ mod tests {
         let nodes = build_nodes(&app);
         assert_eq!(
             find(&nodes, "input").unwrap().actions,
-            vec![Action::SetValue],
-            "the draft is empty, so `activate` stays unadvertised"
+            vec![Action::SetValue, Action::Focus],
+            "the draft is empty, so `activate` stays unadvertised, and the \
+             keyboard is back on the list, so `focus` returns"
         );
         assert_eq!(
             find(&nodes, "quit").unwrap().actions,
@@ -570,8 +582,9 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             find(&build_nodes(&app), "input").unwrap().actions,
-            vec![Action::SetValue],
-            "with the list focused there is no keyboard to hand back"
+            vec![Action::SetValue, Action::Focus],
+            "with the list focused there is no keyboard to hand back, and \
+             `focus` is the way to take it"
         );
 
         // The move an agent actually makes: `set_value` takes the keyboard.
@@ -601,8 +614,9 @@ mod tests {
         assert_eq!(focused_id(&nodes).as_deref(), Some("task-1"));
         assert_eq!(
             find(&nodes, "input").unwrap().actions,
-            vec![Action::SetValue],
-            "the draft went with the dismiss, and with it the way to submit it"
+            vec![Action::SetValue, Action::Focus],
+            "the draft went with the dismiss, and with it the way to submit \
+             it; `focus` is back, because the keyboard is the list's again"
         );
     }
 

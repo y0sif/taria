@@ -748,7 +748,7 @@ impl Drop for TariaLayer {
     /// rather than waiting to be woken by a connection, so it returns whether
     /// the socket file was replaced by a second instance, removed, or is
     /// being served by some other process; the worst case is one
-    /// [`ACCEPT_POLL`] nap, plus one [`WRITE_TIMEOUT`] if a connected bridge
+    /// `ACCEPT_POLL` nap, plus one `WRITE_TIMEOUT` if a connected bridge
     /// has stopped reading mid-write.
     fn drop(&mut self) {
         let Some(inner) = self.inner.as_mut() else {

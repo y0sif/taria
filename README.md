@@ -211,7 +211,7 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-python3 scripts/e2e.py           # end-to-end: 20 steps, demo app + bridge + MCP
+python3 scripts/e2e.py           # end-to-end: 21 steps, demo app + bridge + MCP
 python3 scripts/adversarial.py   # 20 edge-case probes
 ```
 

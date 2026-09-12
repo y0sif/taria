@@ -104,6 +104,29 @@ connect.
   on its text input while the keyboard is elsewhere. The hand-check list at
   the end grows from five items to six.
 
+### The demo advertises the way in
+
+`Action::Focus` became the documented way to aim typing, and the reference app
+advertised it on nothing, so the advice had no worked example and no test
+behind it. A live agent found the hole immediately: it wanted the keyboard and
+nothing else, saw only `set_value` advertised on the input, tried to aim with
+an empty value, and ended up letting `set_value` carry the whole title because
+there was no other semantic way in.
+
+The demo's input now advertises `focus` while the keyboard is elsewhere, the
+mirror of the `dismiss` it already advertised while it held the keyboard, and
+the semantic form of the `i` key a person presses. Acting on it moves the
+keyboard and nothing else: the draft is untouched, which is the point. It is
+reported `ignored` when the input already has the keyboard and while the
+dialog is up, so the advertisement and the verdict agree, and the tree stops
+offering it in exactly those states.
+
+`scripts/e2e.py` gains the step that was missing: aim with `focus`, type the
+whole title with one `type_text`, submit with `activate`. The title carries
+the demo's own list bindings (`d`, `j`, `k`, `q`, `y`, `i`) so a character
+routed to them cannot pass unnoticed, and a second `focus` asserts the
+ignored verdict against the same frame that stopped advertising it.
+
 ### The ignore path is gated
 
 The claim that new wording makes to an agent, that text sent while nothing is
@@ -115,7 +138,7 @@ still look like success, because the tree would change. The probe asserts that
 the ack is `Ignored`, that a tree came with it, that the tree does not show
 the input focused, and that every node is untouched either side of the call.
 
-The gate is 20 end-to-end steps and 20 adversarial probes.
+The gate is 21 end-to-end steps and 20 adversarial probes.
 
 ### Packaging and CI
 
