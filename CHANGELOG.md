@@ -89,14 +89,20 @@ connect.
   `Delivered`, the same verdict a person gets for pressing an unbound key.
   `Ignored` is for input the app could not act on at all, which is what makes
   it worth reporting to an agent waiting on an effect.
-- **`Action::Focus` had no documentation at all**, which left "focus the
-  target first" as advice with no way to follow it. It now states what
-  advertising focus promises: an act with it puts the keyboard on that node,
+- **The seven built-in actions had no documentation**, `Custom` aside. For
+  `Action::Focus` that left "focus the target first" as advice with no way to
+  follow it. Each action now says what it does, and `Focus` says what
+  advertising it promises: an act with it puts the keyboard on that node,
   and the next snapshot shows that node as the focused one, so an agent can
   check the move landed rather than assume it. That is what makes it the
   advertised way to aim typing. `set_value` is not a focus call, even in an
   app that moves the keyboard as a side effect of one.
 - A docs.rs link that pointed through a private module is fixed.
+- **The integration guide teaches aiming.** A new section works through
+  routing typed text to a surface, with the handler and the rule that
+  `set_value` is not a focus call, and the running sample advertises `focus`
+  on its text input while the keyboard is elsewhere. The hand-check list at
+  the end grows from five items to six.
 
 ### The ignore path is gated
 
@@ -115,8 +121,9 @@ The gate is 20 end-to-end steps and 20 adversarial probes.
 
 - **All three crates carry a `readme`.** `taria-ratatui` and `taria-mcp` had
   none, so their crates.io pages would have rendered empty next to `taria`'s.
-- **The workspace dependency on `taria` carries its own version**, so it moves
-  with the workspace version. Bumping `workspace.package` alone would have
+- **The workspace dependency on `taria` carries its own version**, and cargo
+  has no way to make it follow `workspace.package`, so it is a second literal
+  to bump by hand every release. Bumping `workspace.package` alone would have
   published 0.2.0 crates depending on a 0.1.0 that does not exist.
 - **A tag releases binaries.** `taria-mcp` is what a person installs, so a tag
   builds it for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,

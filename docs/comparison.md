@@ -18,7 +18,7 @@ taria cannot touch at all.
 |---|---|---|---|
 | [ht](https://github.com/andyk/ht) | Runs a command under a headless VT100 emulator, takes JSON commands on stdin, serves the screen over a WebSocket. Built explicitly to make terminals easy for LLMs. | Outside | Any program |
 | tmux, with `send-keys` and `capture-pane` | Detached sessions, virtual keystrokes, a text dump of the pane. The incumbent, widely installed, and stable for years. | Outside | Any program |
-| tmux and PTY MCP servers ([tmux-mcp](https://github.com/bnomei/tmux-mcp), [tmux-mcp-server](https://github.com/lox/tmux-mcp-server), [terminal-control-mcp](https://github.com/wehnsdaefflae/terminal-control-mcp), pty-mcp) | Wrap tmux or a raw PTY as MCP tools, so a harness reaches the screen through the same channel it reaches everything else. | Outside | Any program |
+| tmux and PTY MCP servers ([tmux-mcp](https://github.com/bnomei/tmux-mcp), [tmux-mcp-server](https://github.com/lox/tmux-mcp-server), [terminal-control-mcp](https://github.com/wehnsdaefflae/terminal-control-mcp), and others) | Wrap tmux or a raw PTY as MCP tools, so a harness reaches the screen through the same channel it reaches everything else. | Outside | Any program |
 | [agent-tui](https://github.com/pproenca/agent-tui) | PTY daemon serving screenshots and input over a CLI and JSON-RPC. | Outside | Any program |
 | [tui-use](https://github.com/onesuper/tui-use) | Screen capture plus keystrokes, packaged for agents. | Outside | Any program |
 | [agent-terminal](https://github.com/jasonkneen/agent-terminal) | Headless terminal automation built on node-pty. | Outside | Any program |
@@ -58,8 +58,9 @@ for anything about appearance.
 their output, pasting into a REPL, moving through a pipeline: that is a
 terminal session, not a widget tree. tmux is good at it.
 
-**You are on Windows.** taria's transport is a Unix domain socket. Linux is
-the tested platform, and Windows is not supported.
+**You are on Windows.** The adapter is built on unix-only APIs and the
+transport is a Unix domain socket bound through them. Linux is the tested
+platform, and Windows is not supported.
 
 **You need several agents on one app.** The adapter serves one bridge client
 at a time.
@@ -94,8 +95,9 @@ difference shows up. A thing an agent reads once is not worth annotating.
 ## They compose
 
 taria is not a replacement for tmux, and the two are not competing for the
-same slot. The demo in this repository is normally run under tmux, because a
-TUI needs a real terminal and tmux is how you give a background process one.
+same slot. The demo in this repository runs under tmux whenever it has to run
+without a terminal of its own, because a TUI needs a real one and tmux is how
+you give a background process one.
 An agent can hold both: read the tree through taria for structure and
 verdicts, capture the pane when it needs to see what was drawn.
 
@@ -113,7 +115,8 @@ your key handler exactly as a person's would. That fallback is why an app with
 one annotated widget is already more useful to an agent than an app with none.
 
 The fallbacks are a floor, not the path. A keystroke is a guess about a
-keymap, and an advertised action survives a UI change that a keymap does not.
+keymap, while an advertised action is the app's own statement of what it
+accepts right now, so it is wrong only if the app says something wrong.
 
 ## What taria is not
 

@@ -221,6 +221,9 @@ binaries they test. `--no-build` skips the build and keeps the freshness
 check: it refuses a `target/debug` older than the sources, because a stale
 binary makes every result a report about a build nobody asked for.
 
+`CONTRIBUTING.md` covers the rest: the commit style, and what a change has to
+clear while version 1 of the wire format is frozen.
+
 ## Compatibility
 
 `PROTOCOL_VERSION` is 1 and the wire format is frozen. Within version 1,
@@ -339,7 +342,8 @@ two real retrofits made.
 
 **Does taria work on Windows?**
 
-No. The transport is a Unix domain socket. Linux is the tested platform and
+No. The adapter is built on unix-only APIs, and the transport is a Unix
+domain socket bound through them. Linux is the tested platform and
 the only one CI runs the suites on; the release workflow builds `taria-mcp`
 for macOS, and the AF_UNIX path limit is handled per platform, but nothing
 exercises macOS end to end. Windows is not supported.
