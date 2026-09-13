@@ -101,7 +101,9 @@ refuses a `target/debug` older than the sources.
 
 Details: docs/architecture.md. Normative per-message wire spec:
 docs/protocol.md. Retrofit guidance: docs/integration-guide.md. How taria
-differs from the screen-level tools: docs/comparison.md.
+differs from the screen-level tools: docs/comparison.md. The README delegates
+the rest to docs/faq.md, docs/cli.md and docs/compatibility.md, so a claim
+that moves has to move in those too.
 
 ## Conventions
 

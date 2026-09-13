@@ -13,6 +13,26 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [Unreleased]
+
+### Docs for someone landing on the repository
+
+- **The README is a front page again**: 380 lines down to 199. The FAQ moves
+  whole to `docs/faq.md`, the `taria-mcp` flags, environment variables and
+  socket path resolution to `docs/cli.md`, and Compatibility and Limitations
+  merge into `docs/compatibility.md`. Nothing was cut: every sentence that
+  left the README is in one of those three files.
+- **`docs/comparison.md` and the FAQ are headings now**, one link each at the
+  foot of the README, in place of a mention mid-paragraph.
+- **`docs/compatibility.md` does not restate the freeze.** Section 16 of
+  `docs/protocol.md` is the normative statement on versioning, so the
+  compatibility page points at it and keeps the consequences: what the bridge
+  relays across a version difference, what `#[non_exhaustive]` costs a Rust
+  adopter, and the wildcard arm that hides `Text`.
+- **What the README keeps**: the install split, the quick start, the tool
+  table, the workspace tree, and the six development commands. The prose
+  around those commands was `CONTRIBUTING.md`'s, and is now a link to it.
+
 ## [0.2.0] - 2026-09-12
 
 **The crates are on crates.io.** 0.1.0 froze the wire format and never left
@@ -422,5 +442,6 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[Unreleased]: https://github.com/y0sif/taria/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/y0sif/taria/releases/tag/v0.2.0
 [0.1.0]: https://github.com/y0sif/taria/releases/tag/v0.1.0
