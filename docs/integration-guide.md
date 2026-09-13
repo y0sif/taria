@@ -1,7 +1,8 @@
 # Integration guide
 
 Adding taria to a ratatui app you already have. For how the pieces fit, see
-`architecture.md`; for why taria exists, see `landscape.md`.
+`architecture.md`; for what the wire format requires of a peer, message by
+message, see `protocol.md`; for why taria exists, see `landscape.md`.
 
 Two apps have been through this. One is `examples/demo-app`, written taria
 first. The other was an existing typing tutor, retrofitted after the fact: a
@@ -32,14 +33,10 @@ has the details and a lint that catches it.
 
 ## Add the dependency
 
-Neither crate is published yet, so both come from the repository. They carry
-version `0.1.0` there, the first release. A git dependency resolves to
-whatever the branch holds the day you build it, so pin a revision if you want
-the same build twice.
+Both crates are on crates.io, at version `0.2.0`.
 
-```toml
-[dependencies]
-taria-ratatui = { git = "https://github.com/y0sif/taria" }
+```bash
+cargo add taria-ratatui
 ```
 
 One line is enough. `taria-ratatui` re-exports the protocol crate, so the
@@ -48,8 +45,17 @@ as `taria_ratatui::taria::{Action, IdSpace, Node, Role}`. Add `taria` as a
 dependency of its own if you would rather write them under the name they are
 spelled here:
 
+```bash
+cargo add taria
+```
+
+To track `main` instead of a release, take either crate from the repository.
+A git dependency resolves to whatever the branch holds the day you build it,
+so pin a revision if you want the same build twice.
+
 ```toml
-taria = { git = "https://github.com/y0sif/taria" }
+[dependencies]
+taria-ratatui = { git = "https://github.com/y0sif/taria" }
 ```
 
 What the two sides do have to agree on is `PROTOCOL_VERSION`. Version 1 is
@@ -123,6 +129,14 @@ pub fn build_nodes(app: &App) -> Vec<Node> {
     ]
 }
 ```
+
+Two actions is not the whole set that node wants, and the sample is layered on
+purpose.
+[Advertise a way out of every state](#advertise-a-way-out-of-every-state) adds
+the action that takes the keyboard away again, and
+[Aiming typed text at a surface](#aiming-typed-text-at-a-surface) adds the one
+that brings it here, which is how an agent points `type_text` at this field
+without a raw keystroke.
 
 Then publish it right after drawing:
 
@@ -357,6 +371,12 @@ if !app.draft.trim().is_empty() {
 // because that is when there is something to hand back.
 if focused {
     node = node.action(Action::Dismiss);
+} else {
+    // And the way in, for the same reason from the other side: acting on
+    // it moves the keyboard here, which is only a move while the keyboard
+    // is elsewhere. This is how an agent aims `type_text` at the field;
+    // see "Aiming typed text at a surface" below.
+    node = node.action(Action::Focus);
 }
 ```
 
@@ -699,6 +719,43 @@ no fallback left for the parts of its UI with no semantic coverage. That
 difference is worth one line in your own README, because `type_text` is the
 one an agent has to aim: the tree's focused node is where it will land.
 
+### Aiming typed text at a surface
+
+Aiming it needs an action, and the tree is the only place an agent can learn
+which one. Advertise `Action::Focus` on the surface that takes typing, on the
+same condition as `dismiss` and from the other side, and handle it the same
+way:
+
+```rust
+/// Advertised only while the keyboard is elsewhere, because that is when
+/// acting on it moves anything. Reaching this with the input already
+/// focused means the agent acted on a tree that has moved on, and the
+/// answer is the one `dismiss_input` gives in the mirror case.
+fn focus_input(app: &mut App) -> InputStatus {
+    if app.focus == Focus::Input {
+        return InputStatus::Ignored;
+    }
+    app.focus = Focus::Input;
+    InputStatus::Delivered
+}
+```
+
+Advertising `focus` is a promise about two things: an act with it puts the
+keyboard on this node, and the next snapshot shows this node as the focused
+one, so an agent can check the move landed rather than assume it.
+
+`set_value` is not a focus call, and an app that has only `set_value` on its
+text field has not given an agent a way to aim. Many apps move the keyboard as
+a side effect of setting a value, which is a reasonable thing for an app to
+do, and it is still not a substitute: an agent that wants the keyboard and
+nothing else would have to overwrite the field's contents to get it, and
+`set_value` carrying no value asks for nothing, so the honest handling is to
+answer it `Ignored` rather than treat a missing value as the empty string and
+clear the draft the agent never asked to clear. Advertise `focus` in its own
+right on any surface an agent will need to type into. Without it the raw `key`
+fallback is the only aim left, which is the fallback this guide keeps off the
+primary path.
+
 ## Report what the layer threw away
 
 Four counters record agent traffic that went nowhere. Read them after the
@@ -754,7 +811,9 @@ the app: the input landed and the caller was answered nowhere.
 ## Socket paths
 
 By default the socket is `$XDG_RUNTIME_DIR/taria/<label>.sock`, falling back
-to `<temp dir>/taria-<uid>/<label>.sock`. `$TARIA_SOCK` replaces both and is
+to `<temp dir>/taria-<user>/<label>.sock`, where `<user>` is the effective uid
+where it is available (through `/proc/self` on Linux), else `$USER`, else
+`$LOGNAME`, else the literal `default`. `$TARIA_SOCK` replaces both and is
 used verbatim: on the app side always, and on the bridge side whenever the
 bridge derives its path from `--app`. A bridge started with `--socket <path>`
 takes that path and never reads the variable, so set the variable for both
@@ -824,6 +883,14 @@ the label you passed to `bind_or_disabled`, so it derives the path your app
 bound:
 
 ```bash
+cargo install taria-mcp
+claude mcp add taria -- taria-mcp --app my-app
+```
+
+Or build it from a checkout, which is what to do while you are tracking `main`
+on both sides:
+
+```bash
 cargo build -p taria-mcp
 claude mcp add taria -- /path/to/taria/target/debug/taria-mcp --app my-app
 ```
@@ -831,7 +898,7 @@ claude mcp add taria -- /path/to/taria/target/debug/taria-mcp --app my-app
 That registration line is Claude Code's; any MCP harness works, and the
 README's quick start walks the same steps against the demo app.
 
-The five things worth confirming by hand:
+The six things worth confirming by hand:
 
 - Exactly one node is focused in every state, including the empty ones.
 - Every id you publish still names the same thing after a delete.
@@ -844,6 +911,10 @@ The five things worth confirming by hand:
 - `type_text` sent while nothing is accepting typing comes back ignored, and
   changes nothing. Send a word carrying letters your app binds; the demo's was
   "deploy".
+- An agent can move the keyboard to that typing surface using only what the
+  tree advertises. If the only way in is a raw keystroke, the surface is
+  missing a `focus` action; see
+  [Aiming typed text at a surface](#aiming-typed-text-at-a-surface).
 
 `scripts/e2e.py` and `scripts/adversarial.py` do this against the demo and
 are worth reading as a list of what can go wrong.

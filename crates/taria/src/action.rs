@@ -31,12 +31,35 @@ use crate::NodeId;
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Action {
+    /// Do the node's primary thing: press a button, submit a field, open an
+    /// item.
     Activate,
+    /// Move the keyboard to this node.
+    ///
+    /// Advertising it is a promise about two things. An act with it puts the
+    /// keyboard on this node, and the next snapshot shows this node as the
+    /// focused one, so an agent can check that the move landed rather than
+    /// assume it. That makes it the advertised way to aim typing: an
+    /// [`AgentInput::Text`] goes to whatever surface the app is typing into,
+    /// and this is how an agent chooses that surface without falling back to
+    /// raw keys.
+    ///
+    /// [`SetValue`](Self::SetValue) is not a focus call. An app may well move
+    /// the keyboard as a side effect of setting a value, which is a reasonable
+    /// thing for an app to do, and an app that does is worth advertising this
+    /// action on that node in its own right: an agent that needs the keyboard
+    /// moved and nothing else should not have to overwrite a value to get it.
     Focus,
+    /// Make this node the chosen one among its siblings: a tab, a list row, a
+    /// menu item.
     Select,
+    /// Flip a two-state node: a checkbox, a switch, a disclosure.
     Toggle,
+    /// Move a scrollable node's viewport.
     Scroll,
+    /// Replace the node's value with the one the act carries.
     SetValue,
+    /// Close what the node holds open: a dialog, a popup, an editing mode.
     Dismiss,
     /// App-specific action, described by a keybinding-independent name.
     Custom(String),
@@ -152,8 +175,28 @@ pub enum AgentInput {
     /// parse with the same code.
     #[non_exhaustive]
     Key { key: String },
-    /// Literal text to type, lowered by the adapter into one key event per
-    /// character. One message instead of one round trip per character.
+    /// Literal characters for whatever surface the app puts typing into. One
+    /// message instead of one round trip per character.
+    ///
+    /// The protocol does not say how an app consumes them, only where they are
+    /// aimed: not at the app's key handler, which is where [`Key`](Self::Key)
+    /// goes, but at the field, editor or prompt the app is currently typing
+    /// into. An app with nothing accepting typing acknowledges
+    /// [`Ignored`](crate::wire::InputStatus::Ignored) rather than finding
+    /// somewhere else to put the characters, because somewhere else is usually
+    /// the bindings: one text holding `d` and `y` deleted a task.
+    ///
+    /// An adapter that lowers the text into its framework's key events, which
+    /// is how a surface made of key events is fed, follows one convention, so
+    /// that the same text behaves the same way across frameworks: `'\n'`
+    /// becomes Enter, `'\t'` becomes Tab, `'\r'` is dropped so CRLF reads like
+    /// LF, and every other character is itself with no modifiers held.
+    /// [`text_to_keys`] in `taria-ratatui` is the reference lowering. It is a
+    /// convention for adapters and not a rule this crate can enforce: an app
+    /// whose typing surface is not made of key events reads the characters
+    /// itself and decides there what a newline or a tab means.
+    ///
+    /// [`text_to_keys`]: https://docs.rs/taria-ratatui/latest/taria_ratatui/fn.text_to_keys.html
     #[non_exhaustive]
     Text { text: String },
     /// An input whose `kind` this build does not recognize.

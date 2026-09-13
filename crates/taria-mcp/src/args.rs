@@ -22,7 +22,9 @@ Usage:
                               way the app-side adapter does:
                                 1. $TARIA_SOCK, if set and non-empty
                                 2. $XDG_RUNTIME_DIR/taria/<label>.sock
-                                3. <temp dir>/taria-<uid>/<label>.sock
+                                3. <temp dir>/taria-<user>/<label>.sock
+                                   (<user> is the uid where available,
+                                   else $USER, else $LOGNAME, else default)
   taria-mcp --help            Show this help
 
 Exactly one of --socket or --app is required.

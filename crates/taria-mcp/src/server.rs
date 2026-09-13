@@ -60,8 +60,11 @@ const MAX_KEY_CHARS: usize = 64;
 
 /// Longest string one `type_text` call may carry, in characters.
 ///
-/// A bounded payload keeps one call from monopolizing the app's input queue:
-/// the adapter lowers the text into one key event per character.
+/// A bounded payload keeps one call from costing the app unbounded work. The
+/// protocol does not say how an app consumes typed text, but an app that
+/// lowers it into key events, the way the reference lowering in
+/// `taria-ratatui` does, spends one event per character on it, so the string
+/// an agent sends is the size of the burst the app has to absorb.
 const MAX_TEXT_CHARS: usize = 4096;
 
 /// Longest `value` one `act` call may carry, in characters.
@@ -82,12 +85,14 @@ it returns the app's current semantic tree, including every node id and the acti
 advertises. Prefer act with a node id and one of that node's advertised actions (pass value for \
 set_value); node ids and action names come from the tree, never guess them. An action the tree \
 spells as an object, {\"custom\":\"delete\"}, is passed to act as the inner name alone, \
-\"delete\"; every other action is passed exactly as the tree spells it. type_text types a \
-literal string in one call instead of one call per character; use it for anything you would \
-otherwise spell out with key. key sends a single raw key press and is a fallback for parts of \
-the UI without semantic coverage; its repeat parameter sends the same key up to 64 times, so \
-\"move down five rows\" is one call. act, key and type_text return the updated tree when the app \
-reacts; call read_tree again whenever you need a fresh view.";
+\"delete\"; every other action is passed exactly as the tree spells it. key and type_text lower \
+differently: key goes into the app's key handler and lands wherever focus is, type_text goes to \
+the app's typing surface as literal characters, where a newline arrives as Enter and submits. \
+Type text with type_text rather than spelling it out with key, whose characters meet the app's \
+bindings. key is the fallback for parts of the UI without semantic coverage; its repeat \
+parameter sends the same key up to 64 times, so \"move down five rows\" is one call. act, key \
+and type_text return the updated tree when the app reacts; call read_tree again whenever you \
+need a fresh view.";
 
 /// Parameters for the `act` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -298,10 +303,11 @@ impl TariaMcpServer {
         description = "Invoke an advertised action on a node of the app's semantic tree. `node` \
                        is a node id and `action` an action name, both taken from read_tree; pass \
                        `value` for actions that need one (e.g. set_value), up to 4096 \
-                       characters. An app-specific action appears in the tree as an object, \
-                       {\"custom\":\"delete\"}, and is passed here as the inner name alone, \
-                       \"delete\"; every other action is passed exactly as the tree spells it. \
-                       Returns the updated tree once the app reacts."
+                       characters. An action that needs a value and arrives without one is \
+                       answered ignored. An app-specific action appears in the tree as an \
+                       object, {\"custom\":\"delete\"}, and is passed here as the inner name \
+                       alone, \"delete\"; every other action is passed exactly as the tree \
+                       spells it. Returns the updated tree once the app reacts."
     )]
     pub async fn act(
         &self,
@@ -425,13 +431,17 @@ impl TariaMcpServer {
 
     /// The `type_text` tool: a whole string in one call.
     #[tool(
-        description = "Type literal text into the app, as if every character were pressed in \
-                       turn. One call instead of one key call per character: a 100-character \
-                       string costs 1 call, not 100. This is the tool for filling a text input, \
-                       and for any app that scores individual keystrokes. The text goes wherever \
-                       the app currently sends typing: read_tree names the focused node, so move \
-                       focus to the target first if it is not already there. Up to 4096 \
-                       characters. Returns the updated tree once the app reacts."
+        description = "Type literal text into the app. The characters go to whatever surface the \
+                       app puts typing into, never through its key bindings, so a 100-character \
+                       string is 1 call, not 100 key calls. A newline arrives as Enter and a tab \
+                       as Tab: ending the text with \\n submits wherever Enter submits, and \
+                       characters after a submit usually have nowhere left to go, so send them \
+                       in a second call. Carriage returns are dropped. read_tree names the \
+                       focused node; aim this by moving focus with an advertised focus action, \
+                       or with set_value on the target, which many apps focus as a side effect. \
+                       With nothing accepting typing the app reports it ignored, which comes \
+                       back as a result with the tree, not an error. Up to 4096 characters. \
+                       Returns the updated tree once the app reacts."
     )]
     pub async fn type_text(
         &self,
@@ -970,8 +980,9 @@ fn report(seen: Observed, fallback: AppSnapshot, sent: usize) -> Result<CallTool
             let snapshot = changed.unwrap_or(fallback);
             Ok(text_result(format!(
                 "The app received this input and deliberately did nothing with it (for example \
-                 an action a modal dialog blocks, or a node it no longer knows). Re-plan from \
-                 the current tree below.\n{}",
+                 an act a modal dialog blocks or naming a node it no longer knows, a set_value \
+                 carrying no value, or text sent while nothing is accepting typing). Re-plan \
+                 from the current tree below.\n{}",
                 snapshot_json(&snapshot)
             )))
         }

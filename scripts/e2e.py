@@ -47,8 +47,9 @@ SOURCE_SUFFIXES = (".rs", ".toml", ".lock")
 # to notice rather than absorb.
 IGNORED_PREFIX = (
     "The app received this input and deliberately did nothing with it "
-    "(for example an action a modal dialog blocks, or a node it no longer "
-    "knows). Re-plan from the current tree below."
+    "(for example an act a modal dialog blocks or naming a node it no "
+    "longer knows, a set_value carrying no value, or text sent while "
+    "nothing is accepting typing). Re-plan from the current tree below."
 )
 NO_CHANGE_PREFIX = "The app received this input, and its tree did not change within"
 NO_ACK_PREFIX = "The app neither acknowledged this input nor changed its tree within"
@@ -1247,7 +1248,205 @@ def step_r_idempotent_set_value(client, ctx):
     return f"set_value repeating {draft!r}: acknowledged, no tree change"
 
 
-def step_s_shutdown(client, ctx, app):
+def step_s_focus_then_type(client, ctx):
+    """`focus` takes the keyboard without editing the draft, then one
+    type_text fills it.
+
+    The aiming path in the order an agent plans it: read the tree, see the
+    input advertise a way in, take the keyboard, type the title, submit.
+    Until `focus` was advertised the only semantic way in was `set_value`,
+    which moves the keyboard as a side effect of replacing the draft. A live
+    agent driving this demo looked for a way to aim at the input, found none,
+    tried `set_value` with an empty string to clear itself a way in, and in
+    the end let `set_value` carry the whole title -- which also means the
+    headline `type_text` call never ran in that session. This step gates the
+    two claims that workaround hid: that aiming is not an edit, and that the
+    title can ride one `type_text`.
+
+    The demo cannot hold a draft while the keyboard is on the list (`dismiss`
+    and a submit both clear it, and `set_value` takes the keyboard with it),
+    so the byte-identity assertion below is on the draft this step really
+    finds, an empty one. The half-typed case is
+    `focus_takes_the_keyboard_without_touching_the_draft` in
+    examples/demo-app/src/update.rs, in process.
+
+    The second `focus` is pipelined behind the first the way step j pipelines
+    behind the dialog: once the app has published the tree the first one
+    produced, the input no longer advertises `focus` and the bridge refuses
+    the call on advertisement rather than handing it over. Losing that race
+    is the bridge doing its job, so it is retried rather than failed; winning
+    it is the only way to hear the app's own verdict on an action that would
+    now do nothing.
+    """
+    title = "Typed after aiming: d j k q y i"
+
+    # Whatever state this step inherits, the keyboard has to be on the list
+    # for there to be anything to aim, and the Active tab on screen for the
+    # task map below to mean anything. `dismiss` is the advertised way back,
+    # so the precondition costs no raw key.
+    tree = client.read_tree()
+    require(find(tree, "dialog") is None, "a modal is open; it gates every act here")
+    if one_focused(tree, "the state this step inherits") == "input":
+        tree = act(client, "input", "dismiss")
+    tree = show_tab(client, "tab-active")
+    holder = one_focused(tree, "before aiming")
+    require(
+        holder != "input",
+        "could not get the keyboard off the input, so there is nothing to aim",
+    )
+    before = task_labels(tree)
+    require(
+        title not in before.values(),
+        f"a task labelled {title!r} exists before typing it",
+    )
+
+    # What an agent reads before it aims: a way in, and no way back out of a
+    # keyboard the input does not hold.
+    node = find(tree, "input")
+    require(
+        has_action(node, "focus"),
+        f"the keyboard is on {holder} and the input advertises "
+        f"{node.get('actions')}: nothing there aims at it",
+    )
+    require(
+        not has_action(node, "dismiss"),
+        f"the input advertises `dismiss` with the keyboard on {holder}: "
+        f"{node.get('actions')}",
+    )
+    draft = node.get("value")
+
+    refused = 0
+    restored = False
+    try:
+        for _ in range(5):
+            ids = [
+                client.send_call("act", {"node": "input", "action": "focus"}),
+                client.send_call("act", {"node": "input", "action": "focus"}),
+            ]
+            responses = client.collect(ids)
+
+            kind, tree = parse_result(response_text(responses[ids[0]]))
+            require(
+                kind == "tree",
+                f"the focus act answered {kind!r}; expected the app to take the "
+                "keyboard and publish it",
+            )
+            aimed = one_focused(tree, "after the focus act")
+            require(aimed == "input", f"focus left the keyboard on {aimed}")
+            node = find(tree, "input")
+            require(
+                node.get("value") == draft,
+                f"focus changed the draft from {draft!r} to "
+                f"{node.get('value')!r}: aiming is not an edit",
+            )
+            require(
+                has_action(node, "dismiss"),
+                f"focus took the keyboard and the input advertises "
+                f"{node.get('actions')}: no advertised way back out",
+            )
+
+            try:
+                text = response_text(responses[ids[1]])
+            except ToolError as err:
+                # The bridge saw the tree the first act produced and refused on
+                # advertisement, which is the same claim from the other side.
+                require(
+                    "does not advertise" in err.message,
+                    f"unexpected rejection of the second focus: "
+                    f"{err.message[:160]}",
+                )
+                refused += 1
+                act(client, "input", "dismiss")
+                continue
+
+            kind, tree = parse_result(text)
+            require(
+                kind == "ignored",
+                f"a second focus on the input that already holds the keyboard "
+                f"came back {kind!r}, expected the ignored shape: {text[:160]}",
+            )
+            node = find(tree, "input")
+            require(
+                one_focused(tree, "the ignored ack's tree") == "input",
+                "the ignored ack's tree does not show the input focused, so it "
+                "cannot explain why the second focus did nothing",
+            )
+            require(
+                not has_action(node, "focus"),
+                f"the ignored ack's tree still advertises `focus` on an input "
+                f"that holds the keyboard: {node.get('actions')}",
+            )
+            break
+        else:
+            raise StepFailure(
+                f"never reached the app's verdict on a second focus: the bridge "
+                f"refused all {refused} attempts on advertisement"
+            )
+
+        # One call types the whole title, and the draft is read before anything
+        # submits it: every character has to be in the draft, because one that
+        # went through the list's bindings instead would be missing from it.
+        tree = type_text(client, title)
+        node = find(tree, "input")
+        require(
+            node.get("value") == title,
+            f"one type_text left the draft reading {node.get('value')!r}, "
+            f"expected {title!r}",
+        )
+        require(
+            find(tree, "dialog") is None,
+            "type_text opened the delete dialog: the `d` in the title went "
+            "through the list's bindings instead of into the draft",
+        )
+
+        # `activate` rather than the trailing newline step i submits with: the
+        # newline is already gated there, and splitting the submit off is what
+        # makes the draft above readable at all. The act also has to pass the
+        # bridge's advertisement check, so it doubles as the assertion that
+        # `activate` appeared once the draft would submit something.
+        tree = act(client, "input", "activate")
+        added = [item for item in task_items(tree) if item["id"] not in before]
+        require(
+            len(added) == 1,
+            f"expected exactly one new task after submitting, got "
+            f"{[item['id'] for item in added]}",
+        )
+        require(
+            added[0].get("label") == title,
+            f"the new task reads {added[0].get('label')!r}, expected {title!r}",
+        )
+        # Nothing else moved: a character that reached the list's bindings would
+        # show here rather than in the draft -- ` ` toggles the selected task
+        # onto the other tab, `d` opens the delete dialog and `y` confirms it,
+        # and either way a task leaves this map.
+        require(
+            task_labels(tree) == {**before, added[0]["id"]: title},
+            f"the Active tab reads {task_labels(tree)}, expected {before} plus "
+            f"the one new task",
+        )
+        ctx["snapshot"] = tree
+        restored = True
+    finally:
+        # This step takes the keyboard on purpose and only the submit hands it
+        # back, so a failure in between would leave it in the input -- where
+        # the shutdown step's `q` is the letter q rather than a quit, and that
+        # step would report an app that is still running, burying this
+        # failure under one that says nothing. Same guard, same reason, as
+        # step r; sent raw and unchecked, because it only runs on that path.
+        if not restored:
+            try:
+                client.call_raw("key", {"key": "esc"})
+            except (ToolError, StepFailure, TimeoutError):
+                pass
+    races = f", {refused} race(s) refused by the bridge first" if refused else ""
+    return (
+        f"focus took the keyboard with the draft untouched, a second focus was "
+        f"ignored{races}; one type_text created {added[0]['id']} labelled "
+        f"{title!r}"
+    )
+
+
+def step_t_shutdown(client, ctx, app):
     # `q` quits, so the app is gone before this call can answer. The answer
     # has to say that: an input that ended the app reported as "the tree did
     # not change" tells the agent the app is idle while it is in fact gone.
@@ -1318,7 +1517,7 @@ def step_s_shutdown(client, ctx, app):
     #
     # An absence proves nothing by itself: the demo prints each line only when
     # its count is above zero, so a deleted counter would satisfy this too.
-    # [`step_t_dropped_counter`] is the positive control -- it drives a demo
+    # [`step_u_dropped_counter`] is the positive control -- it drives a demo
     # of its own into really dropping input and holds the printed count
     # against the bridge's tally of the same drops.
     # A join that timed out leaves the drain mid-stream, so the absence
@@ -1364,7 +1563,7 @@ def step_s_shutdown(client, ctx, app):
     )
 
 
-def step_t_dropped_counter(ctx):
+def step_u_dropped_counter(ctx):
     """Positive control for the counter the shutdown step asserts is silent.
 
     "No dropped-input line in the demo's stderr" is an assertion about a line
@@ -1601,6 +1800,7 @@ def main():
         ("p re-select of the current tab acked, no change", step_p_ack_without_change),
         ("q unbound key acked, no change", step_q_unbound_key_acked),
         ("r repeated set_value acked, no change", step_r_idempotent_set_value),
+        ("s focus aims at the input, then one type_text", step_s_focus_then_type),
     ]
 
     try:
@@ -1639,26 +1839,26 @@ def main():
                     failed_hard = True
 
         # Shutdown is special: it consumes both processes.
-        name = "s clean shutdown"
+        name = "t clean shutdown"
         if failed_hard:
             results.append((name, False, "skipped: earlier step failed"))
             print(f"FAIL {name}: skipped after earlier failure", flush=True)
         else:
             try:
-                evidence = step_s_shutdown(client, ctx, app)
+                evidence = step_t_shutdown(client, ctx, app)
                 results.append((name, True, evidence))
                 print(f"PASS {name}: {evidence}", flush=True)
             except (StepFailure, ToolError, TimeoutError) as err:
                 results.append((name, False, str(err)))
                 print(f"FAIL {name}: {err}", flush=True)
 
-        # The positive control for the counters step s asserts are silent.
+        # The positive control for the counters step t asserts are silent.
         # Its own demo and its own bridge, so it neither needs the scenario's
         # app nor cares that the shutdown step just consumed it -- which is
         # also why an earlier failure does not skip it.
-        name = "t dropped-input counter reports drops"
+        name = "u dropped-input counter reports drops"
         try:
-            evidence = step_t_dropped_counter(ctx)
+            evidence = step_u_dropped_counter(ctx)
             results.append((name, True, evidence))
             print(f"PASS {name}: {evidence}", flush=True)
         except (StepFailure, ToolError, TimeoutError) as err:

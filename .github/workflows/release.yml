@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # taria-mcp is the only artifact a user installs: the adapter and the
+      # core crate are dependencies an app builds against, and the demo is
+      # not published at all.
+      - name: Build
+        run: cargo build --release --locked -p taria-mcp --target ${{ matrix.target }}
+      # Both licences travel with the binary, since the dual licence is the
+      # offer being made to whoever redistributes it.
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/taria-mcp staging/
+          cp README.md LICENSE-MIT LICENSE-APACHE staging/
+          cd staging
+          tar czf ../taria-mcp-${{ matrix.target }}.tar.gz *
+          cd ..
+          shasum -a 256 taria-mcp-${{ matrix.target }}.tar.gz > taria-mcp-${{ matrix.target }}.tar.gz.sha256
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taria-mcp-${{ matrix.target }}
+          path: taria-mcp-${{ matrix.target }}.tar.gz*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      # Release notes are written by hand from CHANGELOG.md. This workflow
+      # publishes binaries; the crates themselves go to crates.io from a
+      # workstation, in dependency order, which is a decision rather than a
+      # step and so stays off the automation.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

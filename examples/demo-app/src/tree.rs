@@ -130,6 +130,16 @@ fn input_node(app: &App) -> Node {
         // too, so the advertisement and the behaviour agree.
         if focused {
             node = node.action(Action::Dismiss);
+        } else {
+            // And the way in, for the same reason read from the other side:
+            // acting on it moves the keyboard here, which is only a move
+            // while the keyboard is elsewhere. `i` is what a person presses;
+            // this is the same affordance for an agent, and it exists
+            // because the alternative was `set_value`, which moves focus
+            // only as a side effect of replacing the draft. An agent that
+            // wants the keyboard and nothing else should not have to
+            // overwrite a draft to get it.
+            node = node.action(Action::Focus);
         }
     }
     node
@@ -412,8 +422,9 @@ mod tests {
         let input = find(&nodes, "input").unwrap();
         assert_eq!(
             input.actions,
-            vec![Action::SetValue],
-            "an empty draft has nothing to submit, so `activate` is not offered"
+            vec![Action::SetValue, Action::Focus],
+            "an empty draft has nothing to submit, so `activate` is not \
+             offered, and the keyboard is on the list, so `focus` is"
         );
         assert_eq!(input.label.as_deref(), Some("New task"));
         let quit = find(&nodes, "quit").unwrap();
@@ -451,6 +462,51 @@ mod tests {
             taria_ratatui::InputStatus::Delivered
         );
         assert!(!input_actions(&app).contains(&Action::Activate));
+    }
+
+    /// `focus` is the way in, so it is advertised exactly where it is a move:
+    /// while the keyboard is somewhere else. Advertised while the input
+    /// already holds it, it would be the same advertised-but-ignored pair
+    /// `activate` used to be, and an agent would learn that an advertised
+    /// action may do nothing.
+    #[test]
+    fn the_input_advertises_focus_only_while_the_keyboard_is_elsewhere() {
+        let mut app = App::new();
+        let input_actions = |app: &App| find(&build_nodes(app), "input").unwrap().actions.clone();
+
+        assert!(
+            input_actions(&app).contains(&Action::Focus),
+            "the keyboard starts on the list, so there is a move to offer"
+        );
+
+        // And what it advertises is what the app does with it.
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            taria_ratatui::InputStatus::Delivered
+        );
+        assert_eq!(focused_id(&build_nodes(&app)).as_deref(), Some("input"));
+        assert!(
+            !input_actions(&app).contains(&Action::Focus),
+            "the keyboard is here now, so the move is no longer offered"
+        );
+
+        // The pair the other way round: not advertised, and not honoured.
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            taria_ratatui::InputStatus::Ignored
+        );
+
+        // The dialog withdraws it like every other action on the input.
+        apply_agent_input(&mut app, act("input", Action::Dismiss));
+        apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
+        assert!(
+            !input_actions(&app).contains(&Action::Focus),
+            "a modal dialog withdraws the way in with everything else"
+        );
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            taria_ratatui::InputStatus::Ignored
+        );
     }
 
     /// The footer has told a person `[q] quit` since the demo existed, while
@@ -515,8 +571,9 @@ mod tests {
         let nodes = build_nodes(&app);
         assert_eq!(
             find(&nodes, "input").unwrap().actions,
-            vec![Action::SetValue],
-            "the draft is empty, so `activate` stays unadvertised"
+            vec![Action::SetValue, Action::Focus],
+            "the draft is empty, so `activate` stays unadvertised, and the \
+             keyboard is back on the list, so `focus` returns"
         );
         assert_eq!(
             find(&nodes, "quit").unwrap().actions,
@@ -570,8 +627,9 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             find(&build_nodes(&app), "input").unwrap().actions,
-            vec![Action::SetValue],
-            "with the list focused there is no keyboard to hand back"
+            vec![Action::SetValue, Action::Focus],
+            "with the list focused there is no keyboard to hand back, and \
+             `focus` is the way to take it"
         );
 
         // The move an agent actually makes: `set_value` takes the keyboard.
@@ -601,8 +659,9 @@ mod tests {
         assert_eq!(focused_id(&nodes).as_deref(), Some("task-1"));
         assert_eq!(
             find(&nodes, "input").unwrap().actions,
-            vec![Action::SetValue],
-            "the draft went with the dismiss, and with it the way to submit it"
+            vec![Action::SetValue, Action::Focus],
+            "the draft went with the dismiss, and with it the way to submit \
+             it; `focus` is back, because the keyboard is the list's again"
         );
     }
 

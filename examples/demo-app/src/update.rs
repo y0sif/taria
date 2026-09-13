@@ -177,6 +177,7 @@ fn apply_act(app: &mut App, node: &str, action: Action, value: Option<String>) -
         },
         ("input", Action::Activate) => submit_input(app),
         ("input", Action::Dismiss) => dismiss_input(app),
+        ("input", Action::Focus) => focus_input(app),
         // The advertised way out. Until this existed, the only exit was the
         // raw `q` key, which is the fallback the project's conventions keep
         // off the primary path, and which types a letter rather than quitting
@@ -382,6 +383,23 @@ fn dismiss_input(app: &mut App) -> InputStatus {
     }
     app.input.clear();
     app.focus = Focus::List;
+    InputStatus::Delivered
+}
+
+/// Move the keyboard to the new-task input: [`dismiss_input`]'s counterpart,
+/// and the semantic form of the `i` key a person presses.
+///
+/// Advertised only while the keyboard is elsewhere, and reported ignored when
+/// it is already here, so the advertisement and the verdict agree the way
+/// `dismiss`'s do. Until this existed the only semantic way to move the
+/// keyboard here was `set_value`, which moves it as a side effect of
+/// replacing the draft, so an agent that wanted the keyboard and nothing else
+/// had to overwrite the draft or clear it with an empty value.
+fn focus_input(app: &mut App) -> InputStatus {
+    if app.focus == Focus::Input {
+        return InputStatus::Ignored;
+    }
+    app.focus = Focus::Input;
     InputStatus::Delivered
 }
 
@@ -601,6 +619,63 @@ mod tests {
             InputStatus::Ignored
         );
         assert!(app.running, "the dialog must stop the quit");
+    }
+
+    /// The path `focus` exists for: take the keyboard without touching the
+    /// draft, then type into it.
+    ///
+    /// Until this action was advertised the only semantic way here was
+    /// `set_value`, which moves the keyboard as a side effect of replacing
+    /// the draft. An agent that wanted to type its own text had to overwrite
+    /// the draft first, or clear it with an empty value, to move a keyboard
+    /// it could then type into. A live agent hit exactly that and worked
+    /// around it by letting `set_value` carry the whole title.
+    #[test]
+    fn focus_takes_the_keyboard_without_touching_the_draft() {
+        let mut app = App::new();
+        app.input = "half typed".to_string();
+        assert_eq!(app.focus, Focus::List);
+
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            InputStatus::Delivered
+        );
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input, "half typed", "focus is not an edit");
+
+        // And now typing lands, which is the whole point of aiming: before
+        // the focus act this same text would have been answered Ignored.
+        assert_eq!(
+            apply_agent_input(&mut app, text(" more")),
+            InputStatus::Delivered
+        );
+        assert_eq!(app.input, "half typed more");
+    }
+
+    /// Advertised only where it does something, so reported ignored where it
+    /// does not: the tree and the verdict have to agree.
+    #[test]
+    fn focus_is_ignored_when_the_input_already_holds_the_keyboard() {
+        let mut app = App::new();
+        app.focus = Focus::Input;
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            InputStatus::Ignored
+        );
+        assert_eq!(app.focus, Focus::Input, "an ignored act changes nothing");
+    }
+
+    /// The modal gate covers `focus` like every other act on a node outside
+    /// the dialog, and the tree stops advertising it for the same reason.
+    #[test]
+    fn focus_is_ignored_while_the_dialog_is_up() {
+        let mut app = App::new();
+        apply_agent_input(&mut app, act("task-1", Action::Custom("delete".into())));
+        assert_eq!(
+            apply_agent_input(&mut app, act("input", Action::Focus)),
+            InputStatus::Ignored
+        );
+        assert_eq!(app.focus, Focus::List, "the dialog must stop the move");
     }
 
     #[test]

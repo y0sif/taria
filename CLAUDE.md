@@ -11,8 +11,8 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
-python3 scripts/e2e.py                      # end-to-end gate, 20 steps
-python3 scripts/adversarial.py              # edge-case probes, 18 of them
+python3 scripts/e2e.py                      # end-to-end gate, 21 steps
+python3 scripts/adversarial.py              # edge-case probes, 20 of them
 ```
 
 Run all six before pushing. CI runs the same gate with `cargo build
@@ -34,7 +34,7 @@ refuses a `target/debug` older than the sources.
   envelope folds back onto the built-ins on the way in. Version 1 is frozen:
   additive changes only (new optional fields, new message variants, new roles
   and actions, which peers degrade to `other` / `Custom` instead of failing
-  the snapshot). The ten types such an addition can reach are
+  the snapshot). The eleven types such an addition can reach are
   `#[non_exhaustive]`, and so are the six struct-like variants inside them
   (`AppToBridge::Hello`/`Ack`, `BridgeToApp::Input`, `AgentInput::Act`/`Key`/
   `Text`), which is why peers build through constructors and destructure with
@@ -90,16 +90,18 @@ refuses a `target/debug` older than the sources.
   identities (`IdSpace`), stable across deletes and restarts; the list
   publishes its selection as its own value; chords are never treated as the
   plain key they contain. Typed text is routed to the new-task input and
-  `Ignored` elsewhere. The input advertises `Dismiss` while it holds the
-  keyboard and `Activate` only while the draft would submit, and a `quit` node
-  advertises the way out of the app, so every state an agent can enter has an
-  advertised way out; acts on nodes that are gone (the dialog's, a deleted
-  task) report `Ignored`. Submitting switches to the tab the new task landed
-  on, so the effect is in the next snapshot. `tree.rs` and `update.rs` are
-  pure and unit-tested, including the one-focused-node and modal-dialog
-  invariants.
+  `Ignored` elsewhere. The input advertises `Focus` while the keyboard is
+  elsewhere, `Dismiss` while it holds it, and `Activate` only while the draft
+  would submit, and a `quit` node advertises the way out of the app, so every
+  state an agent can enter has an advertised way out; acts on nodes that are
+  gone (the dialog's, a deleted task) report `Ignored`. Submitting switches
+  to the tab the new task landed on, so the effect is in the next snapshot.
+  `tree.rs` and `update.rs` are pure and unit-tested, including the
+  one-focused-node and modal-dialog invariants.
 
-Details: docs/architecture.md. Retrofit guidance: docs/integration-guide.md.
+Details: docs/architecture.md. Normative per-message wire spec:
+docs/protocol.md. Retrofit guidance: docs/integration-guide.md. How taria
+differs from the screen-level tools: docs/comparison.md.
 
 ## Conventions
 

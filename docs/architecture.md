@@ -1,7 +1,11 @@
 # Architecture
 
-How the pieces fit together. For why taria exists, see `landscape.md`. For
-adding taria to an existing ratatui app, see `integration-guide.md`.
+How the pieces fit together, and why the protocol is shaped this way. For what
+a conforming peer has to do, message by message, see `protocol.md`: that is
+the normative specification of `PROTOCOL_VERSION` 1 and it wins wherever this
+file and it disagree. For why taria exists, see `landscape.md`. For adding
+taria to an existing ratatui app, see `integration-guide.md`. For how taria
+compares with the screen-level tools, see `comparison.md`.
 
 ## Components
 
@@ -368,7 +372,12 @@ App side (`TariaLayer::bind`, or `bind_or_disabled`):
 
 1. Resolve the path with `taria::socket::resolve_path`: `$TARIA_SOCK`
    verbatim, else `$XDG_RUNTIME_DIR/taria/<label>.sock`, else
-   `<temp dir>/taria-<uid>/<label>.sock`. The label is formatted into a file
+   `<temp dir>/taria-<user>/<label>.sock`, where `<user>` is the effective uid
+   where it is available (through `/proc/self` on Linux), else `$USER`, else
+   `$LOGNAME`, else the literal `default`. That derivation lives in each peer
+   rather than in the shared crate, so a third-party adapter that wants to be
+   found through the fallback branch has to match it.
+   The label is formatted into a file
    name, so it has to be one: a label carrying `/`, or `.`, `..` or empty, is
    refused rather than resolved. The adapter binds *and unlinks* what comes
    out, and `/etc/cron.d/evil` as a label makes the join discard the whole
@@ -521,13 +530,17 @@ layer never prints.
 
 ## Focus contract
 
-Every snapshot carries exactly one focused node.
+Every snapshot should carry exactly one focused node, and one half of that is
+the app's obligation rather than something the implementation enforces.
+`docs/protocol.md` section 15 is the normative statement.
 
 - The adapter guarantees at least one: the auto-generated `app` root is
   focused only when no recorded node (or descendant) is.
-- The app is responsible for recording at most one. The demo unit-tests the
-  invariant in every state: list, input, modal dialog, and empty list (focus
-  parks on the list node itself).
+- At most one is the app's to keep. Nothing checks it. The bridge never reads
+  `focused` beyond passing it to the agent, so an app that publishes two
+  focused nodes produces a tree that parses and misleads. The demo unit-tests
+  the invariant in every state: list, input, modal dialog, and empty list
+  (focus parks on the list node itself), which is the pattern to copy.
 
 Focus tells the agent where a raw key would land, which is what makes the
 `key` fallback usable. It is also how an agent aims `type_text`, but only
@@ -543,10 +556,6 @@ id in the list node's `value`.
 
 ## Deferred
 
-- A per-message JSON schema reference: the exact shape of every message and
-  every field, written for an adapter author in another language. The role
-  table and action list above are the summary of one part of it, and the
-  rustdoc on `crates/taria` is the normative statement until it exists.
 - Rect geometry on nodes (screen coordinates, for correlating the tree with
   rendered output).
 - Nesting inference: `sem`-wrapped widgets record as a flat list today;
@@ -554,8 +563,9 @@ id in the list node's `value`.
 - Multiple simultaneous bridge clients per app.
 - Adapters for other frameworks (Bubble Tea, Textual, Ink).
 
-Three more, found migrating a released typing tutor (keybr-tui) to v0.1. All
-are additive, so they are v0.2 work and not a `PROTOCOL_VERSION` bump.
+Three more, found migrating a released typing tutor (keybr-tui) to v0.1. None
+landed in 0.2. All are additive, so they can land in a later 0.x without a
+`PROTOCOL_VERSION` bump.
 
 - A partially applied input. An agent sends 100 characters, the typing
   surface ends its lesson after 20, and the other 80 go nowhere. The app can
