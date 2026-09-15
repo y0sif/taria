@@ -13,7 +13,14 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-ratatui = "0.30.2"
+# Default features off on purpose. This adapter uses the crossterm event types,
+# `Buffer`, `Rect` and `Widget`, and has no business widening the host app's
+# ratatui. Cargo unions features, so taking the defaults here would turn them
+# back on in an app that trimmed its own, undoing its choice and building the
+# calendar widget and the crates behind the other defaults into it. Terminal
+# output is unaffected: `underline-color` comes from `ratatui-crossterm`'s own
+# defaults, so a crossterm host has it regardless.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde_json.workspace = true
 taria.workspace = true
 
