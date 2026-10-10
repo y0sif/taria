@@ -10,6 +10,7 @@ Python 3 stdlib only.
 
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -42,8 +43,10 @@ READY_TIMEOUT = 5.0
 RPC_TIMEOUT = 10.0
 
 # What the binaries under test are built from, for the freshness check.
+BINARIES = (DEMO_BIN, MCP_BIN)
 SOURCE_ROOTS = ("crates", "examples", "Cargo.toml", "Cargo.lock")
-SOURCE_SUFFIXES = (".rs", ".toml", ".lock")
+CODE_SUFFIXES = (".rs",)
+MANIFEST_SUFFIXES = (".toml", ".lock")
 
 
 class HarnessError(Exception):
@@ -62,52 +65,93 @@ class ToolError(Exception):
 # --- The build ------------------------------------------------------------------
 
 
-def _newest_source():
+def _newest(paths):
+    """(path, mtime) of the newest file in `paths` that exists, or (None, 0.0)."""
     newest, newest_at = None, 0.0
-    for root in SOURCE_ROOTS:
-        path = os.path.join(REPO, root)
-        if os.path.isfile(path):
-            candidates = [path]
-        else:
-            candidates = [
-                os.path.join(dirpath, name)
-                for dirpath, _, names in os.walk(path)
-                for name in names
-                if name.endswith(SOURCE_SUFFIXES)
-            ]
-        for candidate in candidates:
-            try:
-                mtime = os.path.getmtime(candidate)
-            except OSError:
-                continue
-            if mtime > newest_at:
-                newest, newest_at = candidate, mtime
+    for path in paths:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime > newest_at:
+            newest, newest_at = path, mtime
     return newest, newest_at
 
 
-def require_fresh_build():
-    """Refuse a target/debug that is missing or older than the sources.
+def _tree_files(repo, suffixes):
+    """Every file under SOURCE_ROOTS in `repo` ending in one of `suffixes`."""
+    for root in SOURCE_ROOTS:
+        path = os.path.join(repo, root)
+        if os.path.isfile(path):
+            if path.endswith(suffixes):
+                yield path
+            continue
+        for dirpath, _, names in os.walk(path):
+            for name in names:
+                if name.endswith(suffixes):
+                    yield os.path.join(dirpath, name)
+
+
+def dep_info_sources(binary):
+    """The source files cargo's dep-info (`<binary>.d`) says `binary` was built
+    from, or None when there is no readable dep-info for it.
+
+    The file is Makefile syntax, `<binary>: <dep> <dep> ...` on its first
+    line, with a space inside a path escaped as a backslash and a space.
+    """
+    try:
+        with open(binary + ".d") as f:
+            first = f.readline().rstrip("\n")
+    except OSError:
+        return None
+    prefix = binary.replace(" ", "\\ ") + ":"
+    if not first.startswith(prefix):
+        return None
+    deps = [d.replace("\\ ", " ") for d in re.split(r"(?<!\\) ", first[len(prefix):]) if d]
+    return deps or None
+
+
+def require_fresh_build(repo=REPO, binaries=BINARIES):
+    """Refuse a target/debug where any required binary is missing or stale.
 
     The benchmark never builds, so a stale binary would measure a build
-    nobody asked for. The newest binary dates the last build: a build relinks
-    only what changed, so comparing binaries one by one would refuse a fresh
-    tree.
+    nobody asked for. Each binary is held to the sources it is built from,
+    which cargo lists in its dep-info file, so rebuilding one binary cannot
+    hide a stale other, and a binary a build had no reason to relink (an
+    edit to the other one's crate) is not refused. Without a readable
+    dep-info, a binary is held to every `.rs` file in the tree. Manifests
+    and the lock file are workspace-wide and dated against the newest binary,
+    the last build: a build after them relinks whatever they changed.
     """
-    missing = [b for b in (DEMO_BIN, MCP_BIN) if not os.path.exists(b)]
+    missing = [b for b in binaries if not os.path.exists(b)]
     if missing:
         raise HarnessError(
-            f"{', '.join(os.path.relpath(b, REPO) for b in missing)} not built; "
+            f"{', '.join(os.path.relpath(b, repo) for b in missing)} not built; "
             "run cargo build --workspace, then rerun"
         )
-    source, source_at = _newest_source()
-    if source is None:
-        raise HarnessError("found no sources to date the binaries against")
-    built_at = max(os.path.getmtime(b) for b in (DEMO_BIN, MCP_BIN))
-    if built_at < source_at:
+    all_code = None
+    stale = []  # (lag in seconds, what is stale, the newer source)
+    for binary in binaries:
+        sources = dep_info_sources(binary)
+        if sources is None:
+            if all_code is None:
+                all_code = list(_tree_files(repo, CODE_SUFFIXES))
+            sources = all_code
+        source, source_at = _newest(sources)
+        if source is None:
+            raise HarnessError(f"found no sources to date {os.path.relpath(binary, repo)} against")
+        built_at = os.path.getmtime(binary)
+        if built_at < source_at:
+            stale.append((source_at - built_at, os.path.relpath(binary, repo), source))
+    manifest, manifest_at = _newest(_tree_files(repo, MANIFEST_SUFFIXES))
+    last_build = max(os.path.getmtime(b) for b in binaries)
+    if manifest is not None and last_build < manifest_at:
+        stale.append((manifest_at - last_build, "the last build in target/debug", manifest))
+    if stale:
+        lag, what, source = max(stale)
         raise HarnessError(
-            f"the last build in target/debug is {source_at - built_at:.0f}s older than "
-            f"{os.path.relpath(source, REPO)}, so the binaries are not this source "
-            "tree; run cargo build --workspace, then rerun"
+            f"{what} is {lag:.0f}s older than {os.path.relpath(source, repo)}, so it is "
+            "not this source tree; run cargo build --workspace, then rerun"
         )
 
 

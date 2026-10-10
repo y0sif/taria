@@ -28,6 +28,7 @@ from contextlib import redirect_stderr, redirect_stdout
 BENCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH)
 from harness import COLS, REPO, ROWS, DemoRun, McpStdio, mcp_config, require_fresh_build  # noqa: E402
+import harness  # noqa: E402
 import run as runner  # noqa: E402
 import summarize  # noqa: E402
 import tasks  # noqa: E402
@@ -163,28 +164,163 @@ class Outcomes(unittest.TestCase):
         self.assertEqual(c({}, self.GOOD), ("passed", True, None))
         self.assertEqual(c({}, self.BAD), ("failed", False, None))
         self.assertEqual(c({}, {"check_passed": True, "demo_alive": False}), ("failed", False, None))
-        self.assertEqual(c({"timed_out": True}, self.GOOD), ("timeout", False, None))
-        self.assertEqual(c({"result_subtype": "error_max_budget_usd"}, self.GOOD), ("budget", True, None))
-        self.assertEqual(c({"result_subtype": "error_max_budget_usd"}, self.BAD), ("budget", False, None))
         self.assertEqual(c({"harness_error": "x", "timed_out": True}, self.GOOD), ("harness_error", None, "x"))
+        # Every limit is one rule: a failure, whatever the dump says.
+        for outcome, status in (
+            ({"timed_out": True}, "timeout"),
+            ({"result_subtype": "error_max_budget_usd"}, "budget"),
+            ({"result_subtype": "error_max_turns"}, "max_turns"),
+        ):
+            for graded in (self.GOOD, self.BAD):
+                with self.subTest(status=status, check=graded["check_passed"]):
+                    self.assertEqual(c(outcome, graded), (status, False, None))
+
+    def test_cut_off_results_are_not_harness_errors(self):
+        for subtype in ("error_max_budget_usd", "error_max_turns"):
+            self.assertIsNone(runner._result_problem({"subtype": subtype, "is_error": True}))
+        self.assertIn("error_during_execution", runner._result_problem(
+            {"subtype": "error_during_execution", "is_error": True}))
 
     def test_exit_codes(self):
-        self.assertEqual(runner.exit_code(["passed", "budget"], [True, True]), 0)
+        self.assertEqual(runner.exit_code(["passed", "passed"], [True, True]), 0)
         self.assertEqual(runner.exit_code(["passed", "timeout"], [True, False]), 1)
         self.assertEqual(runner.exit_code(["budget"], [False]), 1)
+        self.assertEqual(runner.exit_code(["max_turns"], [False]), 1)
         self.assertEqual(runner.exit_code(["failed", "harness_error"], [False, False]), 2)
 
-    def test_session_markers_never_reach_the_agent(self):
+    def test_the_agent_env_is_an_allowlist(self):
         saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
         os.environ.update(CLAUDECODE="1", CLAUDE_CODE_ENTRYPOINT="cli", CLAUDE_EFFORT="xhigh",
-                          CLAUDE_CODE_EFFORT_LEVEL="max", CLAUDE_CONFIG_DIR="/c", KEEP_ME="y")
-        env, stripped = runner.spend_env()
-        for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT", "CLAUDE_CODE_EFFORT_LEVEL"):
+                          CLAUDE_CODE_EFFORT_LEVEL="max", CLAUDE_CONFIG_DIR="/c", KEEP_ME="y",
+                          ANTHROPIC_MODEL="m", NODE_OPTIONS="--x", LANG="C.UTF-8")
+        env, dropped = runner.spend_env()
+        self.assertLessEqual(set(env), runner.ENV_ALLOW)
+        for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT", "CLAUDE_CODE_EFFORT_LEVEL",
+                     "CLAUDE_CONFIG_DIR", "KEEP_ME", "ANTHROPIC_MODEL", "NODE_OPTIONS"):
             self.assertNotIn(name, env)
-            self.assertIn(name, stripped)
-        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/c")
-        self.assertEqual(env["KEEP_ME"], "y")
+            self.assertIn(name, dropped)
+        self.assertEqual((env["PATH"], env["LANG"]), (os.environ["PATH"], "C.UTF-8"))
+        self.assertEqual(sorted(dropped), dropped)
+        self.assertNotIn("PATH", dropped)
+        self.assertIn("ANTHROPIC_API_KEY", runner.ENV_ALLOW)  # the only credential --bare reads
+        # What the harness sets itself goes on top, and is not "dropped".
+        original = runner.HARNESS_ENV
+        runner.HARNESS_ENV = {"BENCH_HARNESS_SET": "1", "KEEP_ME": "harness"}
+        self.addCleanup(setattr, runner, "HARNESS_ENV", original)
+        env, dropped = runner.spend_env()
+        self.assertEqual((env["BENCH_HARNESS_SET"], env["KEEP_ME"]), ("1", "harness"))
+        self.assertNotIn("KEEP_ME", dropped)
+
+    def test_limits_are_recorded_and_null_for_a_dry_run(self):
+        spend = runner.parse_args(["--spend", "--timeout", "30", "--budget-usd", "0.5", "--max-turns", "9"])
+        self.assertEqual(runner.limits(spend), {"timeout_s": 30.0, "budget_usd": 0.5, "max_turns": 9})
+        default = runner.limits(runner.parse_args(["--spend"]))
+        self.assertEqual(default, {"timeout_s": runner.DEFAULT_TIMEOUT_S,
+                                   "budget_usd": runner.DEFAULT_BUDGET_USD, "max_turns": None})
+        dry = runner.limits(runner.parse_args(["--dry-run", "--timeout", "30"]))
+        self.assertEqual(dry, {"timeout_s": None, "budget_usd": None, "max_turns": None})
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            runner.parse_args(["--spend", "--max-turns", "0"])
+
+
+class Freshness(unittest.TestCase):
+    """require_fresh_build against a made-up tree: each binary is held to the
+    sources its cargo dep-info names, so a fresh binary cannot hide a stale one."""
+
+    def setUp(self):
+        # A space in the path: dep-info escapes it, and the parser must not split there.
+        self.repo = tempfile.mkdtemp(prefix="fresh check ")
+        self.addCleanup(shutil.rmtree, self.repo)
+        files = {
+            "Cargo.toml": "", "Cargo.lock": "",
+            "crates/core/Cargo.toml": "", "crates/core/src/lib.rs": "",
+            "crates/mcp/Cargo.toml": "", "crates/mcp/src/main.rs": "",
+            "examples/demo/Cargo.toml": "", "examples/demo/src/main.rs": "",
+            "target/debug/demo": "", "target/debug/mcp": "",
+        }
+        for rel, text in files.items():
+            path = self.path(rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+        self.demo, self.mcp = self.path("target/debug/demo"), self.path("target/debug/mcp")
+        self.write_dep_info(self.demo, ["crates/core/src/lib.rs", "examples/demo/src/main.rs"])
+        self.write_dep_info(self.mcp, ["crates/core/src/lib.rs", "crates/mcp/src/main.rs"])
+        self.t0 = time.time() - 1000
+        for rel in files:
+            self.touch(rel, 0)
+        self.touch("target/debug/demo", 10)
+        self.touch("target/debug/mcp", 10)
+
+    def path(self, rel):
+        return os.path.join(self.repo, rel)
+
+    def write_dep_info(self, binary, deps):
+        esc = lambda p: p.replace(" ", "\\ ")  # noqa: E731
+        line = f"{esc(binary)}: " + " ".join(esc(self.path(d)) for d in deps)
+        with open(binary + ".d", "w") as f:
+            f.write(line + "\n\n" + "".join(f"{esc(self.path(d))}:\n" for d in deps))
+
+    def touch(self, rel, offset):
+        os.utime(self.path(rel), (self.t0 + offset, self.t0 + offset))
+
+    def check(self):
+        harness.require_fresh_build(self.repo, (self.demo, self.mcp))
+
+    def refused(self):
+        with self.assertRaises(harness.HarnessError) as caught:
+            self.check()
+        return str(caught.exception)
+
+    def test_a_fresh_tree_passes(self):
+        self.check()
+        self.assertEqual(harness.dep_info_sources(self.demo),
+                         [self.path("crates/core/src/lib.rs"), self.path("examples/demo/src/main.rs")])
+
+    def test_a_rebuilt_demo_cannot_hide_a_stale_mcp(self):
+        self.touch("crates/mcp/src/main.rs", 20)
+        self.touch("target/debug/demo", 30)  # newest binary, newer than every source
+        message = self.refused()
+        self.assertIn(os.path.join("target", "debug", "mcp"), message)
+        self.assertIn(os.path.join("crates", "mcp", "src", "main.rs"), message)
+
+    def test_a_shared_source_needs_both_binaries_relinked(self):
+        self.touch("crates/core/src/lib.rs", 20)
+        self.touch("target/debug/demo", 30)
+        self.assertIn(os.path.join("target", "debug", "mcp"), self.refused())
+
+    def test_a_binary_the_build_had_no_reason_to_relink_passes(self):
+        """An edit to the demo's crate relinks only the demo; the older mcp is not stale."""
+        self.touch("examples/demo/src/main.rs", 20)
+        self.touch("target/debug/demo", 30)
+        self.check()
+
+    def test_manifests_are_dated_against_the_last_build(self):
+        self.touch("Cargo.lock", 20)
+        self.assertIn("Cargo.lock", self.refused())
+        self.touch("target/debug/demo", 30)  # a build after the lock change
+        self.check()
+
+    def test_without_dep_info_a_binary_is_held_to_every_source(self):
+        os.remove(self.mcp + ".d")
+        self.assertIsNone(harness.dep_info_sources(self.mcp))
+        self.touch("examples/demo/src/main.rs", 20)
+        self.touch("target/debug/demo", 30)
+        self.assertIn(os.path.join("target", "debug", "mcp"), self.refused())
+
+    def test_a_missing_binary_is_refused(self):
+        os.remove(self.mcp)
+        self.assertIn("not built", self.refused())
+
+    def test_the_real_dep_info_names_each_binarys_sources(self):
+        for binary, own in ((harness.DEMO_BIN, "examples/demo-app/src/main.rs"),
+                            (harness.MCP_BIN, "crates/taria-mcp/src/server.rs")):
+            if not os.path.exists(binary + ".d"):
+                self.skipTest(f"{binary}.d not built")
+            sources = harness.dep_info_sources(binary)
+            self.assertIn(os.path.join(REPO, own), sources)
+            self.assertIn(os.path.join(REPO, "crates/taria/src/lib.rs"), sources)
 
 
 class Checkers(unittest.TestCase):
@@ -305,26 +441,35 @@ class SpendStream(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--max-budget-usd") + 1], "1")
         self.assertEqual(cmd[cmd.index("--effort") + 1], "medium")
         self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
-        cmd = runner.spend_command("Do it.", "/x/mcp.json", 1.0, "m", effort="high")
+        self.assertNotIn("--max-turns", cmd)  # not passed unless asked for
+        cmd = runner.spend_command("Do it.", "/x/mcp.json", 1.0, "m", effort="high", max_turns=12)
         self.assertEqual(cmd[cmd.index("--effort") + 1], "high")
+        self.assertEqual(cmd[cmd.index("--max-turns") + 1], "12")
+
+    def test_an_init_the_guard_cannot_read_is_refused(self):
+        with self.assertRaises(runner.GuardError):
+            runner.StreamStats("taria").feed({**self.INIT_TARIA, "tools": 5})
 
 
 @unittest.skipUnless(HAVE_TMUX, "tmux is not on PATH")
 class FakeClaude(unittest.TestCase):
     """run.py's spend path end to end against a fake `claude`, live demo included."""
 
+    SECRET = "s3cr3t-value-never-recorded"
+
     @classmethod
     def setUpClass(cls):
         require_fresh_build()
         cls.tmp = tempfile.mkdtemp(prefix="fake-claude-")
         os.symlink(FAKE_CLAUDE, os.path.join(cls.tmp, "claude"))
+        cls.control = os.path.join(cls.tmp, "fake_claude.json")
         cls.saved_env = dict(os.environ)
         os.environ.pop("ANTHROPIC_API_KEY", None)  # never needed, never sent
         os.environ["PATH"] = cls.tmp + os.pathsep + os.environ["PATH"]
-        # Markers a parent Claude Code session sets; none may reach the agent.
-        os.environ.update(CLAUDECODE="1", CLAUDE_CODE_FAKE_MARKER="1")
+        # Markers a parent Claude Code session sets, and anything else a shell
+        # exports: none may reach the agent.
+        os.environ.update(CLAUDECODE="1", CLAUDE_CODE_FAKE_MARKER="1", BENCH_SECRET_MARKER=cls.SECRET)
         cls.log = os.path.join(cls.tmp, "argv.json")
-        os.environ["FAKE_CLAUDE_LOG"] = cls.log
 
     @classmethod
     def tearDownClass(cls):
@@ -338,16 +483,35 @@ class FakeClaude(unittest.TestCase):
             self.fail(f"claude on PATH is {found}, not the fake; refusing to spend")
         if os.path.exists(self.log):
             os.remove(self.log)
+        self.steer("success")
+
+    def steer(self, mode, task="T1", solve=False):
+        """The fake reads its orders from a file: no variable of ours reaches it."""
+        with open(self.control, "w") as f:
+            json.dump({"mode": mode, "task": task, "solve": solve, "log": self.log}, f)
 
     def spend(self, mode, arm="taria", task="T1", solve=False, timeout=20, argv=()):
-        os.environ["FAKE_CLAUDE_MODE"] = mode
-        os.environ["FAKE_CLAUDE_SOLVE"] = "1" if solve else "0"
-        os.environ["FAKE_CLAUDE_TASK"] = task
+        self.steer(mode, task, solve)
         args = runner.parse_args(["--spend", "--tasks", task, "--arms", arm, "--timeout",
                                   str(timeout), "--batch", "test-batch", *argv])
         started = time.monotonic()
         record = runner.run_one(tasks.TASKS[task], arm, args, 0)
         return record, time.monotonic() - started
+
+    def spend_batch(self, mode, name, task_ids="T1,T2"):
+        """run_all over two jobs: (exit code, records written, stderr)."""
+        original = runner.has_api_key
+        runner.has_api_key = lambda: True  # the fake needs no key; none is set
+        self.addCleanup(setattr, runner, "has_api_key", original)
+        self.steer(mode)
+        results = os.path.join(self.tmp, f"{name}.jsonl")
+        args = runner.parse_args(["--spend", "--tasks", task_ids, "--arms", "taria", "--results", results])
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = runner.run_all(args)
+        with open(results) as f:
+            records = [json.loads(line) for line in f]
+        return code, records, err.getvalue()
 
     def fake_log(self):
         with open(self.log) as f:
@@ -371,14 +535,41 @@ class FakeClaude(unittest.TestCase):
         self.assertRegex(record["git_sha"] or "", r"^[0-9a-f]{40}$")
         self.assertIn(record["git_dirty"], (True, False))
         self.assertEqual((record["model"], record["effort"]), (runner.DEFAULT_MODEL, "medium"))
+        self.assertEqual((record["timeout_s"], record["budget_usd"], record["max_turns"]),
+                         (20.0, runner.DEFAULT_BUDGET_USD, None))
         # What the agent was started with.
         seen = self.fake_log()
         self.assertEqual(seen["pid"], seen["pgid"], "the agent leads its own process group")
         self.assertTrue(seen["cwd"].endswith("/work"))
         self.assertIn("--setting-sources=", seen["argv"])
         self.assertEqual(seen["argv"][seen["argv"].index("--effort") + 1], "medium")
-        self.assertEqual(seen["env_claude"], [], "session markers reached the agent")
-        self.assertIn("CLAUDECODE", record["env_stripped"])
+        self.assertNotIn("--max-turns", seen["argv"])
+
+    def test_the_agent_gets_only_the_allowlisted_environment(self):
+        record, _ = self.spend("success")
+        seen = set(self.fake_log()["env"])
+        allowed = runner.ENV_ALLOW | set(runner.HARNESS_ENV)
+        self.assertLessEqual(seen, allowed, f"reached the agent: {sorted(seen - allowed)}")
+        self.assertIn("PATH", seen)
+        dropped = record["env_dropped"]
+        for name in ("CLAUDECODE", "CLAUDE_CODE_FAKE_MARKER", "BENCH_SECRET_MARKER"):
+            self.assertIn(name, dropped)
+        self.assertEqual(sorted(seen | set(dropped)), sorted(os.environ), "a name went unaccounted for")
+        self.assertNotIn(self.SECRET, json.dumps(record), "a dropped value was recorded")
+
+    def test_limits_are_recorded_and_passed(self):
+        record, _ = self.spend("success", argv=("--max-turns", "7", "--budget-usd", "0.5"))
+        self.assertEqual((record["timeout_s"], record["budget_usd"], record["max_turns"]), (20.0, 0.5, 7))
+        argv = self.fake_log()["argv"]
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "7")
+        self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "0.5")
+        # And the summary never pools runs held to different limits.
+        other, _ = self.spend("success", argv=("--budget-usd", "0.5"))
+        table = summarize.table([record, other])
+        rows = [line for line in table.splitlines() if line.startswith("| T1 | taria |")]
+        self.assertEqual(len(rows), 2, table)
+        self.assertTrue(any("| 20s, $0.5, 7 turns |" in r for r in rows), rows)
+        self.assertTrue(any("| 20s, $0.5, no turn cap |" in r for r in rows), rows)
 
     def test_an_unsolved_run_fails_on_the_dump(self):
         record, _ = self.spend("success", argv=("--effort", "low"))
@@ -394,6 +585,7 @@ class FakeClaude(unittest.TestCase):
         record, elapsed = self.spend("hang", timeout=2)
         self.assertEqual(record["status"], "timeout")
         self.assertIs(record["passed"], False)
+        self.assertIs(record["check_passed"], False)  # graded all the same
         self.assertIsNone(record["error"])
         self.assertTrue(record["timed_out"])
         self.assertEqual(record["usage_source"], "stream")
@@ -433,37 +625,84 @@ class FakeClaude(unittest.TestCase):
         self.assertIn("permission denial", record["error"])
         self.assertIn("mcp__tui__act", record["error"])
         self.assertEqual(record["permission_denials"], 1)
+        self.assertEqual(record["cost_usd"], 0.01, "the denied run's spend is kept")
 
     def test_an_error_result_is_a_harness_error(self):
         record, _ = self.spend("api_error")
         self.assertEqual(record["status"], "harness_error")
         self.assertIn("API Error: 404", record["error"])
 
-    def test_a_budget_stop_is_graded_and_counted_apart(self):
+    def test_a_budget_stop_fails_with_its_dump_graded(self):
         record, _ = self.spend("budget", arm="tmux", solve=True)
         self.assertEqual(record["status"], "budget")
-        self.assertIs(record["passed"], True)
+        self.assertIs(record["passed"], False, "a cut-off run never passes")
+        self.assertIs(record["check_passed"], True, "the dump is still graded")
+        self.assertIsNone(record["error"])
         self.assertEqual(record["cost_usd"], 1.03)
         record, _ = self.spend("budget")
         self.assertEqual(record["status"], "budget")
+        self.assertIs(record["check_passed"], False)
+
+    def test_a_max_turns_stop_fails_with_its_dump_graded(self):
+        """error_max_turns carries is_error, as the budget stop does; it is the
+        agent hitting a limit, not a harness error."""
+        record, _ = self.spend("max_turns", arm="tmux", solve=True, argv=("--max-turns", "3"))
+        self.assertEqual(record["status"], "max_turns", record.get("error"))
         self.assertIs(record["passed"], False)
+        self.assertIs(record["check_passed"], True)
+        self.assertIsNone(record["error"])
+        self.assertEqual((record["result_subtype"], record["max_turns"], record["cost_usd"]),
+                         ("error_max_turns", 3, 0.2))
+        unsolved, _ = self.spend("max_turns", arm="tmux", argv=("--max-turns", "3"))
+        self.assertEqual((unsolved["status"], unsolved["check_passed"]), ("max_turns", False))
+        line = next(l for l in summarize.table([record, unsolved]).splitlines() if l.startswith("| T1 |"))
+        col = dict(zip(summarize.COLUMNS, (c.strip() for c in line.strip("|").split("|"))))
+        self.assertEqual((col["passed"], col["max turns"]), ("0/2", "2"))
+        self.assertEqual(col["cut off"], "2 (1 with correct state)")
+
+    def test_a_grade_or_quit_failure_keeps_the_runs_cost(self):
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("grading fell over")
+
+        for target, attr in ((runner, "grade"), (runner.DemoRun, "quit")):
+            with self.subTest(failing=attr):
+                original = getattr(target, attr)
+                setattr(target, attr, broken)
+                try:
+                    record, _ = self.spend("success")
+                finally:
+                    setattr(target, attr, original)
+                self.assertEqual(record["status"], "harness_error")
+                self.assertIsNone(record["passed"])
+                self.assertIn("RuntimeError: grading fell over", record["error"])
+                self.assertEqual(record["cost_usd"], 0.01)
+                self.assertEqual(record["usage"], {"input": 12, "output": 34, "cache_read": 100,
+                                                   "cache_creation": 1000})
+                self.assertEqual(record["result_subtype"], "success")
+                self.assertIn("tool_calls_total", record)
 
     def test_a_guard_failure_stops_the_batch_with_its_record_written(self):
-        original = runner.has_api_key
-        runner.has_api_key = lambda: True  # the fake needs no key; none is set
-        self.addCleanup(setattr, runner, "has_api_key", original)
-        os.environ["FAKE_CLAUDE_MODE"] = "plugins"
-        results = os.path.join(self.tmp, "guard.jsonl")
-        args = runner.parse_args(["--spend", "--tasks", "T1,T2", "--arms", "taria", "--results", results])
-        err = io.StringIO()
-        with redirect_stdout(io.StringIO()), redirect_stderr(err):
-            code = runner.run_all(args)
+        code, records, err = self.spend_batch("plugins", "guard")
         self.assertEqual(code, runner.EXIT_HARNESS)
-        with open(results) as f:
-            records = [json.loads(line) for line in f]
         self.assertEqual(len(records), 1, "the batch went on after the guard fired")
         self.assertTrue(records[0]["guard_failed"])
-        self.assertIn("1 run(s) not started", err.getvalue())
+        self.assertIn("at its init event", err)
+        self.assertIn("1 run(s) not started", err)
+
+    def test_a_permission_denial_stops_the_batch(self):
+        """A misconfigured --allowedTools would refuse every run alike: one paid
+        run says so, the rest are never started."""
+        code, records, err = self.spend_batch("denied", "denied")
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertEqual(len(records), 1, "the batch went on after a permission denial")
+        self.assertEqual(records[0]["permission_denials"], 1)
+        self.assertIn("--allowedTools", err)
+        self.assertIn("1 run(s) not started", err)
+
+    def test_a_cut_off_batch_runs_to_the_end(self):
+        code, records, _ = self.spend_batch("max_turns", "turns")
+        self.assertEqual(code, runner.EXIT_FAILED)
+        self.assertEqual([r["status"] for r in records], ["max_turns", "max_turns"])
 
     def test_spend_without_a_key_exits_2(self):
         env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
@@ -517,45 +756,103 @@ class Summary(unittest.TestCase):
         # Symmetric in the arms.
         self.assertAlmostEqual(summarize.fisher_exact(7, 3, 2, 8), summarize.fisher_exact(2, 8, 7, 3))
 
-    def test_outcomes_counted_and_timeouts_fail(self):
+    @staticmethod
+    def columns(out, prefix="| T1 |"):
+        line = next(l for l in out.splitlines() if l.startswith(prefix))
+        return dict(zip(summarize.COLUMNS, (c.strip() for c in line.strip("|").split("|"))))
+
+    def test_outcomes_counted_and_every_cut_off_fails(self):
         records = [
-            self.rec("passed", True),
-            self.rec("failed", False),
-            self.rec("timeout", False, cost_usd=None, result_subtype=None, tokens_in=None, tokens_out=None),
-            self.rec("budget", True, cost_usd=1.0, result_subtype="error_max_budget_usd"),
+            self.rec("passed", True, check_passed=True, demo_alive=True),
+            self.rec("failed", False, check_passed=False, demo_alive=True),
+            self.rec("timeout", False, check_passed=False, demo_alive=True, cost_usd=None,
+                     result_subtype=None, tokens_in=None, tokens_out=None, turns=None),
+            self.rec("budget", False, check_passed=True, demo_alive=True, cost_usd=1.0,
+                     result_subtype="error_max_budget_usd"),
+            self.rec("max_turns", False, check_passed=True, demo_alive=False,
+                     result_subtype="error_max_turns"),
             self.rec("harness_error", None, cost_usd=0.2, result_subtype="success"),
         ]
         out = summarize.table(records)
-        line = next(l for l in out.splitlines() if l.startswith("| T1 |"))
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        col = dict(zip(summarize.COLUMNS, cells))
-        self.assertEqual(col["runs"], "5")
-        self.assertEqual(col["passed"], "2/4")  # the timeout is a graded failure
-        self.assertEqual((col["failed"], col["timeout"], col["budget"], col["harness err"]), ("1", "1", "1", "1"))
-        self.assertTrue(col["pass rate (95% CI)"].startswith("50%"))
-        self.assertEqual(col["cost $ (sum)"], "1.20*")
-        self.assertEqual(col["$ per pass"], "0.600*")
-        self.assertEqual(col["result subtypes"], "error_max_budget_usd 1, none 1, success 3")
+        col = self.columns(out)
+        self.assertEqual(col["runs"], "6")
+        self.assertEqual(col["passed"], "1/5")  # every cut-off run is a graded failure
+        self.assertEqual(
+            (col["failed"], col["timeout"], col["budget"], col["max turns"], col["harness err"]),
+            ("1", "1", "1", "1", "1"),
+        )
+        # The budget run had the right state; the max-turns run's demo had died.
+        self.assertEqual(col["cut off"], "3 (1 with correct state)")
+        self.assertTrue(col["pass rate (95% CI)"].startswith("20%"))
+        self.assertEqual(col["cost $ (sum)"], "1.30*")
+        self.assertEqual(col["$ per pass"], "1.300*")
+        self.assertEqual(col["result subtypes"],
+                         "error_max_budget_usd 1, error_max_turns 1, none 1, success 3")
         self.assertIn("cost unknown for 1 graded run(s)", out)
         self.assertIn("tokens unknown for 1 graded run(s)", out)
+        self.assertIn("turns unknown for 1 graded run(s), 1 of them timeouts", out)
         self.assertIn("Harness-error runs cost $0.20", out)
+        self.assertIn("fails whatever its dump says", out)
+
+    def test_cost_per_pass_with_no_passes(self):
+        col = self.columns(summarize.table([self.rec("failed", False)] * 2))
+        self.assertEqual((col["cost $ (sum)"], col["$ per pass"]), ("0.20", "n/a (0 passes)"))
+        col = self.columns(summarize.table([self.rec("failed", False, cost_usd=None)]))
+        self.assertEqual(col["$ per pass"], "-")
+
+    def test_an_unpriced_harness_error_is_said(self):
+        out = summarize.table([self.rec("harness_error", None, cost_usd=None, guard_failed=True)])
+        self.assertIn("1 harness-error agent run(s) ended before a result event", out)
 
     def test_rows_split_by_model_and_effort_and_arms_are_compared(self):
         records = [self.rec("passed", True)] * 6 + [self.rec("failed", False, arm="tmux")] * 6
         records += [self.rec("passed", True, effort="high")]
         out = summarize.table(records)
         self.assertEqual(sum(1 for l in out.splitlines() if l.startswith("| T1 | taria |")), 2)
-        self.assertIn("| T1 | m | medium | 6/6 | 0/6 | 0.002 |", out)
-        self.assertIn("n < 5 graded runs in T1/taria", out)  # the effort=high row has n=1
+        self.assertIn("| T1 | m | medium | - | 6/6 | 0/6 | 0.002 |", out)
+        self.assertIn("n < 5 graded runs in T1/taria [m, high]", out)  # n=1 there
+
+    def test_rows_and_comparisons_split_by_limits(self):
+        lim = {"timeout_s": 600.0, "budget_usd": 1.0, "max_turns": None}
+        tight = {**lim, "max_turns": 10}
+        records = [self.rec("passed", True, **lim)] * 5 + [self.rec("failed", False, arm="tmux", **lim)] * 5
+        records += [self.rec("failed", False, **tight)] * 5 + [self.rec("passed", True, arm="tmux", **tight)] * 5
+        records += [self.rec("passed", True, **{**lim, "budget_usd": 2.0})]
+        records += [self.rec("passed", True, **{**lim, "timeout_s": 300.0})]
+        out = summarize.table(records)
+        taria = [l for l in out.splitlines() if l.startswith("| T1 | taria |")]
+        self.assertEqual(len(taria), 4, out)
+        self.assertEqual(sorted(self.columns(l, "|")["limits"] for l in taria),
+                         ["300s, $1, no turn cap", "600s, $1, 10 turns", "600s, $1, no turn cap",
+                          "600s, $2, no turn cap"])
+        self.assertIn("| T1 | m | medium | 600s, $1, no turn cap | 5/5 | 0/5 | 0.008 |", out)
+        self.assertIn("| T1 | m | medium | 600s, $1, 10 turns | 0/5 | 5/5 | 0.008 |", out)
+        self.assertIn("T1/taria [m, medium, 600s, $2, no turn cap]", out)  # n < 5
+
+    def test_provenance_names_the_limits(self):
+        records = [
+            self.rec("passed", True, timeout_s=600.0, budget_usd=1.0, max_turns=None),
+            self.rec("passed", True, batch="b2", timeout_s=300.0, budget_usd=0.5, max_turns=20),
+            self.rec("passed", True, batch="old"),  # from before limits were recorded
+        ]
+        lines = summarize.provenance(records)
+        row = lambda b: next(l for l in lines if l.startswith(f"| {b} |"))  # noqa: E731
+        self.assertIn("| 600 | 1 | none |", row("b1"))
+        self.assertIn("| 300 | 0.5 | 20 |", row("b2"))
+        self.assertIn("| unrecorded | unrecorded | unrecorded |", row("old"))
+        self.assertTrue(any("predate recorded limits" in l for l in lines))
+        self.assertIn("timeout s | budget $ | max turns", lines[0])
 
     def test_dry_runs_stay_out_of_the_headline(self):
         dry = {"task": "T1", "arm": "taria", "mode": "dry-run", "solver": "scripted",
-               "status": "passed", "passed": True, "tool_calls_total": 2, "wall_ms": 80, "batch": "b"}
+               "status": "passed", "passed": True, "tool_calls_total": 2, "wall_ms": 80, "batch": "b",
+               "timeout_s": None, "budget_usd": None, "max_turns": None}
         out = summarize.render([dry])
         headline, _, rest = out.partition("## Dry runs")
         self.assertIn("No agent runs", headline)
-        self.assertIn("| T1 | taria | - | - | 1 | 1/1 | 0 | 0 | 0 | 0 |", rest)
+        self.assertIn("| T1 | taria | - | - | - | 1 | 1/1 | 0 | 0 | 0 | 0 | 0 | 0 |", rest)
         self.assertNotIn("cost unknown", rest)
+        self.assertNotIn("turns unknown", rest)
 
     def test_records_are_selected_explicitly(self):
         tmp = tempfile.mkdtemp()

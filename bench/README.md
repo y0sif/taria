@@ -59,8 +59,11 @@ tasks are graded on the state dump rather than on what either arm saw.
 
 ## Run it
 
-Build first (`cargo build --workspace`); `run.py` never builds and refuses a
-`target/debug` older than the sources. Needs `tmux` and Python 3.
+Build first (`cargo build --workspace`); `run.py` never builds. It refuses a
+missing binary, a `taria-demo` or `taria-mcp` older than any source cargo's
+dep-info file (`target/debug/<bin>.d`) says it is built from, and a last
+build older than a manifest or the lock file, so a freshly rebuilt demo
+cannot hide a stale bridge. Needs `tmux` and Python 3.
 
 ```bash
 python3 bench/run.py --dry-run                        # every task, both arms
@@ -92,36 +95,49 @@ Every run ends in exactly one `status`:
 | `passed` | the check passed and the demo is still running | a pass |
 | `failed` | the check said no, or the demo exited | a failure |
 | `timeout` | the agent ran out of wall clock (`--timeout`) | a failure, counted in its own column |
-| `budget` | the result subtype is `error_max_budget_usd` | graded on the dump like any run, counted in its own column |
+| `budget` | the agent hit `--budget-usd` (result subtype `error_max_budget_usd`) | a failure, counted in its own column |
+| `max_turns` | the agent hit `--max-turns` (result subtype `error_max_turns`) | a failure, counted in its own column |
 | `harness_error` | infrastructure, not the agent | left out, counted in its own column |
+
+The three limits are one rule: an agent that hit any of them did not finish
+on its own, so the run fails, whatever its dump says. The dump is still
+graded and the verdict recorded in `check_passed` (and `demo_alive`), and the
+summary's `cut off` column says, per row, how many cut-off runs had the right
+state when they were stopped, for example `2 (1 with correct state)`.
 
 A harness error is a failed setup, a server crash, the init guard, a stale
 build, an exception in the solver or the harness, claude exiting without a
-result event, a result with `is_error` set other than the budget stop (an
-API or auth error, an unknown `--model`), or any permission denial (the agent
-was refused a tool the arm should have approved). The reason is recorded in
-`error`; the dump's verdict is still recorded in `check_passed` and `reason`
-for diagnosis. A timed-out run keeps what it streamed before it was killed:
-its usage is summed from the assistant messages (`usage_source: "stream"`),
-or is null when none arrived. Its cost is null, since only a result event
-carries cost.
+result event, a result with `is_error` set other than a limit (an API or
+auth error, an unknown `--model`), a stream event the harness cannot read,
+or any permission denial (the agent was refused a tool the arm should have
+approved). The reason is recorded in `error`; the dump's verdict is still
+recorded in `check_passed` and `reason` for diagnosis. An exception while
+grading or quitting the demo still writes the record, with the run's cost,
+usage and tool calls. A timed-out run keeps what it streamed before it was
+killed: its usage is summed from the assistant messages (`usage_source:
+"stream"`), or is null when none arrived. Its cost and turns are null, since
+only a result event carries them.
 
-Exit codes: `0` every run passed; `1` a run did not pass (failed, timeout, or
-a budget run that failed its check); `2` a harness error (including a stale
-or missing build, the guard, SIGTERM or SIGHUP). A harness error wins.
-SIGTERM, SIGHUP and Ctrl-C tear down the run's demo, tmux server and temp dir
-before exiting.
+Exit codes: `0` every run passed; `1` a run did not pass (failed, or cut off
+by a limit); `2` a harness error (including a stale or missing build, the
+guard, SIGTERM or SIGHUP). A harness error wins. SIGTERM, SIGHUP and Ctrl-C
+tear down the run's demo, tmux server and temp dir before exiting.
 
 ## Provenance
 
 Every record carries `batch` (one id per `run.py` invocation, `--batch` to
 name it), `git_sha` and `git_dirty` of the tree, `claude_version` (`claude
---version`, free), the requested `model` and `effort` (null for a dry run),
-and `seed`; a spend record adds the `agent_model` system/init reported. `summarize.py` reads only what it is told
-to (files, `--batch`, `--all`, or else the newest batch, named on stderr),
-prints a provenance table of every batch it read, and warns when agent rows
-pool more than one git SHA or claude version, when records come from a dirty
-tree, or when the agent reported a model other than the one asked for.
+--version`, free), the requested `model` and `effort`, the limits the run
+was held to (`timeout_s`, `budget_usd`, and `max_turns`, null when
+`--max-turns` was not passed; all five are null for a dry run), and `seed`;
+a spend record adds the `agent_model` system/init reported and
+`env_dropped`. That is every flag that changes a run; the rest is the code
+at `git_sha`. `summarize.py` reads only what it is told to (files,
+`--batch`, `--all`, or else the newest batch, named on stderr), prints a
+provenance table of every batch it read (limits included), and warns when
+agent rows pool more than one git SHA or claude version, when records come
+from a dirty tree or from before limits were recorded, or when the agent
+reported a model other than the one asked for.
 
 ## Spend runs
 
@@ -136,33 +152,47 @@ claude -p "<prompt>" --bare --setting-sources= \
   --tools "" --allowedTools mcp__tui --permission-mode dontAsk \
   --disable-slash-commands --output-format stream-json --verbose \
   --no-session-persistence --max-budget-usd <--budget-usd, default 1> \
-  --model <--model, default claude-sonnet-5-5> --effort <--effort, default medium>
+  --model <--model, default claude-sonnet-5-5> --effort <--effort, default medium> \
+  [--max-turns <--max-turns, only when given>]
 ```
 
 with a wall-clock limit (`--timeout`, default 600 s), in its own process
 group: a timeout sends the group SIGTERM, then SIGKILL 5 s later, so a child
 that ignores SIGTERM goes too.
 
-**Isolation.** The child's environment drops `CLAUDECODE` and every
-`CLAUDE_*` variable but `CLAUDE_CONFIG_DIR`. A Claude Code session exports
-these (`CLAUDECODE=1`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_ENTRYPOINT`,
-`CLAUDE_EFFORT`, ...), they mark a child as nested in that session, and some
-steer it: `CLAUDE_CODE_EFFORT_LEVEL` overrides `--effort`. The names dropped
-(never the values) are recorded in `env_stripped`. `--setting-sources=` loads
-no user, project or local settings file, so an `effortLevel: xhigh`, a
-`model`, an `outputStyle` or `enabledPlugins` in `~/.claude/settings.json`
-does not apply; managed (policy) settings still would. `--effort` is always
-passed, so the effort is the flag's, not a default's.
+**Isolation.** The child's environment is an allowlist: `PATH`, `HOME`,
+`USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `TMPDIR`, `SHELL` and
+`ANTHROPIC_API_KEY`, plus whatever the harness sets itself (`HARNESS_ENV` in
+`run.py`, empty today). Everything else is dropped and its name (never its
+value) recorded in `env_dropped`: a Claude Code session's markers
+(`CLAUDECODE=1`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_EFFORT`, ...), which mark
+a child as nested in that session, and anything that would steer the agent
+(`CLAUDE_CODE_EFFORT_LEVEL` overrides `--effort`; `ANTHROPIC_MODEL`,
+`ANTHROPIC_BASE_URL`, `NODE_OPTIONS`, `CLAUDE_CONFIG_DIR`). A proxy or CA
+variable (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`) is dropped too; a network
+that needs one needs it added to `ENV_ALLOW`, or every run ends in an API
+error. `claude --version` runs under the same environment.
+`--setting-sources=` loads no user, project or local settings file, so an
+`effortLevel: xhigh`, a `model`, an `outputStyle` or `enabledPlugins` in
+`~/.claude/settings.json` does not apply; managed (policy) settings still
+would. `--effort` is always passed, so the effort is the flag's, not a
+default's.
 
-**The init guard.** Before the agent's first turn, the `system/init` event
-must show exactly the arm's `mcp__tui__*` tools, no plugins, no skills, one
-MCP server (`tui`, `connected`), permission mode `dontAsk`, and the default
-output style (or none). Anything else records a harness error with the
-reasons, kills the agent at once, and stops the batch with exit 2. The init's
-`model`, `tools`, `mcp_servers`, `plugins`, `skills`, `output_style`,
-`permissionMode`, `claude_code_version`, `apiKeySource`, `plugin_errors`,
-`mcp_server_errors` and `memory_paths` are recorded in `agent_env` on every
-spend record.
+**The init guard.** The `system/init` event must show exactly the arm's
+`mcp__tui__*` tools, no plugins, no skills, one MCP server (`tui`,
+`connected`), permission mode `dontAsk`, and the default output style (or
+none). Anything else records a harness error with the reasons, kills the
+agent at that event, and stops the batch with exit 2. Init and the agent's
+first model request can overlap, so the stopped run may already have spent;
+it ends before any result event, so that spend is not known, and the summary
+counts such runs. The init's `model`, `tools`, `mcp_servers`, `plugins`,
+`skills`, `output_style`, `permissionMode`, `claude_code_version`,
+`apiKeySource`, `plugin_errors`, `mcp_server_errors` and `memory_paths` are
+recorded in `agent_env` on every spend record.
+
+**Permission denials.** A result carrying any permission denial is a harness
+error and stops the batch too: a misconfigured `--allowedTools` refuses
+every run alike, so one paid run is enough to say so. Its cost is recorded.
 
 From the stream it records the `result` subtype, `num_turns`, `duration_ms`,
 `duration_api_ms`, `total_cost_usd`, tokens (`input_tokens`,
@@ -174,26 +204,36 @@ and permission denials, then grades the dump.
 
 Verified free:
 
-- Every flag above exists in `claude --help` (2.1.294); `--effort` takes
+- Every flag above exists in `claude --help` (2.1.294) but `--max-turns`,
+  which that version hides from `--help` and still parses (`--max-turns
+  <turns>`, "only works with --print", in the binary); `--effort` takes
   low, medium, high, xhigh or max; `dontAsk` is a `--permission-mode` choice.
 - In the 2.1.294 binary, `--setting-sources` with an empty value parses to
   an empty source list (the same path `--restricted` takes), leaving only
   flag and policy settings; `CLAUDE_CODE_EFFORT_LEVEL` overrides effort for
-  the session; `error_max_budget_usd` results carry `is_error: true`; init
+  the session; `error_max_budget_usd` and `error_max_turns` results carry
+  `is_error: true`, the latter with `Reached maximum number of turns (N)`
+  in `errors`; init
   reports `permissionMode: "dontAsk"` for that mode and lists `plugins`,
   `skills` and `output_style`.
-- The process handling, the guard, the outcome mapping, the env stripping
-  and the provenance, against a fake `claude` on PATH
-  (`bench/fixtures/fake_claude.py`, driven by `bench/test_bench.py`):
-  success, a solved run, timeout with a SIGTERM-ignoring child, no result,
-  an extra tool, a plugin, a permission denial, an error result, the budget
-  stop, a guard stopping the batch, and `--spend` without a key.
+- `claude --version` runs under the allowlisted environment.
+- The process handling, the guard, the outcome mapping, the env allowlist,
+  the limits and the provenance, against a fake `claude` on PATH
+  (`bench/fixtures/fake_claude.py`, driven by `bench/test_bench.py`, steered
+  through a file since no test variable reaches it): success, a solved run,
+  timeout with a SIGTERM-ignoring child, no result, an extra tool, a plugin,
+  a permission denial, an error result, the budget and max-turns stops
+  graded with `check_passed`, the limits recorded and splitting rows, the
+  agent's environment against the allowlist, a grading or quit exception
+  keeping the run's cost, the guard and a permission denial each stopping
+  the batch, and `--spend` without a key.
 
 Not verifiable without a paid call:
 
 - That the real init event reports the `tui` server `connected` and its
-  tools before the first turn, rather than still pending. If it does not,
-  the guard aborts the batch before any model call.
+  tools, rather than still pending. If it does not, the guard stops the
+  batch at that init event, with the stopped run's spend unknown (see the
+  init guard above).
 - That `--effort medium` is the effort the model ran at: init does not
   report effort, and Claude Code may lower a level a model does not offer.
 - That `--bare` with `--setting-sources=` loads no plugin or skill in
@@ -201,18 +241,23 @@ Not verifiable without a paid call:
 - The real stream's exact usage fields per assistant message, which the
   partial-usage recovery for timeouts relies on.
 
-`summarize.py` prints one markdown row per (task, arm, model, effort): runs,
-passed of graded, failed, timeout, budget, harness errors, pass rate with a
-Wilson 95% interval over the graded runs, medians and IQRs of input+cache
-tokens, output tokens, tool calls, turns and wall time, summed cost, cost per
-passed run, and the result subtypes seen. Below each table, per task, a
-two-sided Fisher exact test on pass counts between the arms, and a note when
-a row has fewer than 5 graded runs, where the IQR and the test are weak. A
-cost sum that leaves out runs without a known cost is marked `*` and
-explained, and runs whose tokens could not be recovered are counted in a note
-rather than silently dropped from the medians. Agent runs make the headline table; dry runs get their own,
-labelled, and never feed a headline number. CI never runs the benchmark in
-either mode.
+`summarize.py` prints one markdown row per (task, arm, model, effort,
+limits), so runs held to a different `timeout_s`, `budget_usd` or
+`max_turns` are never pooled: runs, passed of graded, failed, timeout,
+budget, max turns, `cut off` (how many of those had the right state when
+stopped), harness errors, pass rate with a Wilson 95% interval over the
+graded runs, medians and IQRs of input+cache tokens, output tokens, tool
+calls, turns and wall time, summed cost, cost per passed run (`n/a (0
+passes)` when a row spent but never passed), and the result subtypes seen.
+Below each table, per task and limits, a two-sided Fisher exact test on pass
+counts between the arms, and a note when a row has fewer than 5 graded runs,
+where the IQR and the test are weak. A cost sum that leaves out runs without
+a known cost is marked `*` and explained; runs whose tokens or turns could
+not be recovered (a timeout has no result event, so no `num_turns`) are
+counted in a note rather than silently dropped from the medians; harness-error
+runs' cost, and how many of them have none known, are noted under the table.
+Agent runs make the headline table; dry runs get their own, labelled, and
+never feed a headline number. CI never runs the benchmark in either mode.
 
 ## Tasks
 

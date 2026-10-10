@@ -3,25 +3,30 @@
 
 Never calls a model or the network. The test puts a symlink named `claude`
 to this file first on PATH, so run.py's spend path runs against it exactly as
-it would against the real CLI: same argv, same process group, same stream.
+it would against the real CLI: same argv, same process group, same stream,
+same environment.
 
-FAKE_CLAUDE_MODE picks the behaviour:
+run.py hands the agent an allowlisted environment, so the test steers the
+fake through `fake_claude.json` beside the symlink, not through variables:
 
-  success     init, an assistant message, a success result
-  hang        init, a streamed assistant message (no result), then ignore
-              SIGTERM, spawn a child that ignores it too, and sleep
-  noresult    init, an assistant message, then exit 3 with a stderr line
-  extra_tool  init listing a built-in tool beside the arm's, then sleep
-  plugins     init listing a plugin, then sleep
-  denied      a success result carrying a permission denial
-  api_error   a result with is_error set, as an API error reports it
-  budget      a result with subtype error_max_budget_usd
-
-FAKE_CLAUDE_SOLVE=1 first solves FAKE_CLAUDE_TASK (default T1) through the
-MCP server named in --mcp-config, spawned the way claude spawns it, with the
-scripted solver, and reports each call as a tool_use block.
-FAKE_CLAUDE_LOG names a file that gets the argv, cwd, pids and the names of
-the CLAUDE* environment variables this process saw.
+  mode   the behaviour (default success):
+           success     init, an assistant message, a success result
+           hang        init, a streamed assistant message (no result), then
+                       ignore SIGTERM, spawn a child that ignores it too, and
+                       sleep
+           noresult    init, an assistant message, then exit 3 with a stderr
+                       line
+           extra_tool  init listing a built-in tool beside the arm's, then sleep
+           plugins     init listing a plugin, then sleep
+           denied      a success result carrying a permission denial
+           api_error   a result with is_error set, as an API error reports it
+           budget      a result with subtype error_max_budget_usd
+           max_turns   a result with subtype error_max_turns
+  solve  true: first solve `task` (default T1) through the MCP server named
+         in --mcp-config, spawned the way claude spawns it, with the scripted
+         solver, and report each call as a tool_use block
+  log    a file that gets the argv, cwd, pids and the names of every
+         environment variable this process saw
 """
 
 import json
@@ -33,6 +38,16 @@ import time
 
 BENCH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 TOOLS = {"taria": ["read_tree", "act", "key", "type_text"], "tmux": ["screen", "send_keys"]}
+# Beside the symlink the test put on PATH (argv[0]), not beside this file.
+CONTROL = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "fake_claude.json")
+
+
+def control():
+    try:
+        with open(CONTROL) as f:
+            return json.load(f)
+    except OSError:
+        return {}
 
 
 def emit(event):
@@ -46,7 +61,7 @@ def flag(name, default=None):
 
 
 def log(extra=None):
-    path = os.environ.get("FAKE_CLAUDE_LOG")
+    path = control().get("log")
     if not path:
         return
     data = {
@@ -54,7 +69,7 @@ def log(extra=None):
         "cwd": os.getcwd(),
         "pid": os.getpid(),
         "pgid": os.getpgid(0),
-        "env_claude": sorted(k for k in os.environ if k == "CLAUDECODE" or k.startswith("CLAUDE_")),
+        "env": sorted(os.environ),
         **(extra or {}),
     }
     with open(path, "w") as f:
@@ -68,7 +83,7 @@ def usage(input_tokens, output_tokens):
     }
 
 
-def solve_task(entry, arm):
+def solve_task(entry, arm, task):
     sys.path.insert(0, BENCH)
     from harness import McpStdio, wait_ready
     from solvers import CountingSession, solve
@@ -78,7 +93,7 @@ def solve_task(entry, arm):
         client.initialize()
         wait_ready(arm, client)
         session = CountingSession(client)
-        solve(os.environ.get("FAKE_CLAUDE_TASK", "T1"), arm, session)
+        solve(task, arm, session)
     finally:
         client.close()
     return session.calls
@@ -88,7 +103,8 @@ def main():
     if sys.argv[1:] == ["--version"]:
         print("0.0.0 (fake claude)")
         return 0
-    mode = os.environ.get("FAKE_CLAUDE_MODE", "success")
+    ctl = control()
+    mode = ctl.get("mode", "success")
     log()
     with open(flag("--mcp-config")) as f:
         entry = json.load(f)["mcpServers"]["tui"]
@@ -108,8 +124,8 @@ def main():
         time.sleep(30)  # the guard must stop this, not wait it out
         return 0
     calls = {}
-    if os.environ.get("FAKE_CLAUDE_SOLVE") == "1":
-        calls = solve_task(entry, arm)
+    if ctl.get("solve"):
+        calls = solve_task(entry, arm, ctl.get("task", "T1"))
     blocks = [
         {"type": "tool_use", "id": f"{name}-{i}", "name": f"mcp__tui__{name}", "input": {}}
         for name, count in calls.items() for i in range(count)
@@ -144,6 +160,11 @@ def main():
     elif mode == "budget":
         result.update(subtype="error_max_budget_usd", is_error=True, total_cost_usd=1.03,
                       errors=["Reached maximum budget ($1)"])
+    elif mode == "max_turns":
+        # As the 2.1.294 binary builds it: is_error set, the cap in `errors`.
+        result.update(subtype="error_max_turns", is_error=True, total_cost_usd=0.2,
+                      num_turns=int(flag("--max-turns", "0")),
+                      errors=[f"Reached maximum number of turns ({flag('--max-turns')})"])
     emit(result)
     return 0
 

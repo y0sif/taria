@@ -24,27 +24,41 @@ Every run ends in exactly one status:
 
   passed         the check passed and the demo is still running
   failed         the check said no, or the demo exited
-  timeout        the agent ran out of wall clock; a failure in the pass rate
-  budget         the agent hit --max-budget-usd; graded on the dump like
-                 any run, and counted apart
+  timeout        the agent ran out of wall clock (--timeout)
+  budget         the agent hit --max-budget-usd (result error_max_budget_usd)
+  max_turns      the agent hit --max-turns (result error_max_turns)
   harness_error  infrastructure, not the agent: a failed setup, a server
                  crash, the tool guard, a solver or harness exception, an
                  API or auth error, a permission denial, claude exiting
                  without a result. Out of the pass rate, counted per row.
 
+The three limits are one rule: an agent that hit any of them did not finish
+on its own, so the run is a failure in the pass rate, counted in its own
+column. Its dump is still graded and `check_passed` recorded, so the summary
+can say how many cut-off runs had the right state when they were stopped.
+
 Jobs (task x arm x run) are shuffled with --seed, so neither arm always runs
 first or warm. Every record carries the batch id, git SHA and dirty flag,
-`claude --version`, the model and effort, so summarize.py never has to guess
-what produced it.
+`claude --version`, the seed, the model, effort and limits it ran under
+(`timeout_s`, `budget_usd`, `max_turns`; null where not passed or for a dry
+run), and the names of the environment variables the agent was not given.
+That is every flag that changes a run; everything else is the code at that
+SHA (the dirty flag says when it is not), so summarize.py never has to guess
+what produced a record.
 
-Exit codes: 0 every run passed; 1 a run did not pass (failed, timeout, or a
-budget run that failed its check); 2 a harness error (including a stale or
-missing build, the guard, a signal), which wins over 1.
+The batch stops at once on the tool guard or a permission denial: both mean
+the agent is not set up as the arm requires, so every later run would be a
+harness error too, and paid for.
+
+Exit codes: 0 every run passed; 1 a run did not pass (failed, or cut off by
+a limit); 2 a harness error (including a stale or missing build, the guard,
+a signal), which wins over 1.
 
 Python 3 stdlib only. Never builds.
 
 Usage:  python3 bench/run.py --dry-run [--tasks T1,T3] [--arms taria,tmux] [--runs N] [--sabotage]
         python3 bench/run.py --spend   [--tasks ...] [--arms ...] [--runs N] [--model M] [--effort E]
+                                       [--timeout S] [--budget-usd D] [--max-turns N]
 """
 
 import argparse
@@ -92,18 +106,25 @@ DEFAULT_TIMEOUT_S = 600
 # nobody could answer. Pinned so a defaultMode in some settings file cannot
 # change it, and checked against system/init by the guard.
 PERMISSION_MODE = "dontAsk"
-BUDGET_SUBTYPE = "error_max_budget_usd"
-# Environment variables Claude Code sets in a session (CLAUDECODE, CLAUDE_PID,
-# CLAUDE_EFFORT, CLAUDE_CODE_SESSION_ID, CLAUDE_CODE_ENTRYPOINT, ...) mark a
-# child as nested in that session, and some change it: CLAUDE_CODE_EFFORT_LEVEL
-# overrides --effort. None of them reach the agent. CLAUDE_CONFIG_DIR is kept:
-# it says where Claude Code's own files live, not how the run behaves.
-ENV_KEEP = frozenset({"CLAUDE_CONFIG_DIR"})
+# Result subtypes that mean a limit stopped the agent (both carry is_error in
+# the 2.1.294 binary), and the status each run gets.
+CUTOFF_SUBTYPES = {"error_max_budget_usd": "budget", "error_max_turns": "max_turns"}
+# The agent's environment is an allowlist: only these reach it, plus
+# HARNESS_ENV. Anything else a shell exports can steer Claude Code (Claude
+# Code's own session markers, CLAUDE_CODE_EFFORT_LEVEL overriding --effort,
+# ANTHROPIC_MODEL, ANTHROPIC_BASE_URL, NODE_OPTIONS, a proxy), so it is
+# dropped and its name, never its value, is recorded.
+ENV_ALLOW = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+    "TMPDIR", "SHELL", "ANTHROPIC_API_KEY",
+})
+HARNESS_ENV = {}  # what the harness sets on the agent itself; nothing today
 
 KILL_GRACE_S = 5.0  # SIGTERM to SIGKILL, for the agent's process group
 RESULT_GRACE_S = 10.0  # how long claude may take to exit after its result
 
-STATUSES = ("passed", "failed", "timeout", "budget", "harness_error")
+CUTOFFS = ("timeout", "budget", "max_turns")
+STATUSES = ("passed", "failed", *CUTOFFS, "harness_error")
 EXIT_PASSED, EXIT_FAILED, EXIT_HARNESS = 0, 1, 2
 
 
@@ -211,14 +232,16 @@ def dry_run(task, arm, run, config, sabotage):
 # --- Spend run ---------------------------------------------------------------------
 
 
-def spend_command(prompt, config_path, budget_usd, model, effort=DEFAULT_EFFORT):
+def spend_command(prompt, config_path, budget_usd, model, effort=DEFAULT_EFFORT, max_turns=None):
     """The agent's command line. Every flag checked against `claude --help`
-    (2.1.294); what each one does that a free check cannot show is listed in
-    bench/README.md.
+    (2.1.294), but --max-turns, which that version hides from --help and the
+    binary still parses; what each one does that a free check cannot show is
+    listed in bench/README.md.
 
     The prompt goes straight after -p, before the variadic options
     (--mcp-config, --tools, --allowedTools), so none of them can swallow it.
     """
+    turns = [] if max_turns is None else ["--max-turns", str(max_turns)]
     return [
         "claude", "-p", prompt,
         "--bare",  # no hooks, plugin sync, auto-memory or CLAUDE.md discovery
@@ -237,21 +260,18 @@ def spend_command(prompt, config_path, budget_usd, model, effort=DEFAULT_EFFORT)
         "--max-budget-usd", f"{budget_usd:g}",
         "--model", model,
         "--effort", effort,
+        *turns,
     ]
 
 
 def spend_env():
-    """The agent's environment: this one, minus Claude Code's session markers.
+    """The agent's environment: ENV_ALLOW from this one, plus HARNESS_ENV.
 
-    Returns (env, the names stripped). Values are never recorded.
+    Returns (env, the names dropped). Values are never recorded.
     """
-    env, stripped = {}, []
-    for key, value in os.environ.items():
-        if key not in ENV_KEEP and (key == "CLAUDECODE" or key.startswith("CLAUDE_")):
-            stripped.append(key)
-        else:
-            env[key] = value
-    return env, sorted(stripped)
+    env = {k: v for k, v in os.environ.items() if k in ENV_ALLOW}
+    env.update(HARNESS_ENV)
+    return env, sorted(k for k in os.environ if k not in env)
 
 
 # What system/init reports that bears on the measurement, recorded per run.
@@ -309,8 +329,10 @@ class StreamStats:
     """What a `claude -p --output-format stream-json` run did, event by event.
 
     The guard lives here: the first event must be system/init, and it must
-    pass guard_problems, or GuardError stops the run before the agent's first
-    turn is spent. Usage is kept twice: from the result event, which sums the
+    pass guard_problems, or GuardError stops the run at that event. The init
+    event and the first model request can overlap, so a stopped run may
+    already have spent; it ends before any result event, so that spend is
+    not known. Usage is kept twice: from the result event, which sums the
     session, and per assistant message as it streams, which is all a run cut
     off before its result leaves behind.
     """
@@ -328,7 +350,10 @@ class StreamStats:
         kind = event.get("type")
         if kind == "system" and event.get("subtype") == "init":
             self.init = event
-            problems = guard_problems(event, self.arm, self.permission_mode)
+            try:
+                problems = guard_problems(event, self.arm, self.permission_mode)
+            except Exception as err:  # noqa: BLE001 - an init the guard cannot read is not vetted
+                raise GuardError(f"could not vet system/init: {type(err).__name__}: {err}")
             if problems:
                 raise GuardError("; ".join(problems))
             return
@@ -442,15 +467,17 @@ def _result_problem(result):
             f"{len(denials)} permission denial(s) for {names}: the agent was refused "
             "a tool the arm should have approved"
         )
-    if result.get("is_error") and result.get("subtype") != BUDGET_SUBTYPE:
+    if result.get("is_error") and result.get("subtype") not in CUTOFF_SUBTYPES:
         detail = result.get("result") or result.get("errors") or "(no detail)"
         return f"claude reported an error (subtype {result.get('subtype')}): {str(detail)[:400]}"
     return None
 
 
 def spend_run(task, arm, run, args):
-    cmd = spend_command(task.prompt, run.config_path, args.budget_usd, args.model, args.effort)
-    env, stripped = spend_env()
+    cmd = spend_command(
+        task.prompt, run.config_path, args.budget_usd, args.model, args.effort, args.max_turns
+    )
+    env, dropped = spend_env()
     stats = StreamStats(arm)
     stderr = bytearray()
     started = time.monotonic()
@@ -468,7 +495,7 @@ def spend_run(task, arm, run, args):
 
     drainer = threading.Thread(target=drain, daemon=True)
     drainer.start()
-    timed_out, guard, lingered = False, None, False
+    timed_out, guard, lingered, unreadable = False, None, False, None
     try:
         deadline = started + args.timeout
         fd = proc.stdout.fileno()
@@ -499,6 +526,10 @@ def spend_run(task, arm, run, args):
                     stats.feed(event)
                 except GuardError as err:
                     guard = str(err)
+                except Exception as err:  # noqa: BLE001 - one odd event must not lose the run
+                    # Reading on keeps the result event, and with it the cost.
+                    if unreadable is None:
+                        unreadable = f"{type(err).__name__}: {err} in {line[:200]!r}"
         if not timed_out and guard is None:
             try:
                 proc.wait(timeout=RESULT_GRACE_S)
@@ -526,6 +557,8 @@ def spend_run(task, arm, run, args):
         )
     else:
         harness_error = _result_problem(stats.result)
+    if harness_error is None and unreadable is not None:
+        harness_error = f"a stream event could not be read: {unreadable}"
     return {
         **stats.summary(),
         "wall_ms": wall_ms,
@@ -534,7 +567,7 @@ def spend_run(task, arm, run, args):
         "harness_error": harness_error,
         "lingered": lingered,
         "exit_code": proc.returncode,
-        "env_stripped": stripped,
+        "env_dropped": dropped,
     }
 
 
@@ -552,16 +585,29 @@ def grade(task, run):
 
 
 def classify(outcome, graded):
-    """(status, passed, error) for one run, from what ran and how it graded."""
+    """(status, passed, error) for one run, from what ran and how it graded.
+
+    A run cut off by any limit failed, whatever its dump says: the agent did
+    not finish on its own. Its `check_passed` is still recorded beside it.
+    """
     error = outcome.get("harness_error")
     if error:
         return "harness_error", None, error
     if outcome.get("timed_out"):
         return "timeout", False, None
+    cutoff = CUTOFF_SUBTYPES.get(outcome.get("result_subtype"))
+    if cutoff:
+        return cutoff, False, None
     passed = bool(graded["check_passed"] and graded["demo_alive"])
-    if outcome.get("result_subtype") == BUDGET_SUBTYPE:
-        return "budget", passed, None
     return ("passed" if passed else "failed"), passed, None
+
+
+def limits(args):
+    """The limits a run is held to, recorded on every record: null for a dry
+    run, which has none, and max_turns null when --max-turns was not passed."""
+    if not args.spend:
+        return {"timeout_s": None, "budget_usd": None, "max_turns": None}
+    return {"timeout_s": args.timeout, "budget_usd": args.budget_usd, "max_turns": args.max_turns}
 
 
 def run_one(task, arm, args, run_index, prov=None):
@@ -577,6 +623,7 @@ def run_one(task, arm, args, run_index, prov=None):
         "solver": "agent" if args.spend else ("scripted-sabotage" if args.sabotage else "scripted"),
         "model": args.model if args.spend else None,
         "effort": args.effort if args.spend else None,
+        **limits(args),
     }
     run = None
     try:
@@ -594,11 +641,12 @@ def run_one(task, arm, args, run_index, prov=None):
             outcome = spend_run(task, arm, run, args)
         else:
             outcome = dry_run(task, arm, run, config, args.sabotage)
+        # On the record before grading, so a failure from here on still
+        # leaves the run's cost, usage and tool calls behind.
+        record.update(outcome)
+        record["tool_calls_total"] = sum(outcome["tool_calls"].values())
         graded = grade(task, run)
         status, passed, error = classify(outcome, graded)
-        exited = run.quit() if graded["demo_alive"] else False
-        final = run.read_state()
-        record.update(outcome)
         record.update(
             status=status,
             passed=passed,
@@ -606,12 +654,13 @@ def run_one(task, arm, args, run_index, prov=None):
             reason=graded["reason"],
             error=error,
             demo_alive=graded["demo_alive"],
-            tool_calls_total=sum(outcome["tool_calls"].values()),
-            demo_exit=(
-                "crashed" if not graded["demo_alive"]
-                else "clean" if exited and final.get("quit") else "killed"
-            ),
             state=graded["state"],
+        )
+        exited = run.quit() if graded["demo_alive"] else False
+        final = run.read_state()
+        record["demo_exit"] = (
+            "crashed" if not graded["demo_alive"]
+            else "clean" if exited and final.get("quit") else "killed"
         )
     except Exception as err:  # noqa: BLE001 - anything here is the harness's
         record.update(
@@ -674,6 +723,10 @@ def parse_args(argv=None):
         "--timeout", type=float, default=DEFAULT_TIMEOUT_S,
         help=f"spend only: wall-clock seconds per run (default {DEFAULT_TIMEOUT_S})",
     )
+    parser.add_argument(
+        "--max-turns", type=int,
+        help="spend only: claude --max-turns per run (default: not passed, no turn cap)",
+    )
     parser.add_argument("--batch", help="batch id recorded on every run (default: time plus random)")
     parser.add_argument("--results", help="append to this file (default: bench/results/<batch>.jsonl)")
     args = parser.parse_args(argv)
@@ -683,6 +736,10 @@ def parse_args(argv=None):
         parser.error("--runs must be at least 1")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.budget_usd <= 0:
+        parser.error("--budget-usd must be positive")
+    if args.max_turns is not None and args.max_turns < 1:
+        parser.error("--max-turns must be at least 1")
     args.tasks = list(dict.fromkeys(args.tasks or task_ids))
     args.arms = list(dict.fromkeys(args.arms or arms))
     if args.seed is None:
@@ -701,7 +758,8 @@ def has_api_key():
 
 
 def exit_code(statuses, passes):
-    """2 on any harness error; else 1 if any run did not pass; else 0."""
+    """2 on any harness error; else 1 if any run did not pass (a cut-off run
+    never passes); else 0."""
     if "harness_error" in statuses:
         return EXIT_HARNESS
     return EXIT_PASSED if all(passes) else EXIT_FAILED
@@ -731,10 +789,11 @@ def run_all(args):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     prov = provenance(args)
     if args.spend:
+        turns = "no turn cap" if args.max_turns is None else f"at most {args.max_turns} turns"
         print(
             f"run.py: batch {args.batch}: {len(jobs)} paid run(s), model {args.model}, "
-            f"effort {args.effort}, at most ${args.budget_usd:g} each "
-            f"(${args.budget_usd * len(jobs):g} in all)",
+            f"effort {args.effort}, {args.timeout:g}s and {turns} each, at most "
+            f"${args.budget_usd:g} each (${args.budget_usd * len(jobs):g} in all)",
             file=sys.stderr,
         )
     statuses, passes = [], []
@@ -748,10 +807,17 @@ def run_all(args):
         passes.append(record.get("passed") is True)
         if record["status"] == "harness_error":
             print(f"run.py: harness error in {task_id}/{arm}: {record['error']}", file=sys.stderr)
+        stop = None
         if record.get("guard_failed"):
+            stop = "the guard refused the agent's setup at its init event"
+        elif record.get("permission_denials"):
+            stop = (
+                f"the agent was refused {record.get('denied_tools')}, so --allowedTools "
+                "does not approve the arm's tools"
+            )
+        if stop:
             print(
-                f"run.py: aborted before the agent's first turn; {len(jobs) - done} "
-                "run(s) not started",
+                f"run.py: stopped the batch: {stop}; {len(jobs) - done} run(s) not started",
                 file=sys.stderr,
             )
             break
