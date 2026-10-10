@@ -9,6 +9,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-ratatui = "0.30.2"
+# Trimmed the way a careful host trims it, so this workspace resolves ratatui
+# as an adopter's app would. `cargo tree -e features -i ratatui -p taria-demo`
+# shows whether the adapter widens it.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 taria.workspace = true
 taria-ratatui = { path = "../../crates/taria-ratatui" }
