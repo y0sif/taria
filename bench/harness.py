@@ -156,9 +156,11 @@ class DemoRun:
         <tmp>/state.json   the demo's state dump, graded after the run
         <tmp>/mcp.json     the arm's MCP config
 
+        <tmp>/tmux.conf    the private server's only config: status off
+
     `<tmp>` has a neutral `tui-` prefix. The tmux session is named
-    `taria-bench-<hex>`, which never reaches the agent: capture-pane returns
-    the pane, not the status line.
+    `taria-bench-<hex>`, which never reaches the agent: the status line is
+    off, so capture-pane returns the whole COLS x ROWS pane and nothing else.
     """
 
     def __init__(self):
@@ -170,16 +172,22 @@ class DemoRun:
         self.tmux_sock = os.path.join(sockdir, "tmux.sock")
         self.state_path = os.path.join(self.tmpdir, "state.json")
         self.config_path = os.path.join(self.tmpdir, "mcp.json")
-        # A private server on a socket inside the temp dir, with no config
-        # file: the user's tmux sessions and settings stay out of the
+        # A private server on a socket inside the temp dir, with a config of
+        # its own: the user's tmux sessions and settings stay out of the
         # measurement, teardown cannot touch anything but this run, and
-        # removing the temp dir removes the socket whatever else failed.
-        self.tmux = ["tmux", "-S", self.tmux_sock, "-f", os.devnull]
+        # removing the temp dir removes the socket whatever else failed. The
+        # config turns the status line off before the session exists, so the
+        # demo starts at the full COLS x ROWS (with it on, a row goes to the
+        # status line and the demo is resized under both arms).
+        self.tmux_conf = os.path.join(self.tmpdir, "tmux.conf")
+        self.tmux = ["tmux", "-S", self.tmux_sock, "-f", self.tmux_conf]
         self.server_pid = None
         self.demo_pid = None
         try:
             os.mkdir(self.workdir, 0o700)
             os.mkdir(sockdir, 0o700)
+            with open(self.tmux_conf, "w") as f:
+                f.write("set-option -g status off\n")
         except BaseException:  # a signal included: nothing else holds tmpdir yet
             shutil.rmtree(self.tmpdir, ignore_errors=True)
             raise
@@ -236,6 +244,26 @@ class DemoRun:
 
     def alive(self):
         return self._tmux("has-session", "-t", self.name, check=False).returncode == 0
+
+    def demo_alive(self):
+        """Whether the demo process itself still runs, not just its dump.
+
+        A crashed demo leaves a dump that says `quit: false`, so grading asks
+        the process. The pane's pid is the demo (tmux execs the command, env
+        execs the binary); /proc must still show it, which a zombie does not.
+        Without /proc or a pid, the tmux session's life stands in: it ends
+        when the demo does.
+        """
+        if self.demo_pid and os.path.isdir("/proc"):
+            line = _cmdline(self.demo_pid)
+            return line is not None and DEMO_BIN in line
+        return self.alive()
+
+    def pane_size(self):
+        """(columns, rows) of the demo's pane, as the demo sees it."""
+        out = self._tmux("display-message", "-p", "-t", self.name, "#{pane_width} #{pane_height}").stdout
+        cols, rows = (int(x) for x in out.split())
+        return cols, rows
 
     def capture(self):
         return self._tmux("capture-pane", "-p", "-t", self.name, check=False).stdout
