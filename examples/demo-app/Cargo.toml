@@ -13,5 +13,7 @@ publish = false
 # as an adopter's app would. `cargo tree -e features -i ratatui -p taria-demo`
 # shows whether the adapter widens it.
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+serde.workspace = true
+serde_json.workspace = true
 taria.workspace = true
 taria-ratatui = { path = "../../crates/taria-ratatui" }

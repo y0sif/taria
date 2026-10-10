@@ -4,14 +4,22 @@
 //! raw keys as a fallback rather than as the way in. Typed text is not a
 //! fallback: it goes to the field that accepts typing, and nowhere else (see
 //! [`mod@update`]).
+//!
+//! With `TARIA_DEMO_STATE=<path>` set, the demo also keeps its state as JSON
+//! at that path (see [`mod@state`]), for harnesses that grade what an agent
+//! did. Unset, nothing is written.
 
 mod app;
 mod events;
+mod state;
 mod tree;
 mod ui;
 mod update;
 
+use std::ffi::OsString;
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 
 use ratatui::DefaultTerminal;
 use taria_ratatui::TariaLayer;
@@ -95,26 +103,86 @@ fn run(terminal: &mut DefaultTerminal, layer: &mut TariaLayer) -> io::Result<()>
     } else {
         "taria disabled".to_string()
     };
+    let mut state_file = StateFile::from_env();
+    let result = event_loop(terminal, layer, &mut app, &mut state_file);
+    // On exit, however the loop ended, so the file holds the final state.
+    sync_state(&mut state_file, &app);
+    result
+}
+
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    layer: &mut TariaLayer,
+    app: &mut App,
+    state_file: &mut Option<StateFile>,
+) -> io::Result<()> {
     let rx = setup_event_channel();
 
     while app.running {
         // Agent inputs are drained around the blocking recv below; the 50ms
         // tick bounds the latency between an agent act and its effect.
-        drain_agent_input(&mut app, layer);
+        drain_agent_input(app, layer);
+        // Before the draw and the publish, so a harness that sees the effect
+        // on screen or in the tree finds it in the file too.
+        sync_state(state_file, app);
 
-        terminal.draw(|frame| view(&app, frame))?;
+        terminal.draw(|frame| view(app, frame))?;
 
         // Publish the semantic tree for the exact state just drawn; the
         // layer dedups identical trees, so publishing every frame is free.
-        layer.publish(tree::build_nodes(&app));
+        layer.publish(tree::build_nodes(app));
 
         match rx.recv() {
-            Ok(event) => update(&mut app, event),
+            Ok(event) => update(app, event),
             Err(_) => break,
         }
-        drain_agent_input(&mut app, layer);
+        drain_agent_input(app, layer);
+        sync_state(state_file, app);
     }
     Ok(())
+}
+
+/// Where the state dump goes, when a harness asked for one with
+/// `TARIA_DEMO_STATE`, and the last contents written there.
+///
+/// Unset or empty means no file at all and no behaviour change: the dump is
+/// for benchmarks and tests, never for the person running the demo.
+struct StateFile {
+    path: PathBuf,
+    written: Option<String>,
+}
+
+impl StateFile {
+    fn from_env() -> Option<Self> {
+        std::env::var_os("TARIA_DEMO_STATE")
+            .filter(|path| !path.is_empty())
+            .map(|path| Self {
+                path: PathBuf::from(path),
+                written: None,
+            })
+    }
+}
+
+/// Write the state dump if the state changed since the last write.
+///
+/// Written whole to `<path>.tmp` and renamed over `<path>`, so a reader never
+/// sees half a file. A failed write is ignored and retried on the next change
+/// check: the dump serves a harness, and the app must not fail, print over its
+/// own screen, or stop for one.
+fn sync_state(state_file: &mut Option<StateFile>, app: &App) {
+    let Some(file) = state_file else { return };
+    let Ok(json) = state::to_json(app) else {
+        return;
+    };
+    if file.written.as_deref() == Some(json.as_str()) {
+        return;
+    }
+    let mut tmp = OsString::from(file.path.as_os_str());
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if fs::write(&tmp, &json).is_ok() && fs::rename(&tmp, &file.path).is_ok() {
+        file.written = Some(json);
+    }
 }
 
 /// Apply every queued agent input, refining the ack of each one the app
