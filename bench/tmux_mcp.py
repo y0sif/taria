@@ -4,20 +4,30 @@
 Speaks MCP (newline-delimited JSON-RPC 2.0) on stdio, the way taria-mcp does,
 and exposes the two tools a tmux-driving agent gets: `screen`, the pane's text
 from `tmux capture-pane -p`, and `send_keys`, `tmux send-keys` followed by a
-wait for the screen to settle. The settle budget is the same 500 ms taria-mcp
-waits for an app to react (UPDATE_WAIT in crates/taria-mcp/src/server.rs), so
-neither arm buys accuracy with a longer wait.
+wait for the screen to settle.
+
+Each key name is its own `tmux send-keys`, 30 ms after the last. Sent in one
+command, "Escape d" reaches the application as the bytes ESC d back to back,
+which a terminal input parser (crossterm included) reads as alt+d: the call
+would not mean what it says. The settle waits for the screen to differ from
+the capture taken before sending, then for two captures 50 ms apart to agree,
+all within the same 500 ms taria-mcp waits for an app to react (UPDATE_WAIT in
+crates/taria-mcp/src/server.rs), so neither arm buys accuracy with a longer
+wait. A key that changes nothing costs the whole 500 ms, as an unchanged tree
+does in taria-mcp.
 
 Nothing here knows which application runs in the pane. Python 3 stdlib only.
 
-Usage:  python3 bench/tmux_mcp.py --session NAME [--socket-name NAME]
+Usage:  python3 bench/tmux_mcp.py --session NAME [--socket-path PATH | --socket-name NAME]
 
-`--socket-name` is tmux's `-L`: the benchmark runs each demo on a private
-tmux server so a user's own tmux configuration and sessions stay out of it.
+`--socket-path` is tmux's `-S` and `--socket-name` its `-L`: the benchmark
+runs each demo on a private tmux server so a user's own tmux configuration
+and sessions stay out of it.
 """
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -31,6 +41,7 @@ PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 
 POLL_INTERVAL = 0.05  # seconds between captures while waiting for a settle
 SETTLE_CAP = 0.5  # taria-mcp's UPDATE_WAIT
+KEY_GAP = 0.03  # seconds between two key names, so an Esc is not read as alt
 MAX_KEYS_CHARS = 4096  # taria-mcp's bound on type_text and set_value
 
 PARSE_ERROR = -32700
@@ -44,16 +55,18 @@ INSTRUCTIONS = (
     "colours or text styles, so emphasis such as a highlighted row or a focused box "
     "shows only through the characters drawn. send_keys sends keystrokes to the "
     "application as if typed on its keyboard; they land wherever the application has "
-    "focus. keys is a space-separated list of tmux key names, each sent as one press: "
-    "Enter, Escape, Tab, BTab (shift+tab), Space, BSpace (backspace), Up, Down, Left, "
-    "Right, Home, End, PageUp, PageDown, F1 to F12; C-x is ctrl+x and M-x is alt+x, so "
-    "C-c is ctrl+c. Any other word is sent as its characters, so \"d\" presses d and "
-    "\"Down Down Enter\" is three presses. Set literal to true to send keys verbatim "
-    "as characters, spaces included, with no key names interpreted; use it to type "
-    "text, and send Enter as its own call. Characters typed this way still meet "
-    "whatever the application binds those keys to. send_keys waits up to 0.5 seconds "
-    "for the screen to stop changing and returns it; call screen again whenever you "
-    "need a fresh view."
+    "focus. keys is a space-separated list of tmux key names, pressed one at a time in "
+    "order with a short pause between presses: Enter, Escape, Tab, BTab (shift+tab), "
+    "Space, BSpace (backspace), Up, Down, Left, Right, Home, End, PageUp, PageDown, F1 "
+    "to F12; C-x is ctrl+x and M-x is alt+x, so C-c is ctrl+c. Any other word is sent "
+    "as its characters, so \"d\" presses d, \"Down Down Enter\" is three presses, and "
+    "\"Escape d\" is Escape and then d (alt+d is M-d). Set literal to true to send keys "
+    "verbatim as characters, spaces included, with no key names interpreted; use it to "
+    "type text, and send Enter as its own call. Characters typed this way still meet "
+    "whatever the application binds those keys to. After sending, send_keys waits up to "
+    "0.5 seconds for the screen to change and then stop changing, and returns it; when "
+    "the keys change nothing on screen it returns the unchanged screen after the full "
+    "0.5 seconds. Call screen again whenever you need a fresh view."
 )
 
 TOOLS = [
@@ -70,11 +83,12 @@ TOOLS = [
         "name": "send_keys",
         "description": (
             "Send keystrokes to the application in the pane, then wait up to 0.5 "
-            "seconds for the screen to stop changing and return it. `keys` is a "
-            "space-separated list of tmux key names, one press each: Enter, Escape, "
-            "Tab, BTab, Space, BSpace, Up, Down, Left, Right, Home, End, PageUp, "
-            "PageDown, F1-F12, C-x for ctrl+x, M-x for alt+x; any other word is sent "
-            "as its characters. With `literal` true, `keys` is sent verbatim as "
+            "seconds for the screen to change and stop changing, and return it. `keys` "
+            "is a space-separated list of tmux key names, pressed one at a time in "
+            "order: Enter, Escape, Tab, BTab, Space, BSpace, Up, Down, Left, Right, "
+            "Home, End, PageUp, PageDown, F1-F12, C-x for ctrl+x, M-x for alt+x; any "
+            "other word is sent as its characters, so \"Escape d\" is Escape then d. "
+            "With `literal` true, `keys` is sent verbatim as "
             "characters, spaces included, which is how to type text; send Enter "
             "separately. Up to 4096 characters. The keys reach whatever has focus, "
             "exactly as typed on a keyboard."
@@ -118,14 +132,20 @@ class RpcError(Exception):
 class Pane:
     """The one tmux pane this server drives."""
 
-    def __init__(self, session, socket_name=None):
+    def __init__(self, session, socket_name=None, socket_path=None):
         self.target = session
-        self.base = ["tmux"] + (["-L", socket_name] if socket_name else [])
+        self.base = ["tmux"]
+        if socket_path:
+            self.base += ["-S", socket_path]
+        elif socket_name:
+            self.base += ["-L", socket_name]
+        self.env = {k: v for k, v in os.environ.items() if k != "TMUX"}
 
     def _tmux(self, *args):
         try:
             result = subprocess.run(
-                self.base + list(args), capture_output=True, text=True, timeout=5
+                self.base + list(args), capture_output=True, text=True, timeout=5,
+                env=self.env,
             )
         except (OSError, subprocess.TimeoutExpired) as err:
             raise RpcError(INTERNAL_ERROR, f"could not run tmux: {err}")
@@ -144,21 +164,44 @@ class Pane:
     def send(self, keys, literal):
         if literal:
             self._tmux("send-keys", "-t", self.target, "-l", "--", keys)
-        else:
-            self._tmux("send-keys", "-t", self.target, "--", *keys.split())
+            return
+        # One send-keys per key name, KEY_GAP apart. In one command the keys
+        # reach the pane back to back, and an Escape followed by any key is
+        # then the escape sequence for alt+key, not the two presses asked for.
+        for i, name in enumerate(keys.split()):
+            if i:
+                time.sleep(KEY_GAP)
+            self._tmux("send-keys", "-t", self.target, "--", name)
 
-    def settle(self):
-        """Poll until two consecutive captures match, or SETTLE_CAP runs out."""
+    def send_and_settle(self, keys, literal):
+        """Send, then return the screen once the keys' effect has landed.
+
+        The pre-send capture is the baseline: a capture taken too early still
+        shows the old screen, and two of those agree, so waiting only for two
+        captures to match could return the screen from before the keys. Wait
+        first for the screen to differ from the baseline, then for two
+        captures POLL_INTERVAL apart to agree, all within SETTLE_CAP of the
+        last key. Nothing changing costs the whole SETTLE_CAP.
+        """
+        before = self.capture()
+        self.send(keys, literal)
         deadline = time.monotonic() + SETTLE_CAP
-        time.sleep(POLL_INTERVAL)
-        last = self.capture()
-        while time.monotonic() < deadline:
-            time.sleep(POLL_INTERVAL)
-            current = self.capture()
-            if current == last:
+        current = before
+        while current == before:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return current
-            last = current
-        return last
+            time.sleep(min(POLL_INTERVAL, remaining))
+            current = self.capture()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return current
+            time.sleep(min(POLL_INTERVAL, remaining))
+            latest = self.capture()
+            if latest == current:
+                return latest
+            current = latest
 
 
 def tool_result(text, is_error=False):
@@ -196,8 +239,7 @@ def call_tool(pane, name, arguments):
                 f"keys is {len(keys)} characters, over the {MAX_KEYS_CHARS} character "
                 "limit for one send_keys call; send it in smaller pieces",
             )
-        pane.send(keys, literal)
-        return tool_result(pane.settle())
+        return tool_result(pane.send_and_settle(keys, literal))
     raise RpcError(INVALID_PARAMS, f"tool not found: {name}")
 
 
@@ -258,10 +300,12 @@ def serve(pane, stdin=sys.stdin, stdout=sys.stdout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--session", required=True, help="tmux target session")
-    parser.add_argument("--socket-name", help="tmux -L socket name of the server")
+    sockets = parser.add_mutually_exclusive_group()
+    sockets.add_argument("--socket-path", help="tmux -S socket path of the server")
+    sockets.add_argument("--socket-name", help="tmux -L socket name of the server")
     args = parser.parse_args()
     try:
-        serve(Pane(args.session, args.socket_name))
+        serve(Pane(args.session, args.socket_name, args.socket_path))
     except (BrokenPipeError, KeyboardInterrupt):
         pass
 
