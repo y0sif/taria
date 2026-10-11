@@ -3,10 +3,12 @@
 //!
 //! The wire format is not involved. An app sends the same version 1 JSON
 //! either way; this only decides the text an agent reads. The JSON is the
-//! default and is relayed untouched. The outline carries the same information
-//! in fewer characters: most of a snapshot line is repeated field names,
-//! `"focused":false` on nearly every node, and punctuation, and the outline
-//! drops all three.
+//! default and is relayed untouched. The outline carries every node, id,
+//! role, label, value, focus state and other field, and the name of every
+//! action as `act` takes it, in fewer characters: most of a snapshot line is
+//! repeated field names, `"focused":false` on nearly every node, and
+//! punctuation, and the outline drops all three. Extra keys inside an action
+//! object are not shown, because `act` takes only the name.
 //!
 //! # Grammar
 //!
@@ -51,20 +53,24 @@
 //! never from this build's typed parse of it. That is the reason the JSON is
 //! relayed in the first place: the typed parse turns a role this build has
 //! never heard of into `other`, and drops a field it has no slot for, while
-//! the `Value` keeps both by name. Anything the outline cannot express falls
-//! back to the JSON text rather than losing part of the tree.
+//! the `Value` keeps both by name. A field in a shape the line has no slot
+//! for goes to the tail as JSON, and a tree the outline cannot express at all
+//! is served as the JSON text, so neither loses part of the tree.
 //!
-//! Action names are the one exception, and only their spelling. The outline
-//! tells the agent to pass an action to `act` exactly as it prints, and `act`
-//! validates against the typed parse, so the name printed is the one that
-//! parse reads (see [`action_name`]). That loses nothing: the parse keeps an
-//! action it does not know as `Custom` under its own name. Reading it off the
-//! `Value` instead would not be the same thing, because the relayed text has
-//! been through a `Value` already and its keys are sorted, so the first key of
-//! an object, the one the parse names the action after, can differ.
+//! Actions are the one exception. The outline tells the agent to pass an
+//! action to `act` exactly as it prints, and `act` validates against the
+//! typed parse, so the name printed is the one that parse reads (see
+//! [`action_name`]). The name survives, since the parse keeps an action it
+//! does not know as `Custom` under its own name, but nothing else in an
+//! action object does: `{"row":3}` in `{"scroll_to":{"row":3}}`, or
+//! `"icon":"x"` beside `"custom":"delete"`, is not shown, because `act` takes
+//! only the name. Reading the name off the `Value` instead would not be the
+//! same thing, because the relayed text has been through a `Value` already
+//! and its keys are sorted, so the first key of an object, the one the parse
+//! names the action after, can differ.
 
 use serde_json::{Map, Value};
-use taria::{Action, Node};
+use taria::{Action, Node, Snapshot};
 
 use crate::bridge::AppSnapshot;
 use crate::server::action_name;
@@ -119,15 +125,22 @@ impl TreeFormat {
 /// Render `tree_json` as an outline, or return it unchanged when it is not a
 /// snapshot the outline can express.
 ///
-/// With no parse beside the text, each action is named by reading it with the
-/// same rules the bridge parses a line with. [`TreeFormat::render`] has the
-/// parse, and names actions from it.
+/// With no parse beside the text, this parses `tree_json` as a [`Snapshot`]
+/// itself, reading keys in the text's order as the bridge does, and names
+/// actions from that, so on an app's line it prints what the bridge would.
+/// Two cases can differ from [`TreeFormat::render`]. Given the bridge's
+/// relayed text, whose keys are already sorted, an action object with more
+/// than one key can read differently than it did in the app's original line,
+/// which is why `render` uses the bridge's own parse. And text that does not
+/// parse as a snapshot, which the bridge would have rejected, has its actions
+/// read off the sorted `Value`.
 ///
 /// A line that reached the bridge parsed as a snapshot, so the fallback is
 /// not reachable from a peer; it is here so that a shape this renderer has no
 /// spelling for costs the agent the shorter format, never part of the tree.
 pub fn outline(tree_json: &str) -> String {
-    outline_of(tree_json, None)
+    let parsed = serde_json::from_str::<Snapshot>(tree_json).ok();
+    outline_of(tree_json, parsed.as_ref().map(|parsed| &parsed.root))
 }
 
 /// [`outline`], naming actions from `parsed_root` where it lines up.
@@ -270,9 +283,10 @@ fn role(role: &Value) -> String {
 }
 
 /// An action, spelled the way `act` takes it: [`action_name`] of the action
-/// the bridge parsed, or, without that parse, of the action the same rules
-/// read from the text. Only a value no action parse accepts, which cannot
-/// reach the outline from a line the bridge kept, prints as compact JSON.
+/// the bridge parsed, or, without that parse, of the action read off the
+/// text's `Value`, whose sorted keys can name an object with several keys
+/// differently. Only a value no action parse accepts, which cannot reach the
+/// outline from a line the bridge kept, prints as compact JSON.
 fn action(value: &Value, parsed: Option<&Action>) -> String {
     if let Some(parsed) = parsed {
         return token(&action_name(parsed));
@@ -395,10 +409,10 @@ app app "taria-demo"
         );
     }
 
-    /// Without a parse beside the text, an action object is read by the
-    /// rules the bridge parses a line with: the envelope folds onto its inner
-    /// name, a longer envelope keeps that name, and an object a newer app
-    /// might send is named by its key, its payload dropped.
+    /// Rendered on its own, the outline parses the text the way the bridge
+    /// parses a line and names actions from that: the envelope folds onto
+    /// its inner name, a longer envelope keeps that name, and an object a
+    /// newer app might send is named by its key, its payload dropped.
     #[test]
     fn an_action_renders_as_the_name_act_takes() {
         let out = render_root(
@@ -427,7 +441,10 @@ app app "taria-demo"
     /// With the parse, the name is the one the parse holds, which is what
     /// `act` checks against. The relayed text's keys are sorted, so an object
     /// whose first key on the wire was `zoom` reads as `custom` first there:
-    /// the text alone would print `x`, a name the node never advertised.
+    /// the relayed text alone would print `x`, a name the node never
+    /// advertised. On the app's own line the standalone renderer reads keys
+    /// in the line's order and agrees with the bridge, and on a line no
+    /// snapshot parse accepts it falls back to the sorted `Value`.
     #[test]
     fn with_the_parse_an_action_is_named_as_the_parse_read_it() {
         let line = r#"{"protocol_version":1,"seq":3,"root":{"id":"row","role":"list_item","actions":[{"zoom":1,"custom":"x"},"select"]}}"#;
@@ -444,6 +461,9 @@ app app "taria-demo"
             "{tree_json}"
         );
         assert!(outline(&tree_json).ends_with("[x select]"));
+        assert!(outline(line).ends_with("[zoom select]"));
+        let rejected = line.replace(r#""select""#, r#"{"custom":7}"#);
+        assert!(outline(&rejected).ends_with(r#"[x {"custom":7}]"#));
 
         let snapshot = AppSnapshot { tree_json, parsed };
         let out = TreeFormat::Outline.render(&snapshot);

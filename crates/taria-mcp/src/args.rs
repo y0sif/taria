@@ -36,8 +36,9 @@ Options:
                               How read_tree and the input tools show the
                               tree: json (the default) relays the app's own
                               snapshot line; outline renders the same
-                              snapshot as one indented line per node, with
-                              the same information in fewer characters.
+                              snapshot as one indented line per node, in
+                              fewer characters. It names each action as act
+                              takes it, without other keys in its object.
 
 Environment:
   TARIA_LOG    Log filter (tracing env-filter syntax), default `info`.

@@ -19,9 +19,11 @@ a format bump would not wait for one.
 bridge relays the app's JSON line, and most of that line is repeated field
 names, `"focused":false` on nearly every node, and punctuation, which is how a
 benchmark found a taria tree costing more per call than a tmux screen of the
-same app. The outline carries the same information in under half the
+same app. The outline carries every node, id, role, label, value, focus
+state and field, and every action by the name `act` takes, in under half the
 characters: the demo's first tree is 1132 characters as JSON and 525 as an
-outline. It is opt-in, and the default does not move.
+outline. Extra keys inside an action object are not shown, because `act`
+takes only the name. It is opt-in, and the default does not move.
 
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1 and apps send the same
 JSON; only the text the bridge hands the model changes, and only when asked.

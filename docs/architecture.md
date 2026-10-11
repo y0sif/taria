@@ -217,8 +217,9 @@ parse stays authoritative for what the bridge decides, because it is typed:
 detection compares parses rather than text. A line is relayed only after it
 parsed, so a malformed one is still skipped. `taria-mcp --tree-format outline`
 hands the agent an indented outline instead of the line, and renders it from
-the line for the same reason, so the outline keeps every name the JSON would
-have shown.
+the line for the same reason, so the outline keeps every role, action and
+field name the JSON would have shown. It drops only the extra keys inside an
+action object, since `act` takes the action's name alone.
 
 Additive on the wire is not automatically additive in Rust. A peer skips a
 message variant it cannot parse, but a peer rebuilt against the version that

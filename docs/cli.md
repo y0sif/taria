@@ -84,10 +84,12 @@ indented two spaces per level, the root at zero:
   against. An app-specific action, `{"custom":"delete"}` in the JSON, prints
   as `delete`, a longer envelope such as `{"custom":"delete","icon":"x"}` as
   `delete` too, and an object in a shape a newer app might send, such as
-  `{"scroll_to":{"row":3}}`, as the name the parse keeps, `scroll_to`. A value
-  no parse reads as an action, such as `{"custom":7}`, has no name `act`
-  would take and would print whole as compact JSON, but a line carrying one is
-  rejected before it is relayed, so the outline never shows one. Pass `act` an
+  `{"scroll_to":{"row":3}}`, as the name the parse keeps, `scroll_to`.
+  Anything else in an action object, `"icon":"x"` or the payload `{"row":3}`
+  here, is not shown, because `act` takes only the name. A value no parse
+  reads as an action, such as `{"custom":7}`, has no name `act` would take
+  and would print whole as compact JSON, but a line carrying one is rejected
+  before it is relayed, so the outline never shows one. Pass `act` an
   id and an action name exactly as the line spells them, without the quotes if
   one is quoted.
 - `*focused` appears only on a node whose `focused` is `true`.
