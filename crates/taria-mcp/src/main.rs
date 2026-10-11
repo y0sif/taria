@@ -26,7 +26,15 @@ fn main() -> ExitCode {
         args::Cli::Run {
             socket,
             tree_format,
+            ..
         } => (socket, tree_format),
+        // `Cli` is `#[non_exhaustive]` for the library's callers. This binary
+        // ships with the parser, so the arm is unreachable; a variant added
+        // without handling it here is a usage error rather than a panic.
+        other => {
+            eprintln!("taria-mcp: unsupported command line: {other:?}");
+            return ExitCode::from(2);
+        }
     };
 
     init_tracing();

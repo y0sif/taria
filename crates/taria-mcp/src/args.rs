@@ -44,9 +44,15 @@ Environment:
                Logs go to stderr; stdout is the MCP channel.";
 
 /// Parsed command line.
+///
+/// `#[non_exhaustive]`, and so is [`Run`](Self::Run), so that the next flag
+/// is a field and the next mode a variant without breaking a caller's build:
+/// match with a wildcard arm and destructure `Run` with `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Cli {
     /// Run the bridge against this socket path.
+    #[non_exhaustive]
     Run {
         /// Path of the app's taria Unix socket.
         socket: PathBuf,

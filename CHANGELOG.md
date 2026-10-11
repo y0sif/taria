@@ -26,6 +26,17 @@ outline. It is opt-in, and the default does not move.
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1 and apps send the same
 JSON; only the text the bridge hands the model changes, and only when asked.
 
+**This breaks the Rust API of `taria-mcp`, so the next release is 0.3.0.**
+`args::Cli::Run` gained a field, and `Cli`, its `Run` variant and the new
+`TreeFormat` are now `#[non_exhaustive]`, so that the next flag or format is
+not another break. Code outside the crate that builds or matches them stops
+compiling: a pattern `Cli::Run { socket }` fails with a missing-field error,
+and a `match` over `Cli` that names only `Run` and `Help` fails as
+non-exhaustive. Destructure with `..`, as `Cli::Run { socket, .. }`, and add a
+wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
+`Cli::Run` is no longer possible outside the crate; get one from
+`args::parse`. Nothing changes for whoever runs the binary.
+
 ### For whoever drives an app
 
 - **`--tree-format <json|outline>`**, default `json`. The outline is a header
@@ -36,27 +47,35 @@ JSON; only the text the bridge hands the model changes, and only when asked.
   usage error.
 - **Every tree goes out in the chosen format**: `read_tree`, and the tree in
   every `act`, `key` and `type_text` answer, the ignored note's tree included.
-- **The outline is rendered from the relayed line, not from the parse**, so a
+- **The outline is rendered from the relayed line**, so a
   role, an action or a field this bridge has never heard of still reaches the
-  agent by name. An app-specific action prints as the name `act` takes,
-  `delete` rather than `{"custom":"delete"}`. An id or a label that would
-  break the line is JSON-quoted, and a line the outline cannot express is
-  served as JSON.
+  agent by name. Every action prints as the name `act` takes for it, spelled
+  from the bridge's own parse, which is what `act` checks it against:
+  `delete` rather than `{"custom":"delete"}`, `delete` for
+  `{"custom":"delete","icon":"x"}`, and `scroll_to` for an object a newer app
+  might send, `{"scroll_to":{"row":3}}`. A test passes every printed name
+  back through `act`. An id or a label that would break the line is
+  JSON-quoted, with U+2028, U+2029 and U+0085 escaped as well as the newline,
+  and a line the outline cannot express is served as JSON.
 - **The agent is told which format it is reading.** In outline mode the MCP
-  instructions, the `read_tree` and `act` descriptions and the description of
-  `act`'s `action` parameter describe the outline instead of the JSON. Every
-  other word is the same, and a test holds the JSON mode to the text it
-  served before, byte for byte.
+  instructions, the `read_tree` and `act` descriptions and the descriptions of
+  `act`'s `node` and `action` parameters describe the outline instead of the
+  JSON. Every other word is the same, and a test holds the JSON mode to the
+  text it served before, byte for byte.
 - **For a Rust caller**: `TariaMcpServer::with_tree_format` builds the handler
   in either format, `TariaMcpServer::new` still serves JSON, the renderer is
   `taria_mcp::tree_format`, and `args::Cli::Run` carries the parsed
-  `tree_format` beside the socket.
+  `tree_format` beside the socket, which is the break described above.
 
 ### The end-to-end gate
 
 - `scripts/e2e.py` grows from 21 steps to 22. The new one starts a demo behind
   a bridge run with `--tree-format outline`, reads the outline, and selects a
   row through an `act` named from it, whose answer has to be an outline too.
+  It then deletes that row through the custom action as its line spells it,
+  `delete`, checks the confirm dialog opened, and closes it through the
+  dialog's advertised `dismiss`, so the demo ends with no modal and the row
+  intact.
 
 ## [0.2.1] - 2026-10-11
 

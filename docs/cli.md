@@ -8,13 +8,14 @@ taria-mcp --app <label>     Derive the socket path for <label>
 taria-mcp --help            Show help
 ```
 
-Exactly one of `--socket` or `--app` is required.
+Exactly one of `--socket` or `--app` is required. Any usage error exits with
+status 2.
 
 Options:
 
 | Flag | Effect |
 |---|---|
-| `--tree-format <json\|outline>` | How `read_tree`, and every input tool that answers with a tree, show the tree to the agent. `json`, the default, relays the app's own snapshot line minus its `type` framing key. `outline` renders that same line as one indented line per node (see [The outline](#the-outline)). The wire format is the same either way. A missing or unknown value is a usage error, exit status 2. |
+| `--tree-format <json\|outline>` | How `read_tree`, and every input tool that answers with a tree, show the tree to the agent. `json`, the default, relays the app's own snapshot line minus its `type` framing key. `outline` renders that same line as one indented line per node (see [The outline](#the-outline)). The wire format is the same either way. A missing or unknown value is a usage error. |
 
 Environment variables:
 
@@ -67,21 +68,38 @@ indented two spaces per level, the root at zero:
 
 - An id, a role, an action name or a field key prints bare when it is
   non-empty and made only of `A-Z`, `a-z`, `0-9` and `_ . : / @ + -`, and
-  JSON-quoted otherwise. A role sent as a single-key object prints as its key.
+  JSON-quoted otherwise.
+- A role sent as a string prints as that string, and one sent as a
+  single-key object, `{"heading":{"level":2}}`, as its key, `heading`. A role
+  in any other shape, an object with several keys or an array, prints whole as
+  compact JSON rather than guessed at.
 - The label and the value are always JSON-quoted, so an empty value shows as
-  `= ""` and a newline in a label cannot split a node across two lines.
-  `null` or absent omits them.
-- An app-specific action, `{"custom":"delete"}` in the JSON, prints as
-  `delete`, which is the name `act` takes. Pass `act` an id and an action name
-  exactly as the line spells them, without the quotes if one is quoted.
+  `= ""`. `null` or absent omits them. Every quoted string, here and in the
+  header and the appended fields, escapes U+2028, U+2029 and U+0085 as well
+  as the newline and carriage return JSON escapes, so a label carrying any of
+  them cannot split a node across two lines, even in a client that breaks
+  lines on them.
+- Every action prints as the name `act` takes for it, which is the name the
+  bridge's own parse of the line gives it, the same parse `act` checks a name
+  against. An app-specific action, `{"custom":"delete"}` in the JSON, prints
+  as `delete`, a longer envelope such as `{"custom":"delete","icon":"x"}` as
+  `delete` too, and an object in a shape a newer app might send, such as
+  `{"scroll_to":{"row":3}}`, as the name the parse keeps, `scroll_to`. A value
+  no parse reads as an action, such as `{"custom":7}`, has no name `act`
+  would take and would print whole as compact JSON, but a line carrying one is
+  rejected before it is relayed, so the outline never shows one. Pass `act` an
+  id and an action name exactly as the line spells them, without the quotes if
+  one is quoted.
 - `*focused` appears only on a node whose `focused` is `true`.
 - Any other field, a field this bridge has never heard of included, is
   appended as ` key=<compact json>`, and so is a known field in a shape the
   line has no slot for.
 
-The outline is rendered from the app's line, never from the bridge's parse of
+The outline is rendered from the app's line, not from the bridge's parse of
 it, so a role, an action or a field this bridge does not know reaches the
-agent by name, as it does in the JSON. A line the outline cannot express is
-served as JSON instead. In this mode the MCP instructions and the `read_tree`
+agent by name, as it does in the JSON. Only the spelling of action names comes
+from the parse, because that is what `act` validates against, and the parse
+keeps an action it does not know under its own name. A line the outline
+cannot express is served as JSON instead. In this mode the MCP instructions and the `read_tree`
 and `act` descriptions describe the outline rather than the JSON; everything
 else they say is the same.

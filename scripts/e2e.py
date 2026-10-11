@@ -1693,7 +1693,11 @@ def step_v_outline_format(ctx):
     has consumed its app by now. The outline is the agent's whole view in this
     mode, so the step reads it the way an agent would: the header line, a
     node line per widget, and an act passed the id and action name exactly as
-    a line spells them, whose answer has to be an outline too.
+    a line spells them, whose answer has to be an outline too. Then the
+    custom action, the one the outline spells differently from the JSON: a
+    task's `delete`, named from its line, has to open the confirm dialog, and
+    the dialog's own advertised action closes it again, so the demo ends with
+    no modal and every task intact.
     """
     tmpdir = tempfile.mkdtemp(prefix="taria-e2e-outline-")
     sock = os.path.join(tmpdir, "outline.sock")
@@ -1763,9 +1767,67 @@ def step_v_outline_format(ctx):
             ),
             f"{target} is not the focused row after select:\n{answer}",
         )
+
+        def node_line(outline, depth, node_id):
+            prefix = "  " * depth + node_id + " "
+            found = [line for line in outline.split("\n") if line.startswith(prefix)]
+            return found[0] if found else None
+
+        def line_actions(line):
+            # The bracket list closes the line, before `*focused` if present.
+            # Demo labels carry no brackets, and the names it uses are bare.
+            match = re.search(r"\[([^\]\"]*)\](?: \*focused)?$", line)
+            require(match is not None, f"no action list on the line: {line!r}")
+            return match.group(1).split()
+
+        row = node_line(answer, 2, target)
+        require(
+            '{"custom"' not in row,
+            f"the outline spells a custom action as the JSON envelope: {row!r}",
+        )
+        builtins = {"activate", "focus", "select", "toggle", "scroll", "set_value", "dismiss"}
+        custom = [name for name in line_actions(row) if name not in builtins]
+        require(
+            custom == ["delete"],
+            f"{target}'s line should advertise exactly one custom action, delete: {row!r}",
+        )
+        opened = client.call_raw("act", {"node": target, "action": custom[0]})
+        require(
+            re.fullmatch(r"protocol_version=1 seq=\d+", opened.split("\n")[0]),
+            f"act {custom[0]} did not answer with an outline: {opened[:200]}",
+        )
+        dialog = node_line(opened, 1, "dialog")
+        require(
+            dialog is not None
+            and dialog.startswith("  dialog dialog ")
+            and dialog.endswith(" *focused"),
+            f"act {custom[0]} did not open the focused confirm dialog:\n{opened}",
+        )
+        for button in ("dialog-confirm", "dialog-cancel"):
+            line = node_line(opened, 2, button)
+            require(
+                line is not None and line_actions(line) == ["activate"],
+                f"the dialog has no {button} advertising activate:\n{opened}",
+            )
+        way_out = line_actions(dialog)
+        require(way_out == ["dismiss"], f"the dialog should advertise dismiss: {dialog!r}")
+        closed = client.call_raw("act", {"node": "dialog", "action": way_out[0]})
+        require(
+            re.fullmatch(r"protocol_version=1 seq=\d+", closed.split("\n")[0]),
+            f"act dialog {way_out[0]} did not answer with an outline: {closed[:200]}",
+        )
+        require(
+            node_line(closed, 1, "dialog") is None,
+            f"the dialog is still open after {way_out[0]}:\n{closed}",
+        )
+        require(
+            node_line(closed, 2, target) is not None,
+            f"dismissing the dialog must not delete {target}:\n{closed}",
+        )
         return (
-            f"{len(text)} chars for {len(lines) - 1} nodes; act select {target} "
-            "answered with an outline"
+            f"{len(text)} chars for {len(lines) - 1} nodes; act select {target}, "
+            f"act {custom[0]} opened the dialog, act dialog {way_out[0]} closed it, "
+            "every answer an outline"
         )
     finally:
         if client is not None:

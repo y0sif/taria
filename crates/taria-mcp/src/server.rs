@@ -159,6 +159,13 @@ const ACT_ACTION_PASSAGE: FormatPassage = FormatPassage {
               quoted.",
 };
 
+/// The same for `act`'s `node` parameter: an id the outline quotes is passed
+/// without the quotes, which "exactly as it appears" would contradict.
+const ACT_NODE_PASSAGE: FormatPassage = FormatPassage {
+    json: "exactly as it appears in the tree from read_tree.",
+    outline: "exactly as the tree's outline line spells it, without the quotes if it is quoted.",
+};
+
 /// Parameters for the `act` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ActParams {
@@ -584,12 +591,15 @@ fn describe_outline(router: &mut ToolRouter<TariaMcpServer>) {
     if let Some(route) = router.map.get_mut("act") {
         swap_description(&mut route.attr.description, &ACT_PASSAGE);
         let schema = std::sync::Arc::make_mut(&mut route.attr.input_schema);
-        if let Some(serde_json::Value::Object(action)) = schema
-            .get_mut("properties")
-            .and_then(|properties| properties.get_mut("action"))
-            && let Some(serde_json::Value::String(description)) = action.get_mut("description")
-        {
-            *description = ACT_ACTION_PASSAGE.to_outline(description);
+        for (param, passage) in [("node", &ACT_NODE_PASSAGE), ("action", &ACT_ACTION_PASSAGE)] {
+            if let Some(serde_json::Value::Object(property)) = schema
+                .get_mut("properties")
+                .and_then(|properties| properties.get_mut(param))
+                && let Some(serde_json::Value::String(description)) =
+                    property.get_mut("description")
+            {
+                *description = passage.to_outline(description);
+            }
         }
     }
 }
@@ -819,10 +829,11 @@ fn text_result(text: String) -> CallToolResult {
 /// the snapshot is stored (see [`AppSnapshot::from_line`]), because this tool
 /// promises the app's tree and that key was never part of one.
 ///
-/// The outline is rendered from that relayed text too, never from the parse,
-/// for the same reason (see [`crate::tree_format`]).
+/// The outline is rendered from that relayed text too, for the same reason,
+/// and takes only its action names from the parse, because the parse is what
+/// `act` checks a name against (see [`crate::tree_format`]).
 fn snapshot_text(snapshot: &AppSnapshot, format: TreeFormat) -> String {
-    format.render(&snapshot.tree_json)
+    format.render(snapshot)
 }
 
 /// What the app said about one burst of inputs inside [`UPDATE_WAIT`].
@@ -1872,13 +1883,13 @@ mod tests {
         as a result with the tree, not an error. Up to 4096 characters. Returns the updated tree \
         once the app reacts.";
 
-    /// The description of `act`'s `action` parameter, which schemars builds
-    /// from the doc comment on [`ActParams::action`].
-    fn action_param_description(server: &TariaMcpServer) -> String {
+    /// The description of one of `act`'s parameters, which schemars builds
+    /// from the doc comment on that field of [`ActParams`].
+    fn act_param_description(server: &TariaMcpServer, param: &str) -> String {
         let act = server.get_tool("act").expect("act is listed");
-        act.input_schema["properties"]["action"]["description"]
+        act.input_schema["properties"][param]["description"]
             .as_str()
-            .expect("the action parameter is described")
+            .unwrap_or_else(|| panic!("the {param} parameter is described"))
             .to_string()
     }
 
@@ -1906,9 +1917,13 @@ mod tests {
         assert_eq!(description(&server, "key"), PINNED_KEY);
         assert_eq!(description(&server, "type_text"), PINNED_TYPE_TEXT);
         assert!(
-            action_param_description(&server).ends_with(ACT_ACTION_PASSAGE.json),
+            act_param_description(&server, "action").ends_with(ACT_ACTION_PASSAGE.json),
             "{}",
-            action_param_description(&server)
+            act_param_description(&server, "action")
+        );
+        assert_eq!(
+            act_param_description(&server, "node"),
+            "Id of the target node, exactly as it appears in the tree from read_tree."
         );
         // Every other byte of the listing too: names, schemas, annotations.
         assert_eq!(
@@ -1966,8 +1981,13 @@ mod tests {
                 &ACT_PASSAGE,
             ),
             (
-                action_param_description(&json),
-                action_param_description(&outline),
+                act_param_description(&json, "node"),
+                act_param_description(&outline, "node"),
+                &ACT_NODE_PASSAGE,
+            ),
+            (
+                act_param_description(&json, "action"),
+                act_param_description(&outline, "action"),
                 &ACT_ACTION_PASSAGE,
             ),
         ];
@@ -1979,7 +1999,9 @@ mod tests {
             );
             assert!(outline_text.contains(passage.outline), "{outline_text}");
             assert!(
-                !outline_text.contains("{\"custom\"") && !outline_text.contains("JSON"),
+                !outline_text.contains("{\"custom\"")
+                    && !outline_text.contains("JSON")
+                    && !outline_text.contains("as it appears"),
                 "the outline mode must not describe the JSON: {outline_text}"
             );
             assert_eq!(
@@ -1991,7 +2013,7 @@ mod tests {
         assert!(description(&outline, "read_tree").contains("as an outline"));
 
         // `key` and `type_text` describe no format, so they do not move at all,
-        // and neither does any schema but the one description in `act`'s.
+        // and neither does any schema but the two descriptions in `act`'s.
         for name in ["key", "type_text", "read_tree"] {
             assert_eq!(
                 outline.get_tool(name).map(|tool| tool.input_schema),
@@ -2001,6 +2023,130 @@ mod tests {
         }
         assert_eq!(description(&outline, "key"), PINNED_KEY);
         assert_eq!(description(&outline, "type_text"), PINNED_TYPE_TEXT);
+        let mut act_schema = outline.get_tool("act").expect("act is listed").input_schema;
+        for (param, passage) in [("node", &ACT_NODE_PASSAGE), ("action", &ACT_ACTION_PASSAGE)] {
+            let schema = std::sync::Arc::make_mut(&mut act_schema);
+            let description = &mut schema["properties"][param]["description"];
+            *description = description
+                .as_str()
+                .map(|text| text.replace(passage.outline, passage.json))
+                .into();
+        }
+        assert_eq!(
+            Some(act_schema),
+            json.get_tool("act").map(|tool| tool.input_schema),
+            "act's schema differs only in the two descriptions"
+        );
+    }
+
+    /// The action names in an outline line, in order, unquoted the way the
+    /// outline tells an agent to pass them.
+    fn outline_action_names(line: &str) -> Vec<String> {
+        let start = line.find(" [").expect("the line lists actions") + 2;
+        let mut rest = &line[start..];
+        let mut names = Vec::new();
+        loop {
+            rest = rest.trim_start_matches(' ');
+            if rest.starts_with(']') {
+                return names;
+            }
+            if rest.starts_with('"') {
+                let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+                let name = stream
+                    .next()
+                    .expect("a quoted name")
+                    .expect("a JSON string");
+                rest = &rest[stream.byte_offset()..];
+                names.push(name);
+            } else {
+                let end = rest.find([' ', ']']).expect("the list is closed");
+                names.push(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+        }
+    }
+
+    /// The outline tells the agent to pass an action exactly as the line
+    /// spells it, so every name it prints has to get through `act`'s
+    /// validation and reach the app as the action the node advertised. The
+    /// shapes here are the ones a plain envelope rule got wrong: a longer
+    /// envelope, an object a newer app might send, an envelope naming a
+    /// built-in, a name that needs quoting, and an object whose first key on
+    /// the wire is not the first in the relayed, key-sorted text.
+    #[tokio::test]
+    async fn every_action_name_the_outline_prints_is_one_act_accepts() {
+        let line = concat!(
+            r#"{"type":"snapshot","protocol_version":1,"seq":4,"root":{"id":"app","role":"app","#,
+            r#""children":[{"id":"row","role":"list_item","actions":["select","#,
+            r#"{"custom":"delete","icon":"x"},{"scroll_to":{"row":3}},{"custom":"activate"},"#,
+            r#"{"custom":"two words"},"frobnicate",{"zoom":1,"custom":"x"}]}]}}"#
+        );
+        let Ok(taria::wire::AppToBridge::Snapshot(parsed)) = serde_json::from_str(line) else {
+            panic!("the line is a snapshot");
+        };
+        let tree = AppSnapshot::from_line(line, parsed);
+        let outline = snapshot_text(&tree, TreeFormat::Outline);
+        assert_eq!(
+            outline,
+            "protocol_version=1 seq=4\napp app\n  row list_item \
+             [select delete scroll_to activate \"two words\" frobnicate zoom]"
+        );
+        let names = outline_action_names(outline.lines().last().expect("a node line"));
+        let row = find_node(&tree.parsed.root, "row").expect("the row parsed");
+        assert_eq!(names.len(), row.actions.len(), "{names:?}");
+
+        // A bridge whose app acks every input as dropped, which ends each
+        // call at once; what matters is which inputs got as far as the app.
+        let (_state_tx, state_rx) = watch::channel(BridgeState::Connected(tree.clone()));
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let (ack_tx, _) = broadcast::channel(4);
+        let (_protocol_tx, protocol_rx) = watch::channel(Some(PROTOCOL_VERSION));
+        let (_rejected_tx, rejected_rx) = watch::channel(None);
+        let (_link_tx, link_rx) = watch::channel(LinkState::Down);
+        let app_acks = ack_tx.clone();
+        let server = TariaMcpServer::with_tree_format(
+            BridgeHandle {
+                state_rx,
+                input_tx,
+                ack_tx,
+                protocol_rx,
+                rejected_rx,
+                link_rx,
+            },
+            TreeFormat::Outline,
+        );
+        let app = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while let Some((id, input)) = input_rx.recv().await {
+                received.push(input);
+                let _ = app_acks.send((id, InputStatus::Dropped));
+            }
+            received
+        });
+        for name in &names {
+            let result = server
+                .act(Parameters(ActParams {
+                    node: "row".to_string(),
+                    action: name.clone(),
+                    value: None,
+                }))
+                .await;
+            if let Err(err) = result {
+                assert!(
+                    err.message.contains("dropped"),
+                    "`{name}` is printed in the outline, so act must send it: {}",
+                    err.message
+                );
+            }
+        }
+        drop(server);
+        let received = app.await.expect("the fake app");
+        let sent: Vec<AgentInput> = row
+            .actions
+            .iter()
+            .map(|action| AgentInput::act(NodeId("row".to_string()), action.clone(), None))
+            .collect();
+        assert_eq!(received, sent, "names: {names:?}");
     }
 
     /// Every tree an input tool hands back goes out in the server's format,

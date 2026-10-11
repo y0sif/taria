@@ -76,9 +76,11 @@ refuses a `target/debug` older than the sources.
   `type` framing key) beside the parse of it: the line is what the agent
   reads, so an unknown role, action or field survives by name; the parse is
   what the bridge validates and diffs against. `--tree-format outline`
-  (default `json`) renders that line, never the parse, as one indented line
-  per node for every tree an agent receives, and swaps only the format
-  passages of the instructions and the `read_tree`/`act` descriptions; the
+  (default `json`) renders that line as one indented line per node for every
+  tree an agent receives, with action names taken from the parse because that
+  is what `act` checks, and swaps only the format passages of the
+  instructions and of the `read_tree` and `act` descriptions, `act`'s
+  parameters included; the
   JSON mode stays byte-identical, which a test pins. `act` validates node ids
   and advertised actions and bounds `value` (4096 chars), `key` parses the
   shared grammar and bounds `repeat` (1-64), `type_text` bounds the payload

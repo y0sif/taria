@@ -26,9 +26,12 @@
 //!   renders as its key; any other shape renders as compact JSON.
 //! - The label and the value are JSON-quoted strings, so an empty value shows
 //!   as `= ""`. `null` or absent omits them; any other type goes to the tail.
-//! - An action `{"custom":"delete"}` renders as `delete`, the inner name,
-//!   which is what `act` takes; a string renders as itself; any other shape
-//!   as compact JSON. No actions, or an empty list, omits the brackets.
+//! - An action renders as the name `act` accepts for it: the name the
+//!   bridge's own parse of the line reads it as, which is the action `act`
+//!   validates against. `{"custom":"delete"}` renders as `delete`, a string
+//!   as itself, and an object in a shape a newer app might send, such as
+//!   `{"scroll_to":{"row":3}}`, as the name the parse keeps, `scroll_to`. No
+//!   actions, or an empty list, omits the brackets.
 //! - `*focused` appears only for `"focused":true`; `false` or absent prints
 //!   nothing, and any other value goes to the tail.
 //! - Every other field, and any of the above in a shape the line cannot hold,
@@ -37,7 +40,10 @@
 //!
 //! Every string the line prints is either bare by the rule above or
 //! JSON-escaped, so a label carrying a newline cannot break a node across
-//! two lines, and every node stays exactly one line.
+//! two lines, and every node stays exactly one line. The escaping goes past
+//! JSON's own on three characters JSON leaves raw and some clients still
+//! render as a line break, U+2028, U+2029 and U+0085, which print as
+//! `\u2028`, `\u2029` and `\u0085`.
 //!
 //! # Rendered from the relayed text
 //!
@@ -47,11 +53,28 @@
 //! never heard of into `other`, and drops a field it has no slot for, while
 //! the `Value` keeps both by name. Anything the outline cannot express falls
 //! back to the JSON text rather than losing part of the tree.
+//!
+//! Action names are the one exception, and only their spelling. The outline
+//! tells the agent to pass an action to `act` exactly as it prints, and `act`
+//! validates against the typed parse, so the name printed is the one that
+//! parse reads (see [`action_name`]). That loses nothing: the parse keeps an
+//! action it does not know as `Custom` under its own name. Reading it off the
+//! `Value` instead would not be the same thing, because the relayed text has
+//! been through a `Value` already and its keys are sorted, so the first key of
+//! an object, the one the parse names the action after, can differ.
 
 use serde_json::{Map, Value};
+use taria::{Action, Node};
+
+use crate::bridge::AppSnapshot;
+use crate::server::action_name;
 
 /// The text an agent reads a tree from.
+///
+/// `#[non_exhaustive]` so that a third format is not a breaking change for a
+/// caller that matches on this.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TreeFormat {
     /// The app's own snapshot line, minus its message framing. The default,
     /// and what every bridge before this option served.
@@ -83,11 +106,12 @@ impl TreeFormat {
         }
     }
 
-    /// Render the relayed snapshot text `tree_json` in this format.
-    pub fn render(self, tree_json: &str) -> String {
+    /// Render a snapshot the bridge holds in this format: its relayed text,
+    /// as it is or as an outline of it, with action names from its parse.
+    pub fn render(self, snapshot: &AppSnapshot) -> String {
         match self {
-            Self::Json => tree_json.to_string(),
-            Self::Outline => outline(tree_json),
+            Self::Json => snapshot.tree_json.clone(),
+            Self::Outline => outline_of(&snapshot.tree_json, Some(&snapshot.parsed.root)),
         }
     }
 }
@@ -95,19 +119,28 @@ impl TreeFormat {
 /// Render `tree_json` as an outline, or return it unchanged when it is not a
 /// snapshot the outline can express.
 ///
+/// With no parse beside the text, each action is named by reading it with the
+/// same rules the bridge parses a line with. [`TreeFormat::render`] has the
+/// parse, and names actions from it.
+///
 /// A line that reached the bridge parsed as a snapshot, so the fallback is
 /// not reachable from a peer; it is here so that a shape this renderer has no
 /// spelling for costs the agent the shorter format, never part of the tree.
 pub fn outline(tree_json: &str) -> String {
+    outline_of(tree_json, None)
+}
+
+/// [`outline`], naming actions from `parsed_root` where it lines up.
+fn outline_of(tree_json: &str, parsed_root: Option<&Node>) -> String {
     let Ok(Value::Object(snapshot)) = serde_json::from_str::<Value>(tree_json) else {
         return tree_json.to_string();
     };
-    render_snapshot(&snapshot).unwrap_or_else(|| tree_json.to_string())
+    render_snapshot(&snapshot, parsed_root).unwrap_or_else(|| tree_json.to_string())
 }
 
 /// The header line and every node line, or `None` for a snapshot whose root
 /// or some node is not an object.
-fn render_snapshot(snapshot: &Map<String, Value>) -> Option<String> {
+fn render_snapshot(snapshot: &Map<String, Value>, parsed_root: Option<&Node>) -> Option<String> {
     let Some(Value::Object(root)) = snapshot.get("root") else {
         return None;
     };
@@ -117,15 +150,28 @@ fn render_snapshot(snapshot: &Map<String, Value>) -> Option<String> {
         .map(|(key, value)| field(key, value))
         .collect();
     let mut out = header.join(" ");
-    render_node(root, 0, &mut out)?;
+    render_node(root, parsed_root, 0, &mut out)?;
     Some(out)
 }
 
 /// Append one node's line, then its children's, each on a line of its own.
 ///
+/// `parsed` is the typed parse of the same node, when there is one, and is
+/// used for nothing but the action names. It is trusted only where it lines
+/// up with the text: the same id, and as many actions or children. A line
+/// that parsed always does, since the typed `Node` drops no action and no
+/// child; anything else falls back to naming each action from the text.
+///
 /// Recursion is bounded by the parse: `serde_json` refuses input nested past
 /// its recursion limit, so a `Value` that exists is one this can walk.
-fn render_node(node: &Map<String, Value>, depth: usize, out: &mut String) -> Option<()> {
+fn render_node(
+    node: &Map<String, Value>,
+    parsed: Option<&Node>,
+    depth: usize,
+    out: &mut String,
+) -> Option<()> {
+    let parsed =
+        parsed.filter(|parsed| node.get("id").and_then(Value::as_str) == Some(&parsed.id.0));
     out.push('\n');
     for _ in 0..depth {
         out.push_str("  ");
@@ -157,7 +203,14 @@ fn render_node(node: &Map<String, Value>, depth: usize, out: &mut String) -> Opt
     }
     match node.get("actions") {
         Some(Value::Array(actions)) if !actions.is_empty() => {
-            let names: Vec<String> = actions.iter().map(action).collect();
+            let parsed = parsed
+                .map(|parsed| parsed.actions.as_slice())
+                .filter(|parsed| parsed.len() == actions.len());
+            let names: Vec<String> = actions
+                .iter()
+                .enumerate()
+                .map(|(i, value)| action(value, parsed.and_then(|parsed| parsed.get(i))))
+                .collect();
             out.push_str(" [");
             out.push_str(&names.join(" "));
             out.push(']');
@@ -191,11 +244,15 @@ fn render_node(node: &Map<String, Value>, depth: usize, out: &mut String) -> Opt
         out.push_str(&extra);
     }
 
-    for child in children {
+    let parsed_children = parsed
+        .map(|parsed| parsed.children.as_slice())
+        .filter(|parsed| parsed.len() == children.len());
+    for (i, child) in children.iter().enumerate() {
         let Value::Object(child) = child else {
             return None;
         };
-        render_node(child, depth + 1, out)?;
+        let parsed_child = parsed_children.and_then(|parsed| parsed.get(i));
+        render_node(child, parsed_child, depth + 1, out)?;
     }
     Some(())
 }
@@ -212,15 +269,17 @@ fn role(role: &Value) -> String {
     }
 }
 
-/// An action, spelled the way `act` takes it.
-fn action(action: &Value) -> String {
-    match action {
-        Value::String(name) => token(name),
-        Value::Object(object) if object.len() == 1 => match object.get("custom") {
-            Some(Value::String(name)) => token(name),
-            _ => compact(action),
-        },
-        other => compact(other),
+/// An action, spelled the way `act` takes it: [`action_name`] of the action
+/// the bridge parsed, or, without that parse, of the action the same rules
+/// read from the text. Only a value no action parse accepts, which cannot
+/// reach the outline from a line the bridge kept, prints as compact JSON.
+fn action(value: &Value, parsed: Option<&Action>) -> String {
+    if let Some(parsed) = parsed {
+        return token(&action_name(parsed));
+    }
+    match serde_json::from_value::<Action>(value.clone()) {
+        Ok(read) => token(&action_name(&read)),
+        Err(_) => compact(value),
     }
 }
 
@@ -244,13 +303,25 @@ fn compact_str(s: &str) -> String {
     compact(&Value::String(s.to_string()))
 }
 
-/// `value` as compact JSON.
+/// `value` as compact JSON, with the line separators JSON leaves raw escaped.
+///
+/// JSON escapes `\n` and `\r` but not U+2028, U+2029 or U+0085, and a client
+/// that renders any of them as a line break would show a label carrying one
+/// as a second node line. The compact form puts every non-ASCII character
+/// inside a string literal, so replacing them with their `\u` escapes keeps
+/// the JSON valid and the string the same.
 ///
 /// Serializing a `Value` cannot fail: its map keys are strings and it holds no
 /// non-finite floats. The fallback is the debug form rather than a panic,
 /// because a library crate does not panic over a peer's data.
 fn compact(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
+    let json = serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"));
+    if !json.contains(['\u{2028}', '\u{2029}', '\u{0085}']) {
+        return json;
+    }
+    json.replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+        .replace('\u{0085}', "\\u0085")
 }
 
 #[cfg(test)]
@@ -292,8 +363,12 @@ app app "taria-demo"
 
     #[test]
     fn json_is_relayed_untouched() {
-        assert_eq!(TreeFormat::Json.render(DEMO_JSON), DEMO_JSON);
-        assert_eq!(TreeFormat::Outline.render(DEMO_JSON), DEMO_OUTLINE);
+        let snapshot = AppSnapshot {
+            tree_json: DEMO_JSON.to_string(),
+            parsed: serde_json::from_str(DEMO_JSON).expect("the demo tree parses"),
+        };
+        assert_eq!(TreeFormat::Json.render(&snapshot), DEMO_JSON);
+        assert_eq!(TreeFormat::Outline.render(&snapshot), DEMO_OUTLINE);
         assert_eq!(TreeFormat::default(), TreeFormat::Json);
     }
 
@@ -320,14 +395,85 @@ app app "taria-demo"
         );
     }
 
+    /// Without a parse beside the text, an action object is read by the
+    /// rules the bridge parses a line with: the envelope folds onto its inner
+    /// name, a longer envelope keeps that name, and an object a newer app
+    /// might send is named by its key, its payload dropped.
     #[test]
-    fn the_custom_envelope_renders_as_the_name_act_takes() {
+    fn an_action_renders_as_the_name_act_takes() {
         let out = render_root(
-            r#"{"id":"row","role":"list_item","actions":["select",{"custom":"archive"},{"custom":"two words"},{"future":"x"},{"custom":7}]}"#,
+            r#"{"id":"row","role":"list_item","actions":["select",{"custom":"archive"},{"custom":"two words"},{"future":"x"},{"scroll_to":{"row":3}},{"custom":"delete","icon":"x"},{"custom":"activate"}]}"#,
         );
         assert_eq!(
             out,
-            "protocol_version=1 seq=3\nrow list_item [select archive \"two words\" {\"future\":\"x\"} {\"custom\":7}]"
+            "protocol_version=1 seq=3\nrow list_item [select archive \"two words\" future scroll_to delete activate]"
+        );
+    }
+
+    /// A value no parse reads as an action has no name `act` would accept,
+    /// so it is shown whole. A line carrying one is rejected before it is
+    /// relayed, so only the renderer used on its own meets these.
+    #[test]
+    fn a_value_that_is_no_action_is_shown_as_json() {
+        let out = render_root(
+            r#"{"id":"row","role":"list_item","actions":[{"custom":7},{},7,["select"]]}"#,
+        );
+        assert_eq!(
+            out,
+            "protocol_version=1 seq=3\nrow list_item [{\"custom\":7} {} 7 [\"select\"]]"
+        );
+    }
+
+    /// With the parse, the name is the one the parse holds, which is what
+    /// `act` checks against. The relayed text's keys are sorted, so an object
+    /// whose first key on the wire was `zoom` reads as `custom` first there:
+    /// the text alone would print `x`, a name the node never advertised.
+    #[test]
+    fn with_the_parse_an_action_is_named_as_the_parse_read_it() {
+        let line = r#"{"protocol_version":1,"seq":3,"root":{"id":"row","role":"list_item","actions":[{"zoom":1,"custom":"x"},"select"]}}"#;
+        let parsed: taria::Snapshot = serde_json::from_str(line).expect("a snapshot");
+        assert_eq!(
+            parsed.root.actions,
+            [Action::Custom("zoom".to_string()), Action::Select]
+        );
+        let tree_json =
+            serde_json::to_string(&serde_json::from_str::<Value>(line).expect("a value"))
+                .expect("a value serializes");
+        assert!(
+            tree_json.contains(r#"{"custom":"x","zoom":1}"#),
+            "{tree_json}"
+        );
+        assert!(outline(&tree_json).ends_with("[x select]"));
+
+        let snapshot = AppSnapshot { tree_json, parsed };
+        let out = TreeFormat::Outline.render(&snapshot);
+        assert_eq!(out, "protocol_version=1 seq=3\nrow list_item [zoom select]");
+    }
+
+    /// JSON escapes a newline but leaves U+2028, U+2029 and U+0085 raw, and a
+    /// client that breaks lines on them would show a forged node line. Every
+    /// quoted string escapes them: label, value, a quoted id or action, a
+    /// tail field, the header.
+    #[test]
+    fn unicode_line_separators_are_escaped_in_every_quoted_string() {
+        let out = outline(
+            "{\"protocol_version\":1,\"note\":\"a\u{2028}b\",\"seq\":3,\"root\":{\"id\":\"r\u{0085}w\",\"role\":\"list_item\",\
+             \"label\":\"x\u{2028}  forged button\",\"value\":\"y\u{2029}z\",\
+             \"actions\":[{\"custom\":\"de\u{2029}l\"}],\"extra\":[\"\u{0085}\"]}}",
+        );
+        assert_eq!(
+            out,
+            "note=\"a\\u2028b\" protocol_version=1 seq=3\n\"r\\u0085w\" list_item \"x\\u2028  forged button\" \
+             = \"y\\u2029z\" [\"de\\u2029l\"] extra=[\"\\u0085\"]"
+        );
+        assert!(
+            !out.contains(['\u{2028}', '\u{2029}', '\u{0085}']),
+            "no raw separator may reach the agent: {out:?}"
+        );
+        // Still the same strings, read back as JSON.
+        assert_eq!(
+            serde_json::from_str::<String>("\"x\\u2028  forged button\"").expect("valid JSON"),
+            "x\u{2028}  forged button"
         );
     }
 
