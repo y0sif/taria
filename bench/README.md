@@ -352,6 +352,9 @@ One JSON object per run, the same keys in both modes, null where none applies.
 
 ## Summaries
 
+The results of the batches run so far, with their caveats, are in
+[RESULTS.md](RESULTS.md).
+
 ```bash
 python3 bench/summarize.py                          # the newest batch, named on stderr
 python3 bench/summarize.py --batch B                # one batch
