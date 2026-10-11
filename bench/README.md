@@ -244,12 +244,18 @@ added to the agent's prompt:
 | rule | types | the guard |
 |---|---|---|
 | verified | `prompt_snapshot`, `mcp_instructions_delta`, `deferred_tools_delta`, `deferred_tools_record`, `max_turns_reached`, `instructions` | reads what they carry and holds the run to it (below) |
-| harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `thinking_drop`, `total_tokens_reminder` | holds each to the shape it is known in: a snapshot of the 8 keys a real run's has and their types, session context of `userEmail` and `gitStatus` only, a `YYYY-MM-DD` date rendered as "Today's date is ...", a model identity of `modelId`, `marketingName` and `knowledgeCutoff` and the one line spelled from it, no rendered text for `credential_org` and `thinking_drop` (diagnostics Claude Code records and never shows the model), a `<total_tokens>` count and nothing else; any other field is refused |
+| harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `thinking_drop`, `total_tokens_reminder` | holds each to the top-level fields it is known with (any other field is refused) and to the shape it is known in: a snapshot of the 8 keys a real run's has, their types, one line each; session context of `userEmail` and `gitStatus` only, each in Claude Code's words around the data (the e-mail sentence around the address, the git status's opening sentence and section labels around the repo's branches, status and commits); a `YYYY-MM-DD` date; a model identity of `modelId`, `marketingName` and `knowledgeCutoff`; a `<total_tokens>` count. Its rendered text must be the one text its own values fill, character for character: for the environment and the session context, the template every archived run rendered them in (`ENVIRONMENT_TEXT` and `SESSION_CONTEXT_TEXT` in `bench/transcript.py`), so a sentence Claude Code adds is refused; "Today's date is ..."; the model line spelled from its identity; the count; and no text at all for `credential_org` and `thinking_drop` (diagnostics Claude Code records and never shows the model) |
 | flagged | `remote_session_change`, `skill_listing` | refuses it by name |
 
 Any other type, an attachment line with no type, or one whose attachment is
 not an object makes the run a harness error, and the guard's sentence names
 the type, how many arrived and how many characters of them were rendered.
+So does an attachment of any type whose `rendered` field is there but does
+not read as text: real runs hold a list of objects whose one key is
+`content`, a string (or text blocks), and anything else (a plain string, an
+object keyed otherwise, a block that is not text) is refused rather than
+read as no text, which would skip every check of the text and count 0
+characters. Its characters are counted as JSON.
 That is how `remote_session_change` was caught after the fact: with
 `/remote-control` on in the orchestrating session, Claude Code put a
 ~710-character attribution note, as a user-role reminder beside a tool
@@ -287,16 +293,18 @@ assistant line), and the guard. The guard makes a run a harness error if it:
   problem too;
 - ever got the instructions of an MCP server other than `tui`, got none
   from `tui`, or lost `tui`'s mid-run;
-- was given an attachment without a rule, one flagged by name, or a
-  harmless one in a shape it is not known in (the table above);
-- has a `<system-reminder>` block inside a tool result, which is where
-  Claude Code appends its reminders to a tool's output, out of reach of the
-  attachment rules (`context.tool_result_reminders` counts them; no real run
-  has had one);
+- was given an attachment without a rule, one flagged by name, one whose
+  rendered text does not read, or a harmless one in a shape or with
+  rendered text it is not known in (the table above);
+- has a `<system-reminder>` block inside a tool result, or beside one in
+  the same user message, which is where Claude Code appends its reminders
+  to a tool's output, out of reach of the attachment rules
+  (`context.tool_result_reminders` counts them; no real run has had one);
 - has a transcript line whose type is not `user`, `assistant` or
   `attachment`;
 - was given more than one prompt (a message sent to the agent mid-run, a
-  hook);
+  hook, or text or any other block beside a tool result that is not a
+  `<system-reminder>`);
 - never took a turn.
 
 A run is also a harness error when it did not end on its own: Claude Code's
@@ -392,7 +400,7 @@ One JSON object per run, the same keys in both modes, null where none applies.
 | `tokens` | `input`, `cache_creation`, `cache_read`, `output`, summed over messages |
 | `output_tokens_lower_bound`, `unclosed_messages` | `tokens.output` is a lower bound because a message never got its closing line; how many messages did not |
 | `final_text` | the agent's last text, up to 500 characters |
-| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers (at the end, and every one ever added), environment cwd, skill listing, attachment types, `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description); `cli_prefixes`, the agent's identity line; `refused_attachments`, one entry per type, rule (`unknown`, `flagged` or `shape`) and detail the guard refused, with its count and rendered characters; `unknown_line_types`; and `prompts`, the user lines that are not tool results |
+| `context` | `offered_tools` and `offered_tools_snapshots`, the tools the prompt snapshots listed (their union, and each snapshot's list); `claude_md_files`; `deferred_tools`, `loaded_tools` and `deferred_tools_added` (at the end, loaded by ToolSearch, every one ever added); `mcp_instruction_servers` and `mcp_instruction_servers_added` (at the end, every one ever added); `environment_cwd`; `skill_listing`; `attachment_types`; `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description); `cli_prefixes`, the agent's identity line; `refused_attachments`, one entry per type, rule (`unknown`, `flagged` or `shape`) and detail the guard refused, with its count and rendered characters; `unknown_line_types`; `prompts`, the user lines that are not tool results, plus each tool-result line with anything beside its results but reminders; and `tool_result_reminders`, the `<system-reminder>` blocks in or beside tool results |
 | `status_at_run`, `regraded_at`, `regrade_git_sha`, `regrade_git_dirty`, `regrade_note` | added by `regrade` only: see Regrading |
 
 ## Summaries

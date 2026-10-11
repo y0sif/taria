@@ -14,14 +14,19 @@ rule in bench/transcript.py first, so no fixture holds context the guard
 has never judged, and none silently loses it either.
 
 Replaced:
-  - session_context: every context value, and its rendered text;
+  - session_context: the orchestrating repo's git status (branch, user,
+    status lines, commits) after Claude Code's opening sentence, in the
+    context and in its rendered text alike; the e-mail address, as below;
+    any other context value whole. So the attachment keeps the shape
+    bench/transcript.py pins, and its rendered text stays the one its values
+    fill;
   - credential_org: organizationUuid (zeroes);
   - remote_session_change and anywhere else: a claude.ai session URL's
     session id (https://claude.ai/code/session_FIXTURE);
   - mcp_instructions_delta: each addedBlocks entry by a placeholder naming its
     server (addedNames are kept), and its rendered text;
-  - environment: workingDirectory and scratchpadDirectory (the latter in
-    every string too);
+  - environment: workingDirectory (in its rendered text too, which shows
+    it) and scratchpadDirectory (in every string too);
   - every line: cwd (/home/user/project), gitBranch, slug, sessionId, agentId;
   - in every string anywhere: the session ids, the agent id, the
     organization uuid, a /home/<user> prefix (/home/user), the user name,
@@ -55,6 +60,9 @@ from transcript import KNOWN_ATTACHMENTS  # noqa: E402  (bench/transcript.py)
 FAKE_ORG = "00000000-0000-0000-0000-000000000000"
 FAKE_CWD = "/home/user/project"
 FAKE_SCRATCH = "/tmp/scratchpad"
+FAKE_GIT_BODY = ("Current branch: fixture\n\nMain branch (you will usually use this for PRs): main\n\n"
+                 "Git user: user\n\nStatus:\n(clean)\n\nRecent commits:\n0000000 (scrubbed from the fixture)")
+SCRUBBED = "(scrubbed from the fixture)"
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 HOME = re.compile(r"/home/([^/\s\"']+)")
 SAFE_EMAIL = "user@example.com"
@@ -131,18 +139,46 @@ class Scrubber:
         return found
 
 
+def scrub_context_value(key, value):
+    """A session context value with the orchestrating session's data out:
+    the git status after its opening sentence, which Claude Code wrote and
+    the guard pins; the e-mail line as it is (the address is replaced with
+    every other one); anything else whole."""
+    if key == "userEmail" and isinstance(value, str):
+        return value
+    if key == "gitStatus" and isinstance(value, str):
+        head, sep, _ = value.partition("\n\nCurrent branch: ")
+        if sep:
+            return f"{head}\n\n{FAKE_GIT_BODY}"
+    return SCRUBBED
+
+
+def replace_in_rendered(line, old, new, what):
+    """Replace `old` with `new` in the line's rendered text, refusing when a
+    rendered text does not hold `old`: what it rendered would then be kept
+    unscrubbed, or lost."""
+    for item in line.get("rendered") or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, str) or old not in content:
+            raise ValueError(f"{what}: its rendered text does not hold the value verbatim; scrub it by hand")
+        item["content"] = content.replace(old, new)
+
+
 def scrub_attachment(line, att, servers, note):
     kind = att.get("type")
     if kind == "session_context":
         context = att.get("context") if isinstance(att.get("context"), dict) else {}
-        att["context"] = {key: "(scrubbed from the fixture)" for key in context}
-        line["rendered"] = rendered("(session context scrubbed from the fixture)")
+        att["context"] = {key: scrub_context_value(key, value) for key, value in context.items()}
+        for key, value in context.items():
+            if att["context"][key] != value:
+                replace_in_rendered(line, value, att["context"][key], f"session_context {key}")
     elif kind == "credential_org":
         att["organizationUuid"] = FAKE_ORG
     elif kind == "environment":
         snapshot = att.get("snapshot")
         if isinstance(snapshot, dict):
-            if "workingDirectory" in snapshot:
+            if isinstance(snapshot.get("workingDirectory"), str):
+                replace_in_rendered(line, snapshot["workingDirectory"], FAKE_CWD, "environment workingDirectory")
                 snapshot["workingDirectory"] = FAKE_CWD
             if "scratchpadDirectory" in snapshot:
                 snapshot["scratchpadDirectory"] = FAKE_SCRATCH

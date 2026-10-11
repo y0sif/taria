@@ -1438,12 +1438,30 @@ class AgentFiles(unittest.TestCase):
 # --- The subagent path, end to end, without a model ------------------------------------------
 
 
-# The opening of each bridge arm's read_tree description, as taria-mcp
-# serves it (what tells the taria and outline arms apart in a transcript).
+# Each bridge arm's read_tree description, as taria-mcp serves it (what tells
+# the taria and outline arms apart in a transcript): the texts
+# crates/taria-mcp/src/server.rs pins as PINNED_READ_TREE and
+# PINNED_OUTLINE_READ_TREE and holds the served ones to, byte for byte.
+# OutlineArm holds these to those.
 TOOL_DESCRIPTIONS = {
-    ("taria", "read_tree"): "Read the connected TUI app's current semantic tree as JSON: every node ...",
-    ("outline", "read_tree"): "Read the connected TUI app's current semantic tree as an outline: every node ...",
+    ("taria", "read_tree"): "Read the TUI app's current semantic tree as JSON. Call this first.",
+    ("outline", "read_tree"): (
+        "Read the TUI app's current semantic tree as an outline, one node per line, indented by depth: id role "
+        "\"label\" = \"value\" *focused act: a|b, parts only when set. Each name after act: is one action to pass "
+        "to act. Call this first."),
 }
+SERVER_RS = os.path.join(os.path.dirname(BENCH), "crates", "taria-mcp", "src", "server.rs")
+
+
+def rust_str_const(source, name):
+    """The value of `const NAME: &str = "...";` in Rust `source`: a line
+    continuation (backslash, newline, indentation) is dropped, and \\" and
+    \\\\ unescaped."""
+    match = re.search(rf'const {name}: &str =\s*"((?:[^"\\]|\\.)*)";', source, re.S)
+    if match is None:
+        raise AssertionError(f"no const {name} in server.rs")
+    text = re.sub(r"\\\n\s*", "", match.group(1))
+    return re.sub(r'\\(["\\])', r"\1", text)
 
 
 def write_transcript(directory, agent_id, prompt, arm, calls, agent_type,
@@ -1771,6 +1789,15 @@ class OutlineArm(unittest.TestCase):
             client = Client()
             harness.wait_ready(arm, client)
             self.assertEqual(client.calls, want, arm)
+
+    def test_the_described_texts_are_the_served_ones(self):
+        with open(SERVER_RS, encoding="utf-8") as f:
+            source = f.read()
+        self.assertEqual(TOOL_DESCRIPTIONS[("taria", "read_tree")], rust_str_const(source, "PINNED_READ_TREE"))
+        self.assertEqual(TOOL_DESCRIPTIONS[("outline", "read_tree")],
+                         rust_str_const(source, "PINNED_OUTLINE_READ_TREE"))
+        for (arm, _), text in TOOL_DESCRIPTIONS.items():
+            self.assertEqual(transcript.tree_format_of(text), harness.ARM_TREE_FORMAT[arm])
 
     def test_the_dry_run_checks_the_served_tree_format(self):
         def tools(description):

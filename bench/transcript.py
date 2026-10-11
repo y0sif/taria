@@ -80,18 +80,29 @@ a `tool_use` message and its result. `ending` infers the cut-off from that
 shape and the turn count, and takes a `max_turns_reached` attachment as
 proof if a later version records one.
 
+A harmless attachment is held to its fields and to the text it rendered:
+the environment's and the session context's rendered text must be the
+template Claude Code 2.1.294 renders them in (ENVIRONMENT_TEXT,
+SESSION_CONTEXT_TEXT) filled with the attachment's own values, the date's
+and the model's their one sentence. An attachment whose `rendered` is there
+but does not read as text is refused too, never taken for no text.
+
 Context can also arrive inside a tool result rather than as an attachment:
 Claude Code appends its reminders to a tool's output as `<system-reminder>`
-blocks. No real run has carried one, and none can be told harmless from its
-place, so each is counted (`tool_result_reminders`) and refused.
+blocks, inside the result or as a text block beside it in the same user
+message. No real run has carried one, and none can be told harmless from its
+place, so each is counted (`tool_result_reminders`) and refused. Anything
+else beside a tool result (text outside a reminder, a block that is not
+text) counts as a prompt.
 
 Reading never raises: a malformed line is skipped and counted
 (`malformed_lines`), and a missing field reads as absent. What a run should
 not have is recorded in its context instead, and `guard` refuses the run for
 each: an attachment of a type with no rule, or in a shape its rule does not
-know; an attachment line with no type, or whose attachment is not an
-object; a `<system-reminder>` block inside a tool result; a line whose type
-is not `user`, `assistant` or `attachment`; and a second prompt.
+know, or whose rendered text does not read; an attachment line with no
+type, or whose attachment is not an object; a `<system-reminder>` block in
+or beside a tool result; a line whose type is not `user`, `assistant` or
+`attachment`; and a second prompt, beside a tool result or on its own.
 
 Python 3 stdlib only.
 """
@@ -149,6 +160,19 @@ ATTACHMENTS_FLAGGED = {
 }
 KNOWN_ATTACHMENTS = ATTACHMENTS_VERIFIED | ATTACHMENTS_HARMLESS | frozenset(ATTACHMENTS_FLAGGED)
 LINE_TYPES = frozenset({"user", "assistant", "attachment"})
+# The top-level fields each harmless type is known with, `type` included: any
+# other is refused. thinking_drop's are those of every record Claude Code
+# 2.1.280 and 2.1.294 wrote outside the bench (no bench run has had one).
+HARMLESS_FIELDS = {
+    "environment": ("type", "snapshot"),
+    "session_context": ("type", "context"),
+    "date": ("type", "date"),
+    "model": ("type", "identity", "text"),
+    "credential_org": ("type", "organizationUuid"),
+    "thinking_drop": ("type", "requestId", "model", "querySource", "thinkingBlocksSent", "thinkingTurnsSent",
+                      "newlyDropped", "blockHashes", "firstReportForThreadInProcess", "clientChange"),
+    "total_tokens_reminder": ("type", "text"),
+}
 SESSION_CONTEXT_KEYS = ("gitStatus", "userEmail")
 # environment.snapshot: the keys every real run's has (a tmux run from another
 # orchestrating session had all but scratchpadDirectory), and each one's type.
@@ -156,6 +180,69 @@ ENVIRONMENT_KEYS = {
     "additionalWorkingDirectories": list, "isGitRepo": bool, "isWorktree": bool, "osVersion": str,
     "platform": str, "scratchpadDirectory": str, "shell": str, "workingDirectory": str,
 }
+# The text the environment and session_context attachments render, as Claude
+# Code 2.1.294 wrote it in every archived run (full1, outline1 and probe3,
+# every arm) and in every fixture: the rendered text must be the template
+# filled with the attachment's own values, character for character, so a
+# sentence Claude Code adds is refused. Each {field} is the snapshot's value
+# (a bool as true or false); the scratchpad line is there only when the
+# snapshot has a scratchpadDirectory, as the real tmux fixture's has not. A
+# snapshot of a worktree renders more lines, which no bench run has had, so
+# its text matches no template and is refused.
+ENVIRONMENT_TEXT = (
+    "<system-reminder>\n"
+    "# Environment\n"
+    "You have been invoked in the following environment: \n"
+    " - Primary working directory: {workingDirectory}\n"
+    " - Is a git repository: {isGitRepo}\n"
+    " - Platform: {platform}\n"
+    " - Shell: {shell}\n"
+    " - OS Version: {osVersion}\n"
+    "{scratchpad}"
+    " - Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, "
+    "keep scripts you write in a different directory, and pass paths as arguments instead of running an "
+    "interpreter or build tool from inside it. Interpreters load code from the script's directory and the "
+    "current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. "
+    "This does not apply to code the user asked you to build or run.\n"
+    "</system-reminder>"
+)
+ENVIRONMENT_SCRATCHPAD = (
+    " - Scratchpad directory: {scratchpadDirectory} — always use it for temporary files (intermediate "
+    "results, scripts, outputs that don't belong in the project) instead of `/tmp` or other system temp "
+    "directories; it is session-specific, isolated from the project, and can generally be used without "
+    "permission prompts. Only use `/tmp` if the user explicitly asks.\n"
+)
+# The snapshot fields the environment text shows, always.
+ENVIRONMENT_SHOWN = ("workingDirectory", "isGitRepo", "platform", "shell", "osVersion")
+# session_context renders one `# key` section per context value, in the
+# context's order. The values carry Claude Code's own sentences too, so each
+# is pinned as well: the e-mail line around the address, and the git status's
+# opening sentence and section labels around the orchestrating repo's branch
+# names, status lines and commits (data, not Claude Code's words).
+SESSION_CONTEXT_TEXT = (
+    "<system-reminder>\n"
+    "As you answer the user's questions, you can use the following context:\n"
+    "{sections}"
+    "\n"
+    "Claude Code attached this context automatically; it isn't part of the user's message. It describes the "
+    "user's own account and workspace, so they don't need it reported back.\n"
+    "</system-reminder>"
+)
+SESSION_CONTEXT_SECTION = "# {key}\n{value}\n"
+USER_EMAIL = re.compile(re.escape("The user's email address is ") + r"[^\s@]+@[^\s@]+" + re.escape(
+    ". Use it only to identify the user, such as for authorship, attribution, or filtering their own work. "
+    "Never send it to an unrelated service, such as in a request header, URL, or payload, unless the user "
+    "explicitly asks."))
+GIT_STATUS = re.compile(
+    re.escape("This is the git status at the start of the conversation. Note that this status is a snapshot "
+              "in time, and will not update during the conversation.")
+    + r"\n\nCurrent branch: [^\n]*"
+    + r"\n\nMain branch \(you will usually use this for PRs\): [^\n]*"
+    + r"(?:\n\nGit user: [^\n]*)?"
+    + r"\n\nStatus:\n[^\n]+(?:\n[^\n]+)*"
+    + r"\n\nRecent commits:\n[0-9a-f]{7,40} [^\n]*(?:\n[0-9a-f]{7,40} [^\n]*)*"
+)
+SESSION_CONTEXT_VALUES = {"userEmail": USER_EMAIL, "gitStatus": GIT_STATUS}
 MODEL_IDENTITY_KEYS = ("knowledgeCutoff", "marketingName", "modelId")
 # The model attachment's text, spelled from its identity, and the date's.
 MODEL_TEXT = ("You are powered by the model named {marketingName}. The exact model ID is {modelId}. "
@@ -240,6 +327,11 @@ def _block_text(content):
     return "".join(texts) if texts else None
 
 
+def _text_block(block):
+    """Whether `block` is a text block: type text, a string text."""
+    return isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+
+
 def _result_texts(content):
     """The text a tool_result block's `content` put in front of the model:
     the string, or each text block's text."""
@@ -259,6 +351,24 @@ def _prompt_text(content):
     if _is_tool_result(content):
         return None
     return _block_text(content)
+
+
+def _beside_results(content):
+    """(reminders, prompt) for the blocks of a tool-result user message that
+    are not tool results: how many <system-reminder> blocks they hold, and 1
+    when anything else is there (text outside a reminder, a block that is not
+    text), which counts as one more prompt, else 0."""
+    reminders, other = 0, False
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            continue
+        text = block if isinstance(block, str) else block["text"] if _text_block(block) else None
+        if text is None:
+            other = True
+            continue
+        reminders += text.count(REMINDER_OPEN)
+        other = other or bool(REMINDER.sub("", text).strip())
+    return reminders, int(other)
 
 
 def _is_prompt(content):
@@ -305,11 +415,14 @@ def _snapshot_tools(att):
     return sorted({t["name"] for t in tools if isinstance(t, dict) and isinstance(t.get("name"), str)})
 
 
-# How taria-mcp's read_tree description names the tree's format: "... the
-# current semantic tree as JSON: ..." by default, "... as an outline: ..."
-# under --tree-format outline (crates/taria-mcp/src/server.rs,
-# READ_TREE_PASSAGE). The taria and outline arms list the same tools, so
-# this is what tells their runs apart.
+# How taria-mcp's read_tree description names the tree's format: "Read the
+# TUI app's current semantic tree as JSON. Call this first." by default, "...
+# semantic tree as an outline, one node per line, ..." under --tree-format
+# outline (crates/taria-mcp/src/server.rs, READ_TREE_PASSAGE). The batches
+# archived so far (full1, outline1, probe3) were served the longer texts of
+# the day, "... the connected TUI app's current semantic tree as JSON: every
+# node ...", which carry the same markers. The taria and outline arms list
+# the same tools, so this is what tells their runs apart.
 TREE_FORMAT_MARKERS = (("outline", "tree as an outline"), ("json", "tree as JSON"))
 READ_TREE = SERVER_PREFIX + "read_tree"
 
@@ -345,16 +458,30 @@ def _deferred_tree_formats(definitions):
 
 
 def _rendered_texts(line):
-    """The text an attachment line put in front of the model: each
-    `rendered[].content` (a string, or blocks whose text counts)."""
-    texts = []
-    for item in line.get("rendered") if isinstance(line.get("rendered"), list) else []:
-        content = item.get("content") if isinstance(item, dict) else None
+    """(texts, unreadable) for an attachment line: the text it put in front
+    of the model, each `rendered[].content` (a string, or a list of text
+    blocks), and how many characters of `rendered`, as JSON, are in no shape
+    that reads so (0 when all of it reads). Real runs hold a list of objects
+    whose one key is `content`, a string. No `rendered`, null or [] is no
+    text; anything else that does not read (a plain string, an item with
+    another key or without `content`, a block that is not text) is
+    unreadable, and the guard refuses the attachment rather than take it for
+    no text."""
+    rendered = line.get("rendered")
+    if rendered is None:
+        return [], 0
+    if not isinstance(rendered, list):
+        return [], len(json.dumps(rendered))
+    texts, unreadable = [], 0
+    for item in rendered:
+        content = item["content"] if isinstance(item, dict) and list(item) == ["content"] else None
         if isinstance(content, str):
             texts.append(content)
-        elif isinstance(content, list):
-            texts += [b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)]
-    return texts
+        elif isinstance(content, list) and all(_text_block(b) for b in content):
+            texts += [b["text"] for b in content]
+        else:
+            unreadable += len(json.dumps(item))
+    return texts, unreadable
 
 
 def _label(kind):
@@ -378,36 +505,98 @@ def _unwrapped(text):
     return match.group(1) if match else text
 
 
+def _listed(names):
+    """`names` as prose: "a", "a and b", "a, b and c"."""
+    names = list(names)
+    return " and ".join(names) if len(names) < 3 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _first_difference(text, expected):
+    """Where `text` first parts from `expected`: the line's number and the
+    text's line there, cut to 80 characters."""
+    got, want = text.split("\n"), expected.split("\n")
+    number = next((n for n, (a, b) in enumerate(zip(got, want), 1) if a != b), min(len(got), len(want)) + 1)
+    line = got[number - 1] if number <= len(got) else "<end of text>"
+    return f"line {number}, {line if len(line) <= 80 else line[:77] + '...'!r}"
+
+
+def _rendered_problem(texts, expected, what):
+    """None when every rendered text is `expected`, else where one is not."""
+    for text in texts:
+        if text != expected:
+            return f"its rendered text is not {what}: it differs at {_first_difference(text, expected)}"
+    return None
+
+
+def _environment_text(snapshot):
+    """The text Claude Code renders from an environment `snapshot`
+    (ENVIRONMENT_TEXT), or None when it lacks a field the text shows."""
+    if any(key not in snapshot for key in ENVIRONMENT_SHOWN):
+        return None
+    values = {key: json.dumps(snapshot[key]) if isinstance(snapshot[key], bool) else snapshot[key]
+              for key in ENVIRONMENT_SHOWN}
+    scratchpad = snapshot.get("scratchpadDirectory")
+    values["scratchpad"] = "" if scratchpad is None else ENVIRONMENT_SCRATCHPAD.format(scratchpadDirectory=scratchpad)
+    return ENVIRONMENT_TEXT.format(**values)
+
+
+def _session_context_text(context):
+    """The text Claude Code renders from a session `context`
+    (SESSION_CONTEXT_TEXT): a section per value, in the context's order."""
+    return SESSION_CONTEXT_TEXT.format(sections="".join(
+        SESSION_CONTEXT_SECTION.format(key=key, value=value) for key, value in context.items()))
+
+
 def _harmless_shape(kind, att, texts):
     """None when a harmless attachment has the shape it is known in, else
-    what differs. Each is pinned where its content is: the keys it carries,
-    and for date and model the one sentence they render, so a field or a
-    sentence Claude Code adds is noticed."""
+    what differs. Each is held to its top-level fields (HARMLESS_FIELDS),
+    then to its content: the environment's snapshot keys, their types, one
+    line each; the session context's two keys, each value in the words a
+    real run's has; the date's format; the model identity's keys and the
+    line it spells. Its rendered text is then held to the one text its own
+    values fill: ENVIRONMENT_TEXT, SESSION_CONTEXT_TEXT, the date sentence,
+    the model line, a bare <total_tokens> count, or no text at all for
+    credential_org and thinking_drop. So a field or a sentence Claude Code
+    adds is refused. An attachment with no rendered text put nothing in front
+    of the model, and only its fields are checked."""
+    fields = HARMLESS_FIELDS[kind]
+    extra = _beyond(att, fields)
+    if extra:
+        return f"fields beyond {_listed(fields[1:])}: {extra}"
     if kind == "environment":
         snapshot = att.get("snapshot")
         if not isinstance(snapshot, dict):
             return "it has no snapshot object"
-        extra = _beyond(att, ("type", "snapshot"))
-        if extra:
-            return f"fields beyond snapshot: {extra}"
         extra = _beyond(snapshot, ENVIRONMENT_KEYS)
         if extra:
             return f"snapshot keys beyond the {len(ENVIRONMENT_KEYS)} a real run's has: {extra}"
         wrong = sorted(k for k, v in snapshot.items() if not isinstance(v, ENVIRONMENT_KEYS[k]))
-        return f"snapshot values of another type than a real run's: {', '.join(wrong)}" if wrong else None
+        if wrong:
+            return f"snapshot values of another type than a real run's: {', '.join(wrong)}"
+        spanning = sorted(k for k, v in snapshot.items() if isinstance(v, str) and "\n" in v)
+        if spanning:
+            return f"snapshot values that span lines: {', '.join(spanning)}"
+        expected = _environment_text(snapshot)
+        if expected is None and texts:
+            missing = [key for key in ENVIRONMENT_SHOWN if key not in snapshot]
+            return f"its rendered text cannot be checked: its snapshot has no {', '.join(missing)}"
+        return _rendered_problem(texts, expected, "the environment text its snapshot fills")
     if kind == "session_context":
         context = att.get("context")
         if not isinstance(context, dict):
             return "it has no context object"
         extra = sorted(str(k) for k in context if k not in SESSION_CONTEXT_KEYS)
-        return f"context beyond {' and '.join(SESSION_CONTEXT_KEYS)}: {', '.join(extra)}" if extra else None
+        if extra:
+            return f"context beyond {' and '.join(SESSION_CONTEXT_KEYS)}: {', '.join(extra)}"
+        wrong = sorted(k for k, v in context.items()
+                       if not (isinstance(v, str) and SESSION_CONTEXT_VALUES[k].fullmatch(v)))
+        if wrong:
+            return f"context values not in the words a real run's has: {', '.join(wrong)}"
+        return _rendered_problem(texts, _session_context_text(context), "the session context text its values fill")
     if kind == "date":
         date = att.get("date")
         if not isinstance(date, str):
             return "it has no date string"
-        extra = _beyond(att, ("type", "date"))
-        if extra:
-            return f"fields beyond date: {extra}"
         if not DATE.fullmatch(date):
             return "its date is not YYYY-MM-DD"
         if any(_unwrapped(t) != DATE_TEXT.format(date=date) for t in texts):
@@ -417,9 +606,6 @@ def _harmless_shape(kind, att, texts):
         text, identity = att.get("text"), att.get("identity")
         if not isinstance(text, str) or not isinstance(identity, dict):
             return "it has no model text and identity"
-        extra = _beyond(att, ("type", "identity", "text"))
-        if extra:
-            return f"fields beyond identity and text: {extra}"
         if sorted(identity) != list(MODEL_IDENTITY_KEYS) or not all(isinstance(v, str) for v in identity.values()):
             return f"its identity is not {', '.join(MODEL_IDENTITY_KEYS)}, as strings"
         if text != MODEL_TEXT.format(**identity):
@@ -430,43 +616,50 @@ def _harmless_shape(kind, att, texts):
     if kind == "credential_org" or kind == "thinking_drop":
         return "it carries rendered text, which it never has" if any(t.strip() for t in texts) else None
     if kind == "total_tokens_reminder":
-        shown = texts or [att.get("text")]
-        if all(isinstance(t, str) and TOTAL_TOKENS.fullmatch(t.strip()) for t in shown):
+        if all(isinstance(t, str) and TOTAL_TOKENS.fullmatch(t.strip()) for t in [att.get("text"), *texts]):
             return None
         return "its text is not a <total_tokens> count"
     return None
 
 
-def _refusal(kind, att, texts):
+UNREADABLE = ("its rendered field is in no shape the guard reads (a list of objects whose one key is content, "
+              "a string or text blocks), so the text it put in front of the model cannot be checked")
+
+
+def _refusal(kind, att, texts, unreadable=0):
     """(rule, detail) when the guard refuses this attachment, else None:
     "unknown" for a type with no rule (or no type, or no attachment object),
-    "flagged" for one refused by name, "shape" for a harmless type in a
-    shape it is not known in."""
+    "flagged" for one refused by name, "shape" for a known type whose
+    rendered text does not read (`unreadable` characters of it, as JSON, the
+    count the guard's sentence includes), or a harmless type in a shape it
+    is not known in."""
     if not isinstance(att, dict) or not isinstance(kind, str) or kind not in KNOWN_ATTACHMENTS:
         return "unknown", None
     if kind in ATTACHMENTS_FLAGGED:
         return "flagged", None
+    if unreadable:
+        return "shape", UNREADABLE
     detail = _harmless_shape(kind, att, texts) if kind in ATTACHMENTS_HARMLESS else None
     return ("shape", detail) if detail else None
 
 
 def _context(attachments):
-    """The context row field from `attachments`: (attachment, rendered texts)
-    pairs in transcript order, the attachment as the line carries it (not
-    always an object)."""
+    """The context row field from `attachments`: (attachment, rendered texts,
+    unreadable rendered characters) in transcript order, the attachment as
+    the line carries it (not always an object)."""
     claude_md, deferred, loaded, servers, types = [], set(), set(), set(), set()
     deferred_added, servers_added = set(), set()  # every name ever added, removals ignored
     snapshots, offered, tree_formats, prefixes = [], set(), set(), set()
     refused = {}  # (label, rule, detail) -> [count, rendered chars]
     cwd, skills = None, False
-    for att, texts in attachments:
+    for att, texts, unreadable in attachments:
         kind = att.get("type") if isinstance(att, dict) else None
-        refusal = _refusal(kind, att, texts)
+        refusal = _refusal(kind, att, texts, unreadable)
         if refusal is not None:
             label = _label(kind) if isinstance(att, dict) else "<not an object>"
             tally = refused.setdefault((label, *refusal), [0, 0])
             tally[0] += 1
-            tally[1] += sum(len(t) for t in texts)
+            tally[1] += sum(len(t) for t in texts) + unreadable
         if not isinstance(kind, str):
             continue
         types.add(kind)
@@ -540,7 +733,8 @@ def _context(attachments):
         # The attachments the guard refuses, one entry per (type, rule,
         # detail): rule "unknown" (no rule for the type, no type, or no
         # attachment object), "flagged" (refused by name) or "shape" (a
-        # harmless type in a shape it is not known in, detail saying how).
+        # rendered field that does not read, or a harmless type in a shape
+        # it is not known in, detail saying how).
         "refused_attachments": [
             {"type": label, "rule": rule, "detail": detail, "count": count, "rendered_chars": chars}
             for (label, rule, detail), (count, chars) in sorted(refused.items(), key=lambda kv: (
@@ -559,7 +753,7 @@ def read_transcript(path):
     errors = set()
     synthetic = set()
     first_prompt, seen_user, prompts = None, False, 0
-    reminders = 0  # <system-reminder> blocks inside tool results
+    reminders = 0  # <system-reminder> blocks in or beside tool results
     other_lines = Counter()  # line types other than user, assistant and attachment
     final = None  # the last assistant line's message: {"id", "synthetic", "text", "error"}
     max_turns_reached = None
@@ -576,7 +770,7 @@ def read_transcript(path):
             other_lines[_label(kind)] += 1
         if kind == "attachment":
             att = line.get("attachment")
-            attachments.append((att, _rendered_texts(line)))
+            attachments.append((att, *_rendered_texts(line)))
             if isinstance(att, dict) and att.get("type") == "max_turns_reached":
                 max_turns_reached = {"max_turns": att.get("maxTurns"), "turn_count": att.get("turnCount")}
         elif kind == "user" and isinstance(line.get("message"), dict):
@@ -586,6 +780,13 @@ def read_transcript(path):
                 first_prompt = _prompt_text(content)
             if _is_prompt(content):
                 prompts += 1
+            elif _is_tool_result(content):
+                # Blocks beside the results, in the same user message: a
+                # reminder there is context like one inside a result, and
+                # anything else came from outside the run, as a prompt does.
+                beside, other = _beside_results(content)
+                reminders += beside
+                prompts += other
             for pos, block in enumerate(content if isinstance(content, list) else []):
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
@@ -670,7 +871,8 @@ def read_transcript(path):
     context["unknown_line_types"] = dict(sorted(other_lines.items()))
     context["prompts"] = prompts
     # Context Claude Code appended to a tool's output, which no attachment
-    # rule sees: <system-reminder> blocks inside tool results.
+    # rule sees: <system-reminder> blocks inside tool results, or beside them
+    # in the same user message.
     context["tool_result_reminders"] = reminders
 
     return {
@@ -731,8 +933,9 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
     tools, so this is what holds each to its own), or one offered only
     deferred whose description no record carries, so its format cannot be
     checked; an attachment the context refuses (see ATTACHMENTS_VERIFIED and
-    the rest: a type with no rule, one flagged by name, a harmless one in a
-    new shape); a <system-reminder> block inside a tool result; a transcript
+    the rest: a type with no rule, one flagged by name, a rendered field that
+    does not read, a harmless one in a new shape or with new rendered text);
+    a <system-reminder> block in or beside a tool result; a transcript
     line of a type other than user, assistant and attachment; more than one
     prompt; and a run with no assistant turn. The
     identity line (`cli_prefixes`) is recorded, not checked.
@@ -788,8 +991,8 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
                  if isinstance(entry, dict)]
     reminders = context.get("tool_result_reminders")
     if isinstance(reminders, int) and reminders > 0:
-        problems.append(f"has {reminders} <system-reminder> block(s) inside tool results: context Claude Code "
-                        "added to a tool's output, which the guard cannot check")
+        problems.append(f"has {reminders} <system-reminder> block(s) in or beside tool results: context Claude "
+                        "Code added to a tool's output, which the guard cannot check")
     for kind, count in sorted((context.get("unknown_line_types") or {}).items()):
         problems.append(f"has {count} transcript line(s) of type {kind}, which the guard does not know")
     prompts = context.get("prompts")
