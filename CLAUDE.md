@@ -79,14 +79,15 @@ refuses a `target/debug` older than the sources.
   (default `json`) renders that line as one indented line per node for every
   tree an agent receives, with action names taken from the parse because that
   is what `act` checks, and swaps only the format passages of the
-  instructions and of the `read_tree` and `act` descriptions, `act`'s
-  parameters included; the
-  JSON mode stays byte-identical, which a test pins. `act` validates node ids
-  and advertised actions and bounds `value` (4096 chars), `key` parses the
-  shared grammar and bounds `repeat` (1-64), `type_text` bounds the payload
-  (4096 chars). Results are anchored on the app's ack, not on whatever the tree
-  did: dropped, ignored, delivered-and-changed,
-  delivered-and-unchanged, no ack, partial burst, lost acks, and the app
+  instructions and of the `read_tree` and `act` descriptions. Those texts are
+  short because they are resent with every model call: no parameter is
+  described but `repeat`'s default, the `{"custom":...}` rule is in `act`'s
+  description only, and a test pins the JSON mode's text byte for byte.
+  `act` validates node ids and advertised actions and bounds `value` (4096
+  chars), `key` parses the shared grammar and bounds `repeat` (1-64),
+  `type_text` bounds the payload (4096 chars). Results are anchored on the
+  app's ack, not on whatever the tree did: dropped, ignored,
+  delivered-and-changed, delivered-and-unchanged, no ack, partial burst, lost acks, and the app
   disconnecting. A protocol mismatch keeps `read_tree` for as long as the
   peer's snapshots parse, and refuses every input tool. When lines from the
   app were rejected, `read_tree` says the socket path is right and quotes the

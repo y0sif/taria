@@ -46,29 +46,30 @@ With `--tree-format outline`, the demo app's first screen reads:
 protocol_version=1 seq=1
 app app "taria-demo"
   tabs tabs "Tabs" = "Active"
-    tab-active tab "Active" = "selected" [select]
-    tab-done tab "Done" [select]
+    tab-active tab "Active" = "selected" act: select
+    tab-done tab "Done" act: select
   tasks list "Active tasks" = "task-1"
-    task-1 list_item "Write the taria README" = "todo" [select toggle delete] *focused
-    task-3 list_item "Wire up the MCP bridge" = "todo" [select toggle delete]
-    task-4 list_item "Record the killer demo" = "todo" [select toggle delete]
-  input text_input "New task" = "" [set_value focus]
-  quit button "Quit" [activate]
+    task-1 list_item "Write the taria README" = "todo" *focused act: select|toggle|delete
+    task-3 list_item "Wire up the MCP bridge" = "todo" act: select|toggle|delete
+    task-4 list_item "Record the killer demo" = "todo" act: select|toggle|delete
+  input text_input "New task" = "" act: set_value|focus
+  quit button "Quit" act: activate
 ```
 
-That is 525 characters. The same tree as JSON is 1132.
+That is 546 characters. The same tree as JSON is 1132.
 
 The first line holds every top-level snapshot field except `root`, as
 `key=<compact json>`, space-separated. Then one line per node, depth-first,
 indented two spaces per level, the root at zero:
 
 ```text
-<id> <role>[ "<label>"][ = "<value>"][ [<action> ...]][ *focused][ <key>=<compact json> ...]
+<id> <role>[ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
 ```
 
 - An id, a role, an action name or a field key prints bare when it is
   non-empty and made only of `A-Z`, `a-z`, `0-9` and `_ . : / @ + -`, and
-  JSON-quoted otherwise.
+  JSON-quoted otherwise. One spelled `act:` is quoted too, so the only bare
+  `act:` on a line is the marker that opens its action list.
 - A role sent as a string prints as that string, and one sent as a
   single-key object, `{"heading":{"level":2}}`, as its key, `heading`. A role
   in any other shape, an object with several keys or an array, prints whole as
@@ -79,6 +80,14 @@ indented two spaces per level, the root at zero:
   as the newline and carriage return JSON escapes, so a label carrying any of
   them cannot split a node across two lines, even in a client that breaks
   lines on them.
+- `*focused` appears only on a node whose `focused` is `true`.
+- Any other field, a field this bridge has never heard of included, is
+  appended as ` key=<compact json>`, after `*focused` and before the actions,
+  and so is a known field in a shape the line has no slot for.
+- The actions end the line, after the marker `act: `, joined by `|` with no
+  spaces. A node with no actions, or an empty list, has no marker. A name
+  holding a space, a `|`, a quote or anything else outside the bare set is
+  quoted, so `act: "a|b"|"two words"|c` is three actions.
 - Every action prints as the name `act` takes for it, which is the name the
   bridge's own parse of the line gives it, the same parse `act` checks a name
   against. An app-specific action, `{"custom":"delete"}` in the JSON, prints
@@ -89,19 +98,24 @@ indented two spaces per level, the root at zero:
   here, is not shown, because `act` takes only the name. A value no parse
   reads as an action, such as `{"custom":7}`, has no name `act` would take
   and would print whole as compact JSON, but a line carrying one is rejected
-  before it is relayed, so the outline never shows one. Pass `act` an
-  id and an action name exactly as the line spells them, without the quotes if
-  one is quoted.
-- `*focused` appears only on a node whose `focused` is `true`.
-- Any other field, a field this bridge has never heard of included, is
-  appended as ` key=<compact json>`, and so is a known field in a shape the
-  line has no slot for.
+  before it is relayed, so the outline never shows one.
+
+Pass `act` an id and an action name as the line spells them. A quoted one is
+a JSON string, so pass the string it holds, without the quotes.
+
+A program can split a node line, past its indent, into tokens at its spaces
+outside JSON strings, since compact JSON holds no space outside a string and a
+bare token holds none at all. The marker is the first token that is exactly
+`act:`, and the action list is the one token after it, split at every `|`
+outside a JSON string. `scripts/e2e.py` reads the demo's outline this way.
 
 The outline is rendered from the app's line, not from the bridge's parse of
 it, so a role, an action or a field this bridge does not know reaches the
 agent by name, as it does in the JSON. Only the spelling of action names comes
 from the parse, because that is what `act` validates against, and the parse
 keeps an action it does not know under its own name. A line the outline
-cannot express is served as JSON instead. In this mode the MCP instructions and the `read_tree`
-and `act` descriptions describe the outline rather than the JSON; everything
-else they say is the same.
+cannot express is served as JSON instead. In this mode the MCP instructions
+and the `read_tree` description say the tree is an outline and how a line
+reads, and `act`'s description says to pass names as the line spells them in
+place of the `{"custom":"delete"}` rule. Every other word is the same in both
+modes.

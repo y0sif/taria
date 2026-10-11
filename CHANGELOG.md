@@ -21,12 +21,18 @@ names, `"focused":false` on nearly every node, and punctuation, which is how a
 benchmark found a taria tree costing more per call than a tmux screen of the
 same app. The outline carries every node, id, role, label, value, focus
 state and field, and every action by the name `act` takes, in under half the
-characters: the demo's first tree is 1132 characters as JSON and 525 as an
+characters: the demo's first tree is 1132 characters as JSON and 546 as an
 outline. Extra keys inside an action object are not shown, because `act`
-takes only the name. It is opt-in, and the default does not move.
+takes only the name. It is opt-in, and the default stays JSON.
+
+**The bridge's own text is less than half as long.** The server instructions
+and the four tool definitions are resent with every model call, and at 4,788
+characters they were the bridge's largest fixed cost, against 2,787 for the
+benchmark's tmux driver. They are now 1,990 characters, and 2,195 with the
+outline. `act` also says what `activate` does, which no text said before.
 
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1 and apps send the same
-JSON; only the text the bridge hands the model changes, and only when asked.
+JSON; only the text the bridge hands the model changes.
 
 **This breaks the Rust API of `taria-mcp`, so the next release is 0.3.0.**
 `args::Cli::Run` gained a field, and `Cli`, its `Run` variant and the new
@@ -44,9 +50,16 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
 - **`--tree-format <json|outline>`**, default `json`. The outline is a header
   line of the snapshot's other fields (`protocol_version=1 seq=1`), then one
   line per node, indented two spaces per level, as
-  `id role "label" = "value" [actions] *focused`, with each part present only
+  `id role "label" = "value" *focused act: a|b`, with each part present only
   when set. `docs/cli.md` has the grammar. A missing or unknown value is a
   usage error.
+- **The actions end the line, labelled `act:`**, joined by `|`, so the list
+  reads as the call to make. A benchmark of an unlabelled list,
+  `[set_value activate dismiss]`, had Sonnet submit a new task with
+  `key enter` in all 10 of its runs of the two tasks that add one, where all
+  10 JSON runs used `act activate`. A name holding a space or a `|` is
+  quoted, and so is an id, role or name spelled `act:`, so the marker cannot
+  be forged.
 - **Every tree goes out in the chosen format**: `read_tree`, and the tree in
   every `act`, `key` and `type_text` answer, the ignored note's tree included.
 - **The outline is rendered from the relayed line**, so a
@@ -60,10 +73,27 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
   JSON-quoted, with U+2028, U+2029 and U+0085 escaped as well as the newline,
   and a line the outline cannot express is served as JSON.
 - **The agent is told which format it is reading.** In outline mode the MCP
-  instructions, the `read_tree` and `act` descriptions and the descriptions of
-  `act`'s `node` and `action` parameters describe the outline instead of the
-  JSON. Every other word is the same, and a test holds the JSON mode to the
-  text it served before, byte for byte.
+  instructions and the `read_tree` description say the tree is an outline and
+  how a line reads, and `act`'s description says to pass names as the line
+  spells them, minus any quotes. Every other word is the same, and a test pins
+  the JSON mode's text byte for byte.
+- **The instructions give the order of work and one rule.** Read the tree,
+  prefer `act` with an advertised action, fall back on `key`, and type text
+  only with `type_text`, because through `key` the characters hit the app's
+  bindings. `key` and `type_text` both say it again, for a client that drops
+  the instructions.
+- **The `{"custom":"delete"}` rule lives only in `act`'s description**, in
+  JSON mode. The outline prints the inner name, so it never shows the
+  envelope.
+- **`act` says `activate` presses a button or submits a field.**
+- **Parameters carry no description but `repeat`'s "Defaults to 1."** The
+  tool descriptions already cover them, and the schema still states every
+  bound: 4096 characters for `value` and `text`, 64 for `key`, and 1 to 64
+  presses for `repeat`.
+- **Some of what the texts said is now left to the answers.** A key outside
+  the grammar is still refused with the grammar in the error, and an input
+  the app ignored still comes back as a result carrying the tree, not as an
+  error.
 - **For a Rust caller**: `TariaMcpServer::with_tree_format` builds the handler
   in either format, `TariaMcpServer::new` still serves JSON, the renderer is
   `taria_mcp::tree_format`, and `args::Cli::Run` carries the parsed
