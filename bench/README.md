@@ -67,10 +67,14 @@ each slot. Needs `tmux` and Python 3.
 
 ```bash
 cargo build --workspace     # run.py never builds, and refuses a stale build
-python3 bench/run.py agents --slots 4 --dir ~/Projects/taria/.claude/agents
+python3 bench/run.py agents --slots 4
 python3 bench/run.py plan --batch B --models sonnet,haiku --runs 5
 python3 bench/run.py next --batch B --slot 1
 ```
+
+`agents --dir` and `next --agents-dir` both default to `.claude/agents` at
+the root of the repo the bench is in. When the orchestrating session starts
+somewhere else, pass that session's `.claude/agents` to both.
 
 `plan` writes the shuffled jobs (task x arm x model x run) and the seed to
 `results/B/plan.json`, and never replaces one. `next` claims the slot's next
@@ -94,6 +98,19 @@ prints the slot's next job, or `{"done": true}`. Run each slot's loop side by
 side. When `next` refuses, it prints `{"error": ..., "slot": K}` and exits 2.
 A harness error stops the slot: the row is recorded, nothing is claimed. Fix
 the setup, then `next --batch B --slot K` resumes.
+
+Before it grades, `next --agent-id` checks that the agent can have run the
+slot's job. It refuses when:
+
+- the batch already recorded that agent id;
+- no transcript exists for the id;
+- the transcript has no `.meta.json` beside it;
+- the `.meta.json` names another slot's agent;
+- the transcript's first prompt, compared stripped, is not the job's task;
+- the transcript started before the slot was prepared.
+
+These are the orchestrator's mistakes, not runs. A refusal exits 2, records
+nothing and keeps the slot, so pass the right id or `abort` the slot.
 
 `status` shows progress and `abort` records a harness error and frees a slot.
 The free check, `dry-run`, drives every task on both arms with a scripted
@@ -135,6 +152,12 @@ slot's demo. An exec, not a proxy: the MCP stream passes straight through. A
 missing slot file, a slot not ready, or a slot holding the other arm's job
 exits 1, so the agent gets no tools rather than the wrong arm's.
 
+One launch per job. Before the exec, the launcher creates the marker
+`results/slots/<K>.<job>.launched`, and it refuses when that marker exists,
+so a second agent cannot drive a demo another agent already used. `run.py`
+removes a slot's markers when it frees the slot. A refused agent is offered
+no tools, and the guard makes that run a harness error.
+
 ## Isolation
 
 This is what makes the numbers fair. Measured on 2026-10-11 from subagent
@@ -166,21 +189,46 @@ in the orchestrating project's `.claude/settings.local.json`:
 Adjust the plugin and server names to whatever your session has connected.
 The connector switch is also the env var `ENABLE_CLAUDEAI_MCP_SERVERS=false`.
 Changes to plugins and MCP servers need a session restart; only the connector
-switch applied live. Then check a probe run's row:
-`context.mcp_instruction_servers` must be exactly `["tui"]`. The guard does
-not check this, so read it before a real batch.
+switch applied live. The guard checks the result: every MCP server whose
+instructions ever reached the agent must be `tui`, even one that later
+disconnected (`context.mcp_instruction_servers_added`). A leaking session
+turns every run into a harness error, so run a probe and read its rows
+before a real batch.
 
 What every run still receives, identical across arms: the environment block
 (working directory), the date, the model identity and the session context.
 
 What each row proves, from the transcript: `model_resolved` (the models its
 turns ran on), `efforts_resolved` (the efforts Claude Code recorded on every
-assistant line), and the guard. A run is a harness error if it called a tool
-outside its arm (ToolSearch, which loads the arm's deferred tools, is
-allowed), was given a CLAUDE.md or memory file, was offered a deferred tool
-beyond its arm's (this catches the other arm's), ran on a model outside
-`claude-<family>-*`, never took a turn, or was spawned as another slot's
-agent (the transcript's `.meta.json` names the type).
+assistant line), and the guard. The guard makes a run a harness error if it:
+
+- called a tool outside its arm (ToolSearch, which loads the arm's deferred
+  tools, is allowed);
+- ran on a model outside `claude-<family>-*`;
+- ran at an effort other than the plan's on any turn, or recorded none;
+- was given a CLAUDE.md or memory file;
+- was offered tools that are not exactly its arm's, or has no
+  `prompt_snapshot` to tell (a server that never started, or that
+  `mcp_launch` refused, offers none);
+- was ever offered a deferred tool beyond its arm's (this catches the other
+  arm's), even one later removed;
+- ever got the instructions of an MCP server other than `tui`, got none
+  from `tui`, or lost `tui`'s mid-run;
+- never took a turn.
+
+A run is also a harness error when it did not end on its own: Claude Code's
+own `<synthetic>` message comes last (a usage limit, an API error), its last
+message stopped on anything but `end_turn` (`max_tokens`, `refusal` and the
+like), or it stopped on a tool call under the turn cap.
+
+One shape counts as ended: a final text reply whose stop_reason is null.
+Claude Code 2.1.294 sometimes never writes the closing line of a final
+message, so its lines carry stop_reason null and a placeholder output count.
+The reply arrived, so the run ended. The row says `end_inferred: true`, and
+its `notes` say that message's output tokens are a lower bound.
+
+Which agent ran is settled before grading, by refusing (see How runs
+execute), not by the guard.
 
 ## Statuses
 
@@ -188,12 +236,42 @@ agent (the transcript's `.meta.json` names the type).
 |---|---|---|
 | `passed` | the check passed and the demo still runs | a pass |
 | `failed` | the check said no, or the demo exited | a failure |
-| `max_turns` | the transcript ends on a tool call at the batch's max turns | a failure whatever the dump says |
-| `harness_error` | infrastructure, not the agent: a failed setup, a server or solver failure, no transcript, the guard, a grading failure, an abort | left out, counted on its own |
+| `max_turns` | the transcript ends on a tool call (stop_reason `tool_use`, or null) at the batch's max turns | a failure whatever the dump says |
+| `harness_error` | infrastructure, not the agent: a failed setup, a server or solver failure, an unreadable transcript, the guard (offered tools, deferred tools, MCP instruction servers, model, effort, instruction files), a run that did not end on its own (a trailing synthetic message, a stop other than `end_turn`, a tool call under the cap), a grading failure, an abort | left out, counted on its own |
+
+A final text reply with a null stop_reason is not a harness error: it ended
+on its own (`end_inferred`, above).
 
 Exit codes: 0 ok (dry-run: every run passed); 1 dry-run only, a run did not
-pass; 2 a harness error (a stale build, bad arguments, slot misuse, or a
-graded run that was a harness error).
+pass; 2 a harness error (a stale build, bad arguments, slot misuse, an agent
+`next` refused, or a graded run that was a harness error).
+
+## Regrading
+
+```bash
+python3 bench/run.py regrade --batch B
+```
+
+This grades every row of batch B again with the current code. Use it after a
+change to the grading logic (the guard, how an ending is read, a task's
+check), so that one batch keeps one grading logic for all its rows. It uses
+only what persists: each row's recorded `state` (the task's check runs on it
+again), its `demo_alive`, and its transcript. The transcript is found again
+by agent id under `~/.claude/projects` and read with the plan's effort and
+max turns. Nothing runs again and no model is called.
+
+It refuses while any slot of the batch is held. It copies `runs.jsonl` to
+`runs.orig-<UTC time>.jsonl` first, never over an existing backup, then
+replaces `runs.jsonl` in one atomic step. A regraded row keeps every field.
+Its status, verdict, error, guard problems and transcript stats are
+recomputed. It gains `status_at_run` (the status recorded at run time, kept
+across regrades), `regraded_at`, `regrade_git_sha` and `regrade_git_dirty`.
+
+Dry-run rows stay as they are. A row with no agent id (an abort, a failed
+prepare), no state, or a transcript that can no longer be found keeps its
+status and stats, and gets a `regrade_note` saying why. The command prints
+how many rows changed status, and each change as `job: old -> new (reason)`.
+A second regrade changes nothing.
 
 ## Rows
 
@@ -202,7 +280,7 @@ One JSON object per run, the same keys in both modes, null where none applies.
 | key | meaning |
 |---|---|
 | `ts`, `batch`, `job` | when the row was written (UTC), the batch, the plan's job id |
-| `task`, `arm`, `run`, `seed` | the task, the arm, the repeat index, the shuffle seed |
+| `task`, `arm`, `run`, `slot`, `seed` | the task, the arm, the repeat index, the slot it ran in (null in a dry run), the shuffle seed |
 | `mode`, `solver` | `dry-run` or `subagent`; `scripted`, `scripted-sabotage` or `agent` |
 | `model`, `model_resolved` | the family asked for; the models the transcript shows |
 | `effort`, `efforts_resolved`, `max_turns` | the plan's effort; the efforts on the assistant lines; the plan's maxTurns |
@@ -212,12 +290,14 @@ One JSON object per run, the same keys in both modes, null where none applies.
 | `status`, `passed` | see Statuses; `passed` is null for a harness error |
 | `check_passed`, `reason` | the check's verdict and why, recorded even when the status ignores it |
 | `error`, `guard_problems` | the harness error, if any; the guard's sentences |
+| `end_inferred`, `notes` | the run's end was inferred from a final text reply with a null stop_reason; sentences such as that its last message's output tokens are a lower bound |
 | `demo_alive`, `demo_exit`, `state` | the demo ran at grading; `clean`, `killed` or `crashed` when quit; the graded dump |
 | `turns`, `wall_ms` | assistant messages (Claude Code's synthetic ones excluded); first to last transcript timestamp (dry-run: the solver's time) |
 | `tool_calls`, `tool_calls_total`, `toolsearch_calls` | calls by name; total without ToolSearch; ToolSearch calls |
 | `tokens` | `input`, `cache_creation`, `cache_read`, `output`, summed over messages |
 | `final_text` | the agent's last text, up to 500 characters |
-| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers, environment cwd, skill listing, attachment types |
+| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers (at the end, and every one ever added), environment cwd, skill listing, attachment types |
+| `status_at_run`, `regraded_at`, `regrade_git_sha`, `regrade_git_dirty`, `regrade_note` | added by `regrade` only: see Regrading |
 
 ## Summaries
 
@@ -244,17 +324,14 @@ python3 bench/test_bench.py        # the harness on live tmux, subagent path reh
 python3 bench/test_transcript.py   # the transcript reader and summary
 ```
 
-## First runs
+## Probes
 
-The probe, T3 on both arms and both models, passed 4/4. It ran before
-isolation was in place (its rows list six MCP instruction servers, `taria`
-among them), so it shows the pipeline works, not a fair comparison.
-
-A leak-check run of T1 on tmux with Haiku, isolated to `["tui"]`, failed. The
-agent typed the title through `send_keys` while the list held the keyboard.
-The characters hit the app's bindings and marked two tasks done. This is the
-failure mode taria's Text input exists to avoid: `type_text` goes to the app's
-typing surface, never its bindings. That is one run, not a benchmark result.
+Two probes ran T3 on both arms and both models. Each recorded 4/4 passed.
+The first (`results/probe`) ran before isolation was in place: its rows list
+six MCP instruction servers, `taria` among them, and today's guard refuses
+all four. The second (`results/probe2`) ran isolated, and every row lists
+only `tui`. They show the pipeline works end to end, not how the arms
+compare. Batch results are written up separately.
 
 ## Known limits
 
@@ -263,4 +340,6 @@ typing surface, never its bindings. That is one run, not a benchmark result.
   (`~/Projects/taria`) to both arms, not the empty dir the MCP server runs in.
 - The agent files' launcher and slot paths point at this worktree until
   `feat/benchmark` merges. Rewrite them with `agents` after the merge.
+  Until then the default agents dir is this worktree's `.claude/agents`, so
+  pass `--dir` to `agents` and `--agents-dir` to `next`.
 - Tokens are subscription usage. Rows carry no dollar cost.

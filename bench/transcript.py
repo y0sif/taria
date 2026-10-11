@@ -38,7 +38,13 @@ tools inline (no deferral, no ToolSearch). A run whose server never started
 has no tools in any snapshot, which is what `guard` checks.
 
 How a run ended is read off its final assistant message: `end_turn` when
-the agent finished on its own. Claude Code's own `<synthetic>` messages
+the agent finished on its own. Claude Code 2.1.294 sometimes never writes the
+closing line of a final text reply, so every line of that message carries
+stop_reason null and a placeholder output_tokens (1 or 5, say). A final
+message whose last block is a non-empty text, with no tool_use after it,
+ended on its own all the same: `end_inferred` says the end was inferred, and
+its output tokens are a lower bound (`output_tokens_lower_bound`). Claude
+Code's own `<synthetic>` messages
 (`isApiErrorMessage`, `error` such as `rate_limit` or `server_error`, text
 such as "You've hit your session limit") are left out of models and turns,
 but one written last means the run died on that error. A run stopped at
@@ -194,6 +200,7 @@ def _snapshot_tools(att):
 
 def _context(attachments):
     claude_md, deferred, loaded, servers, types = [], set(), set(), set(), set()
+    deferred_added, servers_added = set(), set()  # every name ever added, removals ignored
     snapshots, offered = [], set()
     cwd, skills = None, False
     for att in attachments:
@@ -213,6 +220,7 @@ def _context(attachments):
         elif kind == "deferred_tools_delta":
             for key in ("addedNames", "readdedNames", "surfacedNames"):
                 deferred.update(_names(att.get(key)))
+                deferred_added.update(_names(att.get(key)))
             deferred.difference_update(_names(att.get("removedNames")))
         elif kind == "deferred_tools_record":
             # A schema loaded by ToolSearch: the tool was on offer.
@@ -222,6 +230,7 @@ def _context(attachments):
                     loaded.add(name)
         elif kind == "mcp_instructions_delta":
             servers.update(_names(att.get("addedNames")))
+            servers_added.update(_names(att.get("addedNames")))
             servers.difference_update(_names(att.get("removedNames")))
         elif kind == "environment":
             snapshot = att.get("snapshot")
@@ -235,9 +244,14 @@ def _context(attachments):
         "offered_tools": sorted(offered),
         "offered_tools_snapshots": snapshots,
         "claude_md_files": claude_md,
+        # Net of removals: what was on offer at the end.
         "deferred_tools": sorted(deferred | loaded),
         "loaded_tools": sorted(loaded),
         "mcp_instruction_servers": sorted(servers),
+        # Every name ever added, removals ignored: a server or tool that
+        # reached the agent and later left still reached it.
+        "deferred_tools_added": sorted(deferred_added | loaded),
+        "mcp_instruction_servers_added": sorted(servers_added),
         "environment_cwd": cwd,
         "skill_listing": skills,
         "attachment_types": sorted(types),
@@ -325,7 +339,8 @@ def read_transcript(path):
         if base.startswith("agent-") and base.endswith(".jsonl"):
             agent_id = base[len("agent-"):-len(".jsonl")]
 
-    last_model = last_stop_reason = synthetic_text = synthetic_error = None
+    last_model = last_stop_reason = synthetic_text = synthetic_error = last_block_type = None
+    end_inferred = False
     if final is not None and final["synthetic"]:
         last_model, last_stop_reason = SYNTHETIC_MODEL, final["stop_reason"]
         synthetic_text = (final["text"] or "")[:FINAL_TEXT_MAX] or None
@@ -335,6 +350,18 @@ def read_transcript(path):
         last_model = entry["model"]
         reasons = [l["stop_reason"] for l in entry["lines"] if isinstance(l["stop_reason"], str)]
         last_stop_reason = reasons[-1] if reasons else None
+        own = [block for (mid, _), block in blocks.items() if mid == final["id"]]
+        last_block = own[-1] if own else {}
+        last_block_type = last_block.get("type") if isinstance(last_block.get("type"), str) else None
+        # A text reply whose closing line Claude Code never wrote (see the
+        # module doc): it ended on its own, inferred from its shape.
+        end_inferred = bool(
+            last_stop_reason is None and last_block_type == "text"
+            and isinstance(last_block.get("text"), str) and last_block["text"].strip()
+        )
+    # A message no line of which carries a stop_reason never got its final
+    # usage line: its output count is the largest partial one, a lower bound.
+    unstopped = sum(1 for e in messages.values() if not any(l["stop_reason"] is not None for l in e["lines"]))
 
     return {
         "agent_id": agent_id,
@@ -355,6 +382,9 @@ def read_transcript(path):
         # recorded a max_turns_reached.
         "last_model": last_model,
         "last_stop_reason": last_stop_reason,
+        "last_block_type": last_block_type,
+        "end_inferred": end_inferred,
+        "output_tokens_lower_bound": unstopped > 0,
         "ended_synthetic": bool(final and final["synthetic"]),
         "synthetic_text": synthetic_text,
         "synthetic_error": synthetic_error,
@@ -385,6 +415,11 @@ def guard(stats, arm, model_family, arm_tools, effort=None):
     the arm's, or no prompt_snapshot to tell; any deferred tool beyond the
     arm's; MCP instructions from any server but `tui`, or none from it; and a
     run with no assistant turn.
+
+    Other servers and deferred tools are held against every name ever
+    added, so one that reached the agent and later left (a server that
+    disconnected) still counts. Removals matter only for `tui` itself: its
+    instructions must still be there at the end.
     """
     allowed = {SERVER_PREFIX + t for t in arm_tools}
     problems = []
@@ -403,17 +438,21 @@ def guard(stats, arm, model_family, arm_tools, effort=None):
     if files:
         problems.append(f"was given {len(files)} instruction file(s) despite omitClaudeMd: {', '.join(files)}")
     problems += _offered_problems(context, allowed, arm)
-    extra = [t for t in context.get("deferred_tools") or [] if t not in allowed]
+    deferred_ever = sorted(set(context.get("deferred_tools_added") or []) | set(context.get("deferred_tools") or []))
+    extra = [t for t in deferred_ever if t not in allowed]
     if extra:
         problems.append(f"was offered {len(extra)} deferred tool(s) beyond the {arm} arm: {', '.join(extra)}")
     servers = context.get("mcp_instruction_servers") or []
-    others = [s for s in servers if s != SERVER]
+    servers_ever = sorted(set(context.get("mcp_instruction_servers_added") or []) | set(servers))
+    others = [s for s in servers_ever if s != SERVER]
     if others:
         problems.append(
             f"was given the instructions of {len(others)} MCP server(s) besides {SERVER}: {', '.join(others)}"
         )
-    if SERVER not in servers:
+    if SERVER not in servers_ever:
         problems.append(f"never got the {SERVER} server's instructions: it did not start, or was refused")
+    elif SERVER not in servers:
+        problems.append(f"lost the {SERVER} server's instructions mid-run: the server was removed (it disconnected)")
     if not stats.get("turns"):
         problems.append("never ran: the transcript has no assistant turn")
     return problems
@@ -442,7 +481,9 @@ def _offered_problems(context, allowed, arm):
 
 def cut_off_at_max_turns(stats, max_turns):
     """Whether the run looks stopped by maxTurns: its final message asked for
-    a tool, with no text after, at `max_turns` turns or more.
+    a tool, with no text after, at `max_turns` turns or more. Its stop_reason
+    is tool_use, or null when Claude Code never wrote the message's closing
+    line (as it sometimes does for a final text reply; see the module doc).
 
     An inference, isolated here: no real cut-off transcript exists yet. It
     rests on Claude Code 2.1.294's agent loop, which runs the last turn's
@@ -451,9 +492,15 @@ def cut_off_at_max_turns(stats, max_turns):
     """
     turns = stats.get("turns")
     return bool(
-        stats.get("last_stop_reason") == "tool_use" and stats.get("ended_on_tool_use")
+        stats.get("last_stop_reason") in ("tool_use", None) and stats.get("ended_on_tool_use")
         and isinstance(turns, int) and isinstance(max_turns, int) and turns >= max_turns
     )
+
+
+INFERRED_END = (
+    "its last message is a text reply with no stop_reason (Claude Code never wrote the message's "
+    "closing line), so the end is inferred; that message's output tokens are a lower bound"
+)
 
 
 def ending(stats, max_turns):
@@ -465,6 +512,12 @@ def ending(stats, max_turns):
     max-turns case: an API error, a usage limit, an interruption, or a run
     still going), or "never_ran" (no assistant message at all; `guard` says
     so). detail is one sentence, or None for end_turn.
+
+    A final text reply with a null stop_reason (`end_inferred`) is end_turn,
+    with INFERRED_END as its detail: Claude Code left the closing line out,
+    the reply arrived. A null stop_reason on anything else (a final tool_use
+    under the cap, a thinking block) is still a harness error, and so is any
+    explicit stop_reason but end_turn (max_tokens, refusal, ...).
     """
     reached = stats.get("max_turns_reached")
     if isinstance(reached, dict):
@@ -485,6 +538,8 @@ def ending(stats, max_turns):
         return "max_turns", f"stopped on a tool call at turn {stats.get('turns')} of maxTurns {max_turns}"
     if reason == END_TURN:
         return "end_turn", None
+    if reason is None and stats.get("end_inferred") and not stats.get("ended_on_tool_use"):
+        return "end_turn", INFERRED_END
     if reason is None:
         why = "it never finished streaming: an API error, a usage limit or an interruption cut it off"
     elif reason == "tool_use":

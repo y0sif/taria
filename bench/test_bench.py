@@ -630,6 +630,7 @@ class GradeAgentRun(unittest.TestCase):
                          ("j004", 1, 5, "a1", "s1"))
         self.assertEqual((row["tool_calls_total"], row["toolsearch_calls"], row["turns"]), (3, 1, 4))
         self.assertEqual(row["guard_problems"], [])
+        self.assertEqual((row["slot"], row["end_inferred"], row["notes"]), (2, False, []))
         self.assertEqual(row["demo_exit"], "clean")
         self.assertEqual(run.quits, 1)
 
@@ -662,6 +663,13 @@ class GradeAgentRun(unittest.TestCase):
         self.assertEqual(row["status"], "harness_error")
         self.assertIn("never finished streaming", row["error"])
 
+    def test_a_final_text_reply_without_a_stop_reason_ended_on_its_own(self):
+        unclosed = {**self.STATS, "last_stop_reason": None, "last_block_type": "text", "end_inferred": True}
+        row, _, _ = self.grade(stats=unclosed)
+        self.assertEqual((row["status"], row["passed"], row["error"]), ("passed", True, None))
+        self.assertIs(row["end_inferred"], True)
+        self.assertEqual(row["notes"], [transcript.INFERRED_END])
+
     def test_guard_problems_are_a_harness_error(self):
         row, _, _ = self.grade(problems=["called Bash (1x), which is not a taria arm tool"])
         self.assertEqual((row["status"], row["passed"]), ("harness_error", None))
@@ -683,17 +691,6 @@ class GradeAgentRun(unittest.TestCase):
         self.assertEqual(row["status"], "harness_error")
         self.assertIn("OSError: gone", row["error"])
 
-    def test_another_slots_agent_is_a_harness_error(self):
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp)
-        path = os.path.join(tmp, "agent-a1.jsonl")
-        open(path, "w").close()
-        with open(os.path.join(tmp, "agent-a1.meta.json"), "w") as f:
-            json.dump({"agentType": "tui-taria-1"}, f)
-        row, _, _ = self.grade(path=path)
-        self.assertEqual(row["status"], "harness_error")
-        self.assertIn("'tui-taria-1', not this slot's agent 'tui-taria-2'", row["error"])
-
     def real(self, name, slot=None, state=None, **plan):
         """Grade a real (scrubbed) fixture through the real transcript module."""
         path = os.path.join(BENCH, "fixtures", "transcripts", name)
@@ -709,6 +706,15 @@ class GradeAgentRun(unittest.TestCase):
         row = self.real("real_tmux_clean.jsonl",
                         slot={**self.SLOT, "slot": 1, "task": "T1", "arm": "tmux", "model": "haiku"})
         self.assertEqual((row["status"], row["guard_problems"]), ("passed", []))
+
+    def test_a_real_unclosed_final_reply_passes(self):
+        """Job j108 of batch full1, which the old rule called a harness error."""
+        row = self.real("real_taria_unclosed.jsonl", slot={**self.SLOT, "task": "T4", "model": "haiku"})
+        self.assertEqual((row["status"], row["passed"], row["error"], row["guard_problems"]),
+                         ("passed", True, None, []))
+        self.assertIs(row["end_inferred"], True)
+        self.assertEqual(row["notes"], [transcript.INFERRED_END])
+        self.assertEqual(row["tokens"]["output"], 421)
 
     def test_a_real_leaked_run_is_a_harness_error(self):
         row = self.real("real_taria_leaked.jsonl", slot={**self.SLOT, "slot": 1, "task": "T1", "model": "haiku"})
@@ -769,9 +775,10 @@ class AgentIdentity(unittest.TestCase):
         runner.write_slot(self.paths, 1, slot)
         return plan, slot
 
-    def refused(self, agent_id="afixturetariaclean"):
+    def refused(self, agent_id="afixturetariaclean", transcript_file=None):
         code, out, err = quiet_cli("next", "--batch", "b", "--slot", "1", "--agent-id", agent_id,
-                                   "--transcript-file", self.FIXTURE, "--results-dir", self.results)
+                                   "--transcript-file", transcript_file or self.FIXTURE,
+                                   "--results-dir", self.results)
         self.assertEqual(code, runner.EXIT_HARNESS, err)
         self.assertIsNotNone(runner.read_slot(self.paths, 1), "the slot is kept for the right agent")
         self.assertFalse(any(r.get("job") == "j001" for r in runner.read_rows(self.paths)), "nothing recorded")
@@ -807,6 +814,238 @@ class AgentIdentity(unittest.TestCase):
 
     def test_the_prepared_time_is_recorded_to_the_millisecond(self):
         self.assertRegex(runner.now("milliseconds"), r"T\d\d:\d\d:\d\d\.\d{3}\+00:00$")
+
+    def test_the_first_prompt_is_compared_stripped(self):
+        _, slot = self.hold()
+        stats = transcript.read_transcript(self.FIXTURE)
+        for padded in (stats["first_prompt"] + "\n", "  " + stats["first_prompt"] + " \n"):
+            self.assertEqual(runner.identity_problems(slot, {**stats, "first_prompt": padded}), [])
+        self.assertEqual(len(runner.identity_problems(slot, {**stats, "first_prompt": None})), 1)
+
+    def copy_fixture(self, agent_type="tui-taria-1"):
+        """The fixture under a temp dir, with a meta file naming `agent_type`
+        (none when it is None)."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        path = os.path.join(tmp, "agent-afixturetariaclean.jsonl")
+        shutil.copy(self.FIXTURE, path)
+        if agent_type is not None:
+            with open(runner.meta_path(path), "w") as f:
+                json.dump({"agentType": agent_type}, f)
+        return path
+
+    def test_no_transcript_is_refused(self):
+        self.hold()
+        missing = os.path.join(self.results, "agent-nobody.jsonl")
+        error = self.refused(agent_id="nobody", transcript_file=missing)
+        self.assertIn("no transcript for agent nobody", error)
+        plan, slot = runner.load_plan(self.paths), runner.read_slot(self.paths, 1)
+        nowhere = types.SimpleNamespace(find_transcript=lambda agent_id: None)
+        with self.assertRaises(runner.CommandError) as caught:
+            runner.check_agent_identity(self.paths, plan, 1, slot, "nobody", transcript_mod=nowhere)
+        self.assertIn("no transcript for agent nobody (~/.claude/projects)", str(caught.exception))
+
+    def test_a_transcript_without_a_meta_file_is_refused(self):
+        self.hold()
+        error = self.refused(transcript_file=self.copy_fixture(agent_type=None))
+        self.assertIn("has no meta file", error)
+        self.assertIn("agent type it was spawned as cannot be checked", error)
+
+    def test_another_slots_agent_is_refused(self):
+        self.hold()
+        error = self.refused(transcript_file=self.copy_fixture(agent_type="tui-taria-2"))
+        self.assertIn("was spawned as 'tui-taria-2', not this slot's agent 'tui-taria-1'", error)
+
+
+class Regrade(unittest.TestCase):
+    """`regrade` grades a batch's rows again with the current code, from the
+    recorded state and demo_alive and the transcripts re-read (here the real
+    fixtures, placed in a projects dir laid out as Claude Code's)."""
+
+    FIXTURES = os.path.join(BENCH, "fixtures", "transcripts")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.results = os.path.join(self.tmp, "results")
+        self.projects = os.path.join(self.tmp, "projects")
+        self.paths = runner.Paths(self.results, "b")
+        code, _, err = quiet_cli("plan", "--batch", "b", "--tasks", "T1,T3,T4", "--arms", "taria",
+                                 "--models", "sonnet,haiku", "--seed", "1", "--results-dir", self.results)
+        self.assertEqual(code, 0, err)
+
+    def place(self, fixture, agent_id, agent_type=None):
+        """A fixture as agent `agent_id`'s transcript, meta file and all."""
+        directory = os.path.join(self.projects, "-proj", "sess-1", "subagents")
+        os.makedirs(directory, exist_ok=True)
+        dst = os.path.join(directory, f"agent-{agent_id}.jsonl")
+        shutil.copy(os.path.join(self.FIXTURES, fixture), dst)
+        with open(os.path.join(self.FIXTURES, fixture[: -len(".jsonl")] + ".meta.json")) as f:
+            meta = json.load(f)
+        if agent_type is not None:
+            meta["agentType"] = agent_type
+        with open(runner.meta_path(dst), "w") as f:
+            json.dump(meta, f)
+
+    def row(self, job, task, model, agent_id, status, state=None, **extra):
+        state = state if state is not None else tasks.self_test_cases()[task][0][0]
+        fields = dict(ts="2026-10-11T06:00:00+00:00", batch="b", job=job, task=task, arm="taria", run=0, seed=1,
+                      mode="subagent", solver="agent", model=model, effort="medium", max_turns=30,
+                      agent_id=agent_id, status=status, passed={"passed": True, "failed": False}.get(status),
+                      check_passed=True, demo_alive=True, demo_exit="clean", state=state,
+                      error="old error" if status == "harness_error" else None)
+        fields.update(extra)
+        return fields  # an older row: no slot, end_inferred or notes keys unless given
+
+    def write_rows(self, rows, junk=False):
+        os.makedirs(self.paths.batch_dir, exist_ok=True)
+        with open(self.paths.runs, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+            if junk:
+                f.write("{not a row\n")
+
+    def regrade(self):
+        code, out, err = quiet_cli("regrade", "--batch", "b", "--results-dir", self.results,
+                                   "--projects-dir", self.projects)
+        self.assertEqual(code, 0, err)
+        with open(self.paths.runs) as f:
+            lines = f.read().splitlines()
+        return out, {json.loads(l)["job"]: json.loads(l) for l in lines if l.startswith("{\"")}, lines
+
+    def batch(self):
+        self.place("real_taria_unclosed.jsonl", "aunclosed")
+        self.place("real_taria_clean.jsonl", "aclean")
+        self.place("real_taria_leaked.jsonl", "aleaked")
+        self.place("real_taria_clean.jsonl", "awrongslot")
+        rows = [
+            # The old rule's false positive: an unclosed final reply.
+            self.row("j001", "T4", "haiku", "aunclosed", "harness_error"),
+            # Nothing to change.
+            self.row("j002", "T3", "sonnet", "aclean", "passed"),
+            # A leaked run once let through: the guard refuses it now.
+            self.row("j003", "T1", "haiku", "aleaked", "passed"),
+            # The recorded state is checked again: the seed is no deletion.
+            self.row("j004", "T3", "sonnet", "aclean2", "passed", state=tasks.SEED_STATE),
+            # A transcript that is gone keeps the row as it was.
+            self.row("j005", "T1", "sonnet", "agone", "failed", check_passed=False),
+            # An abort: no agent id.
+            self.row("j006", "T1", "haiku", None, "harness_error", error="aborted: test"),
+            # A row that names its slot is held to that slot's agent.
+            self.row("j007", "T3", "sonnet", "awrongslot", "passed", slot=3),
+            # A dry-run row keeps everything.
+            dict(self.row("j008", "T1", "sonnet", None, "passed"), mode="dry-run", solver="scripted"),
+        ]
+        self.place("real_taria_clean.jsonl", "aclean2")
+        self.write_rows(rows, junk=True)
+        return rows
+
+    def test_rows_are_regraded_from_what_persists(self):
+        before = self.batch()
+        with open(self.paths.runs, "rb") as f:
+            original = f.read()
+        out, rows, lines = self.regrade()
+        self.assertEqual(lines[-1], "{not a row", "a line that is not a row is kept as it was")
+        status = {job: r["status"] for job, r in rows.items()}
+        self.assertEqual(status, {"j001": "passed", "j002": "passed", "j003": "harness_error", "j004": "failed",
+                                  "j005": "failed", "j006": "harness_error", "j007": "harness_error",
+                                  "j008": "passed"})
+        self.assertIn("8 rows (1 dry-run kept, 2 kept as recorded); 4 changed status", out)
+        self.assertIn("j001: harness_error -> passed (its last message is a text reply with no stop_reason", out)
+        self.assertIn("j003: passed -> harness_error (guard: was given the instructions of 4 MCP server(s)", out)
+        self.assertIn("j004: passed -> failed (", out)
+        self.assertIn("j007: passed -> harness_error (guard: was spawned as 'tui-taria-1', not this slot's agent "
+                      "'tui-taria-3')", out)
+        unclosed = rows["j001"]
+        self.assertEqual((unclosed["passed"], unclosed["error"], unclosed["end_inferred"]), (True, None, True))
+        self.assertEqual(unclosed["notes"], [transcript.INFERRED_END])
+        self.assertEqual(unclosed["tokens"]["output"], 421)
+        self.assertEqual(rows["j004"]["reason"], tasks.check_t3(tasks.SEED_STATE)[1])
+        # Every field kept, the regrade's added; the original status kept beside the new one.
+        for old in before:
+            new = rows[old["job"]]
+            if old["mode"] == "dry-run":
+                self.assertEqual(new, old)
+                continue
+            self.assertTrue(set(old) <= set(new))
+            self.assertEqual(new["status_at_run"], old["status"])
+            self.assertEqual(new["regrade_git_sha"], runner.git_provenance()["git_sha"])
+            self.assertIn("regrade_git_dirty", new)
+            self.assertIsNotNone(runner.parse_time(new["regraded_at"]))
+            for key in ("ts", "state", "demo_exit", "git_sha", "agent_id"):
+                self.assertEqual(new.get(key), old.get(key), key)
+        self.assertEqual(rows["j005"]["status"], "failed")
+        self.assertIn("kept as recorded: no transcript for agent agone", rows["j005"]["regrade_note"])
+        self.assertNotIn("turns", {k for k, v in rows["j005"].items() if v is not None})
+        self.assertIn("no agent id", rows["j006"]["regrade_note"])
+        self.assertEqual(rows["j006"]["error"], "aborted: test")
+        # The original, byte for byte, beside it.
+        (backup,) = [f for f in os.listdir(self.paths.batch_dir) if f.startswith("runs.orig-")]
+        self.assertRegex(backup, r"^runs\.orig-\d{8}T\d{6}Z\.jsonl$")
+        with open(os.path.join(self.paths.batch_dir, backup), "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_a_second_regrade_changes_nothing(self):
+        self.batch()
+        _, first, _ = self.regrade()
+        backups = sorted(f for f in os.listdir(self.paths.batch_dir) if f.startswith("runs.orig-"))
+        with open(os.path.join(self.paths.batch_dir, backups[0]), "rb") as f:
+            first_backup = f.read()
+        out, second, _ = self.regrade()
+        self.assertIn("0 changed status", out)
+        strip = ("regraded_at", "regrade_git_sha", "regrade_git_dirty")
+        self.assertEqual({j: {k: v for k, v in r.items() if k not in strip} for j, r in second.items()},
+                         {j: {k: v for k, v in r.items() if k not in strip} for j, r in first.items()})
+        self.assertEqual(second["j001"]["status_at_run"], "harness_error", "the status at run time stays")
+        after = sorted(f for f in os.listdir(self.paths.batch_dir) if f.startswith("runs.orig-"))
+        self.assertEqual(len(after), 2, "each regrade keeps its own backup")
+        with open(os.path.join(self.paths.batch_dir, backups[0]), "rb") as f:
+            self.assertEqual(f.read(), first_backup, "an existing backup is never overwritten")
+
+    def test_a_backup_never_overwrites_one(self):
+        os.makedirs(self.paths.batch_dir, exist_ok=True)
+        first = runner.backup_path(self.paths, "20261011T000000Z")
+        self.assertTrue(first.endswith("runs.orig-20261011T000000Z.jsonl"))
+        open(first, "w").close()
+        second = runner.backup_path(self.paths, "20261011T000000Z")
+        self.assertTrue(second.endswith("runs.orig-20261011T000000Z-2.jsonl"))
+        open(second, "w").close()
+        self.assertTrue(runner.backup_path(self.paths, "20261011T000000Z").endswith("-3.jsonl"))
+
+    def test_a_held_slot_is_refused(self):
+        self.batch()
+        with open(self.paths.runs, "rb") as f:
+            original = f.read()
+        plan = runner.load_plan(self.paths)
+        os.makedirs(self.paths.slots, exist_ok=True)
+        runner.create_slot(self.paths, 2, {"slot": 2, "batch": "b", "job": "j009", "state": "ready"})
+        code, _, err = quiet_cli("regrade", "--batch", "b", "--results-dir", self.results,
+                                 "--projects-dir", self.projects)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn(f"batch {plan['batch']} still holds slot(s) 2", err)
+        with open(self.paths.runs, "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual([f for f in os.listdir(self.paths.batch_dir) if f.startswith("runs.orig-")], [])
+        # Another batch's slot is not this batch's.
+        runner.free_slot(self.paths, 2)
+        runner.create_slot(self.paths, 2, {"slot": 2, "batch": "other", "job": "j001", "state": "ready"})
+        self.assertEqual(self.regrade()[0].count("changed status"), 1)
+
+    def test_a_batch_without_a_plan_is_refused(self):
+        code, _, err = quiet_cli("regrade", "--batch", "nope", "--results-dir", self.results)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("no plan for batch nope", err)
+
+
+class AgentsDir(unittest.TestCase):
+    def test_the_default_is_this_repos_agents_dir(self):
+        self.assertEqual(agents.DEFAULT_DIR, os.path.join(REPO, ".claude", "agents"))
+        self.assertEqual(os.path.dirname(os.path.dirname(agents.DEFAULT_DIR)), os.path.dirname(BENCH))
+        args = runner.parse_args(["next", "--batch", "b", "--slot", "1"])
+        self.assertEqual(args.agents_dir, agents.DEFAULT_DIR)
+        args = runner.parse_args(["next", "--batch", "b", "--slot", "1", "--agents-dir", "/elsewhere"])
+        self.assertEqual(args.agents_dir, "/elsewhere")
+        self.assertEqual(runner.parse_args(["agents", "--slots", "1"]).dir, agents.DEFAULT_DIR)
 
 
 # --- The launcher and the agent files ------------------------------------------------------
@@ -1158,11 +1397,20 @@ class SubagentRehearsal(unittest.TestCase):
         code, job, err = self.next("err", 1)
         self.assertEqual(code, 0, err)
         demo = runner.read_slot(runner.Paths(self.results), 1)["demo"]
-        # No transcript for this id anywhere: a harness error, and the slot claims nothing.
+        # No transcript for this id anywhere: the orchestrator's mistake, refused, the slot kept.
         empty = os.path.join(self.tmp, "agent-nobody.jsonl")
         code, refused, err = self.next("err", 1, "--agent-id", "nobody", "--transcript-file", empty)
         self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("no transcript for agent nobody", refused["error"])
+        self.assertIsNotNone(runner.read_slot(runner.Paths(self.results), 1), "the slot is kept")
+        self.assertFalse(os.path.exists(os.path.join(self.results, "err", "runs.jsonl")), "nothing recorded")
+        # Its agent, on the wrong model: a harness error, and the slot claims nothing.
+        path = write_transcript(self.tmp, "wrongmodel", job["prompt"], "taria", {"read_tree": 1}, job["agent"],
+                                model="claude-haiku-5-5")
+        code, refused, err = self.next("err", 1, "--agent-id", "wrongmodel", "--transcript-file", path)
+        self.assertEqual(code, runner.EXIT_HARNESS)
         self.assertIn("harness error", refused["error"])
+        self.assertIn("ran on claude-haiku-5-5", refused["error"])
         self.assertIsNone(runner.read_slot(runner.Paths(self.results), 1))
         self.assertTrue(wait_gone(demo["demo_pid"]))
         (row,) = read_rows(self.results, "err")

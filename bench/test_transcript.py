@@ -18,6 +18,10 @@ Two kinds of fixture in bench/fixtures/transcripts/:
     real_tmux_clean    a tmux run (haiku, T1), clean as recorded.
     real_taria_leaked  a taria run (haiku, T1) as recorded, leaked servers
                        and all: the guard must refuse it.
+    real_taria_unclosed  a taria run (haiku, T4, job j108 of batch full1),
+                       clean as recorded, whose final text reply Claude Code
+                       never closed: its lines carry stop_reason null and a
+                       placeholder output_tokens of 1. It ended on its own.
   The guard and ending tests use these, and variants made from them in the
   test (a line dropped, a field changed) to stand for runs not yet seen.
 - the others are synthetic and test parsing edge cases: streamed usage
@@ -49,17 +53,20 @@ from tasks import TASKS  # noqa: E402
 FIXTURES = os.path.join(BENCH, "fixtures", "transcripts")
 RUNS = os.path.join(BENCH, "fixtures", "summary_runs.jsonl")
 TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED = "real_taria_clean.jsonl", "real_tmux_clean.jsonl", "real_taria_leaked.jsonl"
+TARIA_UNCLOSED = "real_taria_unclosed.jsonl"
 CONTRACT = {
     "agent_id": (str,), "session_id": (str,), "models": (list,), "turns": (int,),
     "tool_calls": (dict,), "tool_calls_total": (int,), "toolsearch_calls": (int,),
     "tokens": (dict,), "wall_ms": (int, type(None)), "final_text": (str, type(None)),
     "ended_on_tool_use": (bool,), "tool_errors": (int,), "context": (dict,),
     "last_model": (str, type(None)), "last_stop_reason": (str, type(None)), "ended_synthetic": (bool,),
+    "last_block_type": (str, type(None)), "end_inferred": (bool,), "output_tokens_lower_bound": (bool,),
     "first_prompt": (str, type(None)), "started": (str, type(None)),
 }
 CONTEXT = {
     "offered_tools": (list,), "offered_tools_snapshots": (list,),
     "claude_md_files": (list,), "deferred_tools": (list,), "mcp_instruction_servers": (list,),
+    "deferred_tools_added": (list,), "mcp_instruction_servers_added": (list,),
     "environment_cwd": (str, type(None)), "skill_listing": (bool,), "attachment_types": (list,),
 }
 TUI = {arm: sorted("mcp__tui__" + t for t in tools) for arm, tools in ARM_TOOLS.items()}
@@ -139,7 +146,7 @@ class Variant:
 class ReadTranscript(Variant, unittest.TestCase):
     def test_every_fixture_has_every_contract_key(self):
         names = sorted(f for f in os.listdir(FIXTURES) if f.endswith(".jsonl"))
-        self.assertGreaterEqual(len(names), 7)
+        self.assertGreaterEqual(len(names), 8)
         for name in names:
             with self.subTest(fixture=name):
                 stats = read(name)
@@ -294,6 +301,11 @@ class ReadTranscript(Variant, unittest.TestCase):
         self.assertEqual(ctx["deferred_tools"], ["WebFetch", "mcp__other__lookup", "mcp__tui__act",
                                                  "mcp__tui__key", "mcp__tui__read_tree", "mcp__tui__type_text"])
         self.assertEqual(ctx["mcp_instruction_servers"], ["tui"])
+        # Every name ever added, removals ignored.
+        self.assertEqual(ctx["deferred_tools_added"], ["NotebookEdit", "WebFetch", "mcp__other__lookup",
+                                                       "mcp__tui__act", "mcp__tui__key", "mcp__tui__read_tree",
+                                                       "mcp__tui__type_text"])
+        self.assertEqual(ctx["mcp_instruction_servers_added"], ["other", "tui"])
         self.assertIs(ctx["skill_listing"], True)
         self.assertIn("instructions", ctx["attachment_types"])
         self.assertEqual((ctx["offered_tools"], ctx["offered_tools_snapshots"]), ([], []))
@@ -355,12 +367,36 @@ class Guard(Variant, unittest.TestCase):
         self.assertEqual(problems, ["was given the instructions of 4 MCP server(s) besides tui: furcule, "
                                     "plugin:context7:context7, plugin:posthog:posthog, taria"])
 
-    def test_instruction_servers_are_counted_net_of_removals(self):
+    def test_a_server_that_left_still_counts(self):
+        """Removals do not excuse a server: its instructions reached the
+        agent, whether or not it later disconnected."""
         lines = lines_of(TARIA_LEAKED)
         delta = copy.deepcopy(next(l for l in lines if is_att(l, "mcp_instructions_delta")))
         delta["attachment"].update(addedNames=[], addedBlocks=[], removedNames=[
             "furcule", "plugin:context7:context7", "plugin:posthog:posthog", "taria"])
-        self.assertEqual(self.guard(self.variant(lines + [delta]), "taria", "haiku"), [])
+        stats = self.variant(lines + [delta])
+        self.assertEqual(stats["context"]["mcp_instruction_servers"], ["tui"], "net of removals")
+        self.assertEqual(self.guard(stats, "taria", "haiku"), [
+            "was given the instructions of 4 MCP server(s) besides tui: furcule, "
+            "plugin:context7:context7, plugin:posthog:posthog, taria"])
+
+    def test_a_deferred_tool_that_left_still_counts(self):
+        lines = lines_of(TARIA_CLEAN)
+        added = copy.deepcopy(next(l for l in lines if is_att(l, "environment")))
+        added["attachment"] = {"type": "deferred_tools_delta", "addedNames": ["Bash"], "removedNames": []}
+        removed = copy.deepcopy(added)
+        removed["attachment"] = {"type": "deferred_tools_delta", "addedNames": [], "removedNames": ["Bash"]}
+        stats = self.variant(lines + [added, removed])
+        self.assertEqual(stats["context"]["deferred_tools"], [])
+        self.assertEqual(self.guard(stats, "taria", "sonnet"),
+                         ["was offered 1 deferred tool(s) beyond the taria arm: Bash"])
+
+    def test_removals_matter_for_tui_itself(self):
+        lines = lines_of(TARIA_CLEAN)
+        delta = copy.deepcopy(next(l for l in lines if is_att(l, "mcp_instructions_delta")))
+        delta["attachment"].update(addedNames=[], addedBlocks=[], removedNames=["tui"])
+        self.assertEqual(self.guard(self.variant(lines + [delta]), "taria", "sonnet"),
+                         ["lost the tui server's instructions mid-run: the server was removed (it disconnected)"])
 
     def test_no_tui_instructions(self):
         lines = [l for l in lines_of(TARIA_CLEAN) if not is_att(l, "mcp_instructions_delta")]
@@ -436,7 +472,10 @@ class Guard(Variant, unittest.TestCase):
 
     def test_deferred_tools_beyond_the_arm(self):
         problems = self.guard(read("forbidden.jsonl"), "taria", "sonnet")
-        self.assertIn("was offered 2 deferred tool(s) beyond the taria arm: WebFetch, mcp__other__lookup", problems)
+        # NotebookEdit and the other server were removed later: they still count.
+        self.assertIn("was offered 3 deferred tool(s) beyond the taria arm: NotebookEdit, WebFetch, "
+                      "mcp__other__lookup", problems)
+        self.assertIn("was given the instructions of 1 MCP server(s) besides tui: other", problems)
         self.assertNotIn("ToolSearch", " ".join(problems))
 
     def test_an_agent_that_never_ran(self):
@@ -487,6 +526,22 @@ class Ending(Variant, unittest.TestCase):
         # A run that finished on its own at the cap is not cut off.
         self.assertEqual(transcript.ending(read(TARIA_CLEAN), 4), ("end_turn", None))
 
+    def test_an_unclosed_tool_call_at_the_cap_is_max_turns(self):
+        """The final tool_use message's closing line was never written
+        (stop_reason null on every line): at the cap it is still the cut-off."""
+        lines = cut_after_message(lines_of(TARIA_CLEAN), 3)
+        last = assistant_ids(lines)[-1]
+        for line in lines:
+            if line.get("type") == "assistant" and line["message"]["id"] == last:
+                line["message"]["stop_reason"] = None
+        stats = self.variant(lines)
+        self.assertEqual((stats["last_stop_reason"], stats["ended_on_tool_use"]), (None, True))
+        self.assertTrue(transcript.cut_off_at_max_turns(stats, 3))
+        self.assertEqual(transcript.ending(stats, 3)[0], "max_turns")
+        kind, detail = transcript.ending(stats, 30)
+        self.assertEqual(kind, "harness_error", "under the cap it did not end on its own")
+        self.assertIn("stopped on None", detail)
+
     def test_a_recorded_max_turns_reached_is_proof(self):
         lines = cut_after_message(lines_of(TARIA_CLEAN), 3)
         reached = copy.deepcopy(next(l for l in lines if is_att(l, "environment")))
@@ -496,23 +551,98 @@ class Ending(Variant, unittest.TestCase):
         self.assertEqual(transcript.ending(stats, 30),
                          ("max_turns", "Claude Code recorded max_turns_reached (turn 31 of 30)"))
 
-    def test_a_reply_that_never_finished_streaming(self):
+    def test_a_final_text_reply_without_a_stop_reason_ended_on_its_own(self):
         lines = lines_of(TARIA_CLEAN)
         lines[-1]["message"]["stop_reason"] = None
-        kind, detail = transcript.ending(self.variant(lines), 30)
-        self.assertEqual(kind, "harness_error")
-        self.assertIn("stopped on None (it never finished streaming", detail)
+        stats = self.variant(lines)
+        self.assertEqual((stats["last_block_type"], stats["end_inferred"]), ("text", True))
+        self.assertEqual(transcript.ending(stats, 30), ("end_turn", transcript.INFERRED_END))
+
+    def test_a_final_message_without_a_stop_reason_that_is_not_text(self):
+        for block in ({"type": "thinking", "thinking": "", "signature": "x"}, {"type": "text", "text": "  "}):
+            with self.subTest(block=block["type"]):
+                lines = lines_of(TARIA_CLEAN)
+                lines[-1]["message"].update(stop_reason=None, content=[block])
+                stats = self.variant(lines)
+                self.assertIs(stats["end_inferred"], False)
+                kind, detail = transcript.ending(stats, 30)
+                self.assertEqual(kind, "harness_error")
+                self.assertIn("stopped on None (it never finished streaming", detail)
 
     def test_any_other_stop_reason(self):
-        lines = lines_of(TARIA_CLEAN)
-        lines[-1]["message"]["stop_reason"] = "max_tokens"
-        kind, detail = transcript.ending(self.variant(lines), 30)
-        self.assertEqual(kind, "harness_error")
-        self.assertIn("'max_tokens'", detail)
+        for reason in ("max_tokens", "refusal", "pause_turn", "stop_sequence"):
+            with self.subTest(reason=reason):
+                lines = lines_of(TARIA_CLEAN)
+                lines[-1]["message"]["stop_reason"] = reason
+                stats = self.variant(lines)
+                self.assertIs(stats["end_inferred"], False)
+                kind, detail = transcript.ending(stats, 30)
+                self.assertEqual(kind, "harness_error")
+                self.assertIn(repr(reason), detail)
 
     def test_never_ran(self):
         self.assertEqual(transcript.ending(read("never_ran.jsonl"), 30)[0], "never_ran")
         self.assertEqual(transcript.ending({}, 30)[0], "never_ran")
+
+
+class UnclosedReply(Variant, unittest.TestCase):
+    """A real run whose final text reply Claude Code never closed (job j108
+    of batch full1): its only line carries stop_reason null and an
+    output_tokens of 1. The reply arrived, so the run ended on its own."""
+
+    def test_the_fixture_as_read(self):
+        stats = read(TARIA_UNCLOSED)
+        self.assertEqual((stats["models"], stats["turns"]), (["claude-haiku-5-5"], 4))
+        self.assertEqual(stats["tool_calls"], {"mcp__tui__act": 2, "mcp__tui__read_tree": 1})
+        self.assertEqual(stats["first_prompt"], TASKS["T4"].prompt)
+        self.assertEqual((stats["last_model"], stats["last_stop_reason"], stats["last_block_type"]),
+                         ("claude-haiku-5-5", None, "text"))
+        self.assertEqual((stats["ended_on_tool_use"], stats["ended_synthetic"]), (False, False))
+        self.assertIs(stats["end_inferred"], True)
+        self.assertIs(stats["output_tokens_lower_bound"], True)
+        self.assertEqual(stats["tokens"]["output"], 421)  # the final message counts its placeholder 1
+        self.assertTrue(stats["final_text"].startswith('I added a new task titled "Record the killer demo (follow-up)"'))
+        self.assertEqual(stats["context"]["mcp_instruction_servers"], ["tui"])
+        for name in (TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED):
+            with self.subTest(fixture=name):
+                self.assertEqual((read(name)["end_inferred"], read(name)["output_tokens_lower_bound"]),
+                                 (False, False))
+
+    def test_it_passes_the_guard_and_ended_on_its_own(self):
+        stats = read(TARIA_UNCLOSED)
+        self.assertEqual(transcript.guard(stats, "taria", "haiku", ARM_TOOLS["taria"], effort="medium"), [])
+        self.assertEqual(transcript.ending(stats, 30), ("end_turn", transcript.INFERRED_END))
+        self.assertIn("output tokens are a lower bound", transcript.INFERRED_END)
+
+    def final(self, lines):
+        last = assistant_ids(lines)[-1]
+        return [l for l in lines if l.get("type") == "assistant" and l["message"]["id"] == last]
+
+    def test_a_tool_call_in_its_place_did_not_end_on_its_own(self):
+        lines = lines_of(TARIA_UNCLOSED)
+        (line,) = self.final(lines)
+        line["message"]["content"] = [{"type": "tool_use", "id": "toolu_x", "name": "mcp__tui__read_tree",
+                                       "input": {}}]
+        stats = self.variant(lines)
+        self.assertEqual((stats["end_inferred"], stats["ended_on_tool_use"]), (False, True))
+        kind, detail = transcript.ending(stats, 30)
+        self.assertEqual(kind, "harness_error")
+        self.assertIn("stopped on None", detail)
+        self.assertEqual(transcript.ending(stats, 4)[0], "max_turns", "at the cap: the cut-off")
+
+    def test_an_explicit_stop_other_than_end_turn_is_still_a_harness_error(self):
+        lines = lines_of(TARIA_UNCLOSED)
+        self.final(lines)[0]["message"]["stop_reason"] = "max_tokens"
+        stats = self.variant(lines)
+        self.assertIs(stats["end_inferred"], False)
+        self.assertEqual(transcript.ending(stats, 30)[0], "harness_error")
+
+    def test_a_trailing_synthetic_message_is_still_a_harness_error(self):
+        lines = lines_of(TARIA_UNCLOSED)
+        lines.append(synthetic_line(self.final(lines)[0], "API Error: overloaded", "server_error"))
+        kind, detail = transcript.ending(self.variant(lines), 30)
+        self.assertEqual(kind, "harness_error")
+        self.assertIn("Claude Code's own message", detail)
 
 
 class FindTranscript(unittest.TestCase):

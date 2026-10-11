@@ -37,10 +37,12 @@ import sys
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH)
-from harness import ARMS, SERVER_KEY  # noqa: E402
+from harness import ARMS, REPO, SERVER_KEY  # noqa: E402
 
 MCP_LAUNCH = os.path.join(BENCH, "mcp_launch.py")
-DEFAULT_DIR = "/home/y0sif/Projects/taria/.claude/agents"
+# The repo this bench is in: a Claude Code session started at its root loads
+# these agents. Pass --dir (agents) and --agents-dir (next) to put them elsewhere.
+DEFAULT_DIR = os.path.join(REPO, ".claude", "agents")
 DEFAULT_EFFORT = "medium"
 DEFAULT_MAX_TURNS = 30
 EFFORTS = ("low", "medium", "high", "xhigh", "max")

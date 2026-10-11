@@ -33,9 +33,18 @@ Two ways to drive a run:
             job (results/slots/<K>.<job>.launched). When the agent finishes,
             `next --agent-id` reads its transcript (bench/transcript.py),
             grades the demo, records the row and tears the demo down. It
-            refuses (exit 2, nothing recorded, the slot kept) an agent id the
-            batch already recorded, and a transcript whose first prompt is
-            not the job's task or that started before the slot was prepared.
+            refuses (exit 2, nothing recorded, the slot kept) what is the
+            orchestrator's mistake rather than a run: an agent id the batch
+            already recorded, an id with no transcript, a transcript with no
+            .meta.json or whose meta names another slot's agent, and a
+            transcript whose first prompt is not the job's task or that
+            started before the slot was prepared.
+
+  regrade   grades every row of a finished batch again with the current
+            code, from what persists (the recorded state and demo_alive, the
+            transcript re-read), after copying runs.jsonl to
+            runs.orig-<utc>.jsonl. For after a change to the grading logic,
+            so one batch keeps one logic for all its rows.
 
 Every run ends in exactly one status:
 
@@ -45,11 +54,13 @@ Every run ends in exactly one status:
                  transcript.ending): a failure, whatever the dump says
                  (check_passed is recorded)
   harness_error  infrastructure, not the agent: a failed setup, a server or
-                 solver failure, no transcript, the transcript guard refusing
-                 how the agent was set up, or a run that did not end on its
-                 own (Claude Code's own error message last, or a last message
-                 that stopped on anything but end_turn outside max_turns).
-                 Out of the pass rate.
+                 solver failure, an unreadable transcript, the transcript
+                 guard refusing how the agent was set up, or a run that did
+                 not end on its own (Claude Code's own error message last, an
+                 explicit stop other than end_turn, or a tool call under
+                 max_turns). A final text reply whose closing line Claude
+                 Code never wrote ended on its own (transcript.ending; the
+                 row's end_inferred). Out of the pass rate.
 
 Rows go to results/<batch>/runs.jsonl, one JSON object per run, with the
 same keys in both modes (ROW_KEYS; null where a mode has no value).
@@ -65,9 +76,10 @@ Usage:  python3 bench/run.py dry-run [--tasks T1,T3] [--arms taria,tmux] [--runs
         python3 bench/run.py agents  --slots K [--dir D] [--effort E] [--max-turns N] [--remove]
         python3 bench/run.py plan    --batch B [--tasks ..] [--arms ..] [--models sonnet,haiku]
                                      [--runs N] [--seed S] [--effort E] [--max-turns N]
-        python3 bench/run.py next    --batch B --slot K [--agent-id ID]
+        python3 bench/run.py next    --batch B --slot K [--agent-id ID] [--agents-dir D]
         python3 bench/run.py status  --batch B
         python3 bench/run.py abort   --batch B --slot K [--reason TEXT]
+        python3 bench/run.py regrade --batch B
 """
 
 import argparse
@@ -122,10 +134,11 @@ AGENT_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")
 # (and claude_version, the same joined into one string): read, never asked of
 # `claude`, so they name what ran the agent rather than what is installed now.
 ROW_KEYS = (
-    "ts", "batch", "job", "task", "arm", "run", "seed", "mode", "solver",
+    "ts", "batch", "job", "task", "arm", "run", "slot", "seed", "mode", "solver",
     "model", "model_resolved", "effort", "efforts_resolved", "max_turns", "agent_id",
     "session_id", "git_sha", "git_dirty", "claude_version", "claude_versions",
     "status", "passed", "check_passed", "reason", "error", "guard_problems",
+    "end_inferred", "notes",
     "demo_alive", "demo_exit", "state",
     "turns", "tool_calls", "tool_calls_total", "toolsearch_calls", "tokens",
     "wall_ms", "final_text", "context",
@@ -379,14 +392,17 @@ def prepare_demo(task, on_created=None):
     return run
 
 
-def grade(task, run):
-    """The task's check on the settled dump, and whether the demo still runs."""
-    state = run.settled_state()
-    alive = run.demo_alive()
+def judge(task, state, alive):
+    """The task's check on a dump, and whether the demo still ran."""
     check_passed, reason = task.check(state)
     if not alive:
         reason = "demo exited" if check_passed else f"demo exited; {reason}"
     return {"state": state, "demo_alive": alive, "check_passed": check_passed, "reason": reason}
+
+
+def grade(task, run):
+    """The task's check on the settled dump, and whether the demo still runs."""
+    return judge(task, run.settled_state(), run.demo_alive())
 
 
 def classify(graded, error=None, cut_off=False):
@@ -620,7 +636,8 @@ def prepare_slot(paths, k, slot):
 def base_agent_row(plan, slot, agent_id, prov):
     return new_row(
         ts=now(), batch=plan["batch"], job=slot["job"], task=slot["task"], arm=slot["arm"],
-        run=slot["run"], seed=plan["seed"], mode="subagent", solver="agent", model=slot["model"],
+        run=slot["run"], slot=slot.get("slot"), seed=plan["seed"], mode="subagent", solver="agent",
+        model=slot["model"],
         effort=plan["effort"], max_turns=plan["max_turns"], agent_id=agent_id, **prov,
     )
 
@@ -638,60 +655,96 @@ def _one(values):
     return ", ".join(values) if values else None
 
 
+def meta_path(transcript_path):
+    """The meta file Claude Code writes beside a subagent transcript."""
+    base = transcript_path[: -len(".jsonl")] if transcript_path.endswith(".jsonl") else transcript_path
+    return base + ".meta.json"
+
+
 def agent_type_problems(transcript_path, expected):
     """The subagent's meta file names the agent type it was spawned as: it
-    must be this slot's agent, or the run drove another slot's demo."""
-    meta = transcript_path[: -len(".jsonl")] + ".meta.json" if transcript_path.endswith(".jsonl") else None
-    if meta is None or not os.path.exists(meta):
-        return []
+    must be `expected` (this slot's agent; or, given a compiled pattern, any
+    name it matches), or the run drove another slot's demo. A missing or
+    unreadable meta file is a problem too: the type cannot be checked."""
+    meta = meta_path(transcript_path)
+    if not os.path.exists(meta):
+        return [f"has no meta file ({meta}), so the agent type it was spawned as cannot be checked"]
     try:
         with open(meta) as f:
             kind = json.load(f).get("agentType")
     except (OSError, ValueError, AttributeError):
         return [f"its meta file {meta} cannot be read"]
-    if kind != expected:
-        return [f"was spawned as {kind!r}, not this slot's agent {expected!r}"]
+    ok = expected.fullmatch(kind) is not None if isinstance(expected, re.Pattern) and isinstance(kind, str) \
+        else kind == expected
+    if not ok:
+        want = expected.pattern if isinstance(expected, re.Pattern) else expected
+        return [f"was spawned as {kind!r}, not this slot's agent {want!r}"]
     return []
+
+
+# The row fields a transcript fills, which a regrade recomputes.
+TRANSCRIPT_FIELDS = (
+    "model_resolved", "session_id", "claude_version", "claude_versions", "efforts_resolved",
+    "guard_problems", "end_inferred", "notes", "turns", "tool_calls", "tool_calls_total",
+    "toolsearch_calls", "tokens", "wall_ms", "final_text", "context",
+)
+
+
+def transcript_verdict(transcript_mod, path, arm, model, effort, max_turns, extra_problems=()):
+    """(row fields, errors, cut_off) from the transcript at `path`: the stats
+    a row records, the guard (plus `extra_problems`), and how the run ended.
+    The one grading logic for `next` and `regrade`. Raises when the
+    transcript cannot be read."""
+    stats = transcript_mod.read_transcript(path)
+    problems = list(transcript_mod.guard(stats, arm, model, ARM_TOOLS[arm], effort=effort))
+    problems += list(extra_problems)
+    kind, detail = transcript_mod.ending(stats, max_turns)
+    inferred = kind == "end_turn" and detail is not None
+    fields = {
+        "model_resolved": _one(stats.get("models")),
+        "session_id": stats.get("session_id"),
+        "claude_version": _one(stats.get("claude_versions")),
+        "claude_versions": stats.get("claude_versions"),
+        "efforts_resolved": stats.get("efforts"),
+        "guard_problems": problems,
+        "end_inferred": inferred,
+        "notes": [detail] if inferred else [],
+        "turns": stats.get("turns"),
+        "tool_calls": stats.get("tool_calls"),
+        "tool_calls_total": stats.get("tool_calls_total"),
+        "toolsearch_calls": stats.get("toolsearch_calls"),
+        "tokens": stats.get("tokens"),
+        "wall_ms": stats.get("wall_ms"),
+        "final_text": stats.get("final_text"),
+        "context": stats.get("context"),
+    }
+    errors = []
+    if problems:
+        errors.append("guard: " + "; ".join(problems))
+    if kind == "harness_error":
+        errors.append(detail)
+    return fields, errors, kind == "max_turns"
 
 
 def grade_agent_run(plan, slot, agent_id, run=None, transcript_mod=None, transcript_file=None, prov=None):
     """The row for the agent run in `slot`: its transcript, the guard, and the
-    demo's dump. Quits the demo; does not close it or record the row."""
+    demo's dump. Quits the demo; does not close it or record the row. Who
+    ran it (check_agent_identity) is settled before this, by refusing."""
     arm = slot["arm"]
     prov = prov if prov is not None else git_provenance()
     row = base_agent_row(plan, slot, agent_id, {**prov, "claude_version": None})
-    errors, stats, cut_off = [], None, False
+    errors, cut_off = [], False
     try:
         transcript_mod = transcript_mod or load_transcript_module()
         path = transcript_file or transcript_mod.find_transcript(agent_id)
         if path is None:
             errors.append(f"no transcript for agent {agent_id} under ~/.claude/projects")
         else:
-            stats = transcript_mod.read_transcript(path)
-            problems = list(transcript_mod.guard(stats, arm, slot["model"], ARM_TOOLS[arm], effort=plan["effort"]))
-            problems += agent_type_problems(path, agents.agent_name(arm, slot["slot"]))
-            row.update(
-                model_resolved=_one(stats.get("models")),
-                session_id=stats.get("session_id"),
-                claude_version=_one(stats.get("claude_versions")),
-                claude_versions=stats.get("claude_versions"),
-                efforts_resolved=stats.get("efforts"),
-                guard_problems=problems,
-                turns=stats.get("turns"),
-                tool_calls=stats.get("tool_calls"),
-                tool_calls_total=stats.get("tool_calls_total"),
-                toolsearch_calls=stats.get("toolsearch_calls"),
-                tokens=stats.get("tokens"),
-                wall_ms=stats.get("wall_ms"),
-                final_text=stats.get("final_text"),
-                context=stats.get("context"),
+            fields, found, cut_off = transcript_verdict(
+                transcript_mod, path, arm, slot["model"], plan["effort"], plan["max_turns"]
             )
-            if problems:
-                errors.append("guard: " + "; ".join(problems))
-            kind, detail = transcript_mod.ending(stats, plan["max_turns"])
-            if kind == "harness_error":
-                errors.append(detail)
-            cut_off = kind == "max_turns"
+            row.update(fields)
+            errors += found
     except Exception as err:  # noqa: BLE001 - an unreadable transcript is the harness's
         errors.append(f"reading the transcript failed: {type(err).__name__}: {err}")
     try:
@@ -735,8 +788,10 @@ def identity_problems(slot, stats):
     was ready. Empty when it can be."""
     problems = []
     want = TASKS[slot["task"]].prompt
-    if stats.get("first_prompt") != want:
-        problems.append(f"its first prompt is {stats.get('first_prompt')!r}, not the task's {want!r}")
+    first = stats.get("first_prompt")
+    # Stripped: a trailing newline the orchestrator's Agent call adds is not another task.
+    if not isinstance(first, str) or first.strip() != want.strip():
+        problems.append(f"its first prompt is {first!r}, not the task's {want!r}")
     prepared, started = parse_time(slot.get("prepared")), parse_time(stats.get("started"))
     if prepared is None:
         problems.append("the slot records no prepared time to hold it to")
@@ -749,31 +804,42 @@ def identity_problems(slot, stats):
 
 def check_agent_identity(paths, plan, k, slot, agent_id, transcript_file=None, transcript_mod=None):
     """Refuse (CommandError, nothing recorded, the slot kept) an agent that
-    cannot have run the job slot `k` holds: an id the batch already
-    recorded, or a transcript that is another run's. A transcript that is
-    missing or unreadable is left to grading, which records the harness error."""
+    cannot have run the job slot `k` holds. These are the orchestrator's
+    mistakes, not runs: an id the batch already recorded, an id with no
+    transcript, a transcript with no meta file or whose meta file names
+    another slot's agent, or a transcript that is another run's (another
+    task, or started before the slot was prepared). A transcript that exists
+    but cannot be read is left to grading, which records the harness error."""
     reused = next((r for r in read_rows(paths) if r.get("agent_id") == agent_id), None)
     retry = (f"pass the id of the agent spawned for {slot['job']}, or "
              f"`run.py abort --batch {plan['batch']} --slot {k}`")
+
+    def refuse(why):
+        raise CommandError(f"{why}; nothing recorded: {retry}")
+
     if reused is not None:
-        raise CommandError(
-            f"agent {agent_id} was already recorded for {reused.get('job')}, so it did not run "
-            f"{job_of(slot)} in slot {k}; nothing recorded: {retry}"
-        )
+        refuse(f"agent {agent_id} was already recorded for {reused.get('job')}, so it did not run "
+               f"{job_of(slot)} in slot {k}")
+    transcript_mod = transcript_mod or load_transcript_module()
     try:
-        transcript_mod = transcript_mod or load_transcript_module()
         path = transcript_file or transcript_mod.find_transcript(agent_id)
-        stats = transcript_mod.read_transcript(path) if path is not None else None
+    except ValueError as err:
+        refuse(f"agent {agent_id}'s transcript cannot be told apart: {err}")
+    if path is None or not os.path.isfile(path):
+        where = path if path is not None else "~/.claude/projects"
+        refuse(f"no transcript for agent {agent_id} ({where}), so it did not run {job_of(slot)} in slot {k}")
+    problems = agent_type_problems(path, agents.agent_name(slot["arm"], slot["slot"]))
+    if problems:
+        refuse(f"agent {agent_id} {'; '.join(problems)}, so it is not the run of {job_of(slot)} in slot {k}")
+    try:
+        stats = transcript_mod.read_transcript(path)
     except Exception:  # noqa: BLE001 - grading reads it again and records why it failed
         return
-    if stats is None or (stats.get("started") is None and stats.get("first_prompt") is None):
+    if stats.get("started") is None and stats.get("first_prompt") is None:
         return  # nothing in it to be another run's; grading records the harness error
     problems = identity_problems(slot, stats)
     if problems:
-        raise CommandError(
-            f"agent {agent_id}'s transcript is not the run of {job_of(slot)} in slot {k}: "
-            f"{'; '.join(problems)}; nothing recorded: {retry}"
-        )
+        refuse(f"agent {agent_id}'s transcript is not the run of {job_of(slot)} in slot {k}: {'; '.join(problems)}")
 
 
 def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None):
@@ -945,6 +1011,152 @@ def cmd_abort(args):
     return EXIT_OK
 
 
+# --- Regrade: one grading logic for every row of a batch ----------------------------------------
+
+ARM_AGENT_RE = {arm: re.compile(rf"tui-{re.escape(arm)}-[1-9][0-9]*") for arm in ARMS}
+
+
+def regrade_row(row, plan, transcript_mod, projects_dir=None):
+    """`row` graded again with the current code, from what persists: its
+    recorded state and demo_alive, and its transcript re-read. Returns a new
+    dict; `row` is not changed. A dry-run row comes back as it was. A row
+    that cannot be regraded (no agent id, no state, no transcript any more)
+    keeps its stats and status, with a `regrade_note` saying why."""
+    if row.get("mode") != "subagent":
+        return dict(row)
+    new = dict(row)
+    new["status_at_run"] = row.get("status_at_run", row.get("status"))
+    new["regrade_note"] = None
+    arm, task, agent_id, state = row.get("arm"), TASKS.get(row.get("task")), row.get("agent_id"), row.get("state")
+    keep, path = None, None
+    if not agent_id:
+        keep = "it has no agent id (a failed prepare or an abort), so there is no transcript to re-read"
+    elif task is None or arm not in ARM_TOOLS:
+        keep = f"its task {row.get('task')!r} or arm {arm!r} is unknown to this code"
+    elif not isinstance(state, dict):
+        keep = "it has no recorded state to check again"
+    else:
+        try:
+            path = (transcript_mod.find_transcript(agent_id) if projects_dir is None
+                    else transcript_mod.find_transcript(agent_id, projects_dir))
+        except ValueError as err:
+            keep = f"its transcript cannot be told apart: {err}"
+        if path is None and keep is None:
+            keep = f"no transcript for agent {agent_id} can be found any more"
+    if keep is not None:
+        new["regrade_note"] = f"kept as recorded: {keep}"
+        return new
+
+    errors, cut_off, fields = [], False, {}
+    slot = row.get("slot")
+    expected = agents.agent_name(arm, slot) if isinstance(slot, int) else ARM_AGENT_RE[arm]
+    extra = []
+    if os.path.exists(meta_path(path)):
+        extra = agent_type_problems(path, expected)
+    else:
+        new["regrade_note"] = "its meta file is gone, so the agent type was not checked again"
+    try:
+        fields, found, cut_off = transcript_verdict(
+            transcript_mod, path, arm, row.get("model"), plan["effort"], plan["max_turns"], extra
+        )
+        errors += found
+    except Exception as err:  # noqa: BLE001 - an unreadable transcript is the harness's
+        errors.append(f"reading the transcript failed: {type(err).__name__}: {err}")
+    new.update(fields)
+    try:
+        graded = judge(task, state, bool(row.get("demo_alive")))
+    except Exception as err:  # noqa: BLE001 - a check that falls over is the harness's
+        errors.append(f"grading failed: {type(err).__name__}: {err}")
+        graded = {"check_passed": row.get("check_passed"), "demo_alive": row.get("demo_alive"),
+                  "reason": row.get("reason")}
+    error = "; ".join(errors) or None
+    status, passed = classify(graded, error, cut_off)
+    new.update(status=status, passed=passed, check_passed=graded["check_passed"],
+               reason=graded["reason"], error=error)
+    return new
+
+
+def change_reason(new):
+    """Why a regraded row has its status, in a few words."""
+    if new.get("error"):
+        return new["error"]
+    if new.get("notes"):
+        return "; ".join(new["notes"])
+    return new.get("reason") or "no harness error any more"
+
+
+def backup_path(paths, stamp):
+    """runs.orig-<stamp>.jsonl beside runs.jsonl, never one that exists."""
+    base = os.path.join(paths.batch_dir, f"runs.orig-{stamp}")
+    candidate, n = f"{base}.jsonl", 1
+    while os.path.exists(candidate):
+        n += 1
+        candidate = f"{base}-{n}.jsonl"
+    return candidate
+
+
+def regrade(paths, transcript_mod=None, projects_dir=None):
+    """Regrade every row of the batch at `paths` in place, after a backup.
+    Returns (rows, changes, backup): changes are (job, old, new, reason)."""
+    plan = load_plan(paths)
+    held = sorted(k for k, s in read_all_slots(paths).items() if s.get("batch") == plan["batch"])
+    if held:
+        raise CommandError(
+            f"batch {plan['batch']} still holds slot(s) {', '.join(map(str, held))}; grade or abort "
+            "them first, so every row is regraded once and none is written meanwhile"
+        )
+    if not os.path.exists(paths.runs):
+        raise CommandError(f"batch {plan['batch']} has no rows ({paths.runs})")
+    transcript_mod = transcript_mod or load_transcript_module()
+    prov = git_provenance()
+    stamp_iso = now()
+    with flocked(paths.lock):
+        with open(paths.runs, "rb") as f:
+            original = f.read()
+        out, rows, changes = [], [], []
+        for raw in original.decode("utf-8", errors="surrogateescape").splitlines():
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                row = None
+            if not isinstance(row, dict):
+                out.append(raw)  # not a row: kept byte for byte
+                continue
+            new = regrade_row(row, plan, transcript_mod, projects_dir)
+            if new.get("mode") == "subagent":
+                new.update(regraded_at=stamp_iso, regrade_git_sha=prov["git_sha"],
+                           regrade_git_dirty=prov["git_dirty"])
+            if new.get("status") != row.get("status"):
+                changes.append((row.get("job"), row.get("status"), new.get("status"), change_reason(new)))
+            rows.append(new)
+            out.append(json.dumps(new))
+        backup = backup_path(paths, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(original)
+        tmp = f"{paths.runs}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write("".join(line + "\n" for line in out))
+        os.replace(tmp, paths.runs)
+    return rows, changes, backup
+
+
+def cmd_regrade(args):
+    paths = Paths(args.results_dir, args.batch)
+    rows, changes, backup = regrade(paths, projects_dir=args.projects_dir)
+    kept = sum(1 for r in rows if str(r.get("regrade_note") or "").startswith("kept as recorded"))
+    dry = sum(1 for r in rows if r.get("mode") != "subagent")
+    print(f"run.py: regraded batch {args.batch}: {len(rows)} rows ({dry} dry-run kept, {kept} kept as "
+          f"recorded); {len(changes)} changed status; the original is {backup}")
+    for job, old, new, why in changes:
+        print(f"  {job}: {old} -> {new} ({why})")
+    for row in rows:
+        note = row.get("regrade_note")
+        if note:
+            print(f"  {row.get('job')}: note: {note}")
+    return EXIT_OK
+
+
 # --- Command line ---------------------------------------------------------------------------
 
 
@@ -1029,6 +1241,10 @@ def parse_args(argv=None):
     p.add_argument("--slot", type=_positive, required=True)
     p.add_argument("--reason", default="aborted by the operator")
 
+    p = sub.add_parser("regrade", parents=[common], help="grade every row of a batch again with this code")
+    p.add_argument("--batch", type=_batch, required=True)
+    p.add_argument("--projects-dir", help=argparse.SUPPRESS)  # test hook: where find_transcript looks
+
     args = parser.parse_args(argv)
     if args.command in ("dry-run", "plan"):
         args.tasks = list(dict.fromkeys(args.tasks or task_ids))
@@ -1049,6 +1265,7 @@ COMMANDS = {
     "next": cmd_next,
     "status": cmd_status,
     "abort": cmd_abort,
+    "regrade": cmd_regrade,
 }
 
 
