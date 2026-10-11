@@ -2,130 +2,130 @@
 """Run benchmark tasks against taria-demo through one or both arms.
 
 Each run gets a fresh demo in its own tmux server and temp dir (see
-harness.DemoRun for the layout) and an MCP config for its arm:
+harness.DemoRun for the layout), and one of two MCP servers, both registered
+as `tui`, so the agent sees `mcp__tui__<tool>` either way:
 
   taria  the real bridge, target/debug/taria-mcp --app taria-demo
   tmux   bench/tmux_mcp.py, screen-scraping the same pane
 
-Both arms register their server under the same name, so the agent sees
-`mcp__tui__<tool>` either way. When the solver or agent stops, the run is
-graded on the demo's state dump by the task's check (bench/tasks.py), never
-on the screen or the tree, and on the demo process still running. One JSON
-line is printed and appended to the batch's results file.
+A run is graded on the demo's state dump by the task's check (bench/tasks.py),
+never on the screen or the tree, and on the demo process still running.
 
-Modes:
-  --dry-run   a scripted, non-LLM solver (bench/solvers.py) drives the task
-              through the same MCP server the agent would get, spawned from
-              the same config entry. Free, and what proves the harness.
-  --spend     one real agent per run with `claude -p`. Costs money; needs
-              ANTHROPIC_API_KEY (`--bare` reads no other credential).
+Two ways to drive a run:
+
+  dry-run   a scripted, non-LLM solver (bench/solvers.py) drives each task
+            through the same server an agent gets. Free; proves the harness.
+  subagent  real Claude Code subagents, spawned by an orchestrating Claude
+            Code session through its Agent tool. Python never calls a model:
+
+              run.py agents --slots K --dir D   once: the agent files
+              run.py plan --batch B ...         once: the shuffled job list
+              run.py next --batch B --slot K    prints one job as JSON
+              Agent(subagent_type=<agent>, model=<model>, prompt=<prompt>)
+              run.py next --batch B --slot K --agent-id <id>
+                                                grades that agent's run and
+                                                prints the slot's next job
+
+            Up to K slots run at once. `next` prepares a demo in the slot and
+            writes results/slots/<K>.json; the agent file for that arm and
+            slot (bench/agents.py) starts bench/mcp_launch.py, which reads the
+            slot file and execs the arm's server against that demo. When the
+            agent finishes, `next --agent-id` reads its transcript
+            (bench/transcript.py), grades the demo, records the row and tears
+            the demo down.
 
 Every run ends in exactly one status:
 
   passed         the check passed and the demo is still running
   failed         the check said no, or the demo exited
-  timeout        the agent ran out of wall clock (--timeout)
-  budget         the agent hit --max-budget-usd (result error_max_budget_usd)
-  max_turns      the agent hit --max-turns (result error_max_turns)
-  harness_error  infrastructure, not the agent: a failed setup, a server
-                 crash, the tool guard, a solver or harness exception, an
-                 API or auth error, a permission denial, claude exiting
-                 without a result. Out of the pass rate, counted per row.
+  max_turns      the agent stopped on a tool call at the batch's max turns:
+                 a failure, whatever the dump says (check_passed is recorded)
+  harness_error  infrastructure, not the agent: a failed setup, a server or
+                 solver failure, no transcript, or the transcript guard
+                 refusing how the agent was set up. Out of the pass rate.
 
-The three limits are one rule: an agent that hit any of them did not finish
-on its own, so the run is a failure in the pass rate, counted in its own
-column. Its dump is still graded and `check_passed` recorded, so the summary
-can say how many cut-off runs had the right state when they were stopped.
+Rows go to results/<batch>/runs.jsonl, one JSON object per run, with the
+same keys in both modes (ROW_KEYS; null where a mode has no value).
 
-Jobs (task x arm x run) are shuffled with --seed, so neither arm always runs
-first or warm. Every record carries the batch id, git SHA and dirty flag,
-`claude --version`, the seed, the model, effort and limits it ran under
-(`timeout_s`, `budget_usd`, `max_turns`; null where not passed or for a dry
-run), and the names of the environment variables the agent was not given.
-That is every flag that changes a run; everything else is the code at that
-SHA (the dirty flag says when it is not), so summarize.py never has to guess
-what produced a record.
+Exit codes: 0 ok (dry-run: every run passed); 1 dry-run: a run did not
+pass; 2 a harness error (a stale build, bad arguments, slot misuse, or a
+graded run that was a harness error, after which `next` claims nothing).
 
-The batch stops at once on the tool guard or a permission denial: both mean
-the agent is not set up as the arm requires, so every later run would be a
-harness error too, and paid for.
+Python 3 stdlib only. Never builds, never calls a model.
 
-Exit codes: 0 every run passed; 1 a run did not pass (failed, or cut off by
-a limit); 2 a harness error (including a stale or missing build, the guard,
-a signal), which wins over 1.
-
-Python 3 stdlib only. Never builds.
-
-Usage:  python3 bench/run.py --dry-run [--tasks T1,T3] [--arms taria,tmux] [--runs N] [--sabotage]
-        python3 bench/run.py --spend   [--tasks ...] [--arms ...] [--runs N] [--model M] [--effort E]
-                                       [--timeout S] [--budget-usd D] [--max-turns N]
+Usage:  python3 bench/run.py dry-run [--tasks T1,T3] [--arms taria,tmux] [--runs N] [--seed S]
+                                     [--sabotage] [--batch B]
+        python3 bench/run.py agents  --slots K [--dir D] [--effort E] [--max-turns N] [--remove]
+        python3 bench/run.py plan    --batch B [--tasks ..] [--arms ..] [--models sonnet,haiku]
+                                     [--runs N] [--seed S] [--effort E] [--max-turns N]
+        python3 bench/run.py next    --batch B --slot K [--agent-id ID]
+        python3 bench/run.py status  --batch B
+        python3 bench/run.py abort   --batch B --slot K [--reason TEXT]
 """
 
 import argparse
+import fcntl
+import glob
 import json
 import os
 import random
-import select
+import re
 import shutil
 import signal
 import subprocess
 import sys
-import threading
 import time
 import traceback
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH)
+import agents  # noqa: E402
 from harness import (  # noqa: E402
     ARM_TOOLS,
     ARMS,
     REPO,
-    SERVER_KEY,
     SERVER_NAMES,
     DemoRun,
     HarnessError,
     McpStdio,
     ToolError,
-    mcp_config,
     require_fresh_build,
+    server_entry,
     wait_ready,
 )
 from solvers import CountingSession, SolverError, solve  # noqa: E402
 from tasks import TASKS  # noqa: E402
 
 RESULTS_DIR = os.path.join(BENCH, "results")
-DEFAULT_MODEL = "claude-sonnet-5-5"
-DEFAULT_EFFORT = "medium"
-EFFORTS = ("low", "medium", "high", "xhigh", "max")  # `claude --help`, --effort
-DEFAULT_BUDGET_USD = 1.0
-DEFAULT_TIMEOUT_S = 600
-# `claude --help` lists the --permission-mode choices; dontAsk denies whatever
-# --allowedTools does not approve instead of prompting, which in -p mode
-# nobody could answer. Pinned so a defaultMode in some settings file cannot
-# change it, and checked against system/init by the guard.
-PERMISSION_MODE = "dontAsk"
-# Result subtypes that mean a limit stopped the agent (both carry is_error in
-# the 2.1.294 binary), and the status each run gets.
-CUTOFF_SUBTYPES = {"error_max_budget_usd": "budget", "error_max_turns": "max_turns"}
-# The agent's environment is an allowlist: only these reach it, plus
-# HARNESS_ENV. Anything else a shell exports can steer Claude Code (Claude
-# Code's own session markers, CLAUDE_CODE_EFFORT_LEVEL overriding --effort,
-# ANTHROPIC_MODEL, ANTHROPIC_BASE_URL, NODE_OPTIONS, a proxy), so it is
-# dropped and its name, never its value, is recorded.
-ENV_ALLOW = frozenset({
-    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
-    "TMPDIR", "SHELL", "ANTHROPIC_API_KEY",
-})
-HARNESS_ENV = {}  # what the harness sets on the agent itself; nothing today
+# The Agent tool's model choices; a plan names model families from these.
+MODELS = ("sonnet", "opus", "haiku", "fable")
+DEFAULT_MODELS = "sonnet"
+STATUSES = ("passed", "failed", "max_turns", "harness_error")
+EXIT_OK, EXIT_FAILED, EXIT_HARNESS = 0, 1, 2
+BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+AGENT_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")
 
-KILL_GRACE_S = 5.0  # SIGTERM to SIGKILL, for the agent's process group
-RESULT_GRACE_S = 10.0  # how long claude may take to exit after its result
+# One row per run, in this order, in both modes. From an agent's transcript:
+# model_resolved (the models it ran on), efforts_resolved (the effort Claude
+# Code recorded on its turns, which proves the effort used), claude_versions
+# (and claude_version, the same joined into one string): read, never asked of
+# `claude`, so they name what ran the agent rather than what is installed now.
+ROW_KEYS = (
+    "ts", "batch", "job", "task", "arm", "run", "seed", "mode", "solver",
+    "model", "model_resolved", "effort", "efforts_resolved", "max_turns", "agent_id",
+    "session_id", "git_sha", "git_dirty", "claude_version", "claude_versions",
+    "status", "passed", "check_passed", "reason", "error", "guard_problems",
+    "demo_alive", "demo_exit", "state",
+    "turns", "tool_calls", "tool_calls_total", "toolsearch_calls", "tokens",
+    "wall_ms", "final_text", "context",
+)
 
-CUTOFFS = ("timeout", "budget", "max_turns")
-STATUSES = ("passed", "failed", *CUTOFFS, "harness_error")
-EXIT_PASSED, EXIT_FAILED, EXIT_HARNESS = 0, 1, 2
+
+class CommandError(Exception):
+    """A subcommand refused: bad arguments, a stale build, slot misuse. Exit 2."""
 
 
 class Stopped(SystemExit):
@@ -143,9 +143,15 @@ def _on_signal(signum, _frame):
     raise Stopped(signum)
 
 
-class GuardError(Exception):
-    """The agent was not set up as the arm requires. Systematic, so the whole
-    batch stops rather than spending on runs that measure nothing."""
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def new_row(**fields):
+    unknown = set(fields) - set(ROW_KEYS)
+    if unknown:
+        raise KeyError(f"not row keys: {sorted(unknown)}")
+    return {key: fields.get(key) for key in ROW_KEYS}
 
 
 # --- Provenance --------------------------------------------------------------------
@@ -161,31 +167,12 @@ def _git(*args):
     return out.stdout if out.returncode == 0 else None
 
 
-def claude_version():
-    """`claude --version`, or None when there is no claude on PATH. Free: no API call."""
-    if shutil.which("claude") is None:
-        return None
-    try:
-        out = subprocess.run(
-            ["claude", "--version"], capture_output=True, text=True, timeout=30,
-            env=spend_env()[0], stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    return out.stdout.strip() or None
-
-
-def provenance(args):
-    """What produced a batch: recorded on every one of its records."""
+def git_provenance():
     sha = _git("rev-parse", "HEAD")
     status = _git("status", "--porcelain")
     return {
-        "batch": args.batch,
         "git_sha": sha.strip() if sha else None,
         "git_dirty": None if status is None else bool(status.strip()),
-        "claude_version": claude_version(),
     }
 
 
@@ -194,18 +181,227 @@ def new_batch_id():
     return f"{stamp}-{uuid.uuid4().hex[:6]}"
 
 
-# --- Dry run -----------------------------------------------------------------------
+# --- Where things live ---------------------------------------------------------------
 
 
-def dry_run(task, arm, run, config, sabotage):
+class Paths:
+    """results/<batch>/{plan.json,runs.jsonl,.lock} and results/slots/<K>.json."""
+
+    def __init__(self, results_dir, batch=None):
+        self.results = os.path.abspath(results_dir)
+        self.slots = os.path.join(self.results, "slots")
+        self.batch = batch
+        if batch is not None:
+            self.batch_dir = os.path.join(self.results, batch)
+            self.plan = os.path.join(self.batch_dir, "plan.json")
+            self.runs = os.path.join(self.batch_dir, "runs.jsonl")
+            self.lock = os.path.join(self.batch_dir, ".lock")
+
+    def slot(self, k):
+        return os.path.join(self.slots, f"{k}.json")
+
+    def slot_lock(self, k):
+        return os.path.join(self.slots, f".{k}.lock")
+
+
+@contextmanager
+def flocked(path, blocking=True):
+    """An exclusive flock on `path` (created if need be) for the block.
+
+    Non-blocking raises BlockingIOError when another process holds it.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_rows(paths):
+    try:
+        with open(paths.runs) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def append_row(paths, row):
+    os.makedirs(os.path.dirname(paths.runs), exist_ok=True)
+    line = json.dumps(row) + "\n"
+    with flocked(paths.lock):
+        with open(paths.runs, "a") as f:
+            f.write(line)
+
+
+def load_plan(paths):
+    try:
+        with open(paths.plan) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise CommandError(f"no plan for batch {paths.batch} ({paths.plan}); run `run.py plan` first")
+    except ValueError as err:
+        raise CommandError(f"{paths.plan} is not JSON: {err}")
+
+
+def read_slot(paths, k):
+    try:
+        with open(paths.slot(k)) as f:
+            slot = json.load(f)
+    except FileNotFoundError:
+        return None
+    except ValueError as err:
+        raise CommandError(f"{paths.slot(k)} is not JSON ({err}); `run.py abort` cannot read it either")
+    if not isinstance(slot, dict):
+        raise CommandError(f"{paths.slot(k)} is not a slot file")
+    return slot
+
+
+def read_all_slots(paths):
+    """{K: slot} for every readable slot file."""
+    slots = {}
+    for path in glob.glob(os.path.join(paths.slots, "*.json")):
+        name = os.path.basename(path)[: -len(".json")]
+        if not name.isdigit():
+            continue
+        try:
+            with open(path) as f:
+                slot = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(slot, dict):
+            slots[int(name)] = slot
+    return slots
+
+
+def create_slot(paths, k, slot):
+    """Write a new slot file; refuses one that exists (the slot is held)."""
+    os.makedirs(paths.slots, exist_ok=True)
+    try:
+        fd = os.open(paths.slot(k), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise CommandError(f"slot {k} is held ({paths.slot(k)} exists)")
+    with os.fdopen(fd, "w") as f:
+        json.dump(slot, f, indent=2)
+
+
+def write_slot(paths, k, slot):
+    tmp = f"{paths.slot(k)}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(slot, f, indent=2)
+    os.replace(tmp, paths.slot(k))
+
+
+def free_slot(paths, k):
+    try:
+        os.remove(paths.slot(k))
+    except FileNotFoundError:
+        pass
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def teardown(slot):
+    """Close the demo a slot describes, if it describes one. Never raises."""
+    demo = slot.get("demo")
+    if not demo:
+        return
+    try:
+        DemoRun.from_slot(demo).close()
+    except HarnessError as err:
+        print(f"run.py: could not tear down slot's demo: {err}", file=sys.stderr)
+
+
+# --- One run, either mode ---------------------------------------------------------------
+
+
+def prepare_demo(task, on_created=None):
+    """A started demo, through the task's setup, ready for either arm's server.
+
+    `on_created(run)` is called once the temp dir exists and before anything
+    is started, so a caller can record what to tear down if this process dies.
+    """
+    run = DemoRun()
+    try:
+        if on_created is not None:
+            on_created(run)
+        run.start()
+        if task.setup is not None:
+            try:
+                task.setup(run)
+            except HarnessError as err:
+                raise HarnessError(f"setup for {task.id} failed: {err}")
+        run.wait_ready_for_agent()
+    except BaseException:
+        run.close()
+        raise
+    return run
+
+
+def grade(task, run):
+    """The task's check on the settled dump, and whether the demo still runs."""
+    state = run.settled_state()
+    alive = run.demo_alive()
+    check_passed, reason = task.check(state)
+    if not alive:
+        reason = "demo exited" if check_passed else f"demo exited; {reason}"
+    return {"state": state, "demo_alive": alive, "check_passed": check_passed, "reason": reason}
+
+
+def classify(graded, error=None, cut_off=False):
+    """(status, passed) for one run.
+
+    A harness error wins; a run cut off at max turns failed whatever its dump
+    says; otherwise it passed only if the check passed and the demo runs.
+    """
+    if error:
+        return "harness_error", None
+    if cut_off:
+        return "max_turns", False
+    passed = bool(graded["check_passed"] and graded["demo_alive"])
+    return ("passed" if passed else "failed"), passed
+
+
+def quit_demo(run, alive):
+    """How the demo ended: clean (quit when asked), killed, or crashed."""
+    exited = run.quit() if alive else False
+    final = run.read_state()
+    if not alive:
+        return "crashed"
+    return "clean" if exited and final.get("quit") else "killed"
+
+
+# --- Dry run -------------------------------------------------------------------------
+
+
+def drive_scripted(task, arm, run, sabotage):
     name = SERVER_NAMES[arm]
-    client = McpStdio(config["mcpServers"][SERVER_KEY], cwd=run.workdir, name=name)
+    client = McpStdio(server_entry(arm, run), cwd=run.workdir, name=name)
     try:
         client.initialize()
         tools = client.tools_list()
         if sorted(tools) != sorted(ARM_TOOLS[arm]):
             raise HarnessError(
-                f"{name} lists tools {sorted(tools)}, but the spend guard expects "
+                f"{name} lists tools {sorted(tools)}, but grading expects "
                 f"{sorted(ARM_TOOLS[arm])}; update ARM_TOOLS in bench/harness.py"
             )
         wait_ready(arm, client)
@@ -221,461 +417,462 @@ def dry_run(task, arm, run, config, sabotage):
         wall_ms = round((time.monotonic() - started) * 1000)
     finally:
         client.close()
-    return {
-        "tool_calls": dict(session.calls),
-        "wall_ms": wall_ms,
-        "solver_error": solver_error,
-        "harness_error": f"the scripted solver failed: {solver_error}" if solver_error else None,
-    }
+    return dict(session.calls), wall_ms, solver_error
 
 
-# --- Spend run ---------------------------------------------------------------------
-
-
-def spend_command(prompt, config_path, budget_usd, model, effort=DEFAULT_EFFORT, max_turns=None):
-    """The agent's command line. Every flag checked against `claude --help`
-    (2.1.294), but --max-turns, which that version hides from --help and the
-    binary still parses; what each one does that a free check cannot show is
-    listed in bench/README.md.
-
-    The prompt goes straight after -p, before the variadic options
-    (--mcp-config, --tools, --allowedTools), so none of them can swallow it.
-    """
-    turns = [] if max_turns is None else ["--max-turns", str(max_turns)]
-    return [
-        "claude", "-p", prompt,
-        "--bare",  # no hooks, plugin sync, auto-memory or CLAUDE.md discovery
-        # No user, project or local settings files (an effortLevel, model,
-        # outputStyle or enabledPlugins there would apply otherwise). The
-        # binary parses an empty list as no sources; --restricted uses the
-        # same path. Only managed (policy) settings still apply.
-        "--setting-sources=",
-        "--strict-mcp-config", "--mcp-config", config_path,
-        "--tools", "",  # no built-in tools
-        "--allowedTools", f"mcp__{SERVER_KEY}",  # the arm's tools, unprompted
-        "--permission-mode", PERMISSION_MODE,
-        "--disable-slash-commands",  # no skills
-        "--output-format", "stream-json", "--verbose",
-        "--no-session-persistence",
-        "--max-budget-usd", f"{budget_usd:g}",
-        "--model", model,
-        "--effort", effort,
-        *turns,
-    ]
-
-
-def spend_env():
-    """The agent's environment: ENV_ALLOW from this one, plus HARNESS_ENV.
-
-    Returns (env, the names dropped). Values are never recorded.
-    """
-    env = {k: v for k, v in os.environ.items() if k in ENV_ALLOW}
-    env.update(HARNESS_ENV)
-    return env, sorted(k for k in os.environ if k not in env)
-
-
-# What system/init reports that bears on the measurement, recorded per run.
-INIT_FIELDS = (
-    "model", "tools", "mcp_servers", "plugins", "skills", "output_style",
-    "permissionMode", "claude_code_version", "apiKeySource", "plugin_errors",
-    "mcp_server_errors", "memory_paths",
-)
-
-
-def guard_problems(init, arm, permission_mode=PERMISSION_MODE):
-    """Every way a system/init event says the agent is not set up as `arm` requires."""
-    expected = sorted(f"mcp__{SERVER_KEY}__{t}" for t in ARM_TOOLS[arm])
-    problems = []
-    tools = sorted(init.get("tools") or [])
-    if tools != expected:
-        problems.append(f"the agent was given tools {tools}; the {arm} arm allows exactly {expected}")
-    plugins = init.get("plugins") or []
-    if plugins:
-        names = [p.get("name", p) if isinstance(p, dict) else p for p in plugins]
-        problems.append(f"plugins are loaded: {names}")
-    skills = init.get("skills") or []
-    if skills:
-        problems.append(f"skills are loaded: {skills}")
-    servers = [
-        (s.get("name"), s.get("status")) if isinstance(s, dict) else (s, None)
-        for s in init.get("mcp_servers") or []
-    ]
-    if servers != [(SERVER_KEY, "connected")]:
-        problems.append(f"MCP servers are {servers}; expected only {SERVER_KEY!r}, connected")
-    if init.get("permissionMode") != permission_mode:
-        problems.append(
-            f"permission mode is {init.get('permissionMode')!r}; expected {permission_mode!r}"
-        )
-    style = init.get("output_style")
-    if style not in (None, "default"):
-        problems.append(f"output style is {style!r}; expected 'default'")
-    return problems
-
-
-USAGE_KEYS = {
-    "input": "input_tokens",
-    "output": "output_tokens",
-    "cache_read": "cache_read_input_tokens",
-    "cache_creation": "cache_creation_input_tokens",
-}
-
-
-def usage_parts(usage):
-    """{input, output, cache_read, cache_creation} from an API usage object."""
-    return {short: usage.get(long) for short, long in USAGE_KEYS.items()}
-
-
-class StreamStats:
-    """What a `claude -p --output-format stream-json` run did, event by event.
-
-    The guard lives here: the first event must be system/init, and it must
-    pass guard_problems, or GuardError stops the run at that event. The init
-    event and the first model request can overlap, so a stopped run may
-    already have spent; it ends before any result event, so that spend is
-    not known. Usage is kept twice: from the result event, which sums the
-    session, and per assistant message as it streams, which is all a run cut
-    off before its result leaves behind.
-    """
-
-    def __init__(self, arm, permission_mode=PERMISSION_MODE):
-        self.arm = arm
-        self.permission_mode = permission_mode
-        self.init = None
-        self.result = None
-        self.tool_calls = {}
-        self._seen_tool_ids = set()
-        self._usage_by_message = {}
-
-    def feed(self, event):
-        kind = event.get("type")
-        if kind == "system" and event.get("subtype") == "init":
-            self.init = event
-            try:
-                problems = guard_problems(event, self.arm, self.permission_mode)
-            except Exception as err:  # noqa: BLE001 - an init the guard cannot read is not vetted
-                raise GuardError(f"could not vet system/init: {type(err).__name__}: {err}")
-            if problems:
-                raise GuardError("; ".join(problems))
-            return
-        if self.init is None and kind in ("assistant", "user", "result"):
-            raise GuardError(f"a {kind} event arrived before system/init; cannot vet the agent")
-        if kind == "assistant":
-            message = event.get("message") or {}
-            usage = message.get("usage")
-            if isinstance(usage, dict):
-                # One API message can stream as several events, each carrying
-                # the message's usage so far: keep the latest per message.
-                key = message.get("id") or f"anonymous-{len(self._usage_by_message)}"
-                self._usage_by_message[key] = usage
-            for block in message.get("content") or []:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                if block.get("id") in self._seen_tool_ids:
-                    continue
-                self._seen_tool_ids.add(block.get("id"))
-                name = block.get("name", "?").removeprefix(f"mcp__{SERVER_KEY}__")
-                self.tool_calls[name] = self.tool_calls.get(name, 0) + 1
-        elif kind == "result":
-            self.result = event
-
-    def usage(self):
-        """(parts, source): from the result if one came, else summed from the stream."""
-        result_usage = (self.result or {}).get("usage")
-        if isinstance(result_usage, dict):
-            parts = usage_parts(result_usage)
-            if any(isinstance(v, int) for v in parts.values()):
-                return parts, "result"
-        if self._usage_by_message:
-            totals = dict.fromkeys(USAGE_KEYS, 0)
-            for usage in self._usage_by_message.values():
-                for short, value in usage_parts(usage).items():
-                    if isinstance(value, int):
-                        totals[short] += value
-            return totals, "stream"
-        return None, None
-
-    def agent_env(self):
-        if self.init is None:
-            return None
-        return {field: self.init.get(field) for field in INIT_FIELDS}
-
-    def summary(self):
-        result = self.result or {}
-        parts, source = self.usage()
-
-        def part(name):
-            value = (parts or {}).get(name)
-            return value if isinstance(value, int) else None
-
-        known = [v for v in (parts or {}).values() if isinstance(v, int)]
-        tokens_in = [part(k) for k in ("input", "cache_read", "cache_creation")]
-        denials = result.get("permission_denials") or []
-        return {
-            "result_subtype": result.get("subtype"),
-            "is_error": result.get("is_error"),
-            "turns": result.get("num_turns"),
-            "duration_ms": result.get("duration_ms"),
-            "duration_api_ms": result.get("duration_api_ms"),
-            # Only a result event carries cost; a run cut off before one has
-            # none to recover, and summarize.py says so.
-            "cost_usd": result.get("total_cost_usd"),
-            "usage": parts,
-            "usage_source": source,
-            "input_tokens": part("input"),
-            "output_tokens": part("output"),
-            "cache_read_tokens": part("cache_read"),
-            "cache_creation_tokens": part("cache_creation"),
-            "tokens_in": sum(v for v in tokens_in if v is not None) if any(v is not None for v in tokens_in) else None,
-            "tokens_out": part("output"),
-            "tokens": sum(known) if known else None,
-            "agent_model": (self.init or {}).get("model"),
-            "agent_env": self.agent_env(),
-            "permission_denials": len(denials),
-            "denied_tools": sorted({d.get("tool_name", "?") for d in denials if isinstance(d, dict)}),
-            "tool_calls": dict(self.tool_calls),
-        }
-
-
-def _kill_group(proc, grace=None):
-    """Stop the agent and everything it spawned (its own process group)."""
-    grace = KILL_GRACE_S if grace is None else grace
-    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 5)):
-        if proc.poll() is not None:
-            break
-        try:
-            os.killpg(proc.pid, sig)
-        except OSError:
-            break
-        try:
-            proc.wait(timeout=wait)
-        except subprocess.TimeoutExpired:
-            pass
-    # The leader may be gone while something it spawned lingers in the group,
-    # a child that ignored SIGTERM included.
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        pass
-
-
-def _result_problem(result):
-    """Why a result event is the harness's fault rather than the agent's, or None."""
-    denials = result.get("permission_denials") or []
-    if denials:
-        names = sorted({d.get("tool_name", "?") for d in denials if isinstance(d, dict)})
-        return (
-            f"{len(denials)} permission denial(s) for {names}: the agent was refused "
-            "a tool the arm should have approved"
-        )
-    if result.get("is_error") and result.get("subtype") not in CUTOFF_SUBTYPES:
-        detail = result.get("result") or result.get("errors") or "(no detail)"
-        return f"claude reported an error (subtype {result.get('subtype')}): {str(detail)[:400]}"
-    return None
-
-
-def spend_run(task, arm, run, args):
-    cmd = spend_command(
-        task.prompt, run.config_path, args.budget_usd, args.model, args.effort, args.max_turns
+def dry_run_one(task, arm, run_index, job_id, batch, seed, sabotage, prov):
+    row = new_row(
+        ts=now(), batch=batch, job=job_id, task=task.id, arm=arm, run=run_index, seed=seed,
+        mode="dry-run", solver="scripted-sabotage" if sabotage else "scripted", **prov,
     )
-    env, dropped = spend_env()
-    stats = StreamStats(arm)
-    stderr = bytearray()
-    started = time.monotonic()
-    # Its own session, so the group can be killed whole, and so a signal
-    # aimed at this script's group does not reach it before cleanup does.
-    proc = subprocess.Popen(
-        cmd, cwd=run.workdir, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, start_new_session=True, env=env,
-    )
-
-    def drain():
-        for line in proc.stderr:
-            stderr.extend(line)
-            del stderr[:-4096]
-
-    drainer = threading.Thread(target=drain, daemon=True)
-    drainer.start()
-    timed_out, guard, lingered, unreadable = False, None, False, None
-    try:
-        deadline = started + args.timeout
-        fd = proc.stdout.fileno()
-        buf = b""
-        while guard is None and stats.result is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                break
-            ready, _, _ = select.select([fd], [], [], min(remaining, 1.0))
-            if not ready:
-                continue
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf and guard is None and stats.result is None:
-                line, buf = buf.split(b"\n", 1)
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue  # not an event; stream-json lines are all JSON
-                if not isinstance(event, dict):
-                    continue
-                try:
-                    stats.feed(event)
-                except GuardError as err:
-                    guard = str(err)
-                except Exception as err:  # noqa: BLE001 - one odd event must not lose the run
-                    # Reading on keeps the result event, and with it the cost.
-                    if unreadable is None:
-                        unreadable = f"{type(err).__name__}: {err} in {line[:200]!r}"
-        if not timed_out and guard is None:
-            try:
-                proc.wait(timeout=RESULT_GRACE_S)
-            except subprocess.TimeoutExpired:
-                lingered = True  # killed below; the result, if any, stands
-    finally:
-        _kill_group(proc)
-        drainer.join(2)  # the group is gone, so stderr is at EOF
-        for pipe in (proc.stdout, proc.stderr):
-            try:
-                pipe.close()
-            except (OSError, ValueError):
-                pass
-    wall_ms = round((time.monotonic() - started) * 1000)
-    harness_error = None
-    if guard is not None:
-        harness_error = f"guard: {guard}"
-    elif timed_out:
-        pass  # the agent's outcome, not the harness's
-    elif stats.result is None:
-        tail = stderr.decode(errors="replace").strip()[-800:]
-        harness_error = (
-            f"claude exited {proc.returncode} without a result event; "
-            f"stderr: {tail or '(empty)'}"
-        )
-    else:
-        harness_error = _result_problem(stats.result)
-    if harness_error is None and unreadable is not None:
-        harness_error = f"a stream event could not be read: {unreadable}"
-    return {
-        **stats.summary(),
-        "wall_ms": wall_ms,
-        "timed_out": timed_out,
-        "guard_failed": guard is not None,
-        "harness_error": harness_error,
-        "lingered": lingered,
-        "exit_code": proc.returncode,
-        "env_dropped": dropped,
-    }
-
-
-# --- One run -----------------------------------------------------------------------
-
-
-def grade(task, run):
-    """The task's check on the settled dump, and whether the demo still runs."""
-    state = run.settled_state()
-    alive = run.demo_alive()
-    check_passed, reason = task.check(state)
-    if not alive:
-        reason = "demo exited" if check_passed else f"demo exited; {reason}"
-    return {"state": state, "demo_alive": alive, "check_passed": check_passed, "reason": reason}
-
-
-def classify(outcome, graded):
-    """(status, passed, error) for one run, from what ran and how it graded.
-
-    A run cut off by any limit failed, whatever its dump says: the agent did
-    not finish on its own. Its `check_passed` is still recorded beside it.
-    """
-    error = outcome.get("harness_error")
-    if error:
-        return "harness_error", None, error
-    if outcome.get("timed_out"):
-        return "timeout", False, None
-    cutoff = CUTOFF_SUBTYPES.get(outcome.get("result_subtype"))
-    if cutoff:
-        return cutoff, False, None
-    passed = bool(graded["check_passed"] and graded["demo_alive"])
-    return ("passed" if passed else "failed"), passed, None
-
-
-def limits(args):
-    """The limits a run is held to, recorded on every record: null for a dry
-    run, which has none, and max_turns null when --max-turns was not passed."""
-    if not args.spend:
-        return {"timeout_s": None, "budget_usd": None, "max_turns": None}
-    return {"timeout_s": args.timeout, "budget_usd": args.budget_usd, "max_turns": args.max_turns}
-
-
-def run_one(task, arm, args, run_index, prov=None):
-    prov = prov if prov is not None else provenance(args)
-    record = {
-        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        **prov,
-        "task": task.id,
-        "arm": arm,
-        "run": run_index,
-        "seed": args.seed,
-        "mode": "spend" if args.spend else "dry-run",
-        "solver": "agent" if args.spend else ("scripted-sabotage" if args.sabotage else "scripted"),
-        "model": args.model if args.spend else None,
-        "effort": args.effort if args.spend else None,
-        **limits(args),
-    }
     run = None
     try:
-        run = DemoRun()
-        run.start()
-        config = mcp_config(arm, run)
-        with open(run.config_path, "w") as f:
-            json.dump(config, f, indent=2)
-        if task.setup is not None:
-            try:
-                task.setup(run)
-            except HarnessError as err:
-                raise HarnessError(f"setup for {task.id} failed: {err}")
-        if args.spend:
-            outcome = spend_run(task, arm, run, args)
-        else:
-            outcome = dry_run(task, arm, run, config, args.sabotage)
-        # On the record before grading, so a failure from here on still
-        # leaves the run's cost, usage and tool calls behind.
-        record.update(outcome)
-        record["tool_calls_total"] = sum(outcome["tool_calls"].values())
+        run = prepare_demo(task)
+        calls, wall_ms, solver_error = drive_scripted(task, arm, run, sabotage)
+        row.update(tool_calls=calls, tool_calls_total=sum(calls.values()), wall_ms=wall_ms)
         graded = grade(task, run)
-        status, passed, error = classify(outcome, graded)
-        record.update(
-            status=status,
-            passed=passed,
-            check_passed=graded["check_passed"],
-            reason=graded["reason"],
-            error=error,
-            demo_alive=graded["demo_alive"],
+        error = f"the scripted solver failed: {solver_error}" if solver_error else None
+        status, passed = classify(graded, error)
+        row.update(
+            status=status, passed=passed, check_passed=graded["check_passed"],
+            reason=graded["reason"], error=error, demo_alive=graded["demo_alive"],
             state=graded["state"],
         )
-        exited = run.quit() if graded["demo_alive"] else False
-        final = run.read_state()
-        record["demo_exit"] = (
-            "crashed" if not graded["demo_alive"]
-            else "clean" if exited and final.get("quit") else "killed"
-        )
+        row["demo_exit"] = quit_demo(run, graded["demo_alive"])
     except Exception as err:  # noqa: BLE001 - anything here is the harness's
-        record.update(
-            status="harness_error",
-            passed=None,
-            error=f"{type(err).__name__}: {err}",
-            traceback=traceback.format_exc(limit=8),
-        )
+        traceback.print_exc(limit=8, file=sys.stderr)
+        row.update(status="harness_error", passed=None, error=f"{type(err).__name__}: {err}")
     finally:
         if run is not None:
             run.close()
-    return record
+    return row
 
 
-# --- Runner ------------------------------------------------------------------------
+def preflight():
+    if shutil.which("tmux") is None:
+        raise CommandError("tmux not on PATH")
+    try:
+        require_fresh_build()
+    except HarnessError as err:
+        raise CommandError(str(err))
+
+
+def cmd_dry_run(args):
+    paths = Paths(args.results_dir, args.batch)
+    if os.path.exists(paths.plan):
+        raise CommandError(f"batch {args.batch} is a subagent batch ({paths.plan}); name another")
+    preflight()
+    jobs = [(t, a, r) for t in args.tasks for a in args.arms for r in range(args.runs)]
+    random.Random(args.seed).shuffle(jobs)
+    prov = {**git_provenance(), "claude_version": None}
+    statuses, passes = [], []
+    for number, (task_id, arm, run_index) in enumerate(jobs, 1):
+        row = dry_run_one(
+            TASKS[task_id], arm, run_index, f"j{number:03d}", args.batch, args.seed,
+            args.sabotage, prov,
+        )
+        append_row(paths, row)
+        print(json.dumps(row), flush=True)
+        statuses.append(row["status"])
+        passes.append(row["passed"] is True)
+        if row["status"] == "harness_error":
+            print(f"run.py: harness error in {task_id}/{arm}: {row['error']}", file=sys.stderr)
+    counts = {s: statuses.count(s) for s in STATUSES if s in statuses}
+    print(
+        f"run.py: batch {args.batch}: {sum(passes)}/{len(jobs)} passed "
+        f"({', '.join(f'{s} {n}' for s, n in counts.items())}); results in {paths.runs}",
+        file=sys.stderr,
+    )
+    if "harness_error" in statuses:
+        return EXIT_HARNESS
+    return EXIT_OK if all(passes) else EXIT_FAILED
+
+
+# --- Agents and plans -------------------------------------------------------------------
+
+
+def cmd_agents(args):
+    if args.remove:
+        removed = agents.remove(args.dir)
+        print(f"run.py: removed {len(removed)} agent file(s) from {args.dir}")
+        return EXIT_OK
+    if args.slots is None or args.slots < 1:
+        raise CommandError("agents needs --slots K (at least 1), or --remove")
+    slots_dir = Paths(args.results_dir).slots
+    try:
+        written = agents.write(args.slots, args.dir, slots_dir, args.effort, args.max_turns)
+    except (FileExistsError, ValueError) as err:
+        raise CommandError(str(err))
+    print(
+        f"run.py: wrote {len(written)} agent file(s) to {args.dir} (slots 1-{args.slots}, "
+        f"{', '.join(ARMS)}; effort {args.effort}, maxTurns {args.max_turns}); "
+        f"their launcher reads {slots_dir}"
+    )
+    return EXIT_OK
+
+
+def cmd_plan(args):
+    paths = Paths(args.results_dir, args.batch)
+    if os.path.exists(paths.plan):
+        raise CommandError(f"{paths.plan} exists; a plan is never replaced, name a new batch")
+    combos = [
+        (t, a, m, r) for t in args.tasks for a in args.arms for m in args.models for r in range(args.runs)
+    ]
+    random.Random(args.seed).shuffle(combos)
+    jobs = [
+        {"id": f"j{n:03d}", "task": t, "arm": a, "model": m, "run": r}
+        for n, (t, a, m, r) in enumerate(combos, 1)
+    ]
+    plan = {
+        "batch": args.batch,
+        "created": now(),
+        "tasks": args.tasks,
+        "arms": args.arms,
+        "models": args.models,
+        "runs": args.runs,
+        "seed": args.seed,
+        "effort": args.effort,
+        "max_turns": args.max_turns,
+        "agent_body_sha256": agents.body_sha256(),
+        **git_provenance(),
+        "jobs": jobs,
+    }
+    os.makedirs(paths.batch_dir, exist_ok=True)
+    try:
+        fd = os.open(paths.plan, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        raise CommandError(f"{paths.plan} exists; a plan is never replaced, name a new batch")
+    with os.fdopen(fd, "w") as f:
+        json.dump(plan, f, indent=2)
+    print(
+        f"run.py: batch {args.batch}: {len(jobs)} jobs ({len(args.tasks)} tasks x "
+        f"{len(args.arms)} arms x {len(args.models)} models x {args.runs} runs), seed "
+        f"{args.seed}, effort {args.effort}, max {args.max_turns} turns; {paths.plan}"
+    )
+    return EXIT_OK
+
+
+# --- Subagent runs: next, status, abort ---------------------------------------------------
+
+
+def job_of(slot):
+    return f"{slot.get('job')} ({slot.get('task')}/{slot.get('arm')}/{slot.get('model')} run {slot.get('run')})"
+
+
+def claim(paths, plan, k):
+    """Claim the first job in plan order that has no row and no slot, into
+    slot `k`. Returns (job, slot) or (None, None) when nothing is left.
+
+    Under the batch lock, so two `next` commands never claim the same job.
+    """
+    with flocked(paths.lock):
+        recorded = {row.get("job") for row in read_rows(paths)}
+        held = {s.get("job") for s in read_all_slots(paths).values() if s.get("batch") == plan["batch"]}
+        for job in plan["jobs"]:
+            if job["id"] in recorded or job["id"] in held:
+                continue
+            slot = {
+                "slot": k, "batch": plan["batch"], "job": job["id"], "task": job["task"],
+                "arm": job["arm"], "model": job["model"], "run": job["run"], "state": "claimed",
+                "pid": os.getpid(), "claimed": now(),
+            }
+            create_slot(paths, k, slot)
+            return job, slot
+    return None, None
+
+
+def prepare_slot(paths, k, slot):
+    """Start the slot's demo and mark the slot ready for its agent."""
+
+    def created(run):
+        slot.update(state="starting", demo=run.to_slot())
+        write_slot(paths, k, slot)
+
+    run = prepare_demo(TASKS[slot["task"]], on_created=created)
+    slot.update(state="ready", demo=run.to_slot(), prepared=now())
+    write_slot(paths, k, slot)
+
+
+def base_agent_row(plan, slot, agent_id, prov):
+    return new_row(
+        ts=now(), batch=plan["batch"], job=slot["job"], task=slot["task"], arm=slot["arm"],
+        run=slot["run"], seed=plan["seed"], mode="subagent", solver="agent", model=slot["model"],
+        effort=plan["effort"], max_turns=plan["max_turns"], agent_id=agent_id, **prov,
+    )
+
+
+def load_transcript_module():
+    try:
+        import transcript
+    except ImportError as err:
+        raise HarnessError(f"bench/transcript.py cannot be imported: {err}")
+    return transcript
+
+
+def _one(values):
+    values = sorted({v for v in values or [] if isinstance(v, str)})
+    return ", ".join(values) if values else None
+
+
+def agent_type_problems(transcript_path, expected):
+    """The subagent's meta file names the agent type it was spawned as: it
+    must be this slot's agent, or the run drove another slot's demo."""
+    meta = transcript_path[: -len(".jsonl")] + ".meta.json" if transcript_path.endswith(".jsonl") else None
+    if meta is None or not os.path.exists(meta):
+        return []
+    try:
+        with open(meta) as f:
+            kind = json.load(f).get("agentType")
+    except (OSError, ValueError, AttributeError):
+        return [f"its meta file {meta} cannot be read"]
+    if kind != expected:
+        return [f"was spawned as {kind!r}, not this slot's agent {expected!r}"]
+    return []
+
+
+def grade_agent_run(plan, slot, agent_id, run=None, transcript_mod=None, transcript_file=None, prov=None):
+    """The row for the agent run in `slot`: its transcript, the guard, and the
+    demo's dump. Quits the demo; does not close it or record the row."""
+    arm = slot["arm"]
+    prov = prov if prov is not None else git_provenance()
+    row = base_agent_row(plan, slot, agent_id, {**prov, "claude_version": None})
+    errors, stats = [], None
+    try:
+        transcript_mod = transcript_mod or load_transcript_module()
+        path = transcript_file or transcript_mod.find_transcript(agent_id)
+        if path is None:
+            errors.append(f"no transcript for agent {agent_id} under ~/.claude/projects")
+        else:
+            stats = transcript_mod.read_transcript(path)
+            problems = list(transcript_mod.guard(stats, arm, slot["model"], ARM_TOOLS[arm]))
+            problems += agent_type_problems(path, agents.agent_name(arm, slot["slot"]))
+            row.update(
+                model_resolved=_one(stats.get("models")),
+                session_id=stats.get("session_id"),
+                claude_version=_one(stats.get("claude_versions")),
+                claude_versions=stats.get("claude_versions"),
+                efforts_resolved=stats.get("efforts"),
+                guard_problems=problems,
+                turns=stats.get("turns"),
+                tool_calls=stats.get("tool_calls"),
+                tool_calls_total=stats.get("tool_calls_total"),
+                toolsearch_calls=stats.get("toolsearch_calls"),
+                tokens=stats.get("tokens"),
+                wall_ms=stats.get("wall_ms"),
+                final_text=stats.get("final_text"),
+                context=stats.get("context"),
+            )
+            if problems:
+                errors.append("guard: " + "; ".join(problems))
+    except Exception as err:  # noqa: BLE001 - an unreadable transcript is the harness's
+        errors.append(f"reading the transcript failed: {type(err).__name__}: {err}")
+    try:
+        run = run if run is not None else DemoRun.from_slot(slot["demo"])
+        graded = grade(TASKS[slot["task"]], run)
+        cut_off = bool(
+            stats and stats.get("ended_on_tool_use")
+            and isinstance(stats.get("turns"), int) and stats["turns"] >= plan["max_turns"]
+        )
+        error = "; ".join(errors) or None
+        status, passed = classify(graded, error, cut_off)
+        row.update(
+            status=status, passed=passed, check_passed=graded["check_passed"],
+            reason=graded["reason"], error=error, demo_alive=graded["demo_alive"],
+            state=graded["state"],
+        )
+        row["demo_exit"] = quit_demo(run, graded["demo_alive"])
+    except Exception as err:  # noqa: BLE001 - anything here is the harness's
+        traceback.print_exc(limit=8, file=sys.stderr)
+        row.update(
+            status="harness_error", passed=None,
+            error="; ".join(errors + [f"grading failed: {type(err).__name__}: {err}"]),
+        )
+    return row
+
+
+def summary_line(row):
+    bits = [f"{row['status']}"]
+    if row.get("agent_id"):
+        bits.append(f"agent {row['agent_id']}")
+    if row.get("turns") is not None:
+        bits.append(f"{row['turns']} turns")
+    if row.get("tool_calls_total") is not None:
+        bits.append(f"{row['tool_calls_total']} tool calls")
+    detail = row.get("error") or row.get("reason")
+    return (
+        f"run.py: {row['job']} {row['task']}/{row['arm']}/{row['model']} run {row['run']}: "
+        f"{', '.join(bits)}{'; ' + detail if detail else ''}"
+    )
+
+
+def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None):
+    """Grade the agent run slot `k` holds, record it, tear the demo down and
+    free the slot. Returns the row (an existing one if the job was recorded
+    before a crash left the slot behind)."""
+    existing = next((r for r in read_rows(paths) if r.get("job") == slot["job"]), None)
+    if existing is not None:
+        print(f"run.py: {slot['job']} was already recorded; freeing slot {k}", file=sys.stderr)
+        teardown(slot)
+        free_slot(paths, k)
+        return existing
+    row = grade_agent_run(plan, slot, agent_id, transcript_file=transcript_file)
+    append_row(paths, row)  # before teardown: a crash from here on leaves a row, not a lost run
+    teardown(slot)
+    free_slot(paths, k)
+    return row
+
+
+def check_agent_files(plan, k, agents_dir, slots_dir):
+    found = []
+    for arm in plan["arms"]:
+        path = os.path.join(agents_dir, f"{agents.agent_name(arm, k)}.md")
+        found += agents.problems(
+            path, arm, k, slots_dir, plan["effort"], plan["max_turns"], plan["agent_body_sha256"]
+        )
+    if found:
+        raise CommandError("the agent files do not match the plan: " + "; ".join(found))
+
+
+def cmd_next(args):
+    paths = Paths(args.results_dir, args.batch)
+    plan = load_plan(paths)
+    if args.agent_id is not None and not AGENT_ID_RE.match(args.agent_id):
+        raise CommandError(f"agent id {args.agent_id!r} is not [0-9A-Za-z_-]+")
+    os.makedirs(paths.slots, exist_ok=True)
+    try:
+        with flocked(paths.slot_lock(args.slot), blocking=False):
+            return _next_locked(args, paths, plan)
+    except BlockingIOError:
+        raise CommandError(f"slot {args.slot} is busy: another run.py is working on it")
+
+
+def _next_locked(args, paths, plan):
+    k = args.slot
+    slot = read_slot(paths, k)
+    if slot is not None and slot.get("state") != "ready":
+        if pid_alive(slot.get("pid")) and slot.get("pid") != os.getpid():
+            raise CommandError(f"slot {k} is being prepared by pid {slot.get('pid')} ({job_of(slot)})")
+        print(f"run.py: slot {k}: a prepare of {job_of(slot)} died; tearing down what it left", file=sys.stderr)
+        teardown(slot)
+        free_slot(paths, k)
+        slot = None
+    if slot is not None:
+        if slot.get("batch") != plan["batch"]:
+            raise CommandError(f"slot {k} holds {job_of(slot)} of batch {slot.get('batch')}, not {plan['batch']}")
+        if args.agent_id is None:
+            raise CommandError(
+                f"slot {k} holds {job_of(slot)}; pass --agent-id of the agent that ran it, "
+                f"or `run.py abort --batch {plan['batch']} --slot {k}`"
+            )
+        row = finish_slot(paths, plan, k, slot, args.agent_id, args.transcript_file)
+        print(summary_line(row), file=sys.stderr)
+        if row["status"] == "harness_error":
+            raise CommandError(
+                f"{row['job']} was a harness error ({row.get('error')}); claimed nothing. "
+                f"Fix the setup, then `run.py next --batch {plan['batch']} --slot {k}` resumes"
+            )
+    elif args.agent_id is not None:
+        if not any(r.get("agent_id") == args.agent_id for r in read_rows(paths)):
+            raise CommandError(f"slot {k} holds no job, so agent {args.agent_id} did not run from it")
+        print(f"run.py: agent {args.agent_id} was already graded", file=sys.stderr)
+
+    preflight()
+    check_agent_files(plan, k, args.agents_dir, paths.slots)
+    job, slot = claim(paths, plan, k)
+    if job is None:
+        print(json.dumps({"done": True}), flush=True)
+        return EXIT_OK
+    try:
+        prepare_slot(paths, k, slot)
+    except Exception as err:  # noqa: BLE001 - a failed setup is the harness's
+        traceback.print_exc(limit=8, file=sys.stderr)
+        row = base_agent_row(plan, slot, None, {**git_provenance(), "claude_version": None})
+        row.update(status="harness_error", error=f"preparing the demo failed: {type(err).__name__}: {err}")
+        append_row(paths, row)
+        teardown(slot)  # prepare_demo closes its own failures; this covers a failed slot write
+        free_slot(paths, k)
+        raise CommandError(f"{job_of(slot)}: preparing the demo failed: {err}")
+    except BaseException:
+        teardown(slot)  # a signal mid-prepare: the job goes back to pending
+        free_slot(paths, k)
+        raise
+    print(json.dumps({
+        "job": job["id"],
+        "slot": k,
+        "agent": agents.agent_name(job["arm"], k),
+        "model": job["model"],
+        "prompt": TASKS[job["task"]].prompt,
+    }), flush=True)
+    return EXIT_OK
+
+
+def _age(stamp):
+    try:
+        seconds = int(time.time() - datetime.fromisoformat(stamp).timestamp())
+    except (TypeError, ValueError):
+        return "?"
+    return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def cmd_status(args):
+    paths = Paths(args.results_dir, args.batch)
+    plan = load_plan(paths)
+    rows = read_rows(paths)
+    recorded = {r.get("job") for r in rows}
+    slots = {k: s for k, s in read_all_slots(paths).items() if s.get("batch") == plan["batch"]}
+    held = {s.get("job") for s in slots.values()}
+    pending = [j for j in plan["jobs"] if j["id"] not in recorded and j["id"] not in held]
+    counts = {s: sum(1 for r in rows if r.get("status") == s) for s in STATUSES}
+    print(
+        f"batch {plan['batch']}: {len(plan['jobs'])} jobs; {len(recorded)} recorded ("
+        + ", ".join(f"{s} {n}" for s, n in counts.items())
+        + f"); {len(held)} held; {len(pending)} pending"
+    )
+    for k in sorted(slots):
+        s = slots[k]
+        state = s.get("state")
+        if state != "ready" and not pid_alive(s.get("pid")):
+            state = f"{state}, preparer gone"
+        print(f"slot {k}: {job_of(s)}, {state}, {_age(s.get('prepared') or s.get('claimed'))}")
+    return EXIT_OK
+
+
+def cmd_abort(args):
+    paths = Paths(args.results_dir, args.batch)
+    plan = load_plan(paths)
+    os.makedirs(paths.slots, exist_ok=True)
+    try:
+        with flocked(paths.slot_lock(args.slot), blocking=False):
+            slot = read_slot(paths, args.slot)
+            if slot is None:
+                raise CommandError(f"slot {args.slot} holds no job")
+            if slot.get("batch") != plan["batch"]:
+                raise CommandError(
+                    f"slot {args.slot} holds {job_of(slot)} of batch {slot.get('batch')}, not {plan['batch']}"
+                )
+            if not any(r.get("job") == slot["job"] for r in read_rows(paths)):
+                row = base_agent_row(plan, slot, None, {**git_provenance(), "claude_version": None})
+                row.update(status="harness_error", error=f"aborted: {args.reason}")
+                if slot.get("demo"):
+                    try:
+                        run = DemoRun.from_slot(slot["demo"])
+                        graded = grade(TASKS[slot["task"]], run)
+                        row.update(
+                            check_passed=graded["check_passed"], reason=graded["reason"],
+                            demo_alive=graded["demo_alive"], state=graded["state"],
+                        )
+                    except Exception as err:  # noqa: BLE001 - the abort goes ahead regardless
+                        row["error"] += f"; the dump could not be read: {type(err).__name__}: {err}"
+                append_row(paths, row)
+            teardown(slot)
+            free_slot(paths, args.slot)
+    except BlockingIOError:
+        raise CommandError(f"slot {args.slot} is busy: another run.py is working on it")
+    print(f"run.py: aborted {job_of(slot)} in slot {args.slot}: {args.reason}", file=sys.stderr)
+    return EXIT_OK
+
+
+# --- Command line ---------------------------------------------------------------------------
 
 
 def _list(value, choices, what):
@@ -688,149 +885,120 @@ def _list(value, choices, what):
     return items
 
 
+def _batch(value):
+    if not BATCH_RE.match(value) or value == "slots":
+        raise argparse.ArgumentTypeError(f"batch {value!r} must be [A-Za-z0-9._-], not 'slots'")
+    return value
+
+
+def _positive(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run taria benchmark tasks.")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--dry-run", action="store_true", help="scripted solver, no model")
-    mode.add_argument("--spend", action="store_true", help="real claude -p runs (costs money)")
-    task_ids, arms = sorted(TASKS), list(ARMS)
-    parser.add_argument(
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--results-dir", default=RESULTS_DIR,
+        help="where batches and slot files live (default bench/results)",
+    )
+    task_ids = sorted(TASKS)
+    selection = argparse.ArgumentParser(add_help=False)
+    selection.add_argument(
         "--tasks", "--task", dest="tasks", action="extend",
         type=lambda v: _list(v, task_ids, "task"),
         help=f"comma-separated task ids (default: all of {','.join(task_ids)})",
     )
-    parser.add_argument(
+    selection.add_argument(
         "--arms", "--arm", dest="arms", action="extend",
-        type=lambda v: _list(v, arms, "arm"),
+        type=lambda v: _list(v, list(ARMS), "arm"),
         help="comma-separated arms (default: taria,tmux)",
     )
-    parser.add_argument("--runs", type=int, default=1, help="runs per task and arm (default 1)")
-    parser.add_argument("--seed", type=int, help="shuffle seed (default: random, recorded)")
-    parser.add_argument(
-        "--sabotage", action="store_true",
-        help="dry run only: the solver follows a wrong plan, so every check must fail",
-    )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"spend only (default {DEFAULT_MODEL})")
-    parser.add_argument(
-        "--effort", default=DEFAULT_EFFORT, choices=EFFORTS,
-        help=f"spend only: claude --effort, always passed (default {DEFAULT_EFFORT})",
-    )
-    parser.add_argument(
-        "--budget-usd", type=float, default=DEFAULT_BUDGET_USD,
-        help=f"spend only: --max-budget-usd per run (default {DEFAULT_BUDGET_USD:g})",
-    )
-    parser.add_argument(
-        "--timeout", type=float, default=DEFAULT_TIMEOUT_S,
-        help=f"spend only: wall-clock seconds per run (default {DEFAULT_TIMEOUT_S})",
-    )
-    parser.add_argument(
-        "--max-turns", type=int,
-        help="spend only: claude --max-turns per run (default: not passed, no turn cap)",
-    )
-    parser.add_argument("--batch", help="batch id recorded on every run (default: time plus random)")
-    parser.add_argument("--results", help="append to this file (default: bench/results/<batch>.jsonl)")
+    selection.add_argument("--runs", type=_positive, default=1, help="runs per combination (default 1)")
+    selection.add_argument("--seed", type=int, help="shuffle seed (default: random, recorded)")
+    limits = argparse.ArgumentParser(add_help=False)
+    limits.add_argument("--effort", default=agents.DEFAULT_EFFORT, choices=agents.EFFORTS,
+                        help=f"the agents' effort (default {agents.DEFAULT_EFFORT})")
+    limits.add_argument("--max-turns", type=_positive, default=agents.DEFAULT_MAX_TURNS,
+                        help=f"the agents' maxTurns (default {agents.DEFAULT_MAX_TURNS})")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("dry-run", parents=[common, selection], help="scripted solver, no model")
+    p.add_argument("--sabotage", action="store_true", help="a wrong plan per task: every check must fail")
+    p.add_argument("--batch", type=_batch, help="batch id (default: time plus random)")
+
+    p = sub.add_parser("agents", parents=[common, limits], help="write the subagent files")
+    p.add_argument("--slots", type=_positive, help="how many slots (files per arm)")
+    p.add_argument("--dir", default=agents.DEFAULT_DIR, help=f"where (default {agents.DEFAULT_DIR})")
+    p.add_argument("--remove", action="store_true", help="delete this script's tui-*-*.md files from --dir")
+
+    p = sub.add_parser("plan", parents=[common, selection, limits], help="write a batch's job list")
+    p.add_argument("--batch", type=_batch, required=True)
+    p.add_argument("--models", action="extend", type=lambda v: _list(v, list(MODELS), "model"),
+                   help=f"comma-separated model families (default {DEFAULT_MODELS})")
+
+    p = sub.add_parser("next", parents=[common], help="grade a slot's run and claim its next job")
+    p.add_argument("--batch", type=_batch, required=True)
+    p.add_argument("--slot", type=_positive, required=True)
+    p.add_argument("--agent-id", help="the agent that ran the job the slot holds")
+    p.add_argument("--agents-dir", default=agents.DEFAULT_DIR,
+                   help=f"where the agent files are, checked against the plan (default {agents.DEFAULT_DIR})")
+    p.add_argument("--transcript-file", help=argparse.SUPPRESS)  # test hook: skips find_transcript
+
+    p = sub.add_parser("status", parents=[common], help="a batch's progress")
+    p.add_argument("--batch", type=_batch, required=True)
+
+    p = sub.add_parser("abort", parents=[common], help="tear a slot down, recording a harness error")
+    p.add_argument("--batch", type=_batch, required=True)
+    p.add_argument("--slot", type=_positive, required=True)
+    p.add_argument("--reason", default="aborted by the operator")
+
     args = parser.parse_args(argv)
-    if args.sabotage and args.spend:
-        parser.error("--sabotage is for --dry-run only")
-    if args.runs < 1:
-        parser.error("--runs must be at least 1")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
-    if args.budget_usd <= 0:
-        parser.error("--budget-usd must be positive")
-    if args.max_turns is not None and args.max_turns < 1:
-        parser.error("--max-turns must be at least 1")
-    args.tasks = list(dict.fromkeys(args.tasks or task_ids))
-    args.arms = list(dict.fromkeys(args.arms or arms))
-    if args.seed is None:
-        args.seed = random.SystemRandom().randrange(2**31)
-    if args.batch is None:
+    if args.command in ("dry-run", "plan"):
+        args.tasks = list(dict.fromkeys(args.tasks or task_ids))
+        args.arms = list(dict.fromkeys(args.arms or ARMS))
+        if args.seed is None:
+            args.seed = random.SystemRandom().randrange(2**31)
+    if args.command == "plan":
+        args.models = list(dict.fromkeys(args.models or DEFAULT_MODELS.split(",")))
+    if args.command == "dry-run" and args.batch is None:
         args.batch = new_batch_id()
     return args
 
 
-def results_path(path, batch):
-    return path or os.path.join(RESULTS_DIR, f"{batch}.jsonl")
+COMMANDS = {
+    "dry-run": cmd_dry_run,
+    "agents": cmd_agents,
+    "plan": cmd_plan,
+    "next": cmd_next,
+    "status": cmd_status,
+    "abort": cmd_abort,
+}
 
 
-def has_api_key():
-    return bool(os.environ.get("ANTHROPIC_API_KEY"))
-
-
-def exit_code(statuses, passes):
-    """2 on any harness error; else 1 if any run did not pass (a cut-off run
-    never passes); else 0."""
-    if "harness_error" in statuses:
-        return EXIT_HARNESS
-    return EXIT_PASSED if all(passes) else EXIT_FAILED
-
-
-def run_all(args):
-    if args.spend and not has_api_key():
-        print(
-            "run.py: --spend needs ANTHROPIC_API_KEY: it runs claude with --bare, which "
-            "reads no other credential. A subscription (OAuth) run is not wired yet.",
-            file=sys.stderr,
-        )
-        return EXIT_HARNESS
-    missing = [tool for tool in ["tmux"] + (["claude"] if args.spend else []) if shutil.which(tool) is None]
-    if missing:
-        print(f"run.py: {', '.join(missing)} not on PATH", file=sys.stderr)
-        return EXIT_HARNESS
+def cli(argv=None):
+    """Parse `argv`, run the subcommand, return its exit code."""
     try:
-        require_fresh_build()
-    except HarnessError as err:
+        args = parse_args(argv)
+    except SystemExit as exit_:
+        return EXIT_HARNESS if exit_.code else EXIT_OK
+    try:
+        return COMMANDS[args.command](args)
+    except (CommandError, HarnessError) as err:
         print(f"run.py: {err}", file=sys.stderr)
+        if args.command == "next":
+            print(json.dumps({"error": str(err), "slot": args.slot}), flush=True)
         return EXIT_HARNESS
-
-    jobs = [(t, a, r) for t in args.tasks for a in args.arms for r in range(args.runs)]
-    random.Random(args.seed).shuffle(jobs)
-    path = results_path(args.results, args.batch)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    prov = provenance(args)
-    if args.spend:
-        turns = "no turn cap" if args.max_turns is None else f"at most {args.max_turns} turns"
-        print(
-            f"run.py: batch {args.batch}: {len(jobs)} paid run(s), model {args.model}, "
-            f"effort {args.effort}, {args.timeout:g}s and {turns} each, at most "
-            f"${args.budget_usd:g} each (${args.budget_usd * len(jobs):g} in all)",
-            file=sys.stderr,
-        )
-    statuses, passes = [], []
-    for done, (task_id, arm, run_index) in enumerate(jobs, 1):
-        record = run_one(TASKS[task_id], arm, args, run_index, prov)
-        line = json.dumps(record)
-        print(line, flush=True)
-        with open(path, "a") as f:
-            f.write(line + "\n")
-        statuses.append(record["status"])
-        passes.append(record.get("passed") is True)
-        if record["status"] == "harness_error":
-            print(f"run.py: harness error in {task_id}/{arm}: {record['error']}", file=sys.stderr)
-        stop = None
-        if record.get("guard_failed"):
-            stop = "the guard refused the agent's setup at its init event"
-        elif record.get("permission_denials"):
-            stop = (
-                f"the agent was refused {record.get('denied_tools')}, so --allowedTools "
-                "does not approve the arm's tools"
-            )
-        if stop:
-            print(
-                f"run.py: stopped the batch: {stop}; {len(jobs) - done} run(s) not started",
-                file=sys.stderr,
-            )
-            break
-    print(f"run.py: batch {args.batch}, results in {path}", file=sys.stderr)
-    return exit_code(statuses, passes)
 
 
 def main():
-    args = parse_args()
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _on_signal)
     try:
-        code = run_all(args)
+        code = cli(sys.argv[1:])
     except Stopped as stop:
         print(f"run.py: stopped by {stop.signame}; the run's demo, tmux server and temp dir are gone", file=sys.stderr)
         code = EXIT_HARNESS

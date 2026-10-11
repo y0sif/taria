@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
-"""Summarize benchmark results as markdown tables.
+"""Summarize benchmark results as Markdown, on stdout.
 
-Reads the JSONL that bench/run.py writes. Which records are read is always
-said, never assumed:
+Reads the rows bench/run.py writes, one per run, to
+bench/results/<batch>/runs.jsonl. Which rows are read is always said, never
+assumed:
 
   summarize.py FILE [FILE ...]     exactly these files
-  summarize.py --batch ID [...]    these batches, from bench/results/ (or
-                                   from the files given)
-  summarize.py --all               every batch in bench/results/, merged
+  summarize.py --batch ID [...]    only this batch (repeatable), from the
+                                   files given or else bench/results/
+  summarize.py --all               every batch found, merged
   summarize.py                     the newest batch in bench/results/, and
                                    stderr names it
 
-Headline rows are agent runs (--spend) only, one per (task, arm, model,
-effort, limits), the limits being timeout_s, budget_usd and max_turns, so
-runs held to different limits are never pooled. Dry runs are a scripted
-solver, not an agent, so they get their own table, labelled as such, and
-never feed a headline number; sabotage runs are labelled apart from both.
+Without files, bench/results/*/runs.jsonl and bench/results/*.jsonl (the
+older flat layout) are searched.
 
-Per row: runs, then each outcome counted (passed of graded, failed, timeout,
-budget, max turns, harness errors), how many cut-off runs (any limit) had the
-right state when stopped, the pass rate with a Wilson 95% interval over the
-graded runs (everything but harness errors; a cut-off run is a failure),
-medians and IQRs of input+cache tokens, output tokens, tool calls, turns and
-wall time, summed cost, cost per passed run, and the result subtypes seen.
-Under each table, a two-sided Fisher exact test on pass counts between the
-arms, per task, and a provenance section naming every batch, git SHA, claude
-version and limits read.
+Sections:
+
+- Agent runs (headline): subagent rows only, one row per (task, arm, model,
+  effort, max_turns), so runs held to different settings are never pooled.
+  Per row: graded runs (n), passes and the pass rate with a Wilson 95%
+  interval, harness errors (counted, but outside n and the pass rate), runs
+  cut off at max_turns (failures; how many had the right state when cut),
+  and medians: tool calls [IQR] (ToolSearch excluded), ToolSearch calls,
+  turns, tokens processed [IQR] (input + cache_creation + cache_read),
+  output tokens and wall time.
+- Per model, taria vs tmux per task: the pass-rate difference with a
+  two-sided Fisher exact p, and the tmux/taria ratios of median tokens
+  processed and median tool calls. Then each arm across all tasks: pass
+  rate, median tokens processed and tool calls per run, total tokens
+  processed.
+- Model comparison: each pair of models per arm, overall pass rate (Fisher
+  p) and median tokens processed.
+- Dry runs (a scripted solver, no model) in their own table, never headline.
+- Provenance: batch, git SHA and dirty flag, claude version, models
+  requested and resolved, effort, max turns, runs; guard problems; and the
+  context each arm's agents were given (attachment types, deferred tools,
+  MCP instruction servers), so a reader can see both arms got equivalent
+  context.
 
 Python 3 stdlib only.
 """
@@ -38,15 +50,21 @@ import os
 import statistics
 import sys
 from collections import Counter
+from itertools import combinations
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BENCH, "results")
 Z95 = 1.959964
 SMALL_N = 5
-CUTOFFS = ("timeout", "budget", "max_turns")  # the agent hit a limit: a failure
-GRADED = ("passed", "failed", *CUTOFFS)
-LIMIT_FIELDS = ("timeout_s", "budget_usd", "max_turns")
+CUTOFF = "max_turns"  # the agent ran out of turns: a failure
+GRADED = ("passed", "failed", CUTOFF)
+KNOWN = (*GRADED, "harness_error")
+AGENT_MODES = ("subagent", "spend")  # "spend": rows from before subagent runs
+ARMS = ("taria", "tmux")
 NO_BATCH = "(none)"
+
+
+# --- Statistics ---------------------------------------------------------------------------
 
 
 def wilson(passes, n, z=Z95):
@@ -97,44 +115,100 @@ def median_iqr(values):
     return (q2, q1, q3)
 
 
-def _fmt_num(value, scale=1.0, digits=0):
-    value = value / scale
-    return f"{value:,.{digits}f}"
+def median(values):
+    stats = median_iqr(values)
+    return None if stats is None else stats[0]
 
 
-def fmt_spread(values, scale=1.0, digits=0):
+# --- Formatting ---------------------------------------------------------------------------
+
+
+def fmt_tokens(value):
+    return f"{value:,.0f}"
+
+
+def fmt_count(value):
+    """1, 12, 1.5: a median of counts keeps its half."""
+    return f"{value:,.0f}" if float(value).is_integer() else f"{value:,.1f}"
+
+
+def fmt_seconds(ms):
+    return f"{ms / 1000:,.1f}"
+
+
+def fmt_spread(values, fmt=fmt_count):
+    """`median [q1-q3]`, or the median alone when the quartiles meet; `-` for none."""
     stats = median_iqr(values)
     if stats is None:
         return "-"
     med, q1, q3 = stats
-    if q1 == q3:
-        return _fmt_num(med, scale, digits)
-    return f"{_fmt_num(med, scale, digits)} [{_fmt_num(q1, scale, digits)}-{_fmt_num(q3, scale, digits)}]"
+    return fmt(med) if q1 == q3 else f"{fmt(med)} [{fmt(q1)}-{fmt(q3)}]"
+
+
+def fmt_median(values, fmt=fmt_count):
+    med = median(values)
+    return "-" if med is None else fmt(med)
+
+
+def fmt_rate(passes, n):
+    if not n:
+        return "-"
+    low, high = wilson(passes, n)
+    return f"{passes / n:.0%} ({low:.0%}-{high:.0%})"
+
+
+def fmt_p(p):
+    return "-" if p is None else f"{p:.3f}"
+
+
+def fmt_ratio(num, den):
+    if num is None or den is None or den == 0:
+        return "-"
+    return f"{num / den:.2f}x"
+
+
+def _show(value):
+    return "-" if value is None else f"{value:g}" if is_num(value) else str(value)
+
+
+# --- Reading rows ---------------------------------------------------------------------------
 
 
 def label(record):
-    if record.get("mode") == "spend":
+    if record.get("mode") in AGENT_MODES:
         return "agent"
     if record.get("solver") == "scripted-sabotage":
         return "dry-run (sabotage)"
     return "dry-run"
 
 
-def tokens_in(record):
-    """Input plus cache tokens; older records only have the usage dict."""
-    if isinstance(record.get("tokens_in"), int):
+def _tokens(record):
+    tokens = record.get("tokens")
+    return tokens if isinstance(tokens, dict) else {}
+
+
+def tokens_processed(record):
+    """input + cache_creation + cache_read; None when none of them is known."""
+    parts = [_tokens(record).get(k) for k in ("input", "cache_creation", "cache_read")]
+    parts = [p for p in parts if is_num(p)]
+    if parts:
+        return sum(parts)
+    # Rows from before subagent runs.
+    if is_num(record.get("tokens_in")):
         return record["tokens_in"]
     usage = record.get("usage") or {}
-    parts = [usage.get(k) for k in ("input", "cache_read", "cache_creation")]
-    parts = [p for p in parts if isinstance(p, int)]
-    return sum(parts) if parts else None
+    legacy = [usage.get(k) for k in ("input", "cache_read", "cache_creation") if is_num(usage.get(k))]
+    return sum(legacy) if legacy else None
 
 
-def tokens_out(record):
-    if isinstance(record.get("tokens_out"), int):
+def tokens_output(record):
+    value = _tokens(record).get("output")
+    if is_num(value):
+        return value
+    if is_num(record.get("tokens_out")):
         return record["tokens_out"]
     value = (record.get("usage") or {}).get("output")
-    return value if isinstance(value, int) else None
+    return value if is_num(value) else None
 
 
 def load(paths):
@@ -154,30 +228,20 @@ def load(paths):
     return records
 
 
-# --- One table -----------------------------------------------------------------------
-
-COLUMNS = (
-    "task", "arm", "model", "effort", "limits", "runs", "passed", "failed", "timeout",
-    "budget", "max turns", "cut off", "harness err", "pass rate (95% CI)",
-    "in+cache tok med [IQR]", "out tok med [IQR]", "tool calls med [IQR]", "turns med [IQR]",
-    "wall s med [IQR]", "cost $ (sum)", "$ per pass", "result subtypes",
-)
-HEADER = "| " + " | ".join(COLUMNS) + " |"
-RULE = "|" + "|".join(["---"] * len(COLUMNS)) + "|"
+# --- Grouping -----------------------------------------------------------------------------
 
 
 def group_key(record):
-    """(task, arm, model, effort, timeout_s, budget_usd, max_turns): runs held
-    to different limits are different experiments, never one row."""
+    """(task, arm, model, effort, max_turns): runs held to different settings
+    are different experiments, never one row."""
     return (
         record.get("task", "?"), record.get("arm", "?"),
-        record.get("model") or "-", record.get("effort") or "-",
-        *(record.get(field) for field in LIMIT_FIELDS),
+        record.get("model") or "-", record.get("effort") or "-", record.get("max_turns"),
     )
 
 
 def _order(key):
-    """Sort key for a group key, whose limits may be numbers or None."""
+    """Sort key for a tuple whose parts may be numbers, strings or None."""
     def one(value):
         if value is None:
             return (2, 0, "")
@@ -185,264 +249,390 @@ def _order(key):
     return tuple(one(v) for v in key)
 
 
-def _g(value):
-    return f"{value:g}" if is_num(value) else str(value)
-
-
-def fmt_limits(timeout_s, budget_usd, max_turns):
-    """`600s, $1, no turn cap`; `-` when none is recorded (a dry run, or a
-    record from before limits were recorded)."""
-    if timeout_s is None and budget_usd is None and max_turns is None:
-        return "-"
-    return ", ".join([
-        "-" if timeout_s is None else f"{_g(timeout_s)}s",
-        "-" if budget_usd is None else f"${_g(budget_usd)}",
-        "no turn cap" if max_turns is None else f"{_g(max_turns)} turns",
-    ])
+def group(records, key):
+    groups = {}
+    for r in records:
+        groups.setdefault(key(r), []).append(r)
+    return groups
 
 
 def name(key):
     """How notes name a row: task/arm, plus whatever else sets it apart."""
-    task, arm, model, effort, *lims = key
-    extra = [part for part in (model, effort, fmt_limits(*lims)) if part != "-"]
+    task, arm, model, effort, max_turns = key
+    extra = [part for part in (model, effort) if part != "-"]
+    if max_turns is not None:
+        extra.append(f"{_show(max_turns)} turns")
     return f"{task}/{arm}" + (f" [{', '.join(extra)}]" if extra else "")
 
 
 def counts(records):
+    """(statuses, graded rows, passes): harness errors and unknown statuses
+    are outside the graded rows; a cut-off run is a graded failure."""
     by_status = Counter(r.get("status") for r in records)
     graded = [r for r in records if r.get("status") in GRADED]
     passes = sum(1 for r in graded if r.get("passed") is True)
     return by_status, graded, passes
 
 
-def row(key, records):
-    """(markdown row, notes) for one group of records."""
-    task, arm, model, effort, *lims = key
-    who = name(key)
-    by_status, graded, passes = counts(records)
-    n = len(graded)
-    if n:
-        low, high = wilson(passes, n)
-        rate = f"{passes / n:.0%} ({low:.0%}-{high:.0%})"
-    else:
-        rate = "-"
-    notes = []
-    # A scripted solver costs nothing and has no cost to be missing.
-    costs = [r.get("cost_usd") for r in graded if r.get("mode") == "spend"]
-    known = [c for c in costs if is_num(c)]
-    unknown = len(costs) - len(known)
-    mark = "*" if unknown and known else ""
-    if unknown:
-        notes.append(f"{who}: cost unknown for {unknown} graded run(s)")
-    spend = [r for r in graded if r.get("mode") == "spend"]
-    no_tokens = sum(1 for r in spend if tokens_in(r) is None)
-    if no_tokens:
-        notes.append(f"{who}: tokens unknown for {no_tokens} graded run(s), left out of the medians")
-    no_turns = [r for r in spend if not is_num(r.get("turns"))]
-    if no_turns:
-        timeouts = sum(1 for r in no_turns if r.get("status") == "timeout")
-        notes.append(
-            f"{who}: turns unknown for {len(no_turns)} graded run(s), {timeouts} of them "
-            "timeouts (only a result event carries num_turns), left out of the turns median"
-        )
-    cost = f"{sum(known):.2f}{mark}" if known else "-"
-    if known and passes:
-        per_pass = f"{sum(known) / passes:.3f}{mark}"
-    else:
-        per_pass = "n/a (0 passes)" if known else "-"
-    cut = [r for r in graded if r.get("status") in CUTOFFS]
+def cut_off(graded):
+    """`N (M with correct state)` for the max_turns runs among `graded`."""
+    cut = [r for r in graded if r.get("status") == CUTOFF]
+    if not cut:
+        return "0"
     # The state a passing run needs: the check and a live demo.
     correct = sum(1 for r in cut if r.get("check_passed") is True and r.get("demo_alive") is not False)
-    subtypes = Counter(r.get("result_subtype") or "none" for r in records if r.get("mode") == "spend")
-    others = sorted(s for s in by_status if s not in GRADED and s != "harness_error")
+    return f"{len(cut)} ({correct} with correct state)"
+
+
+# --- The per-group table ----------------------------------------------------------------------
+
+COLUMNS = (
+    "task", "arm", "model", "effort", "max turns", "n", "passed", "pass rate (95% CI)",
+    "harness err", "cut off", "tool calls med [IQR]", "ToolSearch med", "turns med",
+    "tokens processed med [IQR]", "output tok med", "wall s med",
+)
+
+
+def _header(columns):
+    return ["| " + " | ".join(columns) + " |", "|" + "|".join(["---"] * len(columns)) + "|"]
+
+
+def _row(cells):
+    return "| " + " | ".join(str(c) for c in cells) + " |"
+
+
+def row(key, records):
+    """(markdown row, notes) for one group of records."""
+    task, arm, model, effort, max_turns = key
+    who = name(key)
+    by_status, graded, passes = counts(records)
+    notes = []
+    agent = [r for r in graded if label(r) == "agent"]
+    no_tokens = sum(1 for r in agent if tokens_processed(r) is None)
+    if no_tokens:
+        notes.append(f"{who}: tokens unknown for {no_tokens} graded run(s), left out of the medians")
+    others = sorted(str(s) for s in by_status if s not in KNOWN)
     if others:
-        notes.append(f"{who}: {sum(by_status[s] for s in others)} record(s) with unknown status {others}")
+        count = sum(n for s, n in by_status.items() if s not in KNOWN)
+        notes.append(f"{who}: {count} row(s) with unknown status {others}, outside n and the pass rate")
     cells = [
-        task, arm, model, effort, fmt_limits(*lims), str(len(records)), f"{passes}/{n}",
-        str(by_status["failed"]), str(by_status["timeout"]), str(by_status["budget"]),
-        str(by_status["max_turns"]),
-        f"{len(cut)} ({correct} with correct state)" if cut else "0",
-        str(by_status["harness_error"]), rate,
-        fmt_spread([tokens_in(r) for r in graded]),
-        fmt_spread([tokens_out(r) for r in graded]),
+        task, arm, model, effort, _show(max_turns), len(graded), f"{passes}/{len(graded)}",
+        fmt_rate(passes, len(graded)), by_status["harness_error"], cut_off(graded),
         fmt_spread([r.get("tool_calls_total") for r in graded]),
-        fmt_spread([r.get("turns") for r in graded]),
-        fmt_spread([r.get("wall_ms") for r in graded], scale=1000, digits=1),
-        cost, per_pass,
-        ", ".join(f"{s} {c}" for s, c in sorted(subtypes.items())) or "-",
+        fmt_median([r.get("toolsearch_calls") for r in graded]),
+        fmt_median([r.get("turns") for r in graded]),
+        fmt_spread([tokens_processed(r) for r in graded], fmt_tokens),
+        fmt_median([tokens_output(r) for r in graded], fmt_tokens),
+        fmt_median([r.get("wall_ms") for r in graded], fmt_seconds),
     ]
-    return "| " + " | ".join(cells) + " |", notes
+    return _row(cells), notes
 
 
-def comparison(groups):
-    """Per (task, model, effort, limits) with both arms: pass counts and Fisher's p."""
-    cells = {}
-    for (task, arm, *rest), records in groups.items():
-        _, graded, passes = counts(records)
-        cells.setdefault((task, *rest), {})[arm] = (passes, len(graded))
-    lines = []
-    for key in sorted(cells, key=_order):
-        task, model, effort, *lims = key
-        arms = cells[key]
-        if "taria" not in arms or "tmux" not in arms:
-            continue
-        (tp, tn), (mp, mn) = arms["taria"], arms["tmux"]
-        p = fisher_exact(tp, tn - tp, mp, mn - mp) if tn and mn else None
-        lines.append(
-            f"| {task} | {model} | {effort} | {fmt_limits(*lims)} | {tp}/{tn} | {mp}/{mn} | "
-            f"{'-' if p is None else f'{p:.3f}'} |"
-        )
-    if not lines:
-        return []
-    return [
-        "",
-        "Arm comparison: two-sided Fisher exact test on pass counts (graded runs).",
-        "",
-        "| task | model | effort | limits | taria passed | tmux passed | Fisher p |",
-        "|---|---|---|---|---|---|---|",
-        *lines,
-    ]
-
-
-def table(records):
-    groups = {}
-    for r in records:
-        groups.setdefault(group_key(r), []).append(r)
+def table(records, agent=True):
+    groups = group(records, group_key)
     ordered = sorted(groups, key=_order)
-    lines, notes = [HEADER, RULE], []
+    lines, notes = _header(COLUMNS), []
     for key in ordered:
         line, row_notes = row(key, groups[key])
         lines.append(line)
         notes += row_notes
-    small = [name(k) for k in ordered if len(counts(groups[k])[1]) < SMALL_N]
-    lines += comparison(groups)
     footer = []
+    small = [name(k) for k in ordered if len(counts(groups[k])[1]) < SMALL_N]
     if small:
         footer.append(
             f"n < {SMALL_N} graded runs in {'; '.join(small)}: at that size the IQR and the "
             "Fisher test are weak, so read them as descriptive."
         )
-    if any(r.get("status") in CUTOFFS for r in records):
+    errors = [r for r in records if r.get("status") == "harness_error"]
+    if errors:
+        spent = [tokens_processed(r) for r in errors if tokens_processed(r) is not None]
         footer.append(
-            "A cut-off run (timeout, budget, max turns) hit a limit before the agent "
-            "finished on its own, so it fails whatever its dump says; `cut off` counts "
-            "how many of them had the right state when they were stopped."
+            f"{len(errors)} harness-error run(s) are counted in `harness err` and left out of n, "
+            "the pass rate and every median"
+            + (f"; they processed {fmt_tokens(sum(spent))} tokens." if spent else ".")
         )
-    if any("cost unknown" in n for n in notes):
+    if any(r.get("status") == CUTOFF for r in records):
         footer.append(
-            "Cost is known only from a result event; a run cut off before one (a timeout) "
-            "has none, so a sum marked * leaves those runs out and is a lower bound. "
-            "Their tokens are what streamed before the cut (usage_source stream) or null."
+            "A cut-off run hit max_turns before the agent finished on its own, so it fails "
+            "whatever the demo's state; `cut off` counts how many had the right state when cut."
+        )
+    if agent and records:
+        footer.append(
+            "Tokens processed = input + cache_creation + cache_read. Tool calls exclude ToolSearch, "
+            "which loads the arm's deferred tools. Slots ran in parallel, so wall time is "
+            "indicative only."
         )
     footer += notes
-    errors = [r for r in records if r.get("status") == "harness_error"]
-    error_cost = [r.get("cost_usd") for r in errors if is_num(r.get("cost_usd"))]
-    if error_cost:
-        footer.append(f"Harness-error runs cost ${sum(error_cost):.2f}, outside every row.")
-    unpriced = sum(1 for r in errors if r.get("mode") == "spend" and not is_num(r.get("cost_usd")))
-    if unpriced:
-        footer.append(
-            f"{unpriced} harness-error agent run(s) ended before a result event (the guard "
-            "stops a run at its init event), so what they spent is not known."
-        )
     if footer:
         lines += [""] + [f"- {f}" for f in footer]
     return "\n".join(lines)
 
 
-# --- Provenance -------------------------------------------------------------------------
+# --- Arm and model comparisons -----------------------------------------------------------------
+
+
+def _arm_stats(records):
+    _, graded, passes = counts(records)
+    return {
+        "passes": passes, "n": len(graded),
+        "tokens": median([tokens_processed(r) for r in graded]),
+        "calls": median([r.get("tool_calls_total") for r in graded]),
+        "total": sum(t for t in (tokens_processed(r) for r in graded) if t is not None),
+        "tasks": len({r.get("task") for r in graded}),
+    }
+
+
+def arm_comparison(records):
+    """Per (task, effort, max_turns) with both arms: taria vs tmux."""
+    cells = {}
+    for r in records:
+        cells.setdefault((r.get("task", "?"), r.get("effort") or "-", r.get("max_turns")), {}) \
+            .setdefault(r.get("arm"), []).append(r)
+    lines = []
+    for key in sorted(cells, key=_order):
+        arms = cells[key]
+        if not all(a in arms for a in ARMS):
+            continue
+        t, m = _arm_stats(arms["taria"]), _arm_stats(arms["tmux"])
+        if t["n"] and m["n"]:
+            diff = f"{(t['passes'] / t['n'] - m['passes'] / m['n']) * 100:+.0f} pp"
+            p = fisher_exact(t["passes"], t["n"] - t["passes"], m["passes"], m["n"] - m["passes"])
+        else:
+            diff, p = "-", None
+        task, effort, max_turns = key
+        lines.append(_row([
+            task, effort, _show(max_turns), f"{t['passes']}/{t['n']}", f"{m['passes']}/{m['n']}",
+            diff, fmt_p(p), fmt_ratio(m["tokens"], t["tokens"]), fmt_ratio(m["calls"], t["calls"]),
+        ]))
+    if not lines:
+        return ["No task has graded runs of both arms for this model."]
+    return [
+        "taria vs tmux per task: pass-rate difference (taria minus tmux, percentage points) "
+        "with a two-sided Fisher exact p, and tmux/taria ratios of the medians (above 1x: tmux "
+        "used more).",
+        "",
+        *_header(("task", "effort", "max turns", "taria passed", "tmux passed", "difference",
+                  "Fisher p", "tokens processed tmux/taria", "tool calls tmux/taria")),
+        *lines,
+    ]
+
+
+def arm_overall(records):
+    """Each arm across all tasks, per (effort, max_turns)."""
+    cells = group(records, lambda r: (r.get("arm", "?"), r.get("effort") or "-", r.get("max_turns")))
+    lines = []
+    for key in sorted(cells, key=_order):
+        s = _arm_stats(cells[key])
+        arm, effort, max_turns = key
+        lines.append(_row([
+            arm, effort, _show(max_turns), s["tasks"], s["n"], f"{s['passes']}/{s['n']}",
+            fmt_rate(s["passes"], s["n"]),
+            "-" if s["tokens"] is None else fmt_tokens(s["tokens"]),
+            "-" if s["calls"] is None else fmt_count(s["calls"]),
+            fmt_tokens(s["total"]) if s["n"] else "-",
+        ]))
+    return [
+        "Each arm across all tasks (graded runs):",
+        "",
+        *_header(("arm", "effort", "max turns", "tasks", "n", "passed", "pass rate (95% CI)",
+                  "tokens processed med/run", "tool calls med/run", "tokens processed total")),
+        *lines,
+    ]
+
+
+def per_model(records):
+    out = []
+    for model in sorted({r.get("model") or "-" for r in records}):
+        subset = [r for r in records if (r.get("model") or "-") == model]
+        out += ["", f"### {model}", "", *arm_comparison(subset), "", *arm_overall(subset)]
+    return out
+
+
+def model_comparison(records):
+    models = sorted({r.get("model") for r in records if r.get("model")})
+    if len(models) < 2:
+        return [f"Only one model in these results ({', '.join(models) or 'none'}); nothing to compare."]
+    out = []
+    for a, b in combinations(models, 2):
+        cells = {}
+        for r in records:
+            if r.get("model") in (a, b):
+                key = (r.get("arm", "?"), r.get("effort") or "-", r.get("max_turns"))
+                cells.setdefault(key, {}).setdefault(r["model"], []).append(r)
+        lines = []
+        for key in sorted(cells, key=_order):
+            if a not in cells[key] or b not in cells[key]:
+                continue
+            sa, sb = _arm_stats(cells[key][a]), _arm_stats(cells[key][b])
+            p = None
+            if sa["n"] and sb["n"]:
+                p = fisher_exact(sa["passes"], sa["n"] - sa["passes"], sb["passes"], sb["n"] - sb["passes"])
+            arm, effort, max_turns = key
+            lines.append(_row([
+                arm, effort, _show(max_turns),
+                f"{sa['passes']}/{sa['n']} {fmt_rate(sa['passes'], sa['n'])}",
+                f"{sb['passes']}/{sb['n']} {fmt_rate(sb['passes'], sb['n'])}", fmt_p(p),
+                "-" if sa["tokens"] is None else fmt_tokens(sa["tokens"]),
+                "-" if sb["tokens"] is None else fmt_tokens(sb["tokens"]),
+            ]))
+        if not lines:
+            out += [f"No arm has runs of both {a} and {b}.", ""]
+            continue
+        out += [
+            *_header(("arm", "effort", "max turns", f"{a} passed", f"{b} passed", "Fisher p",
+                      f"{a} tokens processed med", f"{b} tokens processed med")),
+            *lines, "",
+        ]
+    return out[:-1] if out and out[-1] == "" else out
+
+
+# --- Provenance --------------------------------------------------------------------------------
+
+
+def _values(rows, field, fmt=str):
+    got = set()
+    for r in rows:
+        value = r.get(field)
+        for v in value if isinstance(value, list) else [value]:
+            if v is not None and v != "":
+                got.add(fmt(v))
+    return ", ".join(sorted(got)) or "-"
 
 
 def provenance(records):
-    batches = {}
-    for r in records:
-        batches.setdefault(r.get("batch") or NO_BATCH, []).append(r)
-    lines = [
-        "| batch | kinds | records | git SHA | dirty | claude | models (agent) | efforts | "
-        "timeout s | budget $ | max turns | seeds |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
-    ]
-
-    def values(rs, field, fmt=str):
-        got = sorted({fmt(r.get(field)) for r in rs if r.get(field) is not None})
-        return ", ".join(got) or "-"
-
-    def limit(rs, field):
-        """An agent run's limit: `none` when not passed, `unrecorded` when the
-        record predates the field. Dry runs have none to show."""
-        got = {
-            "unrecorded" if field not in r else "none" if r[field] is None else _g(r[field])
-            for r in rs if label(r) == "agent"
-        }
-        return ", ".join(sorted(got)) or "-"
-
+    batches = group(records, lambda r: r.get("batch") or NO_BATCH)
+    lines = _header(("batch", "kinds", "runs", "git SHA", "dirty", "claude", "models requested",
+                     "models resolved", "efforts", "max turns", "seeds"))
     for batch in sorted(batches):
         rs = batches[batch]
-        lines.append(
-            f"| {batch} | {', '.join(sorted({label(r) for r in rs}))} | {len(rs)} | "
-            f"{values(rs, 'git_sha', lambda s: s[:12])} | {values(rs, 'git_dirty')} | "
-            f"{values(rs, 'claude_version')} | {values(rs, 'agent_model')} | "
-            f"{values(rs, 'effort')} | {limit(rs, 'timeout_s')} | {limit(rs, 'budget_usd')} | "
-            f"{limit(rs, 'max_turns')} | {values(rs, 'seed')} |"
-        )
+        agent = [r for r in rs if label(r) == "agent"]
+        lines.append(_row([
+            batch, ", ".join(sorted({label(r) for r in rs})), len(rs),
+            _values(rs, "git_sha", lambda s: str(s)[:12]), _values(rs, "git_dirty"),
+            _values(rs, "claude_version"), _values(agent, "model"), _values(agent, "model_resolved"),
+            _values(agent, "effort"), _values(agent, "max_turns", _show), _values(rs, "seed"),
+        ]))
     warnings = []
+    agent = [r for r in records if label(r) == "agent"]
     for field, what in (("git_sha", "git SHAs"), ("claude_version", "claude versions")):
-        seen = {r.get(field) for r in records if label(r) == "agent" and r.get(field)}
+        seen = {r.get(field) for r in agent if r.get(field)}
         if len(seen) > 1:
             warnings.append(f"the agent runs mix {len(seen)} {what}; rows pool them")
     if any(r.get("git_dirty") for r in records):
-        warnings.append("some records come from a dirty tree; the SHA alone does not reproduce them")
+        warnings.append("some rows come from a dirty tree; the SHA alone does not reproduce them")
     if any((r.get("batch") or NO_BATCH) == NO_BATCH for r in records):
-        warnings.append("some records predate provenance (no batch, SHA or claude version)")
-    if any(label(r) == "agent" and "timeout_s" not in r for r in records):
-        warnings.append(
-            "some agent records predate recorded limits; their rows show - for the limits, "
-            "and runs held to different limits may be pooled in them"
-        )
-    groups = _agent_groups(records)
-    for key in sorted(groups, key=_order):
-        model = key[2]
-        actual = {r.get("agent_model") for r in groups[key] if r.get("agent_model")}
-        if actual and actual != {model}:
-            warnings.append(f"{name(key)}: asked for {model}, the agent reported {sorted(actual)}")
+        warnings.append("some rows predate provenance (no batch, SHA or claude version)")
+    for (model,), rs in sorted(group(agent, lambda r: (r.get("model"),)).items(), key=lambda kv: _order(kv[0])):
+        off = Counter()
+        for r in rs:
+            value = r.get("model_resolved")
+            for v in value if isinstance(value, list) else [value]:
+                if v and model and not str(v).startswith(f"claude-{model}-"):
+                    off[str(v)] += 1
+        if off:
+            ran = ", ".join(f"{v} in {n} run(s)" for v, n in sorted(off.items()))
+            warnings.append(f"asked for {model}, the agents ran on {ran}")
     return lines + ([""] + [f"- {w}" for w in warnings] if warnings else [])
 
 
-def _agent_groups(records):
-    groups = {}
-    for r in records:
-        if label(r) == "agent":
-            groups.setdefault(group_key(r), []).append(r)
-    return groups
+def guard_section(records):
+    flagged = [r for r in records if r.get("guard_problems")]
+    if not flagged:
+        return ["No run had a guard problem."]
+    problems = Counter()
+    for r in flagged:
+        for p in r["guard_problems"] if isinstance(r["guard_problems"], list) else [r["guard_problems"]]:
+            text = str(p)
+            problems[text if len(text) <= 160 else text[:157] + "..."] += 1
+    statuses = Counter(r.get("status") for r in flagged)
+    lines = [
+        f"{len(flagged)} run(s) had guard problems ("
+        + ", ".join(f"{s} {n}" for s, n in sorted(statuses.items(), key=lambda kv: str(kv[0]))) + "):",
+        "",
+    ]
+    return lines + [f"- {p} ({n}x)" for p, n in problems.most_common()]
+
+
+def _sets(values):
+    """`a, b (4); c (2)`: each distinct list and how many runs had it."""
+    seen = Counter(tuple(v) for v in values)
+    return "; ".join(
+        f"{', '.join(k) or 'none'} ({n})" for k, n in sorted(seen.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+
+
+def context_section(records):
+    """What each arm's agents were given, so the arms can be seen to match."""
+    rows = []
+    for key, rs in sorted(group([r for r in records if label(r) == "agent"],
+                                lambda r: (r.get("arm", "?"), r.get("model") or "-")).items(),
+                          key=lambda kv: _order(kv[0])):
+        contexts = [r["context"] for r in rs if isinstance(r.get("context"), dict)]
+        if not contexts:
+            rows.append(_row([*key, f"0/{len(rs)}", "-", "-", "-", "-", "-", "-"]))
+            continue
+        types = Counter(t for c in contexts for t in set(c.get("attachment_types") or []))
+        every = sorted(t for t, n in types.items() if n == len(contexts))
+        some = sorted(f"{t} ({n})" for t, n in types.items() if n < len(contexts))
+        rows.append(_row([
+            *key, f"{len(contexts)}/{len(rs)}", ", ".join(every) or "-", ", ".join(some) or "-",
+            _sets(sorted(c.get("deferred_tools") or []) for c in contexts),
+            _sets(sorted(c.get("mcp_instruction_servers") or []) for c in contexts),
+            f"{sum(1 for c in contexts if c.get('skill_listing'))}/{len(contexts)}",
+            f"{sum(1 for c in contexts if c.get('claude_md_files'))}/{len(contexts)}",
+        ]))
+    if not rows:
+        return ["No agent runs, so no agent context to show."]
+    return [
+        "Context the agents were given, from their transcripts (runs with a transcript / runs). "
+        "Deferred tools and MCP instruction servers list each distinct set with its run count; "
+        "the arms differ there by design (each arm's own tools), and should match elsewhere.",
+        "",
+        *_header(("arm", "model", "runs with context", "attachment types (every run)",
+                  "attachment types (some runs)", "deferred tools", "MCP instruction servers",
+                  "skill listing", "instruction files")),
+        *rows,
+    ]
+
+
+# --- The whole report --------------------------------------------------------------------------
 
 
 def render(records):
     agent = [r for r in records if label(r) == "agent"]
     scripted = [r for r in records if label(r) != "agent"]
     out = ["## Agent runs (headline)", ""]
-    out.append(table(agent) if agent else "No agent runs (`run.py --spend`) in these results.")
+    if agent:
+        out.append(table(agent))
+        out += ["", "## taria vs tmux, per model"] + per_model(agent)
+        out += ["", "## Model comparison", ""] + model_comparison(agent)
+    else:
+        out.append("No agent runs in these results.")
     if scripted:
         out += [
             "",
             "## Dry runs (scripted solver, no model; not headline numbers)",
             "",
-            "Tokens, turns and cost do not exist for a scripted solver; wall time is "
-            "the solver's, measured once its server is up.",
+            "Tokens and turns do not exist for a scripted solver; wall time is the solver's, "
+            "measured once its server is up.",
         ]
         for kind in ("dry-run", "dry-run (sabotage)"):
             subset = [r for r in scripted if label(r) == kind]
             if subset:
-                out += ["", f"### {kind}", "", table(subset)]
+                out += ["", f"### {kind}", "", table(subset, agent=False)]
     out += ["", "## Provenance", ""] + provenance(records)
+    out += ["", "### Guard", ""] + guard_section(agent)
+    out += ["", "### Agent context", ""] + context_section(agent)
     return "\n".join(out)
 
 
-# --- Selecting records ---------------------------------------------------------------
+# --- Selecting records ---------------------------------------------------------------------
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Summarize taria benchmark results.")
-    parser.add_argument("files", nargs="*", help="results files (default: bench/results/*.jsonl)")
+    parser = argparse.ArgumentParser(description="Summarize taria benchmark results as Markdown.")
+    parser.add_argument("files", nargs="*",
+                        help="results files (default: bench/results/*/runs.jsonl and bench/results/*.jsonl)")
     parser.add_argument("--batch", action="append", help="only this batch id (repeatable)")
     parser.add_argument("--all", action="store_true", help="every batch found, merged")
     args = parser.parse_args(argv)
@@ -451,9 +641,16 @@ def parse_args(argv):
     return args
 
 
+def default_paths():
+    return sorted(
+        glob.glob(os.path.join(RESULTS_DIR, "*", "runs.jsonl"))
+        + glob.glob(os.path.join(RESULTS_DIR, "*.jsonl"))
+    )
+
+
 def select(args):
     """(records, a note on what was selected) or raises SystemExit with a reason."""
-    paths = args.files or sorted(glob.glob(os.path.join(RESULTS_DIR, "*.jsonl")))
+    paths = args.files or default_paths()
     if not paths:
         raise SystemExit(f"summarize.py: no results given and none in {RESULTS_DIR}")
     records = load(paths)
@@ -471,7 +668,7 @@ def select(args):
         return records, f"{len(found)} batch(es) from {len(paths)} file(s): {', '.join(found)}"
     newest = max(
         (b for b in found if b != NO_BATCH),
-        key=lambda b: max(r.get("ts", "") for r, rb in zip(records, batch_of) if rb == b),
+        key=lambda b: max(str(r.get("ts", "")) for r, rb in zip(records, batch_of) if rb == b),
         default=None,
     )
     if newest is None:

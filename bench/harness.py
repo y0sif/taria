@@ -14,6 +14,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -30,8 +31,8 @@ TMUX_MCP = os.path.join(BENCH, "tmux_mcp.py")
 SERVER_KEY = "tui"  # one name for both arms, so tool names do not name the arm
 ARMS = ("taria", "tmux")
 # Exactly the tools each arm's server lists. The dry run checks the live
-# servers against this, and the spend guard holds the agent's tool list to
-# it, so the two cannot drift apart unnoticed.
+# servers against this, and grading holds the agent's tool calls to it
+# (transcript.guard), so the two cannot drift apart unnoticed.
 ARM_TOOLS = {
     "taria": ("read_tree", "act", "key", "type_text"),
     "tmux": ("screen", "send_keys"),
@@ -111,6 +112,20 @@ def dep_info_sources(binary):
     return deps or None
 
 
+def _build_stamp(binary):
+    """When a build last considered `binary`: the later of the binary and its
+    dep-info file. Cargo rewrites `<binary>.d` on every build that includes
+    the binary, relinked or not, so a manifest touched without a change that
+    matters (a checkout rewriting Cargo.lock as it was) is behind the stamp
+    after the next `cargo build --workspace`, though the binary is not."""
+    stamp = os.path.getmtime(binary)
+    try:
+        stamp = max(stamp, os.path.getmtime(binary + ".d"))
+    except OSError:
+        pass
+    return stamp
+
+
 def require_fresh_build(repo=REPO, binaries=BINARIES):
     """Refuse a target/debug where any required binary is missing or stale.
 
@@ -120,8 +135,10 @@ def require_fresh_build(repo=REPO, binaries=BINARIES):
     hide a stale other, and a binary a build had no reason to relink (an
     edit to the other one's crate) is not refused. Without a readable
     dep-info, a binary is held to every `.rs` file in the tree. Manifests
-    and the lock file are workspace-wide and dated against the newest binary,
-    the last build: a build after them relinks whatever they changed.
+    and the lock file are workspace-wide and dated against the last build,
+    the newest binary or dep-info file (see _build_stamp): a build after them
+    relinks whatever they changed, and rewrites the dep-info even when they
+    changed nothing cargo acts on.
     """
     missing = [b for b in binaries if not os.path.exists(b)]
     if missing:
@@ -144,7 +161,7 @@ def require_fresh_build(repo=REPO, binaries=BINARIES):
         if built_at < source_at:
             stale.append((source_at - built_at, os.path.relpath(binary, repo), source))
     manifest, manifest_at = _newest(_tree_files(repo, MANIFEST_SUFFIXES))
-    last_build = max(os.path.getmtime(b) for b in binaries)
+    last_build = max(_build_stamp(b) for b in binaries)
     if manifest is not None and last_build < manifest_at:
         stale.append((manifest_at - last_build, "the last build in target/debug", manifest))
     if stale:
@@ -166,26 +183,58 @@ def _cmdline(pid):
         return None
 
 
-def _kill_if_ours(pid, needle):
-    """SIGKILL `pid` only while its command line still names `needle`.
+def _environ(pid):
+    """The environment `pid` was started with, as a list of NAME=value, or None."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return f.read().decode(errors="replace").split("\0")
+    except OSError:
+        return None
 
-    A pid read at start-up can be reused once its process exits, so it is
-    killed only if /proc still shows the process this run started. Without
-    /proc (not Linux) nothing is killed here; tmux kill-server has already
-    done the work there.
+
+def _is_ours(pid, needle, env_entry=None):
+    """Whether /proc shows `pid` as the process this run started: its command
+    line names `needle` and, when `env_entry` is given, it was started with
+    that NAME=value. A pid can be reused once its process exits, and a slot is
+    torn down by a later process than the one that started it, so the command
+    line alone (every demo's names DEMO_BIN) is not proof enough."""
+    line = _cmdline(pid)
+    if line is None or needle not in line:
+        return False
+    if env_entry is None:
+        return True
+    env = _environ(pid)
+    return env is not None and env_entry in env
+
+
+def _kill_if_ours(pid, needle, env_entry=None):
+    """SIGKILL `pid` only while /proc still shows it as ours (see _is_ours).
+
+    Without /proc (not Linux) nothing is killed here; tmux kill-server has
+    already done the work there.
     """
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
-        line = _cmdline(pid)
-        if line is None or needle not in line:
+        if not _is_ours(pid, needle, env_entry):
             return
         time.sleep(0.05)
-    line = _cmdline(pid)
-    if line is not None and needle in line:
+    if _is_ours(pid, needle, env_entry):
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
+
+
+# The longest AF_UNIX path taria binds (crates/taria/src/socket.rs).
+SOCKET_PATH_MAX = 107 if sys.platform.startswith("linux") else 103
+# The demo draws its socket path on its header line, which the tmux arm
+# reads: a temp dir naming either arm or the benchmark would tell it which.
+TELLTALE = ("taria", "tmux", "bench")
+# What a slot file must carry to reach and tear down its demo.
+SLOT_FIELDS = (
+    "name", "tmpdir", "workdir", "sock", "tmux_sock", "state_path", "tmux_conf",
+    "server_pid", "demo_pid",
+)
 
 
 class DemoRun:
@@ -198,16 +247,29 @@ class DemoRun:
                            path on the demo's header line)
         <tmp>/s/tmux.sock  this run's private tmux server
         <tmp>/state.json   the demo's state dump, graded after the run
-        <tmp>/mcp.json     the arm's MCP config
 
         <tmp>/tmux.conf    the private server's only config: status off
 
-    `<tmp>` has a neutral `tui-` prefix. The tmux session is named
-    `taria-bench-<hex>`, which never reaches the agent: the status line is
-    off, so capture-pane returns the whole COLS x ROWS pane and nothing else.
+    `<tmp>` has a neutral `tui-` prefix, and a temp dir whose path names an
+    arm or the benchmark is refused (the tmux arm reads the socket path off
+    the screen). The tmux session is named `taria-bench-<hex>`, which never
+    reaches the agent: the status line is off, so capture-pane returns the
+    whole COLS x ROWS pane and nothing else.
+
+    A run started by one process can be graded and torn down by another:
+    to_slot() is everything needed to reach it, and from_slot() rebuilds it.
+    The demo lives in the tmux server, which detaches into its own session,
+    so it outlives the process that started it.
     """
 
     def __init__(self):
+        base = tempfile.gettempdir()
+        told = [word for word in TELLTALE if word in base.lower()]
+        if told:
+            raise HarnessError(
+                f"the temp dir {base} names {', '.join(told)}, and the demo draws its socket "
+                "path on screen, where the tmux arm reads it; set TMPDIR=/tmp, then rerun"
+            )
         self.name = f"taria-bench-{uuid.uuid4().hex[:8]}"
         self.tmpdir = tempfile.mkdtemp(prefix="tui-")
         self.workdir = os.path.join(self.tmpdir, "work")
@@ -215,7 +277,12 @@ class DemoRun:
         self.sock = os.path.join(sockdir, "app.sock")
         self.tmux_sock = os.path.join(sockdir, "tmux.sock")
         self.state_path = os.path.join(self.tmpdir, "state.json")
-        self.config_path = os.path.join(self.tmpdir, "mcp.json")
+        if len(os.fsencode(self.sock)) > SOCKET_PATH_MAX:
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
+            raise HarnessError(
+                f"the demo's socket path {self.sock} is over {SOCKET_PATH_MAX} bytes, so taria "
+                "would refuse to bind it; set TMPDIR=/tmp, then rerun"
+            )
         # A private server on a socket inside the temp dir, with a config of
         # its own: the user's tmux sessions and settings stay out of the
         # measurement, teardown cannot touch anything but this run, and
@@ -235,6 +302,38 @@ class DemoRun:
         except BaseException:  # a signal included: nothing else holds tmpdir yet
             shutil.rmtree(self.tmpdir, ignore_errors=True)
             raise
+
+    def to_slot(self):
+        """What a later process needs to talk to this demo and tear it down."""
+        return {field: getattr(self, field) for field in SLOT_FIELDS}
+
+    @classmethod
+    def from_slot(cls, fields):
+        """The run to_slot() described, for grading and close() from another process.
+
+        Refuses fields that do not describe one of ours: close() removes
+        `tmpdir`, so it must be a `tui-` temp dir holding every other path.
+        """
+        missing = [f for f in SLOT_FIELDS if f not in fields]
+        if missing:
+            raise HarnessError(f"slot file lacks {', '.join(missing)}")
+        tmpdir = fields["tmpdir"]
+        if not (isinstance(tmpdir, str) and os.path.isabs(tmpdir)
+                and os.path.basename(tmpdir.rstrip(os.sep)).startswith("tui-")):
+            raise HarnessError(f"slot file's tmpdir {tmpdir!r} is not a tui- temp dir")
+        for field in ("workdir", "sock", "tmux_sock", "state_path", "tmux_conf"):
+            path = fields[field]
+            if not (isinstance(path, str) and os.path.isabs(path) and path != tmpdir
+                    and os.path.commonpath([tmpdir, path]) == tmpdir):
+                raise HarnessError(f"slot file's {field} {path!r} is outside {tmpdir}")
+        for field in ("server_pid", "demo_pid"):
+            if fields[field] is not None and not isinstance(fields[field], int):
+                raise HarnessError(f"slot file's {field} {fields[field]!r} is not a pid")
+        run = cls.__new__(cls)
+        for field in SLOT_FIELDS:
+            setattr(run, field, fields[field])
+        run.tmux = ["tmux", "-S", run.tmux_sock, "-f", run.tmux_conf]
+        return run
 
     def _tmux(self, *args, check=True):
         env = {k: v for k, v in os.environ.items() if k != "TMUX"}
@@ -275,6 +374,32 @@ class DemoRun:
         # hold still so neither arm's first look races the first draw.
         self.wait_screen_settled(deadline - time.monotonic())
 
+    def socket_accepts(self):
+        """Whether the demo's taria socket takes a connection right now."""
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        try:
+            probe.connect(self.sock)
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
+    def wait_ready_for_agent(self, timeout=READY_TIMEOUT):
+        """Hold until either arm's server, started later, finds the demo ready:
+        the socket takes a connection, the state dump exists, and the pane
+        holds a drawn, settled screen. No MCP client is started here."""
+        deadline = time.monotonic() + timeout
+        while not (os.path.exists(self.state_path) and self.socket_accepts()):
+            if time.monotonic() > deadline:
+                raise HarnessError(
+                    f"the demo is not ready for an agent (socket accepts {self.socket_accepts()}, "
+                    f"state dump {os.path.exists(self.state_path)})"
+                )
+            time.sleep(0.05)
+        return self.wait_screen_settled(max(deadline - time.monotonic(), 1.0))
+
     def wait_screen_settled(self, timeout=READY_TIMEOUT):
         deadline = time.monotonic() + max(timeout, 0.2)
         last = None
@@ -299,8 +424,7 @@ class DemoRun:
         when the demo does.
         """
         if self.demo_pid and os.path.isdir("/proc"):
-            line = _cmdline(self.demo_pid)
-            return line is not None and DEMO_BIN in line
+            return _is_ours(self.demo_pid, DEMO_BIN, f"TARIA_SOCK={self.sock}")
         return self.alive()
 
     def pane_size(self):
@@ -379,28 +503,37 @@ class DemoRun:
             except (OSError, subprocess.SubprocessError):
                 pass
         if self.demo_pid:
-            _kill_if_ours(self.demo_pid, DEMO_BIN)
+            _kill_if_ours(self.demo_pid, DEMO_BIN, f"TARIA_SOCK={self.sock}")
         if self.server_pid:
             _kill_if_ours(self.server_pid, self.tmux_sock)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
-def mcp_config(arm, run):
-    """The `mcpServers` config an agent for `arm` is given, and the dry run uses."""
+def server_entry(arm, run):
+    """The stdio server `arm` runs against `run`'s demo, as an MCP config entry.
+
+    The one definition of each arm's server: the dry run spawns it from this
+    entry, and bench/mcp_launch.py execs it for an agent.
+    """
     if arm == "taria":
-        entry = {
+        return {
             "type": "stdio",
             "command": MCP_BIN,
             "args": ["--app", "taria-demo"],
             "env": {"TARIA_SOCK": run.sock},
         }
-    else:
-        entry = {
+    if arm == "tmux":
+        return {
             "type": "stdio",
             "command": sys.executable,
             "args": [TMUX_MCP, "--session", run.name, "--socket-path", run.tmux_sock],
         }
-    return {"mcpServers": {SERVER_KEY: entry}}
+    raise HarnessError(f"unknown arm {arm!r}; choose from {', '.join(ARMS)}")
+
+
+def mcp_config(arm, run):
+    """The `mcpServers` config for `arm` against `run`'s demo."""
+    return {"mcpServers": {SERVER_KEY: server_entry(arm, run)}}
 
 
 # --- A stdio MCP client -----------------------------------------------------------

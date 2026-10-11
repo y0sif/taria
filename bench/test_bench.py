@@ -2,12 +2,14 @@
 """Tests for the benchmark harness itself. Stdlib unittest, no model.
 
 The live tests start a real taria-demo in a private tmux server and drive it
-through bench/tmux_mcp.py over stdio, exactly as the tmux arm's agent would.
-They need tmux and a fresh `cargo build --workspace`.
+through either arm's MCP server over stdio, exactly as an agent would. They
+need tmux and a fresh `cargo build --workspace`.
 
-The spend path is tested against bench/fixtures/fake_claude.py, put first on
-PATH as `claude`: no network, no model, no API key. A test refuses to run if
-`claude` on PATH is anything but the fake.
+The subagent path is rehearsed end to end without a model (SubagentRehearsal):
+plan a batch, write the agent files, `next` prepares a slot, the agent file's
+own launcher command is started by hand and driven by the scripted solver,
+and `next --agent-id` grades it from a hand-written transcript read by the
+real bench/transcript.py.
 
 Usage:  python3 bench/test_bench.py [-v]
 """
@@ -22,21 +24,72 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH)
 from harness import COLS, REPO, ROWS, DemoRun, McpStdio, mcp_config, require_fresh_build  # noqa: E402
+import agents  # noqa: E402
 import harness  # noqa: E402
 import run as runner  # noqa: E402
+import solvers  # noqa: E402
 import summarize  # noqa: E402
 import tasks  # noqa: E402
 import tmux_mcp  # noqa: E402
 
+try:
+    import transcript  # noqa: E402
+except ImportError:  # Lane B's module; the rehearsal needs it
+    transcript = None
+
 INPUT_FOCUSED = "[Enter] add task"
-FAKE_CLAUDE = os.path.join(BENCH, "fixtures", "fake_claude.py")
 HAVE_TMUX = shutil.which("tmux") is not None
+RUN_PY = os.path.join(BENCH, "run.py")
+MCP_LAUNCH = os.path.join(BENCH, "mcp_launch.py")
+
+
+def quiet_cli(*argv):
+    """runner.cli(argv) with its output captured: (code, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = runner.cli(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+def run_py(*argv, timeout=120):
+    """bench/run.py in its own process, as the orchestrator runs it."""
+    return subprocess.run(
+        [sys.executable, RUN_PY, *argv], capture_output=True, text=True, timeout=timeout,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def read_rows(results, batch):
+    with open(os.path.join(results, batch, "runs.jsonl")) as f:
+        return [json.loads(line) for line in f]
+
+
+def _running(pid):
+    """Whether `pid` is a live process (a zombie is not)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            state = f.read().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return False
+    return state != "Z"
+
+
+def wait_gone(pid, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while _running(pid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
 
 
 @unittest.skipUnless(HAVE_TMUX, "tmux is not on PATH")
@@ -133,26 +186,24 @@ class Grading(unittest.TestCase):
         self.assertFalse(graded["demo_alive"])
         self.assertFalse(graded["state"]["quit"], "a crash leaves quit false in the dump")
         self.assertTrue(graded["reason"].startswith("demo exited"), graded["reason"])
-        self.assertEqual(runner.classify({}, graded), ("failed", False, None))
+        self.assertEqual(runner.classify(graded), ("failed", False))
 
     def test_a_harness_exception_is_a_harness_error_and_exits_2(self):
         def broken(*_args, **_kwargs):
             raise RuntimeError("the solver fell over")
 
-        original = runner.solve
-        runner.solve = broken
-        self.addCleanup(setattr, runner, "solve", original)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
-        results = os.path.join(tmp, "r.jsonl")
-        args = runner.parse_args(["--dry-run", "--tasks", "T1", "--arms", "tmux", "--results", results])
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            code = runner.run_all(args)
+        with mock.patch.object(runner, "solve", broken):
+            code, out, _ = quiet_cli("dry-run", "--tasks", "T1", "--arms", "tmux",
+                                     "--results-dir", tmp, "--batch", "broken")
         self.assertEqual(code, runner.EXIT_HARNESS)
-        with open(results) as f:
-            record = json.loads(f.read())
-        self.assertEqual(record["status"], "harness_error")
-        self.assertIn("RuntimeError: the solver fell over", record["error"])
+        (row,) = read_rows(tmp, "broken")
+        self.assertEqual(row["status"], "harness_error")
+        self.assertIn("RuntimeError: the solver fell over", row["error"])
+        self.assertEqual(json.loads(out), row, "the printed line is the recorded row")
+        self.assertEqual(list(row), list(runner.ROW_KEYS))
+        self.assertEqual((row["mode"], row["solver"], row["job"]), ("dry-run", "scripted", "j001"))
 
 
 class Outcomes(unittest.TestCase):
@@ -161,67 +212,23 @@ class Outcomes(unittest.TestCase):
 
     def test_classify(self):
         c = runner.classify
-        self.assertEqual(c({}, self.GOOD), ("passed", True, None))
-        self.assertEqual(c({}, self.BAD), ("failed", False, None))
-        self.assertEqual(c({}, {"check_passed": True, "demo_alive": False}), ("failed", False, None))
-        self.assertEqual(c({"harness_error": "x", "timed_out": True}, self.GOOD), ("harness_error", None, "x"))
-        # Every limit is one rule: a failure, whatever the dump says.
-        for outcome, status in (
-            ({"timed_out": True}, "timeout"),
-            ({"result_subtype": "error_max_budget_usd"}, "budget"),
-            ({"result_subtype": "error_max_turns"}, "max_turns"),
-        ):
-            for graded in (self.GOOD, self.BAD):
-                with self.subTest(status=status, check=graded["check_passed"]):
-                    self.assertEqual(c(outcome, graded), (status, False, None))
+        self.assertEqual(c(self.GOOD), ("passed", True))
+        self.assertEqual(c(self.BAD), ("failed", False))
+        self.assertEqual(c({"check_passed": True, "demo_alive": False}), ("failed", False))
+        self.assertEqual(c(self.GOOD, error="x", cut_off=True), ("harness_error", None))
+        # A cut-off run failed, whatever the dump says.
+        for graded in (self.GOOD, self.BAD):
+            self.assertEqual(c(graded, cut_off=True), ("max_turns", False))
 
-    def test_cut_off_results_are_not_harness_errors(self):
-        for subtype in ("error_max_budget_usd", "error_max_turns"):
-            self.assertIsNone(runner._result_problem({"subtype": subtype, "is_error": True}))
-        self.assertIn("error_during_execution", runner._result_problem(
-            {"subtype": "error_during_execution", "is_error": True}))
+    def test_rows_have_every_key(self):
+        row = runner.new_row(task="T1")
+        self.assertEqual(list(row), list(runner.ROW_KEYS))
+        self.assertIsNone(row["tokens"])
+        with self.assertRaises(KeyError):
+            runner.new_row(cost_usd=1)
 
-    def test_exit_codes(self):
-        self.assertEqual(runner.exit_code(["passed", "passed"], [True, True]), 0)
-        self.assertEqual(runner.exit_code(["passed", "timeout"], [True, False]), 1)
-        self.assertEqual(runner.exit_code(["budget"], [False]), 1)
-        self.assertEqual(runner.exit_code(["max_turns"], [False]), 1)
-        self.assertEqual(runner.exit_code(["failed", "harness_error"], [False, False]), 2)
-
-    def test_the_agent_env_is_an_allowlist(self):
-        saved = dict(os.environ)
-        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
-        os.environ.update(CLAUDECODE="1", CLAUDE_CODE_ENTRYPOINT="cli", CLAUDE_EFFORT="xhigh",
-                          CLAUDE_CODE_EFFORT_LEVEL="max", CLAUDE_CONFIG_DIR="/c", KEEP_ME="y",
-                          ANTHROPIC_MODEL="m", NODE_OPTIONS="--x", LANG="C.UTF-8")
-        env, dropped = runner.spend_env()
-        self.assertLessEqual(set(env), runner.ENV_ALLOW)
-        for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT", "CLAUDE_CODE_EFFORT_LEVEL",
-                     "CLAUDE_CONFIG_DIR", "KEEP_ME", "ANTHROPIC_MODEL", "NODE_OPTIONS"):
-            self.assertNotIn(name, env)
-            self.assertIn(name, dropped)
-        self.assertEqual((env["PATH"], env["LANG"]), (os.environ["PATH"], "C.UTF-8"))
-        self.assertEqual(sorted(dropped), dropped)
-        self.assertNotIn("PATH", dropped)
-        self.assertIn("ANTHROPIC_API_KEY", runner.ENV_ALLOW)  # the only credential --bare reads
-        # What the harness sets itself goes on top, and is not "dropped".
-        original = runner.HARNESS_ENV
-        runner.HARNESS_ENV = {"BENCH_HARNESS_SET": "1", "KEEP_ME": "harness"}
-        self.addCleanup(setattr, runner, "HARNESS_ENV", original)
-        env, dropped = runner.spend_env()
-        self.assertEqual((env["BENCH_HARNESS_SET"], env["KEEP_ME"]), ("1", "harness"))
-        self.assertNotIn("KEEP_ME", dropped)
-
-    def test_limits_are_recorded_and_null_for_a_dry_run(self):
-        spend = runner.parse_args(["--spend", "--timeout", "30", "--budget-usd", "0.5", "--max-turns", "9"])
-        self.assertEqual(runner.limits(spend), {"timeout_s": 30.0, "budget_usd": 0.5, "max_turns": 9})
-        default = runner.limits(runner.parse_args(["--spend"]))
-        self.assertEqual(default, {"timeout_s": runner.DEFAULT_TIMEOUT_S,
-                                   "budget_usd": runner.DEFAULT_BUDGET_USD, "max_turns": None})
-        dry = runner.limits(runner.parse_args(["--dry-run", "--timeout", "30"]))
-        self.assertEqual(dry, {"timeout_s": None, "budget_usd": None, "max_turns": None})
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            runner.parse_args(["--spend", "--max-turns", "0"])
+    def test_statuses(self):
+        self.assertEqual(runner.STATUSES, ("passed", "failed", "max_turns", "harness_error"))
 
 
 class Freshness(unittest.TestCase):
@@ -250,8 +257,8 @@ class Freshness(unittest.TestCase):
         self.t0 = time.time() - 1000
         for rel in files:
             self.touch(rel, 0)
-        self.touch("target/debug/demo", 10)
-        self.touch("target/debug/mcp", 10)
+        for rel in ("target/debug/demo", "target/debug/mcp", "target/debug/demo.d", "target/debug/mcp.d"):
+            self.touch(rel, 10)
 
     def path(self, rel):
         return os.path.join(self.repo, rel)
@@ -301,6 +308,23 @@ class Freshness(unittest.TestCase):
         self.assertIn("Cargo.lock", self.refused())
         self.touch("target/debug/demo", 30)  # a build after the lock change
         self.check()
+
+    def test_a_build_that_relinked_nothing_still_clears_a_touched_lock(self):
+        """A checkout rewrites Cargo.lock as it was: cargo builds nothing, so
+        neither binary is relinked, but it rewrites each dep-info file, and
+        that build must be accepted. Before, it was refused forever."""
+        self.touch("Cargo.lock", 20)
+        self.assertIn("Cargo.lock", self.refused())
+        self.touch("target/debug/demo.d", 30)
+        self.touch("target/debug/mcp.d", 30)
+        self.check()
+
+    def test_a_dep_info_file_does_not_excuse_stale_code(self):
+        """The stamp dates manifests only: a source newer than its binary is
+        still refused, however new the dep-info file is."""
+        self.touch("crates/mcp/src/main.rs", 20)
+        self.touch("target/debug/mcp.d", 30)
+        self.assertIn(os.path.join("target", "debug", "mcp"), self.refused())
 
     def test_without_dep_info_a_binary_is_held_to_every_source(self):
         os.remove(self.mcp + ".d")
@@ -352,394 +376,640 @@ class Checkers(unittest.TestCase):
                     self.assertNotIn(word, task.prompt.lower())
 
 
-class SpendStream(unittest.TestCase):
-    INIT_TARIA = {
-        "type": "system", "subtype": "init", "model": "m",
-        "tools": ["mcp__tui__read_tree", "mcp__tui__act", "mcp__tui__key", "mcp__tui__type_text"],
-        "mcp_servers": [{"name": "tui", "status": "connected"}],
-        "permissionMode": "dontAsk", "plugins": [], "skills": [], "output_style": "default",
-    }
+# --- Plans, claims and slots -----------------------------------------------------------
 
-    def test_the_guard_refuses_anything_but_the_arms_setup(self):
-        bad = {
-            "extra tool": {"tools": self.INIT_TARIA["tools"] + ["Bash"]},
-            "plugin": {"plugins": [{"name": "p", "path": "/p"}]},
-            "skill": {"skills": ["review"]},
-            "second server": {"mcp_servers": [{"name": "tui", "status": "connected"},
-                                              {"name": "x", "status": "connected"}]},
-            "server down": {"mcp_servers": [{"name": "tui", "status": "failed"}]},
-            "permission mode": {"permissionMode": "bypassPermissions"},
-            "output style": {"output_style": "Explanatory"},
-        }
-        runner.StreamStats("taria").feed(self.INIT_TARIA)  # the good one passes
-        for name, change in bad.items():
-            with self.subTest(case=name):
-                stats = runner.StreamStats("taria")
-                with self.assertRaises(runner.GuardError):
-                    stats.feed({**self.INIT_TARIA, **change})
-                self.assertIsNotNone(stats.agent_env(), "a refused init is still recorded")
-        with self.assertRaises(runner.GuardError):
-            runner.StreamStats("tmux").feed(self.INIT_TARIA)
-        with self.assertRaises(runner.GuardError):
-            runner.StreamStats("taria").feed({"type": "assistant", "message": {"content": []}})
 
-    def test_the_stream_is_parsed_into_the_record_fields(self):
-        stats = runner.StreamStats("taria")
-        use = {"type": "tool_use", "id": "a", "name": "mcp__tui__act", "input": {}}
-        events = [
-            self.INIT_TARIA,
-            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}, use]}},
-            {"type": "assistant", "message": {"content": [use]}},  # same block, re-emitted
-            {"type": "assistant", "message": {"content": [{**use, "id": "b", "name": "mcp__tui__read_tree"}]}},
-            {
-                "type": "result", "subtype": "success", "is_error": False, "num_turns": 3,
-                "duration_ms": 9000, "duration_api_ms": 7000, "total_cost_usd": 0.05,
-                "usage": {"input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 300,
-                          "cache_creation_input_tokens": 4000},
-            },
-        ]
-        for event in events:
-            stats.feed(event)
-        got = stats.summary()
-        self.assertEqual(got["tool_calls"], {"act": 1, "read_tree": 1})
-        self.assertEqual(got["tokens"], 4330)
-        self.assertEqual((got["tokens_in"], got["tokens_out"]), (4310, 20))
-        self.assertEqual(
-            (got["input_tokens"], got["output_tokens"], got["cache_read_tokens"], got["cache_creation_tokens"]),
-            (10, 20, 300, 4000),
+class Plan(unittest.TestCase):
+    def setUp(self):
+        self.results = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.results)
+
+    def plan(self, batch, *argv):
+        code, out, err = quiet_cli("plan", "--batch", batch, "--results-dir", self.results, *argv)
+        return code, out + err
+
+    def load(self, batch):
+        with open(os.path.join(self.results, batch, "plan.json")) as f:
+            return json.load(f)
+
+    def test_the_shuffle_is_the_seeds(self):
+        argv = ("--tasks", "T1,T2,T3", "--models", "sonnet,haiku", "--runs", "2", "--seed", "11")
+        self.assertEqual(self.plan("a", *argv)[0], 0)
+        self.assertEqual(self.plan("b", *argv)[0], 0)
+        self.assertEqual(self.plan("c", *argv[:-1], "12")[0], 0)
+        a, b, c = self.load("a"), self.load("b"), self.load("c")
+        strip = lambda p: [(j["task"], j["arm"], j["model"], j["run"]) for j in p["jobs"]]  # noqa: E731
+        self.assertEqual(strip(a), strip(b))
+        self.assertNotEqual(strip(a), strip(c))
+        self.assertEqual(len(a["jobs"]), 3 * 2 * 2 * 2)
+        self.assertEqual(sorted(strip(a)), sorted(strip(c)), "the same jobs, in another order")
+        self.assertEqual([j["id"] for j in a["jobs"]], [f"j{n:03d}" for n in range(1, 25)])
+        self.assertEqual((a["seed"], a["effort"], a["max_turns"]), (11, "medium", 30))
+        self.assertEqual(a["agent_body_sha256"], agents.body_sha256())
+        self.assertEqual(a["models"], ["sonnet", "haiku"])
+
+    def test_an_existing_plan_is_refused(self):
+        self.assertEqual(self.plan("x", "--tasks", "T1", "--seed", "1")[0], 0)
+        before = self.load("x")
+        code, text = self.plan("x", "--tasks", "T2", "--seed", "2")
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("exists", text)
+        self.assertEqual(self.load("x"), before)
+
+    def test_bad_arguments_exit_2(self):
+        self.assertEqual(self.plan("y", "--models", "gpt")[0], runner.EXIT_HARNESS)
+        self.assertEqual(self.plan("../z")[0], runner.EXIT_HARNESS)
+        self.assertEqual(self.plan("slots")[0], runner.EXIT_HARNESS)
+
+
+class Claims(unittest.TestCase):
+    """Two `next` commands never claim the same job: the batch lock covers
+    reading rows and slots and writing the new slot file."""
+
+    def setUp(self):
+        self.results = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.results)
+        code, _, err = quiet_cli("plan", "--batch", "b", "--results-dir", self.results,
+                                 "--tasks", "T1,T2,T3,T4,T5", "--arms", "taria", "--seed", "3")
+        self.assertEqual(code, 0, err)
+
+    def test_concurrent_claims_never_share_a_job(self):
+        script = (
+            "import json, sys; sys.path.insert(0, sys.argv[1]); import run\n"
+            "paths = run.Paths(sys.argv[2], 'b'); plan = run.load_plan(paths)\n"
+            "job, slot = run.claim(paths, plan, int(sys.argv[3]))\n"
+            "print(json.dumps(job and job['id']))\n"
         )
-        self.assertEqual(got["usage_source"], "result")
-        self.assertEqual(got["turns"], 3)
-        self.assertEqual(got["cost_usd"], 0.05)
-        self.assertEqual(got["result_subtype"], "success")
-        self.assertEqual(got["agent_env"]["permissionMode"], "dontAsk")
+        procs = [
+            subprocess.Popen([sys.executable, "-c", script, BENCH, self.results, str(k)],
+                             stdout=subprocess.PIPE, text=True)
+            for k in range(1, 9)
+        ]
+        claimed = [json.loads(p.communicate(timeout=60)[0]) for p in procs]
+        jobs = [j for j in claimed if j is not None]
+        self.assertEqual(len(jobs), 5, claimed)
+        self.assertEqual(len(set(jobs)), 5, f"a job was claimed twice: {claimed}")
+        self.assertEqual(claimed.count(None), 3)
+        paths = runner.Paths(self.results, "b")
+        held = runner.read_all_slots(paths)
+        self.assertEqual(sorted(s["job"] for s in held.values()), sorted(jobs))
 
-    def test_a_cut_off_stream_keeps_its_usage(self):
-        stats = runner.StreamStats("taria")
-        stats.feed(self.INIT_TARIA)
+    def test_a_recorded_job_is_not_claimed_and_a_held_slot_is_refused(self):
+        paths = runner.Paths(self.results, "b")
+        plan = runner.load_plan(paths)
+        first = plan["jobs"][0]["id"]
+        runner.append_row(paths, runner.new_row(job=first, status="passed"))
+        job, slot = runner.claim(paths, plan, 1)
+        self.assertEqual(job["id"], plan["jobs"][1]["id"])
+        self.assertEqual((slot["slot"], slot["state"], slot["arm"]), (1, "claimed", "taria"))
+        with self.assertRaises(runner.CommandError):
+            runner.claim(paths, plan, 1)
 
-        def message(mid, out):
-            usage = {"input_tokens": 5, "output_tokens": out, "cache_read_input_tokens": 50,
-                     "cache_creation_input_tokens": 500}
-            return {"type": "assistant", "message": {"id": mid, "usage": usage, "content": []}}
+    def test_next_refuses_a_held_slot_without_an_agent_id(self):
+        paths = runner.Paths(self.results, "b")
+        plan = runner.load_plan(paths)
+        _, slot = runner.claim(paths, plan, 2)
+        slot["state"] = "ready"
+        runner.write_slot(paths, 2, slot)
+        code, out, err = quiet_cli("next", "--batch", "b", "--slot", "2", "--results-dir", self.results)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn(slot["job"], json.loads(out)["error"])
+        self.assertIn("--agent-id", err)
+        # And a slot of another batch is not this batch's to grade.
+        code, out, _ = quiet_cli("plan", "--batch", "other", "--results-dir", self.results, "--tasks", "T1")
+        code, out, _ = quiet_cli("next", "--batch", "other", "--slot", "2", "--agent-id", "a1",
+                                 "--results-dir", self.results)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("of batch b", json.loads(out)["error"])
 
-        for event in (message("m1", 1), message("m1", 9), message("m2", 3)):
-            stats.feed(event)
-        got = stats.summary()
-        self.assertEqual(got["usage_source"], "stream")
-        self.assertEqual(got["usage"], {"input": 10, "output": 12, "cache_read": 100, "cache_creation": 1000})
-        self.assertIsNone(got["cost_usd"])
+    def test_an_agent_id_for_an_empty_slot_is_refused(self):
+        code, out, _ = quiet_cli("next", "--batch", "b", "--slot", "3", "--agent-id", "nobody",
+                                 "--results-dir", self.results)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("holds no job", json.loads(out)["error"])
+        code, out, _ = quiet_cli("next", "--batch", "b", "--slot", "3", "--agent-id", "../x",
+                                 "--results-dir", self.results)
+        self.assertEqual(code, runner.EXIT_HARNESS)
 
-    def test_the_command_carries_every_flag(self):
-        cmd = runner.spend_command("Do it.", "/x/mcp.json", 1.0, "claude-sonnet-5-5")
-        self.assertEqual(cmd[:3], ["claude", "-p", "Do it."])
-        for flag in ("--bare", "--strict-mcp-config", "--disable-slash-commands",
-                     "--no-session-persistence", "--verbose", "--setting-sources="):
-            self.assertIn(flag, cmd)
-        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
-        self.assertEqual(cmd[cmd.index("--allowedTools") + 1], "mcp__tui")
-        self.assertEqual(cmd[cmd.index("--max-budget-usd") + 1], "1")
-        self.assertEqual(cmd[cmd.index("--effort") + 1], "medium")
-        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
-        self.assertNotIn("--max-turns", cmd)  # not passed unless asked for
-        cmd = runner.spend_command("Do it.", "/x/mcp.json", 1.0, "m", effort="high", max_turns=12)
-        self.assertEqual(cmd[cmd.index("--effort") + 1], "high")
-        self.assertEqual(cmd[cmd.index("--max-turns") + 1], "12")
 
-    def test_an_init_the_guard_cannot_read_is_refused(self):
-        with self.assertRaises(runner.GuardError):
-            runner.StreamStats("taria").feed({**self.INIT_TARIA, "tools": 5})
+class SlotFields(unittest.TestCase):
+    def fields(self, tmpdir="/tmp/tui-abc123"):
+        return {
+            "name": "taria-bench-1", "tmpdir": tmpdir, "workdir": f"{tmpdir}/work",
+            "sock": f"{tmpdir}/s/app.sock", "tmux_sock": f"{tmpdir}/s/tmux.sock",
+            "state_path": f"{tmpdir}/state.json", "tmux_conf": f"{tmpdir}/tmux.conf",
+            "server_pid": 11, "demo_pid": 12,
+        }
+
+    def test_round_trip(self):
+        run = DemoRun.from_slot(json.loads(json.dumps(self.fields())))
+        self.assertEqual(run.to_slot(), self.fields())
+        self.assertEqual(run.tmux, ["tmux", "-S", "/tmp/tui-abc123/s/tmux.sock", "-f", "/tmp/tui-abc123/tmux.conf"])
+
+    def test_fields_that_are_not_ours_are_refused(self):
+        """close() removes tmpdir, so a slot file cannot point it elsewhere."""
+        bad = {
+            "missing": {k: v for k, v in self.fields().items() if k != "sock"},
+            "not tui-": self.fields("/home/user"),
+            "relative": self.fields("tui-abc"),
+            "outside": {**self.fields(), "sock": "/tmp/tui-abc1234/s/app.sock"},
+            "pid": {**self.fields(), "demo_pid": "12"},
+        }
+        for name, fields in bad.items():
+            with self.subTest(case=name), self.assertRaises(harness.HarnessError):
+                DemoRun.from_slot(fields)
 
 
 @unittest.skipUnless(HAVE_TMUX, "tmux is not on PATH")
-class FakeClaude(unittest.TestCase):
-    """run.py's spend path end to end against a fake `claude`, live demo included."""
+class SlotLive(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        require_fresh_build()
 
-    SECRET = "s3cr3t-value-never-recorded"
+    def test_another_process_can_reach_and_close_a_demo(self):
+        demo = DemoRun()
+        self.addCleanup(demo.close)
+        demo.start()
+        demo.wait_ready_for_agent()
+        self.assertTrue(demo.socket_accepts())
+        fields = json.loads(json.dumps(demo.to_slot()))
+        script = (
+            "import json, sys; sys.path.insert(0, sys.argv[1]); from harness import DemoRun\n"
+            "run = DemoRun.from_slot(json.loads(sys.argv[2]))\n"
+            "print(json.dumps([run.demo_alive(), run.read_state()['tab'], 'Active' in run.capture()]))\n"
+            "run.close()\n"
+        )
+        out = subprocess.run([sys.executable, "-c", script, BENCH, json.dumps(fields)],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(json.loads(out.stdout), [True, "active", True], out.stderr)
+        self.assertTrue(wait_gone(demo.demo_pid), "the demo outlived close() from another process")
+        self.assertFalse(_running(demo.server_pid))
+        self.assertFalse(os.path.exists(demo.tmpdir))
+
+    def test_a_reused_pid_is_not_ours(self):
+        """The demo is proved by its socket in its environment, not its name alone."""
+        demo = DemoRun()
+        self.addCleanup(demo.close)
+        demo.start()
+        self.assertTrue(harness._is_ours(demo.demo_pid, harness.DEMO_BIN, f"TARIA_SOCK={demo.sock}"))
+        self.assertFalse(harness._is_ours(demo.demo_pid, harness.DEMO_BIN, "TARIA_SOCK=/elsewhere"))
+        self.assertFalse(harness._is_ours(os.getpid(), harness.DEMO_BIN))
+
+
+# --- Grading an agent run -----------------------------------------------------------------
+
+
+class FakeRun:
+    """Stands in for a DemoRun: a dump, a liveness, a quit."""
+
+    def __init__(self, state, alive=True):
+        self.state, self.alive, self.quits = state, alive, 0
+
+    def settled_state(self):
+        return self.state
+
+    def demo_alive(self):
+        return self.alive
+
+    def quit(self):
+        self.quits += 1
+        self.state = {**self.state, "quit": True}
+        return True
+
+    def read_state(self):
+        return self.state
+
+
+class GradeAgentRun(unittest.TestCase):
+    PLAN = {"batch": "b", "seed": 5, "effort": "medium", "max_turns": 30}
+    SLOT = {"slot": 2, "batch": "b", "job": "j004", "task": "T1", "arm": "taria", "model": "sonnet",
+            "run": 1, "demo": {}}
+    PROV = {"git_sha": "abc", "git_dirty": False}
+    GOOD_STATE = tasks.self_test_cases()["T1"][0][0]
+    STATS = {
+        "agent_id": "a1", "session_id": "s1", "models": ["claude-sonnet-5-5"], "turns": 4,
+        "tool_calls": {"mcp__tui__read_tree": 1, "mcp__tui__act": 2}, "tool_calls_total": 3,
+        "toolsearch_calls": 1, "tokens": {"input": 1, "cache_creation": 2, "cache_read": 3, "output": 4},
+        "wall_ms": 9000, "final_text": "Added it.", "ended_on_tool_use": False, "tool_errors": 0,
+        "context": {"claude_md_files": []}, "efforts": ["medium"], "claude_versions": ["2.1.294"],
+    }
+
+    def module(self, stats=None, problems=(), path="/x/agent-a1.jsonl"):
+        seen = {}
+
+        def guard(stats, arm, family, arm_tools):
+            seen.update(arm=arm, family=family, arm_tools=arm_tools)
+            return list(problems)
+
+        return types.SimpleNamespace(
+            find_transcript=lambda agent_id: path,
+            read_transcript=lambda p: dict(stats or self.STATS),
+            guard=guard,
+        ), seen
+
+    def grade(self, state=None, alive=True, **module_args):
+        mod, seen = self.module(**module_args)
+        run = FakeRun(state if state is not None else self.GOOD_STATE, alive)
+        row = runner.grade_agent_run(self.PLAN, self.SLOT, "a1", run=run, transcript_mod=mod, prov=self.PROV)
+        return row, seen, run
+
+    def test_passed(self):
+        row, seen, run = self.grade()
+        self.assertEqual((row["status"], row["passed"], row["check_passed"]), ("passed", True, True))
+        self.assertEqual(seen, {"arm": "taria", "family": "sonnet", "arm_tools": harness.ARM_TOOLS["taria"]})
+        self.assertEqual(list(row), list(runner.ROW_KEYS))
+        self.assertEqual((row["mode"], row["solver"], row["model"], row["model_resolved"]),
+                         ("subagent", "agent", "sonnet", "claude-sonnet-5-5"))
+        self.assertEqual((row["effort"], row["efforts_resolved"], row["max_turns"]), ("medium", ["medium"], 30))
+        self.assertEqual((row["claude_version"], row["claude_versions"]), ("2.1.294", ["2.1.294"]))
+        self.assertEqual((row["job"], row["run"], row["seed"], row["agent_id"], row["session_id"]),
+                         ("j004", 1, 5, "a1", "s1"))
+        self.assertEqual((row["tool_calls_total"], row["toolsearch_calls"], row["turns"]), (3, 1, 4))
+        self.assertEqual(row["guard_problems"], [])
+        self.assertEqual(row["demo_exit"], "clean")
+        self.assertEqual(run.quits, 1)
+
+    def test_failed(self):
+        row, _, _ = self.grade(state=tasks.SEED_STATE)
+        self.assertEqual((row["status"], row["passed"]), ("failed", False))
+        self.assertIn("no new task", row["reason"])
+        row, _, _ = self.grade(alive=False)
+        self.assertEqual((row["status"], row["demo_exit"]), ("failed", "crashed"))
+
+    def test_max_turns(self):
+        cut = {**self.STATS, "ended_on_tool_use": True, "turns": 30}
+        row, _, _ = self.grade(stats=cut)
+        self.assertEqual((row["status"], row["passed"], row["check_passed"]), ("max_turns", False, True))
+        # Under the cap, ending on a tool call is the agent's choice, graded as usual.
+        row, _, _ = self.grade(stats={**cut, "turns": 29})
+        self.assertEqual(row["status"], "passed")
+
+    def test_guard_problems_are_a_harness_error(self):
+        row, _, _ = self.grade(problems=["called Bash (1x), which is not a taria arm tool"])
+        self.assertEqual((row["status"], row["passed"]), ("harness_error", None))
+        self.assertEqual(row["guard_problems"], ["called Bash (1x), which is not a taria arm tool"])
+        self.assertIn("guard: called Bash", row["error"])
+        self.assertIs(row["check_passed"], True, "the dump is still graded")
+
+    def test_a_missing_transcript_is_a_harness_error(self):
+        row, _, _ = self.grade(path=None)
+        self.assertEqual(row["status"], "harness_error")
+        self.assertIn("no transcript for agent a1", row["error"])
+        self.assertIsNone(row["turns"])
+
+    def test_an_unreadable_transcript_is_a_harness_error(self):
+        mod, _ = self.module()
+        mod.read_transcript = lambda p: (_ for _ in ()).throw(OSError("gone"))
+        row = runner.grade_agent_run(self.PLAN, self.SLOT, "a1", run=FakeRun(self.GOOD_STATE),
+                                     transcript_mod=mod, prov=self.PROV)
+        self.assertEqual(row["status"], "harness_error")
+        self.assertIn("OSError: gone", row["error"])
+
+    def test_another_slots_agent_is_a_harness_error(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        path = os.path.join(tmp, "agent-a1.jsonl")
+        open(path, "w").close()
+        with open(os.path.join(tmp, "agent-a1.meta.json"), "w") as f:
+            json.dump({"agentType": "tui-taria-1"}, f)
+        row, _, _ = self.grade(path=path)
+        self.assertEqual(row["status"], "harness_error")
+        self.assertIn("'tui-taria-1', not this slot's agent 'tui-taria-2'", row["error"])
+
+    def test_the_stub_route_through_load_transcript_module(self):
+        mod, _ = self.module()
+        with mock.patch.object(runner, "load_transcript_module", return_value=mod):
+            row = runner.grade_agent_run(self.PLAN, self.SLOT, "a1", run=FakeRun(self.GOOD_STATE),
+                                         prov=self.PROV)
+        self.assertEqual(row["status"], "passed")
+
+
+# --- The launcher and the agent files ------------------------------------------------------
+
+
+class McpLaunch(unittest.TestCase):
+    def setUp(self):
+        self.slots = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.slots)
+
+    def launch(self, arm, slot=1):
+        return subprocess.run(
+            [sys.executable, MCP_LAUNCH, "--arm", arm, "--slot", str(slot), "--slots-dir", self.slots],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+
+    def write(self, slot, **fields):
+        with open(os.path.join(self.slots, f"{slot}.json"), "w") as f:
+            json.dump(fields, f)
+
+    def test_a_missing_slot_is_refused(self):
+        out = self.launch("taria")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, "", "nothing may reach the MCP stream")
+        self.assertIn("slot 1 holds no job", out.stderr)
+        self.assertEqual(len(out.stderr.strip().splitlines()), 1)
+
+    def test_the_wrong_arm_is_refused(self):
+        self.write(1, job="j002", arm="tmux", state="ready", demo=SlotFields().fields())
+        out = self.launch("taria")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, "")
+        self.assertIn("holds job j002 for the tmux arm, not taria", out.stderr)
+        self.assertIn("wrong one for the slot", out.stderr)
+
+    def test_a_slot_not_ready_is_refused(self):
+        self.write(1, job="j002", arm="taria", state="starting", demo=SlotFields().fields())
+        out = self.launch("taria")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("not ready", out.stderr)
+
+    def test_the_launcher_execs_what_the_dry_run_spawns(self):
+        """One definition of each arm's server: mcp_launch execs server_entry."""
+        fields = SlotFields().fields()
+        run = DemoRun.from_slot(fields)
+        self.assertEqual(harness.server_entry("taria", run)["env"], {"TARIA_SOCK": fields["sock"]})
+        self.assertEqual(harness.server_entry("tmux", run)["args"][-4:],
+                         ["--session", fields["name"], "--socket-path", fields["tmux_sock"]])
+        self.assertEqual(mcp_config("taria", run)["mcpServers"]["tui"], harness.server_entry("taria", run))
+
+
+class AgentFiles(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.slots = os.path.join(self.dir, "results", "slots")
+
+    def test_bodies_are_identical_and_the_frontmatter_complete(self):
+        taria = agents.render("taria", 1, self.slots)
+        tmux = agents.render("tmux", 1, self.slots)
+        a, b = agents.parse(taria), agents.parse(tmux)
+        self.assertEqual(taria.split("\n---\n", 1)[1].encode(), tmux.split("\n---\n", 1)[1].encode())
+        self.assertEqual(a["body"], agents.BODY)
+        self.assertEqual(agents.body_sha256(a["body"]), agents.body_sha256(b["body"]))
+        self.assertEqual(a["fields"], {
+            "name": "tui-taria-1",
+            "description": "Benchmark runner, taria arm, slot 1. Spawned only by bench/run.py's orchestrator.",
+            "tools": "mcp__tui", "model": "sonnet", "effort": "medium", "maxTurns": "30",
+            "omitClaudeMd": "true",
+        })
+        self.assertEqual(a["server"]["_name"], "tui")
+        self.assertEqual(a["server"]["type"], "stdio")
+        self.assertEqual(a["server"]["command"], sys.executable)
+        self.assertTrue(os.path.isabs(a["server"]["command"]))
+        self.assertEqual(a["server"]["args"], [agents.MCP_LAUNCH, "--arm", "taria", "--slot", "1",
+                                               "--slots-dir", os.path.abspath(self.slots)])
+        self.assertEqual(b["server"]["args"][1:5], ["--arm", "tmux", "--slot", "1"])
+        # Only name, description and the launcher's arm and slot differ.
+        diff = [(x, y) for x, y in zip(taria.splitlines(), tmux.splitlines()) if x != y]
+        self.assertEqual([x.split(":")[0].strip() for x, _ in diff], ["name", "description", "args"])
+
+    def test_the_documented_inline_server_shape(self):
+        """The YAML matches the sub-agents doc's inline example: a list item
+        keyed by the server name, holding type, command and args."""
+        text = agents.render("tmux", 3, self.slots, effort="high", max_turns=12)
+        self.assertIn("\nmcpServers:\n  - tui:\n      type: stdio\n      command: ", text)
+        self.assertIn('\n      args: ["', text)
+        self.assertIn("\neffort: high\nmaxTurns: 12\n", text)
+        self.assertTrue(text.startswith("---\nname: tui-tmux-3\n"))
+
+    def test_problems_name_what_differs_from_the_plan(self):
+        (path,) = [p for p in agents.write(1, self.dir, self.slots) if p.endswith("tui-taria-1.md")]
+        sha = agents.body_sha256()
+        self.assertEqual(agents.problems(path, "taria", 1, self.slots, "medium", 30, sha), [])
+        found = agents.problems(path, "taria", 1, self.slots, "high", 20, "0" * 64)
+        self.assertEqual(len(found), 3, found)
+        self.assertTrue(agents.problems(path, "taria", 1, "/other/slots", "medium", 30, sha))
+        self.assertIn("does not exist", agents.problems(path + "x", "taria", 1, self.slots, "medium", 30, sha)[0])
+
+    def test_remove_deletes_only_its_own_files(self):
+        code, out, err = quiet_cli("agents", "--slots", "2", "--dir", self.dir,
+                                   "--results-dir", os.path.join(self.dir, "results"))
+        self.assertEqual(code, 0, err)
+        ours = sorted(f for f in os.listdir(self.dir) if f.endswith(".md"))
+        self.assertEqual(ours, ["tui-taria-1.md", "tui-taria-2.md", "tui-tmux-1.md", "tui-tmux-2.md"])
+        others = {
+            "reviewer.md": "---\nname: reviewer\n---\n",
+            "tui-other-1.md": "---\nname: x\n---\n",
+            "tui-taria-9.md": "---\nname: tui-taria-9\ndescription: a person's own agent\n---\n",
+        }
+        for name, text in others.items():
+            with open(os.path.join(self.dir, name), "w") as f:
+                f.write(text)
+        code, _, _ = quiet_cli("agents", "--remove", "--dir", self.dir)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(f for f in os.listdir(self.dir) if f.endswith(".md")), sorted(others))
+
+    def test_a_file_not_ours_is_never_overwritten(self):
+        path = os.path.join(self.dir, "tui-tmux-1.md")
+        with open(path, "w") as f:
+            f.write("---\nname: tui-tmux-1\ndescription: mine\n---\n")
+        code, _, err = quiet_cli("agents", "--slots", "1", "--dir", self.dir)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("not written by bench/agents.py", err)
+        with open(path) as f:
+            self.assertIn("description: mine", f.read())
+
+
+# --- The subagent path, end to end, without a model ------------------------------------------
+
+
+def write_transcript(directory, agent_id, prompt, arm, calls, agent_type,
+                     model="claude-sonnet-5-5", effort="medium"):
+    """A minimal subagent transcript in Claude Code's shape (see
+    bench/transcript.py): the prompt, the arm's deferred tools, one assistant
+    message per tool call with its result, and a closing sentence. Plus the
+    meta file naming the agent type. Returns the transcript's path."""
+    t0 = datetime(2026, 10, 11, 12, 0, 0, tzinfo=timezone.utc)
+    session = "00000000-0000-4000-8000-00000000beef"
+    lines, n = [], 0
+
+    def line(kind, **extra):
+        nonlocal n
+        n += 1
+        stamp = (t0 + timedelta(milliseconds=500 * n)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        lines.append({"parentUuid": None, "isSidechain": True, "agentId": agent_id, "type": kind,
+                      "uuid": f"{agent_id}-{n}", "timestamp": stamp, "cwd": "/tmp/work",
+                      "sessionId": session, "version": "2.1.294", **extra})
+
+    usage = {"input_tokens": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000,
+             "output_tokens": 20}
+    line("user", message={"role": "user", "content": prompt})
+    names = [f"mcp__tui__{t}" for t in harness.ARM_TOOLS[arm]]
+    line("attachment", attachment={"type": "deferred_tools_delta", "addedNames": names, "removedNames": []})
+    for i, name in enumerate(name for name, count in sorted(calls.items()) for _ in range(count)):
+        line("assistant", apiBlockIndex=0, effort=effort, message={
+            "model": model, "id": f"msg_{i}", "type": "message", "role": "assistant",
+            "content": [{"type": "tool_use", "id": f"toolu_{i}", "name": f"mcp__tui__{name}", "input": {}}],
+            "stop_reason": "tool_use", "usage": usage})
+        line("user", message={"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"toolu_{i}", "content": "ok", "is_error": False}]})
+    line("assistant", apiBlockIndex=0, effort=effort, message={
+        "model": model, "id": "msg_end", "type": "message", "role": "assistant",
+        "content": [{"type": "text", "text": "I did what you asked."}], "stop_reason": "end_turn",
+        "usage": usage})
+    path = os.path.join(directory, f"agent-{agent_id}.jsonl")
+    with open(path, "w") as f:
+        f.writelines(json.dumps(entry) + "\n" for entry in lines)
+    with open(os.path.join(directory, f"agent-{agent_id}.meta.json"), "w") as f:
+        json.dump({"agentType": agent_type, "model": "sonnet"}, f)
+    return path
+
+
+@unittest.skipUnless(HAVE_TMUX, "tmux is not on PATH")
+@unittest.skipIf(transcript is None, "bench/transcript.py is missing")
+class SubagentRehearsal(unittest.TestCase):
+    """What the orchestrator does, with the scripted solver in the agent's
+    place: every command a separate process, the server started from the
+    agent file's own command line."""
 
     @classmethod
     def setUpClass(cls):
         require_fresh_build()
-        cls.tmp = tempfile.mkdtemp(prefix="fake-claude-")
-        os.symlink(FAKE_CLAUDE, os.path.join(cls.tmp, "claude"))
-        cls.control = os.path.join(cls.tmp, "fake_claude.json")
-        cls.saved_env = dict(os.environ)
-        os.environ.pop("ANTHROPIC_API_KEY", None)  # never needed, never sent
-        os.environ["PATH"] = cls.tmp + os.pathsep + os.environ["PATH"]
-        # Markers a parent Claude Code session sets, and anything else a shell
-        # exports: none may reach the agent.
-        os.environ.update(CLAUDECODE="1", CLAUDE_CODE_FAKE_MARKER="1", BENCH_SECRET_MARKER=cls.SECRET)
-        cls.log = os.path.join(cls.tmp, "argv.json")
-
-    @classmethod
-    def tearDownClass(cls):
-        os.environ.clear()
-        os.environ.update(cls.saved_env)
-        shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
-        found = shutil.which("claude")
-        if found is None or os.path.realpath(found) != os.path.realpath(FAKE_CLAUDE):
-            self.fail(f"claude on PATH is {found}, not the fake; refusing to spend")
-        if os.path.exists(self.log):
-            os.remove(self.log)
-        self.steer("success")
+        self.tmp = tempfile.mkdtemp(prefix="rehearsal-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.results = os.path.join(self.tmp, "results")
+        self.agents_dir = os.path.join(self.tmp, "agents")
+        self.common = ("--results-dir", self.results)
+        self.addCleanup(self.abort_leftovers)
 
-    def steer(self, mode, task="T1", solve=False):
-        """The fake reads its orders from a file: no variable of ours reaches it."""
-        with open(self.control, "w") as f:
-            json.dump({"mode": mode, "task": task, "solve": solve, "log": self.log}, f)
+    def abort_leftovers(self):
+        for k, slot in runner.read_all_slots(runner.Paths(self.results)).items():
+            runner.teardown(slot)
 
-    def spend(self, mode, arm="taria", task="T1", solve=False, timeout=20, argv=()):
-        self.steer(mode, task, solve)
-        args = runner.parse_args(["--spend", "--tasks", task, "--arms", arm, "--timeout",
-                                  str(timeout), "--batch", "test-batch", *argv])
-        started = time.monotonic()
-        record = runner.run_one(tasks.TASKS[task], arm, args, 0)
-        return record, time.monotonic() - started
+    def next(self, batch, slot, *argv):
+        out = run_py("next", "--batch", batch, "--slot", str(slot), "--agents-dir", self.agents_dir,
+                     *self.common, *argv)
+        lines = out.stdout.splitlines()
+        self.assertEqual(len(lines), 1, f"next printed {lines!r}; stderr: {out.stderr}")
+        return out.returncode, json.loads(lines[0]), out.stderr
 
-    def spend_batch(self, mode, name, task_ids="T1,T2"):
-        """run_all over two jobs: (exit code, records written, stderr)."""
-        original = runner.has_api_key
-        runner.has_api_key = lambda: True  # the fake needs no key; none is set
-        self.addCleanup(setattr, runner, "has_api_key", original)
-        self.steer(mode)
-        results = os.path.join(self.tmp, f"{name}.jsonl")
-        args = runner.parse_args(["--spend", "--tasks", task_ids, "--arms", "taria", "--results", results])
-        err = io.StringIO()
-        with redirect_stdout(io.StringIO()), redirect_stderr(err):
-            code = runner.run_all(args)
-        with open(results) as f:
-            records = [json.loads(line) for line in f]
-        return code, records, err.getvalue()
+    def launcher(self, agent):
+        entry = agents.read(os.path.join(self.agents_dir, f"{agent}.md"))["server"]
+        return {"command": entry["command"], "args": entry["args"]}
 
-    def fake_log(self):
-        with open(self.log) as f:
-            return json.load(f)
-
-    def test_a_solved_run_passes_with_its_stream_recorded(self):
-        record, _ = self.spend("success", arm="tmux", solve=True)
-        self.assertEqual(record["status"], "passed", record.get("error") or record.get("reason"))
-        self.assertTrue(record["passed"])
-        self.assertEqual(record["result_subtype"], "success")
-        self.assertEqual(record["usage_source"], "result")
-        self.assertEqual((record["tokens_in"], record["tokens_out"]), (12 + 100 + 1000, 34))
-        self.assertEqual(record["cost_usd"], 0.01)
-        self.assertEqual(record["tool_calls"], {"screen": 1, "send_keys": 3})
-        env = record["agent_env"]
-        self.assertEqual((env["plugins"], env["skills"], env["permissionMode"]), ([], [], "dontAsk"))
-        self.assertEqual(env["tools"], ["mcp__tui__screen", "mcp__tui__send_keys"])
-        # Provenance on the record.
-        self.assertEqual(record["batch"], "test-batch")
-        self.assertEqual(record["claude_version"], "0.0.0 (fake claude)")
-        self.assertRegex(record["git_sha"] or "", r"^[0-9a-f]{40}$")
-        self.assertIn(record["git_dirty"], (True, False))
-        self.assertEqual((record["model"], record["effort"]), (runner.DEFAULT_MODEL, "medium"))
-        self.assertEqual((record["timeout_s"], record["budget_usd"], record["max_turns"]),
-                         (20.0, runner.DEFAULT_BUDGET_USD, None))
-        # What the agent was started with.
-        seen = self.fake_log()
-        self.assertEqual(seen["pid"], seen["pgid"], "the agent leads its own process group")
-        self.assertTrue(seen["cwd"].endswith("/work"))
-        self.assertIn("--setting-sources=", seen["argv"])
-        self.assertEqual(seen["argv"][seen["argv"].index("--effort") + 1], "medium")
-        self.assertNotIn("--max-turns", seen["argv"])
-
-    def test_the_agent_gets_only_the_allowlisted_environment(self):
-        record, _ = self.spend("success")
-        seen = set(self.fake_log()["env"])
-        allowed = runner.ENV_ALLOW | set(runner.HARNESS_ENV)
-        self.assertLessEqual(seen, allowed, f"reached the agent: {sorted(seen - allowed)}")
-        self.assertIn("PATH", seen)
-        dropped = record["env_dropped"]
-        for name in ("CLAUDECODE", "CLAUDE_CODE_FAKE_MARKER", "BENCH_SECRET_MARKER"):
-            self.assertIn(name, dropped)
-        self.assertEqual(sorted(seen | set(dropped)), sorted(os.environ), "a name went unaccounted for")
-        self.assertNotIn(self.SECRET, json.dumps(record), "a dropped value was recorded")
-
-    def test_limits_are_recorded_and_passed(self):
-        record, _ = self.spend("success", argv=("--max-turns", "7", "--budget-usd", "0.5"))
-        self.assertEqual((record["timeout_s"], record["budget_usd"], record["max_turns"]), (20.0, 0.5, 7))
-        argv = self.fake_log()["argv"]
-        self.assertEqual(argv[argv.index("--max-turns") + 1], "7")
-        self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "0.5")
-        # And the summary never pools runs held to different limits.
-        other, _ = self.spend("success", argv=("--budget-usd", "0.5"))
-        table = summarize.table([record, other])
-        rows = [line for line in table.splitlines() if line.startswith("| T1 | taria |")]
-        self.assertEqual(len(rows), 2, table)
-        self.assertTrue(any("| 20s, $0.5, 7 turns |" in r for r in rows), rows)
-        self.assertTrue(any("| 20s, $0.5, no turn cap |" in r for r in rows), rows)
-
-    def test_an_unsolved_run_fails_on_the_dump(self):
-        record, _ = self.spend("success", argv=("--effort", "low"))
-        self.assertEqual(record["status"], "failed")
-        self.assertIs(record["passed"], False)
-        self.assertIn("no new task", record["reason"])
-        self.assertEqual(record["effort"], "low")
-
-    def test_a_timeout_kills_the_whole_group_and_keeps_the_streamed_usage(self):
-        original = runner.KILL_GRACE_S
-        runner.KILL_GRACE_S = 0.5
-        self.addCleanup(setattr, runner, "KILL_GRACE_S", original)
-        record, elapsed = self.spend("hang", timeout=2)
-        self.assertEqual(record["status"], "timeout")
-        self.assertIs(record["passed"], False)
-        self.assertIs(record["check_passed"], False)  # graded all the same
-        self.assertIsNone(record["error"])
-        self.assertTrue(record["timed_out"])
-        self.assertEqual(record["usage_source"], "stream")
-        self.assertEqual(record["usage"], {"input": 10, "output": 20, "cache_read": 100, "cache_creation": 1000})
-        self.assertIsNone(record["cost_usd"])
-        self.assertLess(elapsed, 2 + 0.5 + 5 + 3)
-        seen = self.fake_log()
-        for pid in (seen["pid"], seen["child"]):
-            self.assertFalse(_running(pid), f"pid {pid} survived the group kill")
-
-    def test_no_result_event_is_a_harness_error(self):
-        record, _ = self.spend("noresult")
-        self.assertEqual(record["status"], "harness_error")
-        self.assertIsNone(record["passed"])
-        self.assertIn("without a result event", record["error"])
-        self.assertIn("lost the connection", record["error"])
-        self.assertEqual(record["usage_source"], "stream")
-
-    def test_the_guard_stops_an_extra_tool_at_once(self):
-        record, elapsed = self.spend("extra_tool")
-        self.assertEqual(record["status"], "harness_error")
-        self.assertTrue(record["guard_failed"])
-        self.assertIn("'Bash'", record["error"])
-        self.assertIn("Bash", record["agent_env"]["tools"])
-        self.assertLess(elapsed, 10, "the guard waited for the agent instead of stopping it")
-
-    def test_the_guard_stops_a_plugin(self):
-        record, elapsed = self.spend("plugins")
-        self.assertEqual(record["status"], "harness_error")
-        self.assertTrue(record["guard_failed"])
-        self.assertIn("plugins are loaded: ['fake-plugin']", record["error"])
-        self.assertLess(elapsed, 10)
-
-    def test_a_permission_denial_is_a_harness_error(self):
-        record, _ = self.spend("denied")
-        self.assertEqual(record["status"], "harness_error")
-        self.assertIn("permission denial", record["error"])
-        self.assertIn("mcp__tui__act", record["error"])
-        self.assertEqual(record["permission_denials"], 1)
-        self.assertEqual(record["cost_usd"], 0.01, "the denied run's spend is kept")
-
-    def test_an_error_result_is_a_harness_error(self):
-        record, _ = self.spend("api_error")
-        self.assertEqual(record["status"], "harness_error")
-        self.assertIn("API Error: 404", record["error"])
-
-    def test_a_budget_stop_fails_with_its_dump_graded(self):
-        record, _ = self.spend("budget", arm="tmux", solve=True)
-        self.assertEqual(record["status"], "budget")
-        self.assertIs(record["passed"], False, "a cut-off run never passes")
-        self.assertIs(record["check_passed"], True, "the dump is still graded")
-        self.assertIsNone(record["error"])
-        self.assertEqual(record["cost_usd"], 1.03)
-        record, _ = self.spend("budget")
-        self.assertEqual(record["status"], "budget")
-        self.assertIs(record["check_passed"], False)
-
-    def test_a_max_turns_stop_fails_with_its_dump_graded(self):
-        """error_max_turns carries is_error, as the budget stop does; it is the
-        agent hitting a limit, not a harness error."""
-        record, _ = self.spend("max_turns", arm="tmux", solve=True, argv=("--max-turns", "3"))
-        self.assertEqual(record["status"], "max_turns", record.get("error"))
-        self.assertIs(record["passed"], False)
-        self.assertIs(record["check_passed"], True)
-        self.assertIsNone(record["error"])
-        self.assertEqual((record["result_subtype"], record["max_turns"], record["cost_usd"]),
-                         ("error_max_turns", 3, 0.2))
-        unsolved, _ = self.spend("max_turns", arm="tmux", argv=("--max-turns", "3"))
-        self.assertEqual((unsolved["status"], unsolved["check_passed"]), ("max_turns", False))
-        line = next(l for l in summarize.table([record, unsolved]).splitlines() if l.startswith("| T1 |"))
-        col = dict(zip(summarize.COLUMNS, (c.strip() for c in line.strip("|").split("|"))))
-        self.assertEqual((col["passed"], col["max turns"]), ("0/2", "2"))
-        self.assertEqual(col["cut off"], "2 (1 with correct state)")
-
-    def test_a_grade_or_quit_failure_keeps_the_runs_cost(self):
-        def broken(*_args, **_kwargs):
-            raise RuntimeError("grading fell over")
-
-        for target, attr in ((runner, "grade"), (runner.DemoRun, "quit")):
-            with self.subTest(failing=attr):
-                original = getattr(target, attr)
-                setattr(target, attr, broken)
-                try:
-                    record, _ = self.spend("success")
-                finally:
-                    setattr(target, attr, original)
-                self.assertEqual(record["status"], "harness_error")
-                self.assertIsNone(record["passed"])
-                self.assertIn("RuntimeError: grading fell over", record["error"])
-                self.assertEqual(record["cost_usd"], 0.01)
-                self.assertEqual(record["usage"], {"input": 12, "output": 34, "cache_read": 100,
-                                                   "cache_creation": 1000})
-                self.assertEqual(record["result_subtype"], "success")
-                self.assertIn("tool_calls_total", record)
-
-    def test_a_guard_failure_stops_the_batch_with_its_record_written(self):
-        code, records, err = self.spend_batch("plugins", "guard")
-        self.assertEqual(code, runner.EXIT_HARNESS)
-        self.assertEqual(len(records), 1, "the batch went on after the guard fired")
-        self.assertTrue(records[0]["guard_failed"])
-        self.assertIn("at its init event", err)
-        self.assertIn("1 run(s) not started", err)
-
-    def test_a_permission_denial_stops_the_batch(self):
-        """A misconfigured --allowedTools would refuse every run alike: one paid
-        run says so, the rest are never started."""
-        code, records, err = self.spend_batch("denied", "denied")
-        self.assertEqual(code, runner.EXIT_HARNESS)
-        self.assertEqual(len(records), 1, "the batch went on after a permission denial")
-        self.assertEqual(records[0]["permission_denials"], 1)
-        self.assertIn("--allowedTools", err)
-        self.assertIn("1 run(s) not started", err)
-
-    def test_a_cut_off_batch_runs_to_the_end(self):
-        code, records, _ = self.spend_batch("max_turns", "turns")
-        self.assertEqual(code, runner.EXIT_FAILED)
-        self.assertEqual([r["status"] for r in records], ["max_turns", "max_turns"])
-
-    def test_spend_without_a_key_exits_2(self):
-        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-        proc = subprocess.run(
-            [sys.executable, os.path.join(BENCH, "run.py"), "--spend", "--tasks", "T1",
-             "--arms", "taria", "--results", os.path.join(self.tmp, "nokey.jsonl")],
-            capture_output=True, text=True, env=env, timeout=60,
-        )
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("ANTHROPIC_API_KEY", proc.stderr)
-        self.assertFalse(os.path.exists(self.log), "claude was started without a key")
-
-
-def _running(pid):
-    """Whether `pid` is a live process (a zombie is not)."""
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
+    def act_as_agent(self, batch, job):
+        """Start the agent file's server by hand, drive the job with the
+        scripted solver, and write the transcript it would have left."""
+        slot = runner.read_slot(runner.Paths(self.results), job["slot"])
+        arm, task = slot["arm"], slot["task"]
+        self.assertTrue(DemoRun.from_slot(slot["demo"]).demo_alive(), "the demo died with `next`")
+        client = McpStdio(self.launcher(job["agent"]), cwd=self.tmp, name=job["agent"])
         try:
-            with open(f"/proc/{pid}/stat") as f:
-                state = f.read().rsplit(")", 1)[1].split()[0]
-        except OSError:
-            return False
-        if state == "Z":
-            return False
-        time.sleep(0.05)
-    return True
+            client.initialize()
+            self.assertEqual(sorted(client.tools_list()), sorted(harness.ARM_TOOLS[arm]))
+            harness.wait_ready(arm, client)
+            session = solvers.CountingSession(client)
+            solvers.solve(task, arm, session)
+        finally:
+            client.close()
+        agent_id = f"rehearsal{job['job']}"
+        return agent_id, write_transcript(self.tmp, agent_id, job["prompt"], arm, dict(session.calls),
+                                          job["agent"])
+
+    def test_two_jobs_through_one_slot(self):
+        out = run_py("agents", "--slots", "1", "--dir", self.agents_dir, *self.common)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        out = run_py("plan", "--batch", "reh", "--tasks", "T6", "--arms", "taria,tmux", "--seed", "4",
+                     *self.common)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("2 jobs", out.stdout)
+
+        seen_arms, demos = [], []
+        code, job, err = self.next("reh", 1)
+        for _ in range(2):
+            self.assertEqual(code, 0, err)
+            self.assertEqual(set(job), {"job", "slot", "agent", "model", "prompt"})
+            self.assertEqual((job["slot"], job["model"]), (1, "sonnet"))
+            self.assertEqual(job["prompt"], tasks.TASKS["T6"].prompt)
+            arm = job["agent"].split("-")[1]
+            seen_arms.append(arm)
+            slot = runner.read_slot(runner.Paths(self.results), 1)
+            demos.append(slot["demo"])
+            # The other arm's agent file gets no tools for this slot.
+            other = "tmux" if arm == "taria" else "taria"
+            wrong = subprocess.run([*[self.launcher(f"tui-{other}-1")["command"]],
+                                    *self.launcher(f"tui-{other}-1")["args"]],
+                                   capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            self.assertEqual(wrong.returncode, 1)
+            self.assertIn("wrong one for the slot", wrong.stderr)
+            # A second `next` without an agent id is slot misuse.
+            code, refused, _ = self.next("reh", 1)
+            self.assertEqual(code, runner.EXIT_HARNESS)
+            self.assertIn(job["job"], refused["error"])
+            status = run_py("status", "--batch", "reh", *self.common)
+            self.assertIn(f"slot 1: {job['job']} (T6/{arm}/sonnet run 0), ready", status.stdout)
+
+            agent_id, path = self.act_as_agent("reh", job)
+            code, job, err = self.next("reh", 1, "--agent-id", agent_id, "--transcript-file", path)
+            self.assertIn("passed", err)
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(job, {"done": True})
+        self.assertEqual(sorted(seen_arms), ["taria", "tmux"])
+        rows = read_rows(self.results, "reh")
+        self.assertEqual([r["status"] for r in rows], ["passed", "passed"], [r["error"] or r["reason"] for r in rows])
+        for row in rows:
+            self.assertEqual(list(row), list(runner.ROW_KEYS))
+            self.assertEqual((row["mode"], row["solver"], row["demo_exit"]), ("subagent", "agent", "clean"))
+            self.assertEqual((row["model_resolved"], row["efforts_resolved"], row["guard_problems"]),
+                             ("claude-sonnet-5-5", ["medium"], []))
+            self.assertEqual(row["claude_version"], "2.1.294")
+            self.assertGreater(row["tool_calls_total"], 0)
+            self.assertTrue(row["agent_id"].startswith("rehearsalj00"))
+        status = run_py("status", "--batch", "reh", *self.common)
+        self.assertIn("2 recorded (passed 2, failed 0, max_turns 0, harness_error 0); 0 held; 0 pending",
+                      status.stdout)
+        for demo in demos:
+            self.assertFalse(os.path.exists(demo["tmpdir"]))
+            self.assertTrue(wait_gone(demo["demo_pid"]))
+            self.assertFalse(_running(demo["server_pid"]))
+
+    def test_a_harness_error_claims_nothing_and_abort_frees_a_slot(self):
+        run_py("agents", "--slots", "2", "--dir", self.agents_dir, *self.common)
+        out = run_py("plan", "--batch", "err", "--tasks", "T1,T2", "--arms", "taria", "--seed", "1",
+                     *self.common)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        code, job, err = self.next("err", 1)
+        self.assertEqual(code, 0, err)
+        demo = runner.read_slot(runner.Paths(self.results), 1)["demo"]
+        # No transcript for this id anywhere: a harness error, and the slot claims nothing.
+        empty = os.path.join(self.tmp, "agent-nobody.jsonl")
+        code, refused, err = self.next("err", 1, "--agent-id", "nobody", "--transcript-file", empty)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("harness error", refused["error"])
+        self.assertIsNone(runner.read_slot(runner.Paths(self.results), 1))
+        self.assertTrue(wait_gone(demo["demo_pid"]))
+        (row,) = read_rows(self.results, "err")
+        self.assertEqual((row["status"], row["job"]), ("harness_error", job["job"]))
+        # Resuming claims the other job; abort records it and tears it down.
+        code, job2, err = self.next("err", 2)
+        self.assertEqual(code, 0, err)
+        self.assertNotEqual(job2["job"], job["job"])
+        demo = runner.read_slot(runner.Paths(self.results), 2)["demo"]
+        out = run_py("abort", "--batch", "err", "--slot", "2", "--reason", "rehearsal", *self.common)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(wait_gone(demo["demo_pid"]))
+        rows = read_rows(self.results, "err")
+        self.assertEqual(rows[-1]["error"], "aborted: rehearsal")
+        self.assertEqual(rows[-1]["state"]["tasks"], [dict(t) for t in tasks.SEED_TASKS])
+        code, done, _ = self.next("err", 1)
+        self.assertEqual((code, done), (0, {"done": True}))
+
+    def test_next_refuses_agent_files_that_do_not_match_the_plan(self):
+        run_py("agents", "--slots", "1", "--dir", self.agents_dir, "--effort", "high", *self.common)
+        run_py("plan", "--batch", "mismatch", "--tasks", "T1", "--arms", "taria", *self.common)
+        code, refused, _ = self.next("mismatch", 1)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("effort is 'high', the plan needs 'medium'", refused["error"])
+        self.assertEqual(runner.read_all_slots(runner.Paths(self.results)), {})
+
+
+# --- Summary statistics (the rest of summarize.py is tested in test_transcript.py) ---------------
 
 
 class Summary(unittest.TestCase):
-    def rec(self, status, passed=None, **extra):
-        base = {"task": "T1", "arm": "taria", "mode": "spend", "solver": "agent",
-                "model": "m", "effort": "medium", "batch": "b1", "ts": "2026-10-10T00:00:00+00:00",
-                "status": status, "passed": passed, "tool_calls_total": 3, "wall_ms": 1000,
-                "turns": 2, "cost_usd": 0.1, "tokens_in": 1000, "tokens_out": 50,
-                "result_subtype": "success"}
-        return {**base, **extra}
-
     def test_wilson_interval(self):
         low, high = summarize.wilson(1, 1)
         self.assertAlmostEqual(low, 0.2065, places=3)
@@ -755,125 +1025,6 @@ class Summary(unittest.TestCase):
         self.assertAlmostEqual(summarize.fisher_exact(0, 0, 0, 0), 1.0)
         # Symmetric in the arms.
         self.assertAlmostEqual(summarize.fisher_exact(7, 3, 2, 8), summarize.fisher_exact(2, 8, 7, 3))
-
-    @staticmethod
-    def columns(out, prefix="| T1 |"):
-        line = next(l for l in out.splitlines() if l.startswith(prefix))
-        return dict(zip(summarize.COLUMNS, (c.strip() for c in line.strip("|").split("|"))))
-
-    def test_outcomes_counted_and_every_cut_off_fails(self):
-        records = [
-            self.rec("passed", True, check_passed=True, demo_alive=True),
-            self.rec("failed", False, check_passed=False, demo_alive=True),
-            self.rec("timeout", False, check_passed=False, demo_alive=True, cost_usd=None,
-                     result_subtype=None, tokens_in=None, tokens_out=None, turns=None),
-            self.rec("budget", False, check_passed=True, demo_alive=True, cost_usd=1.0,
-                     result_subtype="error_max_budget_usd"),
-            self.rec("max_turns", False, check_passed=True, demo_alive=False,
-                     result_subtype="error_max_turns"),
-            self.rec("harness_error", None, cost_usd=0.2, result_subtype="success"),
-        ]
-        out = summarize.table(records)
-        col = self.columns(out)
-        self.assertEqual(col["runs"], "6")
-        self.assertEqual(col["passed"], "1/5")  # every cut-off run is a graded failure
-        self.assertEqual(
-            (col["failed"], col["timeout"], col["budget"], col["max turns"], col["harness err"]),
-            ("1", "1", "1", "1", "1"),
-        )
-        # The budget run had the right state; the max-turns run's demo had died.
-        self.assertEqual(col["cut off"], "3 (1 with correct state)")
-        self.assertTrue(col["pass rate (95% CI)"].startswith("20%"))
-        self.assertEqual(col["cost $ (sum)"], "1.30*")
-        self.assertEqual(col["$ per pass"], "1.300*")
-        self.assertEqual(col["result subtypes"],
-                         "error_max_budget_usd 1, error_max_turns 1, none 1, success 3")
-        self.assertIn("cost unknown for 1 graded run(s)", out)
-        self.assertIn("tokens unknown for 1 graded run(s)", out)
-        self.assertIn("turns unknown for 1 graded run(s), 1 of them timeouts", out)
-        self.assertIn("Harness-error runs cost $0.20", out)
-        self.assertIn("fails whatever its dump says", out)
-
-    def test_cost_per_pass_with_no_passes(self):
-        col = self.columns(summarize.table([self.rec("failed", False)] * 2))
-        self.assertEqual((col["cost $ (sum)"], col["$ per pass"]), ("0.20", "n/a (0 passes)"))
-        col = self.columns(summarize.table([self.rec("failed", False, cost_usd=None)]))
-        self.assertEqual(col["$ per pass"], "-")
-
-    def test_an_unpriced_harness_error_is_said(self):
-        out = summarize.table([self.rec("harness_error", None, cost_usd=None, guard_failed=True)])
-        self.assertIn("1 harness-error agent run(s) ended before a result event", out)
-
-    def test_rows_split_by_model_and_effort_and_arms_are_compared(self):
-        records = [self.rec("passed", True)] * 6 + [self.rec("failed", False, arm="tmux")] * 6
-        records += [self.rec("passed", True, effort="high")]
-        out = summarize.table(records)
-        self.assertEqual(sum(1 for l in out.splitlines() if l.startswith("| T1 | taria |")), 2)
-        self.assertIn("| T1 | m | medium | - | 6/6 | 0/6 | 0.002 |", out)
-        self.assertIn("n < 5 graded runs in T1/taria [m, high]", out)  # n=1 there
-
-    def test_rows_and_comparisons_split_by_limits(self):
-        lim = {"timeout_s": 600.0, "budget_usd": 1.0, "max_turns": None}
-        tight = {**lim, "max_turns": 10}
-        records = [self.rec("passed", True, **lim)] * 5 + [self.rec("failed", False, arm="tmux", **lim)] * 5
-        records += [self.rec("failed", False, **tight)] * 5 + [self.rec("passed", True, arm="tmux", **tight)] * 5
-        records += [self.rec("passed", True, **{**lim, "budget_usd": 2.0})]
-        records += [self.rec("passed", True, **{**lim, "timeout_s": 300.0})]
-        out = summarize.table(records)
-        taria = [l for l in out.splitlines() if l.startswith("| T1 | taria |")]
-        self.assertEqual(len(taria), 4, out)
-        self.assertEqual(sorted(self.columns(l, "|")["limits"] for l in taria),
-                         ["300s, $1, no turn cap", "600s, $1, 10 turns", "600s, $1, no turn cap",
-                          "600s, $2, no turn cap"])
-        self.assertIn("| T1 | m | medium | 600s, $1, no turn cap | 5/5 | 0/5 | 0.008 |", out)
-        self.assertIn("| T1 | m | medium | 600s, $1, 10 turns | 0/5 | 5/5 | 0.008 |", out)
-        self.assertIn("T1/taria [m, medium, 600s, $2, no turn cap]", out)  # n < 5
-
-    def test_provenance_names_the_limits(self):
-        records = [
-            self.rec("passed", True, timeout_s=600.0, budget_usd=1.0, max_turns=None),
-            self.rec("passed", True, batch="b2", timeout_s=300.0, budget_usd=0.5, max_turns=20),
-            self.rec("passed", True, batch="old"),  # from before limits were recorded
-        ]
-        lines = summarize.provenance(records)
-        row = lambda b: next(l for l in lines if l.startswith(f"| {b} |"))  # noqa: E731
-        self.assertIn("| 600 | 1 | none |", row("b1"))
-        self.assertIn("| 300 | 0.5 | 20 |", row("b2"))
-        self.assertIn("| unrecorded | unrecorded | unrecorded |", row("old"))
-        self.assertTrue(any("predate recorded limits" in l for l in lines))
-        self.assertIn("timeout s | budget $ | max turns", lines[0])
-
-    def test_dry_runs_stay_out_of_the_headline(self):
-        dry = {"task": "T1", "arm": "taria", "mode": "dry-run", "solver": "scripted",
-               "status": "passed", "passed": True, "tool_calls_total": 2, "wall_ms": 80, "batch": "b",
-               "timeout_s": None, "budget_usd": None, "max_turns": None}
-        out = summarize.render([dry])
-        headline, _, rest = out.partition("## Dry runs")
-        self.assertIn("No agent runs", headline)
-        self.assertIn("| T1 | taria | - | - | - | 1 | 1/1 | 0 | 0 | 0 | 0 | 0 | 0 |", rest)
-        self.assertNotIn("cost unknown", rest)
-        self.assertNotIn("turns unknown", rest)
-
-    def test_records_are_selected_explicitly(self):
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp)
-        old, new = os.path.join(tmp, "a.jsonl"), os.path.join(tmp, "b.jsonl")
-        with open(old, "w") as f:
-            f.write(json.dumps(self.rec("passed", True, batch="old", ts="2026-01-01T00:00:00+00:00")) + "\n")
-        with open(new, "w") as f:
-            f.write(json.dumps(self.rec("failed", False, batch="new", ts="2026-02-01T00:00:00+00:00")) + "\n")
-        original = summarize.RESULTS_DIR
-        summarize.RESULTS_DIR = tmp
-        self.addCleanup(setattr, summarize, "RESULTS_DIR", original)
-        pick = lambda *argv: summarize.select(summarize.parse_args(list(argv)))  # noqa: E731
-        records, note = pick()
-        self.assertEqual([r["batch"] for r in records], ["new"])
-        self.assertIn("1 other batch(es) left out", note)
-        self.assertEqual([r["batch"] for r in pick("--batch", "old")[0]], ["old"])
-        self.assertEqual(sorted(r["batch"] for r in pick("--all")[0]), ["new", "old"])
-        self.assertEqual([r["batch"] for r in pick(old)[0]], ["old"])
-        with self.assertRaises(SystemExit):
-            pick("--batch", "missing")
 
 
 if __name__ == "__main__":
