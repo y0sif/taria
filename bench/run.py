@@ -64,7 +64,9 @@ Every run ends in exactly one status:
                  (check_passed is recorded)
   harness_error  infrastructure, not the agent: a failed setup, a server or
                  solver failure, an unreadable transcript, the transcript
-                 guard refusing how the agent was set up, or a run that did
+                 guard refusing how the agent was set up or context that
+                 reached it (an attachment it has no rule for, say), or a
+                 run that did
                  not end on its own (Claude Code's own error message last, an
                  explicit stop other than end_turn, or a tool call under
                  max_turns). A final text reply whose closing line Claude

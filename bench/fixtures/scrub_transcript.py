@@ -6,15 +6,18 @@
 
 Kept as Claude Code wrote it: every user and assistant line, message ids,
 models, usage, stop_reasons, effort, tool_use / tool_result structure and
-timestamps, and the attachments bench/transcript.py reads (prompt_snapshot,
-mcp_instructions_delta, deferred_tools_delta, deferred_tools_record,
-instructions, environment, skill_listing, max_turns_reached), plus
-session_context and credential_org with their content replaced. Every other
-attachment type (date, model, total_tokens_reminder, ...) is dropped.
+timestamps, and every attachment whose type bench/transcript.py has a rule
+for (KNOWN_ATTACHMENTS: verified, harmless or flagged), session_context and
+credential_org with their content replaced. An attachment of any other type,
+or one with no type, is refused (exit 1, nothing written): give the type its
+rule in bench/transcript.py first, so no fixture holds context the guard
+has never judged, and none silently loses it either.
 
 Replaced:
   - session_context: every context value, and its rendered text;
   - credential_org: organizationUuid (zeroes);
+  - remote_session_change and anywhere else: a claude.ai session URL's
+    session id (https://claude.ai/code/session_FIXTURE);
   - mcp_instructions_delta: each addedBlocks entry by a placeholder naming its
     server (addedNames are kept), and its rendered text;
   - environment: workingDirectory and scratchpadDirectory (the latter in
@@ -46,17 +49,17 @@ import os
 import re
 import sys
 
-KEEP = {
-    "prompt_snapshot", "mcp_instructions_delta", "deferred_tools_delta", "deferred_tools_record",
-    "instructions", "environment", "skill_listing", "max_turns_reached",
-    "session_context", "credential_org",
-}
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from transcript import KNOWN_ATTACHMENTS  # noqa: E402  (bench/transcript.py)
+
 FAKE_ORG = "00000000-0000-0000-0000-000000000000"
 FAKE_CWD = "/home/user/project"
 FAKE_SCRATCH = "/tmp/scratchpad"
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 HOME = re.compile(r"/home/([^/\s\"']+)")
 SAFE_EMAIL = "user@example.com"
+SESSION_URL = re.compile(r"(https://claude\.ai/code/session_)([0-9A-Za-z]+)")
+FAKE_SESSION_URL = "https://claude.ai/code/session_FIXTURE"
 META_KEYS = ("agentType", "description", "model")
 
 
@@ -107,6 +110,7 @@ class Scrubber:
             value = value.replace(old, new)
         value = HOME.sub("/home/user", value)
         value = EMAIL.sub(SAFE_EMAIL, value)
+        value = SESSION_URL.sub(FAKE_SESSION_URL, value)
         for word in self.users + self.words:
             value = re.sub(re.escape(word), "user", value, flags=re.IGNORECASE)
         return value
@@ -123,6 +127,7 @@ class Scrubber:
     def leaks(self, text):
         found = [s for s in self.secrets if s.lower() in text.lower()]
         found += [m for m in EMAIL.findall(text) if m != SAFE_EMAIL]
+        found += [m.group(0) for m in SESSION_URL.finditer(text) if m.group(0) != FAKE_SESSION_URL]
         return found
 
 
@@ -159,11 +164,18 @@ def scrub(src, dst, agent_id, session_id, servers=None, note=None, redact=()):
         lines = [json.loads(raw) for raw in f if raw.strip()]
     scrubber = Scrubber(lines, src, agent_id, session_id, redact)
     out = []
+    unknown = sorted({
+        repr(att.get("type")) if isinstance(att, dict) else "(not an object)"
+        for line in lines if line.get("type") == "attachment"
+        for att in [line.get("attachment")]
+        if not isinstance(att, dict) or att.get("type") not in KNOWN_ATTACHMENTS
+    })
+    if unknown:
+        raise ValueError(f"attachment type(s) bench/transcript.py has no rule for: {', '.join(unknown)}; "
+                         "give each its rule there first")
     for line in lines:
         att = line.get("attachment")
-        if line.get("type") == "attachment" and isinstance(att, dict):
-            if att.get("type") not in KEEP:
-                continue
+        if line.get("type") == "attachment":
             scrub_attachment(line, att, servers, note)
         for key, value in (("cwd", FAKE_CWD), ("gitBranch", "fixture"), ("slug", "fixture-slug"),
                            ("sessionId", session_id), ("agentId", agent_id)):

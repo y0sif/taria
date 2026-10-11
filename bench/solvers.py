@@ -147,18 +147,28 @@ class TariaSolver:
 
 # --- outline: the same tree, one line per node ------------------------------------------
 #
-# The grammar is taria-mcp's --tree-format outline (docs/cli.md, The outline):
-# a header line of top-level `key=<compact json>` fields, then one node per
-# line, indented two spaces per level,
+# The grammar is taria-mcp's --tree-format outline (docs/cli.md, The outline;
+# crates/taria-mcp/src/tree_format.rs): a header line of top-level
+# `key=<compact json>` fields, then one node per line, indented two spaces
+# per level,
 #
-#   <id> <role>[ "<label>"][ = "<value>"][ [<action> ...]][ *focused][ <key>=<json> ...]
+#   <id> <role>[ "<label>"][ = "<value>"][ *focused][ <key>=<json> ...][ act: <action>|<action>...]
 #
-# where an id, role, action or key is bare when made only of
-# [A-Za-z0-9_.:/@+-] and JSON-quoted otherwise, and label and value are
-# always JSON-quoted. This parser reads that back into the JSON tree's shape,
-# so the outline solver runs the taria solver's steps on what it parsed.
+# for example `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`.
+# An id, role, action or key is bare when made only of [A-Za-z0-9_.:/@+-] and
+# not the marker `act:` itself, and JSON-quoted otherwise; label and value are
+# always JSON-quoted. The actions end the line, after the bare marker `act: `,
+# joined by `|`, absent when a node has none; a value no parse reads as an
+# action comes as compact JSON. This parser reads that back into the JSON
+# tree's shape, so the outline solver runs the taria solver's steps on what
+# it parsed.
+#
+# It also reads the outline of batches before that (outline1, probe3), whose
+# actions came as ` [<action> <action> ...]` right after the value: no token
+# of the current grammar starts with `[`, so the two cannot be confused.
 
 BARE_RE = re.compile(r"[A-Za-z0-9_.:/@+-]+")
+ACT_MARKER = "act:"
 _DECODER = json.JSONDecoder()
 
 
@@ -195,6 +205,28 @@ def _field(line, pos):
     return key, value, end
 
 
+def _action_list(line, pos):
+    """The actions after the `act: ` marker, from `pos` to the end of the
+    line: names joined by `|`, each bare, JSON-quoted, or (a value no parse
+    reads as an action) compact JSON."""
+    actions = []
+    while True:
+        if line.startswith(("{", "["), pos):
+            try:
+                action, pos = _DECODER.raw_decode(line, pos)
+            except ValueError as err:
+                raise SolverError(f"bad action at column {pos} of outline line {line!r}: {err}")
+        else:
+            action, pos = _name(line, pos, "action")
+        actions.append(action)
+        if pos == len(line):
+            return actions
+        if not line.startswith("|", pos):
+            raise SolverError(f"expected '|' or the line's end at column {pos} of outline line {line!r}: "
+                              "the actions end the line")
+        pos += 1
+
+
 def _node_line(line):
     """One node line, indent stripped, as the JSON tree's node dict (no children)."""
     node, pos = {}, 0
@@ -227,14 +259,19 @@ def _node_line(line):
                                   "neither the label (right after the role) nor a field key")
         elif line.startswith('= "', pos):
             node["value"], pos = _quoted(line, pos + 2, "value")
-        elif line.startswith("[", pos):
-            actions, pos = [], pos + 1
-            while not line.startswith("]", pos):
-                action, pos = _name(line, pos, "action")
-                actions.append(action)
-                if line.startswith(" ", pos):
-                    pos += 1
-            node["actions"], pos = actions, pos + 1
+        elif line.startswith(ACT_MARKER + " ", pos) or line.startswith("[", pos):
+            if "actions" in node:
+                raise SolverError(f"a second action list at column {pos} of outline line {line!r}")
+            if line.startswith("[", pos):  # the outline before act: (see above)
+                actions, pos = [], pos + 1
+                while not line.startswith("]", pos):
+                    action, pos = _name(line, pos, "action")
+                    actions.append(action)
+                    if line.startswith(" ", pos):
+                        pos += 1
+                node["actions"], pos = actions, pos + 1
+            else:
+                node["actions"], pos = _action_list(line, pos + len(ACT_MARKER) + 1), len(line)
         elif line.startswith("*focused", pos) and line[pos + 8:pos + 9] in ("", " "):
             node["focused"], pos = True, pos + 8
         else:

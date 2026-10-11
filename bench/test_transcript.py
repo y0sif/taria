@@ -27,6 +27,12 @@ Two kinds of fixture in bench/fixtures/transcripts/:
                        then a tool call) Claude Code never closed: stop_reason
                        null and output_tokens 2 on both its lines. Its final
                        reply was closed (end_turn).
+    real_outline_remote  an outline run (sonnet, T2, job j022 of batch
+                       outline1) as recorded, from a session with
+                       /remote-control on: a remote_session_change attachment
+                       beside its first tool result, which the guard refuses.
+  Every attachment the run had is kept (the scrubber refuses a type
+  bench/transcript.py has no rule for), session context and ids replaced.
   The guard and ending tests use these, and variants made from them in the
   test (a line dropped, a field changed) to stand for runs not yet seen.
 - the others are synthetic and test parsing edge cases: streamed usage
@@ -39,9 +45,12 @@ writes them.
 
 import contextlib
 import copy
+import importlib.util
+import inspect
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -60,6 +69,10 @@ RUNS = os.path.join(BENCH, "fixtures", "summary_runs.jsonl")
 TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED = "real_taria_clean.jsonl", "real_tmux_clean.jsonl", "real_taria_leaked.jsonl"
 TARIA_UNCLOSED = "real_taria_unclosed.jsonl"
 TARIA_MIDUNCLOSED = "real_taria_midunclosed.jsonl"
+OUTLINE_REMOTE = "real_outline_remote.jsonl"
+REAL = (TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED, TARIA_UNCLOSED, TARIA_MIDUNCLOSED, OUTLINE_REMOTE)
+CLAUDE_CODE_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+AGENT_SDK_PREFIX = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 CONTRACT = {
     "agent_id": (str,), "session_id": (str,), "models": (list,), "turns": (int,),
     "tool_calls": (dict,), "tool_calls_total": (int,), "toolsearch_calls": (int,),
@@ -75,7 +88,8 @@ CONTEXT = {
     "claude_md_files": (list,), "deferred_tools": (list,), "mcp_instruction_servers": (list,),
     "deferred_tools_added": (list,), "mcp_instruction_servers_added": (list,),
     "environment_cwd": (str, type(None)), "skill_listing": (bool,), "attachment_types": (list,),
-    "tree_formats": (list,),
+    "tree_formats": (list,), "cli_prefixes": (list,), "refused_attachments": (list,),
+    "unknown_line_types": (dict,), "prompts": (int,),
 }
 TUI = {arm: sorted("mcp__tui__" + t for t in tools) for arm, tools in ARM_TOOLS.items()}
 
@@ -120,10 +134,17 @@ def cut_after_message(lines, n):
     return lines[:end]
 
 
+def last_assistant(lines):
+    """The last assistant line: a template for one more (attachment lines,
+    such as total_tokens_reminder, sit between messages in real runs)."""
+    return next(l for l in reversed(lines) if l.get("type") == "assistant")
+
+
 def synthetic_line(template, text, error):
     """A trailing Claude Code error message, in the shape real transcripts
     hold (model <synthetic>, stop_sequence, isApiErrorMessage, error)."""
     line = copy.deepcopy(template)
+    line["type"] = "assistant"
     line.pop("apiBlockIndex", None)
     line.pop("requestId", None)
     line.update(isApiErrorMessage=True, error=error, timestamp="2026-10-11T05:30:00.000Z")
@@ -197,8 +218,11 @@ class ReadTranscript(Variant, unittest.TestCase):
         self.assertEqual(ctx["mcp_instruction_servers"], ["tui"])
         self.assertEqual(ctx["environment_cwd"], "/home/user/project")
         self.assertIs(ctx["skill_listing"], False)
-        self.assertEqual(ctx["attachment_types"], ["credential_org", "environment", "mcp_instructions_delta",
-                                                   "prompt_snapshot", "session_context"])
+        self.assertEqual(ctx["attachment_types"], ["credential_org", "date", "environment", "mcp_instructions_delta",
+                                                   "model", "prompt_snapshot", "session_context",
+                                                   "total_tokens_reminder"])
+        self.assertEqual(ctx["cli_prefixes"], [CLAUDE_CODE_PREFIX])
+        self.assertEqual((ctx["refused_attachments"], ctx["unknown_line_types"], ctx["prompts"]), ([], {}, 1))
         self.assertEqual(stats["efforts"], ["medium"])
         self.assertEqual(stats["claude_versions"], ["2.1.294"])
 
@@ -276,7 +300,7 @@ class ReadTranscript(Variant, unittest.TestCase):
 
     def test_a_trailing_synthetic_message_is_recorded(self):
         lines = cut_after_message(lines_of(TARIA_CLEAN), 3)
-        lines.append(synthetic_line(lines[-2], "You've hit your session limit", "rate_limit"))
+        lines.append(synthetic_line(last_assistant(lines), "You've hit your session limit", "rate_limit"))
         stats = self.variant(lines)
         self.assertEqual((stats["last_model"], stats["last_stop_reason"]), ("<synthetic>", "stop_sequence"))
         self.assertIs(stats["ended_synthetic"], True)
@@ -288,7 +312,7 @@ class ReadTranscript(Variant, unittest.TestCase):
     def test_a_synthetic_message_the_run_recovered_from_is_not_its_end(self):
         lines = lines_of(TARIA_CLEAN)
         cut = len(cut_after_message(lines, 2))
-        lines.insert(cut, synthetic_line(lines[cut - 2], "Request timed out", "server_error"))
+        lines.insert(cut, synthetic_line(last_assistant(lines[:cut]), "Request timed out", "server_error"))
         stats = self.variant(lines)
         self.assertEqual((stats["synthetic_messages"], stats["ended_synthetic"]), (1, False))
         self.assertEqual(stats["last_stop_reason"], "end_turn")
@@ -329,6 +353,19 @@ class ReadTranscript(Variant, unittest.TestCase):
         self.assertEqual(stats["final_text"], "All set.")
         self.assertEqual(stats["context"]["deferred_tools"], TUI["taria"])
         self.assertNotIn("progress", stats["context"]["attachment_types"])
+        # Skipped in the numbers, but recorded, and the guard refuses each:
+        # the progress line, the attachment with no type, a second prompt.
+        ctx = stats["context"]
+        self.assertEqual(ctx["unknown_line_types"], {"progress": 1})
+        self.assertEqual(ctx["refused_attachments"], [
+            {"type": "<no type>", "rule": "unknown", "detail": None, "count": 1, "rendered_chars": 0}])
+        self.assertEqual(ctx["prompts"], 2)
+        problems = transcript.guard(stats, "taria", "sonnet", ARM_TOOLS["taria"])
+        self.assertEqual(problems[-3:], [
+            "was given an attachment the guard does not know: <no type> (1x, 0 chars rendered)",
+            "has 1 transcript line(s) of type progress, which the guard does not know",
+            "was given 2 prompts: the task, then 1 more from outside the run (a message sent to the agent, a hook)",
+        ])
 
     def test_an_agent_that_never_ran(self):
         stats = read("never_ran.jsonl")
@@ -614,6 +651,265 @@ class Guard(Variant, unittest.TestCase):
         ])
 
 
+class AttachmentRules(Variant, unittest.TestCase):
+    """Every attachment type has one rule: verified, harmless (in the shape
+    it is known in) or flagged; anything else is refused. So is a line type
+    with no rule, and a second prompt."""
+
+    def guard(self, stats, arm="taria", family="sonnet"):
+        return transcript.guard(stats, arm, family, ARM_TOOLS[arm], effort="medium",
+                                tree_format=ARM_TREE_FORMAT.get(arm))
+
+    def remote_line(self):
+        """The remote_session_change line of a real outline1 run, as recorded
+        (session URL and e-mail scrubbed)."""
+        return copy.deepcopy(next(l for l in lines_of(OUTLINE_REMOTE) if is_att(l, "remote_session_change")))
+
+    @staticmethod
+    def rendered(line):
+        return sum(len(r["content"]) for r in line.get("rendered", []))
+
+    def with_line(self, line, name=TARIA_CLEAN):
+        """`name` with `line` beside its first tool result, where Claude Code
+        put the remote-control note."""
+        lines = lines_of(name)
+        at = next(i for i, l in enumerate(lines) if l["type"] == "user" and isinstance(l["message"]["content"], list))
+        return self.variant(lines[: at + 1] + [line] + lines[at + 1:])
+
+    def attachment(self, body, rendered=None, name=TARIA_CLEAN):
+        line = copy.deepcopy(next(l for l in lines_of(name) if is_att(l, "environment")))
+        line["attachment"] = body
+        if rendered is None:
+            line.pop("rendered", None)
+        else:
+            line["rendered"] = [{"content": text} for text in rendered]
+        return line
+
+    def test_the_buckets_do_not_overlap_and_cover_every_type_read(self):
+        verified, harmless = transcript.ATTACHMENTS_VERIFIED, transcript.ATTACHMENTS_HARMLESS
+        flagged = set(transcript.ATTACHMENTS_FLAGGED)
+        self.assertFalse(verified & harmless or verified & flagged or harmless & flagged)
+        self.assertEqual(transcript.KNOWN_ATTACHMENTS, verified | harmless | flagged)
+        # Every type the reader looks at has a rule: `kind == "..."` in
+        # _context, `att.get("type") == "..."` in read_transcript.
+        read = set(re.findall(r'kind == "([a-z_]+)"', inspect.getsource(transcript._context)))
+        read |= set(re.findall(r'att\.get\("type"\) == "([a-z_]+)"', inspect.getsource(transcript.read_transcript)))
+        self.assertGreaterEqual(len(read), 8, read)
+        self.assertLessEqual(read, transcript.KNOWN_ATTACHMENTS)
+        self.assertEqual(set(re.findall(r'kind == "([a-z_]+)"', inspect.getsource(transcript._harmless_shape))),
+                         harmless, "every harmless type has its shape check")
+        for kind, (what, remedy) in transcript.ATTACHMENTS_FLAGGED.items():
+            self.assertTrue(what and remedy, kind)
+
+    def test_real_fixtures_carry_only_known_types(self):
+        seen = set()
+        for name in REAL:
+            with self.subTest(fixture=name):
+                lines = lines_of(name)
+                self.assertLessEqual({l["type"] for l in lines}, transcript.LINE_TYPES)
+                kinds = {l["attachment"]["type"] for l in lines if l["type"] == "attachment"}
+                self.assertLessEqual(kinds, transcript.KNOWN_ATTACHMENTS)
+                seen |= kinds
+                ctx = read(name)["context"]
+                self.assertEqual((ctx["unknown_line_types"], ctx["prompts"]), ({}, 1))
+                refused = [] if name != OUTLINE_REMOTE else ["remote_session_change"]
+                self.assertEqual([r["type"] for r in ctx["refused_attachments"]], refused)
+        # What real runs carry, every type of it: none was dropped making them.
+        self.assertLessEqual(transcript.ATTACHMENTS_HARMLESS, seen)
+        self.assertLessEqual({"prompt_snapshot", "mcp_instructions_delta", "remote_session_change"}, seen)
+
+    def test_a_real_remote_session_change_is_refused_by_name(self):
+        line = self.remote_line()
+        self.assertTrue(line["renderedBesideToolResult"])
+        self.assertEqual(line["renderedRole"], "user")
+        expected = (f"was given Claude Code's remote-control attribution note (remote_session_change, 1x, "
+                    f"{self.rendered(line)} chars rendered): turn /remote-control off in the orchestrating session")
+        self.assertGreater(self.rendered(line), 600)
+        stats = read(OUTLINE_REMOTE)
+        self.assertEqual(self.guard(stats, "outline"), [expected], "the real outline1 run")
+        # Added to a clean run of another arm: exactly its problem, nothing else.
+        stats = self.with_line(line)
+        self.assertEqual(self.guard(stats), [expected])
+        self.assertEqual(stats["context"]["refused_attachments"], [
+            {"type": "remote_session_change", "rule": "flagged", "detail": None, "count": 1,
+             "rendered_chars": self.rendered(line)}])
+        # And it says how many came.
+        lines = lines_of(TARIA_CLEAN)
+        twice = self.variant(lines[:4] + [line, self.remote_line()] + lines[4:])
+        self.assertIn(f"(remote_session_change, 2x, {2 * self.rendered(line)} chars rendered)", self.guard(twice)[0])
+
+    def test_a_type_with_no_rule_is_refused(self):
+        line = self.attachment({"type": "brand_new_reminder", "text": "Be quick."},
+                               rendered=["<system-reminder>\nBe quick.\n</system-reminder>"])
+        size = self.rendered(line)
+        self.assertEqual(self.guard(self.with_line(line)),
+                         [f"was given an attachment the guard does not know: brand_new_reminder (1x, {size} chars "
+                          "rendered)"])
+        self.assertEqual(self.guard(self.with_line(self.attachment({"type": "brand_new_reminder"}))),
+                         ["was given an attachment the guard does not know: brand_new_reminder (1x, 0 chars rendered)"])
+
+    def test_an_attachment_with_no_type_or_no_object_is_refused(self):
+        cases = {
+            "<no type>": self.attachment({"text": "x"}, rendered=["x"]),
+            "<type 3>": self.attachment({"type": 3}),
+            "<not an object>": self.attachment("a string", rendered=["abc"]),
+        }
+        missing = self.attachment({})
+        del missing["attachment"]
+        cases["<not an object> "] = missing
+        for label, line in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(self.guard(self.with_line(line)),
+                                 [f"was given an attachment the guard does not know: {label.strip()} "
+                                  f"(1x, {self.rendered(line)} chars rendered)"])
+
+    def test_a_skill_listing_is_refused_by_name(self):
+        line = self.attachment({"type": "skill_listing", "content": "- example: an example skill", "skillCount": 1,
+                                "isInitial": True, "names": ["example"]},
+                               rendered=["<system-reminder>\nThe following skills are available:\n- example\n"
+                                         "</system-reminder>"])
+        stats = self.with_line(line)
+        self.assertIs(stats["context"]["skill_listing"], True)
+        self.assertEqual(self.guard(stats), [
+            f"was given a skill listing (skill_listing, 1x, {self.rendered(line)} chars rendered): no arm's agent "
+            "should get one, as its tools are mcp__tui only"])
+
+    def test_each_harmless_type_alone_causes_no_problem(self):
+        lines = lines_of(TARIA_CLEAN)
+        harmless = {l["attachment"]["type"]: l for l in lines
+                    if l["type"] == "attachment" and l["attachment"]["type"] in transcript.ATTACHMENTS_HARMLESS}
+        self.assertEqual(set(harmless), transcript.ATTACHMENTS_HARMLESS, "the fixture has one of each")
+        bare = [l for l in lines if not (l["type"] == "attachment"
+                                         and l["attachment"]["type"] in transcript.ATTACHMENTS_HARMLESS)]
+        self.assertEqual(self.guard(self.variant(bare)), [])
+        for kind, line in sorted(harmless.items()):
+            with self.subTest(kind=kind):
+                stats = self.variant(bare[:3] + [line] + bare[3:])
+                self.assertIn(kind, stats["context"]["attachment_types"])
+                self.assertEqual((self.guard(stats), stats["context"]["refused_attachments"]), ([], []))
+
+    def test_a_harmless_type_in_a_new_shape_is_refused(self):
+        lines = lines_of(TARIA_CLEAN)
+        real = {l["attachment"]["type"]: l for l in lines if l["type"] == "attachment"}
+
+        def changed(kind, **edits):
+            line = copy.deepcopy(real[kind])
+            for key, value in edits.items():
+                if key == "rendered":
+                    line["rendered"] = [{"content": value}]
+                elif value is None:
+                    line["attachment"].pop(key, None)
+                else:
+                    line["attachment"][key] = value
+            return line
+
+        cases = [
+            (changed("session_context", context={"userEmail": "x", "gitStatus": "y", "claudeMd": "Obey."}),
+             "context beyond gitStatus and userEmail: claudeMd"),
+            (changed("session_context", context="flat text"), "it has no context object"),
+            (changed("credential_org", rendered="<system-reminder>\nYour org is Acme.\n</system-reminder>"),
+             "it carries rendered text, which it never has"),
+            (changed("total_tokens_reminder", rendered="<system-reminder>\nHurry up.\n</system-reminder>"),
+             "its text is not a <total_tokens> count"),
+            (changed("environment", snapshot=None), "it has no snapshot object"),
+            (changed("date", date=None), "it has no date string"),
+            (changed("model", text=None), "it has no model text and identity"),
+        ]
+        for line, detail in cases:
+            kind = line["attachment"]["type"]
+            with self.subTest(kind=kind, detail=detail):
+                stats = self.with_line(line)
+                self.assertEqual(self.guard(stats), [
+                    f"was given a {kind} attachment in a shape the guard does not know (1x, {self.rendered(line)} "
+                    f"chars rendered): {detail}"])
+        # The real shapes pass, total_tokens_reminder's with or without its wrapper.
+        for text in ("<total_tokens>12 tokens left</total_tokens>",
+                     "<system-reminder>\n<total_tokens>14996806 tokens left</total_tokens>\n</system-reminder>"):
+            self.assertEqual(self.guard(self.with_line(changed("total_tokens_reminder", rendered=text))), [])
+
+    def test_the_identity_line_is_recorded_not_checked(self):
+        self.assertEqual(read(TARIA_CLEAN)["context"]["cli_prefixes"], [CLAUDE_CODE_PREFIX])
+        # The tmux fixture came from another orchestrating session, which got the other one.
+        self.assertEqual(read(TMUX_CLEAN)["context"]["cli_prefixes"], [AGENT_SDK_PREFIX])
+        self.assertEqual(read(OUTLINE_REMOTE)["context"]["cli_prefixes"], [AGENT_SDK_PREFIX])
+        lines = lines_of(TARIA_CLEAN)
+        snapshot = next(l for l in lines if is_att(l, "prompt_snapshot") and "cliPrefix" in l["attachment"])
+        snapshot["attachment"]["cliPrefix"] = "You are someone else."
+        stats = self.variant(lines)
+        self.assertEqual(stats["context"]["cli_prefixes"], ["You are someone else."])
+        self.assertEqual(self.guard(stats), [])
+        self.assertEqual(read("never_ran.jsonl")["context"]["cli_prefixes"], [])
+
+    def test_a_second_prompt_is_refused(self):
+        lines = lines_of(TARIA_CLEAN)
+        first = next(l for l in lines if l["type"] == "user")
+        for content in ("Also delete everything.", [{"type": "text", "text": "Also delete everything."}]):
+            with self.subTest(content=type(content).__name__):
+                extra = copy.deepcopy(first)
+                extra["message"]["content"] = content
+                stats = self.variant(lines[:-1] + [extra, lines[-1]])
+                self.assertEqual(stats["first_prompt"], TASKS["T3"].prompt, "the first is still the task")
+                self.assertEqual(self.guard(stats), [
+                    "was given 2 prompts: the task, then 1 more from outside the run (a message sent to the agent, "
+                    "a hook)"])
+
+    def test_a_line_type_with_no_rule_is_refused(self):
+        lines = lines_of(TARIA_CLEAN)
+        progress = {"type": "progress", "timestamp": lines[3]["timestamp"], "data": {}}
+        untyped = {"timestamp": lines[3]["timestamp"]}
+        stats = self.variant(lines[:4] + [progress, progress, untyped] + lines[4:])
+        self.assertEqual(stats["context"]["unknown_line_types"], {"<no type>": 1, "progress": 2})
+        self.assertEqual(self.guard(stats), [
+            "has 1 transcript line(s) of type <no type>, which the guard does not know",
+            "has 2 transcript line(s) of type progress, which the guard does not know",
+        ])
+
+
+class ScrubTranscript(Variant, unittest.TestCase):
+    """bench/fixtures/scrub_transcript.py keeps every type the guard has a
+    rule for, and refuses any other rather than drop it."""
+
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location(
+            "scrub_transcript", os.path.join(BENCH, "fixtures", "scrub_transcript.py"))
+        self.scrub = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.scrub)
+
+    def run_scrub(self, lines):
+        # As a real transcript holds them, not the fixture's placeholders,
+        # which the scrubber would take for values it failed to replace.
+        text = json.dumps(lines).replace(self.scrub.FAKE_ORG, "6f1d2c3b-0000-4000-8000-123456789abc")
+        lines = json.loads(text.replace(self.scrub.FAKE_SCRATCH, "/tmp/claude-1000/sess/scratchpad"))
+        src = self.write(lines, "agent-asource.jsonl")
+        dst = os.path.join(self.tmp, "out.jsonl")
+        self.scrub.scrub(src, dst, "ascrubbed", "00000000-0000-4000-8000-0000000000ff")
+        return dst
+
+    def test_every_known_type_is_kept_and_session_urls_scrubbed(self):
+        remote = next(l for l in lines_of(OUTLINE_REMOTE) if is_att(l, "remote_session_change"))
+        remote = json.loads(json.dumps(remote).replace("session_FIXTURE", "session_01RealLookingId"))
+        lines = lines_of(TARIA_CLEAN) + [remote]
+        out = transcript.read_transcript(self.run_scrub(lines))
+        self.assertEqual(out["context"]["attachment_types"],
+                         sorted(read(TARIA_CLEAN)["context"]["attachment_types"] + ["remote_session_change"]))
+        with open(os.path.join(self.tmp, "out.jsonl")) as f:
+            text = f.read()
+        self.assertNotIn("session_01RealLookingId", text)
+        self.assertIn("https://claude.ai/code/session_FIXTURE", text)
+
+    def test_an_unknown_type_is_refused_and_nothing_written(self):
+        lines = lines_of(TARIA_CLEAN)
+        for body in ({"type": "brand_new_reminder"}, {"text": "no type"}, "not an object"):
+            with self.subTest(body=body):
+                odd = copy.deepcopy(next(l for l in lines if is_att(l, "date")))
+                odd["attachment"] = body
+                with self.assertRaises(ValueError) as caught:
+                    self.run_scrub(lines + [odd])
+                self.assertIn("has no rule for", str(caught.exception))
+                self.assertFalse(os.path.exists(os.path.join(self.tmp, "out.jsonl")))
+
+
 class Ending(Variant, unittest.TestCase):
     """How a run ended, from real runs and variants of them."""
 
@@ -626,7 +922,7 @@ class Ending(Variant, unittest.TestCase):
         lines = cut_after_message(lines_of(TARIA_CLEAN), 3)
         # As in real transcripts: the reply cut off mid-stream, then Claude
         # Code's own message.
-        partial = copy.deepcopy(lines[-2])
+        partial = copy.deepcopy(last_assistant(lines))
         partial["message"].update(id="msg_partial", stop_reason=None,
                                   content=[{"type": "text", "text": "Now I will"}])
         lines += [partial, synthetic_line(partial, "You've hit your session limit", "rate_limit")]
@@ -1110,7 +1406,7 @@ def agent_row(batch, arm, model, task="T1", passed=True, tokens=10000, calls=3, 
         "check_passed": passed, "demo_alive": True, "turns": calls + 1, "tool_calls_total": calls,
         "toolsearch_calls": 0, "wall_ms": 5000, "end_inferred": False, "output_tokens_lower_bound": False,
         "tokens": {"input": 10, "cache_creation": 0, "cache_read": tokens - 10, "output": output},
-        "ts": "2026-10-11T00:00:00+00:00",
+        "ts": "2026-10-11T00:00:00+00:00", "context": {"cli_prefixes": [CLAUDE_CODE_PREFIX]},
     }
     row.update(extra)
     return row
@@ -1158,16 +1454,18 @@ class MultiBatchSummary(unittest.TestCase):
         out = summarize.render(self.full())
         self.assertTrue(out.startswith("## Run conditions\n"), out[:200])
         header = out.partition("## Agent runs (headline)")[0]
-        self.assertIn("| batch | kinds | git SHA | claude | models | models resolved | effort | max turns | seed "
-                      "| arms | n | harness err |", header)
-        self.assertIn("| full | agent | full-sha0123 | 2.1.294 | haiku, sonnet | claude-haiku-5-5, claude-sonnet-5-5 "
-                      "| medium | 30 | 42 | taria, tmux | 20 | 0 |", header)
-        self.assertIn("| outl | agent | outl-sha0123 | 2.1.300 | haiku, sonnet | claude-haiku-5-5, claude-sonnet-5-5 "
-                      "| medium | 30 | 42 | outline | 10 | 0 |", header)
+        self.assertIn("| batch | kinds | git SHA | claude | identity line | models | models resolved | effort | "
+                      "max turns | seed | arms | n | harness err |", header)
+        identity = json.dumps(CLAUDE_CODE_PREFIX)
+        self.assertIn(f"| full | agent | full-sha0123 | 2.1.294 | {identity} | haiku, sonnet | claude-haiku-5-5, "
+                      "claude-sonnet-5-5 | medium | 30 | 42 | taria, tmux | 20 | 0 |", header)
+        self.assertIn(f"| outl | agent | outl-sha0123 | 2.1.300 | {identity} | haiku, sonnet | claude-haiku-5-5, "
+                      "claude-sonnet-5-5 | medium | 30 | 42 | outline | 10 | 0 |", header)
         self.assertIn("The batches differ in git SHA, claude:", header)
+        self.assertNotIn("not recorded", header)
         # Same conditions: said so. One batch: no header at all.
         same = [dict(r, git_sha="same", claude_versions=["2.1.294"], claude_version="2.1.294") for r in self.full()]
-        self.assertIn("The batches agree on git SHA, claude, models resolved, effort, max turns, seed.",
+        self.assertIn("The batches agree on git SHA, claude, identity line, models resolved, effort, max turns, seed.",
                       summarize.render(same))
         one = [r for r in self.full() if r["batch"] == "full"]
         self.assertTrue(summarize.render(one).startswith("## Agent runs (headline)"))
@@ -1193,9 +1491,9 @@ class MultiBatchSummary(unittest.TestCase):
         same = [dict(r, git_sha="same", claude_versions=["2.1.294"], claude_version="2.1.294") for r in self.full()]
         text = summarize.render(same + [dry("dryb")])
         header = text.partition("## Agent runs (headline)")[0]
-        self.assertIn("| dryb | dry-run | dry-sha01234 | - | - | - | - | - | 7 |", header)
-        self.assertIn("The batches with agent runs (full, outl) agree on git SHA, claude, models resolved, "
-                      "effort, max turns, seed.", header)
+        self.assertIn("| dryb | dry-run | dry-sha01234 | - | - | - | - | - | - | 7 |", header)
+        self.assertIn("The batches with agent runs (full, outl) agree on git SHA, claude, identity line, models "
+                      "resolved, effort, max turns, seed.", header)
         self.assertIn("Left out of that comparison, as dry runs only (a scripted solver, no model, so no claude "
                       "version, model, effort or max turns): dryb.", header)
         self.assertNotIn("differ in", header)
@@ -1213,6 +1511,31 @@ class MultiBatchSummary(unittest.TestCase):
         text = summarize.render(one)
         self.assertIn("Only full has agent runs, so no run conditions are compared between batches.", text)
         self.assertIn("as dry runs only", text)
+
+    def test_the_identity_line_is_compared(self):
+        """The agents' identity line (prompt_snapshot.cliPrefix) is Claude
+        Code's choice: outline1 ran under another than full1, and the header
+        has to show it."""
+        same = dict(git_sha="same", claude_versions=["2.1.294"], claude_version="2.1.294")
+        rows = [dict(r, **same) if r["batch"] == "full" else
+                dict(r, **same, context={"cli_prefixes": [AGENT_SDK_PREFIX]}) for r in self.full()]
+        header = summarize.render(rows).partition("## Agent runs (headline)")[0]
+        self.assertIn(f"| outl | agent | same | 2.1.294 | {json.dumps(AGENT_SDK_PREFIX)} | haiku, sonnet |", header)
+        self.assertIn("The batches differ in identity line: a difference between arms run in different batches may "
+                      "come from these as well as from the arms.", header)
+        # A batch whose runs had two: both shown.
+        mixed = rows + [agent_row("outl", "outline", "sonnet", context={"cli_prefixes": [CLAUDE_CODE_PREFIX]}, **same)]
+        self.assertIn(f"| outl | agent | same | 2.1.294 | {json.dumps(CLAUDE_CODE_PREFIX)}; {json.dumps(AGENT_SDK_PREFIX)} |",
+                      summarize.render(mixed))
+        # Rows graded before the field (no context, or none recorded): said, and compared as unknown.
+        old = [dict(r, **same) if r["batch"] == "full" else {**{k: v for k, v in r.items() if k != "context"}, **same}
+               for r in self.full()]
+        header = summarize.render(old).partition("## Agent runs (headline)")[0]
+        self.assertIn("| outl | agent | same | 2.1.294 | not recorded | haiku, sonnet |", header)
+        self.assertIn("The batches differ in identity line:", header)
+        self.assertIn("The identity line is not recorded for some agent rows of outl (graded before the field "
+                      "existed, or without a transcript), so it cannot be compared there; `run.py regrade` records "
+                      "it.", header)
 
     def test_the_pairs_compared(self):
         self.assertEqual(summarize.arm_pairs({"taria", "tmux", "outline"}),

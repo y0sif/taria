@@ -18,19 +18,34 @@ transcripts from Claude Code 2.1.294):
   Claude Code's own `<synthetic>` messages (errors it writes itself, not a
   model reply) are left out of models and turns;
 - `user` lines: `message.content` is the prompt string (the first user line
-  is the task the agent was given), or a list of `tool_result` blocks with
-  `tool_use_id` and `is_error`;
-- `attachment` lines carry `attachment.type`. Read here: `prompt_snapshot`
-  (`tools[].name`: the tools the agent was offered, see below; and the
-  `description` of `mcp__tui__read_tree`, which names the tree format),
-  `mcp_instructions_delta` (`addedNames`, `removedNames`: MCP servers whose
-  instructions reached the prompt), `instructions` (`files[].path`: CLAUDE.md
-  and its imports, memory), `deferred_tools_delta` (`addedNames`,
-  `removedNames`, `readdedNames`, and `surfacedNames` for tools whose schema
-  came loaded, with `surfacedDefinitions[].definition.description`),
+  is the task the agent was given, and a real run has no other), or a list
+  of `tool_result` blocks with `tool_use_id` and `is_error`;
+- `attachment` lines carry `attachment.type`, and `rendered[].content`, the
+  text that reached the model (none for an attachment Claude Code only
+  records, such as `prompt_snapshot`). Read here: `prompt_snapshot`
+  (`tools[].name`: the tools the agent was offered, see below; the
+  `description` of `mcp__tui__read_tree`, which names the tree format; and
+  `cliPrefix`, the agent's identity line), `mcp_instructions_delta`
+  (`addedNames`, `removedNames`: MCP servers whose instructions reached the
+  prompt), `instructions` (`files[].path`: CLAUDE.md and its imports,
+  memory), `deferred_tools_delta` (`addedNames`, `removedNames`,
+  `readdedNames`, and `surfacedNames` for tools whose schema came loaded,
+  with `surfacedDefinitions[].definition.description`),
   `deferred_tools_record` (`entries[].name` and `entries[].description`: a
   schema loaded by a ToolSearch call), `environment` (`snapshot.workingDirectory`),
   `skill_listing` and `max_turns_reached` (`maxTurns`, `turnCount`).
+
+Every attachment type has exactly one rule (ATTACHMENTS_VERIFIED,
+ATTACHMENTS_HARMLESS, ATTACHMENTS_FLAGGED below), because an attachment is
+context added to the agent's prompt: verified ones are read and held to the
+arm, harmless ones (the same for every arm) are held to the shape they are
+known in, and flagged ones are refused by name. A type with no rule is
+context nobody checked, and the guard refuses the run, naming the type, how
+many arrived and how many characters of them were rendered. That is what
+caught `remote_session_change`: with /remote-control on in the orchestrating
+session, Claude Code added a ~710-character attribution note beside a tool
+result in every subagent run, and a guard that only read the types it knew
+let it through.
 
 The tools the agent was offered are in its `prompt_snapshot` attachments.
 Claude Code writes the first before any tool is known, without a `tools`
@@ -63,8 +78,13 @@ a `tool_use` message and its result. `ending` infers the cut-off from that
 shape and the turn count, and takes a `max_turns_reached` attachment as
 proof if a later version records one.
 
-Everything here tolerates malformed lines, unknown types and missing
-fields: they are skipped and counted, never raised.
+Reading never raises: a malformed line is skipped and counted
+(`malformed_lines`), and a missing field reads as absent. What a run should
+not have is recorded in its context instead, and `guard` refuses the run for
+each: an attachment of a type with no rule, or in a shape its rule does not
+know; an attachment line with no type, or whose attachment is not an
+object; a line whose type is not `user`, `assistant` or `attachment`; and a
+second prompt.
 
 Python 3 stdlib only.
 """
@@ -89,6 +109,42 @@ TOKEN_KEYS = (
     ("output", "output_tokens"),
 )
 AGENT_ID = re.compile(r"[0-9A-Za-z_-]+")
+
+# --- What a transcript may carry -----------------------------------------------------------
+#
+# Every attachment type has exactly one rule. Verified: the guard reads what
+# these carry and holds the run to it.
+ATTACHMENTS_VERIFIED = frozenset({
+    "prompt_snapshot",         # the tools on offer, read_tree's tree format, the identity line
+    "mcp_instructions_delta",  # the MCP servers whose instructions reached the agent
+    "deferred_tools_delta",    # the deferred tools on offer
+    "deferred_tools_record",   # a deferred tool's schema, loaded
+    "max_turns_reached",       # the turn cap, as proof of a cut-off
+    "instructions",            # CLAUDE.md and memory: any file is a problem
+})
+# Harmless, and the same for every arm: each is held to the shape it is
+# known in (see _harmless_shape), so new content in it is refused like an
+# unknown type.
+ATTACHMENTS_HARMLESS = frozenset({
+    "environment",            # the working directory, platform and shell
+    "session_context",        # the user's e-mail and the orchestrator's git status
+    "date",                   # today's date
+    "model",                  # the model's name and id
+    "credential_org",         # the organization id, recorded and never rendered
+    "total_tokens_reminder",  # the tokens left in the context window
+})
+# Known, and refused by name: (what it is, what to do).
+ATTACHMENTS_FLAGGED = {
+    "remote_session_change": ("Claude Code's remote-control attribution note",
+                              "turn /remote-control off in the orchestrating session"),
+    "skill_listing": ("a skill listing", "no arm's agent should get one, as its tools are mcp__tui only"),
+}
+KNOWN_ATTACHMENTS = ATTACHMENTS_VERIFIED | ATTACHMENTS_HARMLESS | frozenset(ATTACHMENTS_FLAGGED)
+LINE_TYPES = frozenset({"user", "assistant", "attachment"})
+SESSION_CONTEXT_KEYS = ("gitStatus", "userEmail")
+TOTAL_TOKENS = re.compile(
+    r"(?:<system-reminder>\s*)?<total_tokens>\d+ tokens left</total_tokens>(?:\s*</system-reminder>)?"
+)
 
 
 # --- Finding a transcript ---------------------------------------------------------------
@@ -162,11 +218,22 @@ def _block_text(content):
     return "".join(texts) if texts else None
 
 
+def _is_tool_result(content):
+    return isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+
+
 def _prompt_text(content):
     """The prompt a user line carries, or None for a tool result."""
-    if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+    if _is_tool_result(content):
         return None
     return _block_text(content)
+
+
+def _is_prompt(content):
+    """Whether a user line's content is a prompt: a string, or blocks that
+    are not tool results."""
+    return isinstance(content, str) or (isinstance(content, list) and bool(content)
+                                        and not _is_tool_result(content))
 
 
 def _final_usage(lines):
@@ -245,13 +312,84 @@ def _deferred_tree_formats(definitions):
     }
 
 
+def _rendered_texts(line):
+    """The text an attachment line put in front of the model: each
+    `rendered[].content` (a string, or blocks whose text counts)."""
+    texts = []
+    for item in line.get("rendered") if isinstance(line.get("rendered"), list) else []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts += [b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)]
+    return texts
+
+
+def _label(kind):
+    """A line's or an attachment's type as a guard sentence names it."""
+    if isinstance(kind, str):
+        return kind
+    return "<no type>" if kind is None else f"<type {json.dumps(kind)}>"
+
+
+def _harmless_shape(kind, att, texts):
+    """None when a harmless attachment has the shape it is known in, else
+    what differs. Light checks: enough that new content in a known type is
+    noticed, not a pin on every field."""
+    if kind == "environment":
+        return None if isinstance(att.get("snapshot"), dict) else "it has no snapshot object"
+    if kind == "session_context":
+        context = att.get("context")
+        if not isinstance(context, dict):
+            return "it has no context object"
+        extra = sorted(str(k) for k in context if k not in SESSION_CONTEXT_KEYS)
+        return f"context beyond {' and '.join(SESSION_CONTEXT_KEYS)}: {', '.join(extra)}" if extra else None
+    if kind == "date":
+        return None if isinstance(att.get("date"), str) else "it has no date string"
+    if kind == "model":
+        if isinstance(att.get("text"), str) and isinstance(att.get("identity"), dict):
+            return None
+        return "it has no model text and identity"
+    if kind == "credential_org":
+        return "it carries rendered text, which it never has" if any(t.strip() for t in texts) else None
+    if kind == "total_tokens_reminder":
+        shown = texts or [att.get("text")]
+        if all(isinstance(t, str) and TOTAL_TOKENS.fullmatch(t.strip()) for t in shown):
+            return None
+        return "its text is not a <total_tokens> count"
+    return None
+
+
+def _refusal(kind, att, texts):
+    """(rule, detail) when the guard refuses this attachment, else None:
+    "unknown" for a type with no rule (or no type, or no attachment object),
+    "flagged" for one refused by name, "shape" for a harmless type in a
+    shape it is not known in."""
+    if not isinstance(att, dict) or not isinstance(kind, str) or kind not in KNOWN_ATTACHMENTS:
+        return "unknown", None
+    if kind in ATTACHMENTS_FLAGGED:
+        return "flagged", None
+    detail = _harmless_shape(kind, att, texts) if kind in ATTACHMENTS_HARMLESS else None
+    return ("shape", detail) if detail else None
+
+
 def _context(attachments):
+    """The context row field from `attachments`: (attachment, rendered texts)
+    pairs in transcript order, the attachment as the line carries it (not
+    always an object)."""
     claude_md, deferred, loaded, servers, types = [], set(), set(), set(), set()
     deferred_added, servers_added = set(), set()  # every name ever added, removals ignored
-    snapshots, offered, tree_formats = [], set(), set()
+    snapshots, offered, tree_formats, prefixes = [], set(), set(), set()
+    refused = {}  # (label, rule, detail) -> [count, rendered chars]
     cwd, skills = None, False
-    for att in attachments:
-        kind = att.get("type")
+    for att, texts in attachments:
+        kind = att.get("type") if isinstance(att, dict) else None
+        refusal = _refusal(kind, att, texts)
+        if refusal is not None:
+            label = _label(kind) if isinstance(att, dict) else "<not an object>"
+            tally = refused.setdefault((label, *refusal), [0, 0])
+            tally[0] += 1
+            tally[1] += sum(len(t) for t in texts)
         if not isinstance(kind, str):
             continue
         types.add(kind)
@@ -260,6 +398,8 @@ def _context(attachments):
             snapshots.append(names)
             offered.update(names or [])
             tree_formats.update(_snapshot_tree_formats(att))
+            if isinstance(att.get("cliPrefix"), str):
+                prefixes.add(att["cliPrefix"])
         elif kind == "instructions":
             for item in att.get("files") or []:
                 path = item.get("path") if isinstance(item, dict) else None
@@ -316,6 +456,19 @@ def _context(attachments):
         # ["json"] for a taria run, ["outline"] for an outline run, [] when
         # no read_tree was offered or none of its descriptions was recorded.
         "tree_formats": sorted(tree_formats),
+        # The agent's identity line (prompt_snapshot.cliPrefix), which Claude
+        # Code chooses: recorded so batches can be compared on it, not
+        # checked.
+        "cli_prefixes": sorted(prefixes),
+        # The attachments the guard refuses, one entry per (type, rule,
+        # detail): rule "unknown" (no rule for the type, no type, or no
+        # attachment object), "flagged" (refused by name) or "shape" (a
+        # harmless type in a shape it is not known in, detail saying how).
+        "refused_attachments": [
+            {"type": label, "rule": rule, "detail": detail, "count": count, "rendered_chars": chars}
+            for (label, rule, detail), (count, chars) in sorted(refused.items(), key=lambda kv: (
+                kv[0][0], kv[0][1], kv[0][2] or ""))
+        ],
     }
 
 
@@ -328,7 +481,8 @@ def read_transcript(path):
     blocks = {}  # (message id, block index) -> block, in first-seen order
     errors = set()
     synthetic = set()
-    first_prompt, seen_user = None, False
+    first_prompt, seen_user, prompts = None, False, 0
+    other_lines = Counter()  # line types other than user, assistant and attachment
     final = None  # the last assistant line's message: {"id", "synthetic", "text", "error"}
     max_turns_reached = None
     for number, line in enumerate(lines):
@@ -340,16 +494,20 @@ def read_transcript(path):
         if isinstance(line.get("version"), str):
             versions.add(line["version"])
         kind = line.get("type")
-        if kind == "attachment" and isinstance(line.get("attachment"), dict):
-            attachments.append(line["attachment"])
-            if line["attachment"].get("type") == "max_turns_reached":
-                att = line["attachment"]
+        if kind not in LINE_TYPES:
+            other_lines[_label(kind)] += 1
+        if kind == "attachment":
+            att = line.get("attachment")
+            attachments.append((att, _rendered_texts(line)))
+            if isinstance(att, dict) and att.get("type") == "max_turns_reached":
                 max_turns_reached = {"max_turns": att.get("maxTurns"), "turn_count": att.get("turnCount")}
         elif kind == "user" and isinstance(line.get("message"), dict):
             content = line["message"].get("content")
             if not seen_user:
                 seen_user = True
                 first_prompt = _prompt_text(content)
+            if _is_prompt(content):
+                prompts += 1
             for pos, block in enumerate(content if isinstance(content, list) else []):
                 if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") is True:
                     errors.add(block.get("tool_use_id") or (number, pos))
@@ -424,6 +582,12 @@ def read_transcript(path):
     # line, at the end of the run or in the middle of it: its output count is
     # the largest partial one, so the run's output total is a lower bound.
     unclosed = sum(1 for e in messages.values() if not any(l["stop_reason"] is not None for l in e["lines"]))
+    context = _context(attachments)
+    # The lines no rule covers, and how many prompts the agent was given
+    # (user lines that are not tool results): the task, and in a real run
+    # nothing else.
+    context["unknown_line_types"] = dict(sorted(other_lines.items()))
+    context["prompts"] = prompts
 
     return {
         "agent_id": agent_id,
@@ -438,7 +602,7 @@ def read_transcript(path):
         "final_text": final_text or None,
         "ended_on_tool_use": ended_on_tool_use(ordered),
         "tool_errors": len(errors),
-        "context": _context(attachments),
+        "context": context,
         # How the run ended (see `ending`): the final assistant message's
         # model and stop_reason, synthetic or not, and whether Claude Code
         # recorded a max_turns_reached.
@@ -482,7 +646,11 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
     `tree_format` (when given: the taria and outline arms list the same
     tools, so this is what holds each to its own), or one offered only
     deferred whose description no record carries, so its format cannot be
-    checked; and a run with no assistant turn.
+    checked; an attachment the context refuses (see ATTACHMENTS_VERIFIED and
+    the rest: a type with no rule, one flagged by name, a harmless one in a
+    new shape); a transcript line of a type other than user, assistant and
+    attachment; more than one prompt; and a run with no assistant turn. The
+    identity line (`cli_prefixes`) is recorded, not checked.
 
     Other servers and deferred tools are held against every name ever
     added, so one that reached the agent and later left (a server that
@@ -531,9 +699,30 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
         problems.append(f"never got the {SERVER} server's instructions: it did not start, or was refused")
     elif SERVER not in servers:
         problems.append(f"lost the {SERVER} server's instructions mid-run: the server was removed (it disconnected)")
+    problems += [attachment_problem(entry) for entry in context.get("refused_attachments") or []
+                 if isinstance(entry, dict)]
+    for kind, count in sorted((context.get("unknown_line_types") or {}).items()):
+        problems.append(f"has {count} transcript line(s) of type {kind}, which the guard does not know")
+    prompts = context.get("prompts")
+    if isinstance(prompts, int) and prompts > 1:
+        problems.append(f"was given {prompts} prompts: the task, then {prompts - 1} more from outside the run "
+                        "(a message sent to the agent, a hook)")
     if not stats.get("turns"):
         problems.append("never ran: the transcript has no assistant turn")
     return problems
+
+
+def attachment_problem(entry):
+    """The guard's sentence for one `refused_attachments` entry: the type,
+    how many arrived and how many characters of them were rendered."""
+    kind, rule = entry.get("type"), entry.get("rule")
+    size = f"{entry.get('count')}x, {entry.get('rendered_chars')} chars rendered"
+    if rule == "flagged" and kind in ATTACHMENTS_FLAGGED:
+        what, remedy = ATTACHMENTS_FLAGGED[kind]
+        return f"was given {what} ({kind}, {size}): {remedy}"
+    if rule == "shape":
+        return f"was given a {kind} attachment in a shape the guard does not know ({size}): {entry.get('detail')}"
+    return f"was given an attachment the guard does not know: {kind} ({size})"
 
 
 def _offered_problems(context, allowed, arm):

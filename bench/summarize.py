@@ -19,10 +19,12 @@ older flat layout) are searched.
 Sections:
 
 - Run conditions, only when the rows come from more than one batch: per
-  batch the git SHA, claude versions, models, effort, max turns, seed, arms
-  and n, and which of them differ between the batches with agent runs,
-  since merged batches are compared as if they ran together. A batch of dry
-  runs only is listed, and named as left out of that comparison.
+  batch the git SHA, claude versions, the agents' identity line (the first
+  line of their system prompt, prompt_snapshot.cliPrefix, which Claude Code
+  chooses), models, effort, max turns, seed, arms and n, and which of them
+  differ between the batches with agent runs, since merged batches are
+  compared as if they ran together. A batch of dry runs only is listed, and
+  named as left out of that comparison.
 - Agent runs (headline): subagent rows only, one row per (task, arm, model,
   effort, max_turns), so runs held to different settings are never pooled.
   Per row: graded runs (n), passes and the pass rate with a Wilson 95%
@@ -706,6 +708,24 @@ def _sha(row):
     return None if not sha else str(sha)[:12] + (" (dirty)" if row.get("git_dirty") else "")
 
 
+NOT_RECORDED = "not recorded"
+
+
+def _identity_lines(rows):
+    """The agents' identity lines (context.cli_prefixes) over `rows`, each
+    distinct one quoted, plus `not recorded` when a row predates the field
+    (or has no transcript)."""
+    seen = set()
+    for r in rows:
+        context = r.get("context") if isinstance(r.get("context"), dict) else {}
+        prefixes = context.get("cli_prefixes")
+        if isinstance(prefixes, list):
+            seen.update(json.dumps(str(p)) for p in prefixes)
+        else:
+            seen.add(NOT_RECORDED)
+    return "; ".join(sorted(seen)) or "-"
+
+
 def _batch_conditions(rows):
     """What one batch ran under, as display strings: the settings an agent
     run depends on, read from its rows (agent rows where there are any)."""
@@ -719,6 +739,7 @@ def _batch_conditions(rows):
         "kinds": ", ".join(sorted({label(r) for r in rows})),
         "git SHA": ", ".join(sorted({_sha(r) for r in agent if _sha(r)})) or "-",
         "claude": ", ".join(sorted(claude)) or "-",
+        "identity line": _identity_lines([r for r in agent if label(r) == "agent"]),
         "models": _values(agent, "model"),
         "models resolved": _values(agent, "model_resolved"),
         "effort": _values(agent, "effort"),
@@ -730,10 +751,13 @@ def _batch_conditions(rows):
     }
 
 
-CONDITION_COLUMNS = ("kinds", "git SHA", "claude", "models", "models resolved", "effort", "max turns",
-                     "seed", "arms", "n", "harness err")
-# The conditions that can change a result; arms and n differ by design.
-COMPARED_CONDITIONS = ("git SHA", "claude", "models resolved", "effort", "max turns", "seed")
+CONDITION_COLUMNS = ("kinds", "git SHA", "claude", "identity line", "models", "models resolved", "effort",
+                     "max turns", "seed", "arms", "n", "harness err")
+# The conditions that can change a result; arms and n differ by design. The
+# identity line is the first line of the agent's system prompt
+# (prompt_snapshot.cliPrefix), which Claude Code chooses, so two batches can
+# differ in it with nothing in the bench changed.
+COMPARED_CONDITIONS = ("git SHA", "claude", "identity line", "models resolved", "effort", "max turns", "seed")
 
 
 def conditions(records):
@@ -764,6 +788,11 @@ def conditions(records):
                          "different batches may come from these as well as from the arms.")
         else:
             notes.append(f"{which} agree on " + ", ".join(COMPARED_CONDITIONS) + ".")
+    unrecorded = [b for b in compared if NOT_RECORDED in rows[b]["identity line"]]
+    if unrecorded:
+        notes.append(f"The identity line is {NOT_RECORDED} for some agent rows of {', '.join(unrecorded)} "
+                     "(graded before the field existed, or without a transcript), so it cannot be compared "
+                     "there; `run.py regrade` records it.")
     if scripted:
         notes.append(f"Left out of that comparison, as dry runs only (a scripted solver, no model, so no "
                      f"claude version, model, effort or max turns): {', '.join(scripted)}.")

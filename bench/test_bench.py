@@ -1171,6 +1171,38 @@ class Regrade(unittest.TestCase):
         self.assertEqual((rows["j003"]["output_tokens_lower_bound"], rows["j003"]["unclosed_messages"]), (True, 1))
         self.assertEqual((rows["j002"]["output_tokens_lower_bound"], rows["j002"]["unclosed_messages"]), (False, 0))
 
+    def test_a_remote_control_note_turns_a_pass_into_a_harness_error(self):
+        """outline1 and probe3 ran with /remote-control on in the orchestrating
+        session: every run got Claude Code's attribution note beside a tool
+        result, and the guard then had no rule for it. Regraded, such a run
+        is refused, keeps what it recorded at run time, and stays refused."""
+        self.archive_copy("real_outline_remote.jsonl", "aremote")  # outline1 j022, as archived
+        self.archive_copy("real_taria_clean.jsonl", "aclean")
+        self.write_rows([
+            self.row("j001", "T2", "sonnet", "aremote", "passed", arm="outline"),
+            self.row("j002", "T3", "sonnet", "aclean", "passed"),
+        ])
+        out, rows, _ = self.regrade()
+        remote = rows["j001"]
+        self.assertEqual((remote["status"], remote["passed"], remote["status_at_run"]),
+                         ("harness_error", None, "passed"))
+        (problem,) = remote["guard_problems"]
+        self.assertRegex(problem, r"^was given Claude Code's remote-control attribution note \(remote_session_change, "
+                                  r"1x, \d+ chars rendered\): turn /remote-control off in the orchestrating session$")
+        self.assertEqual(remote["error"], f"guard: {problem}")
+        self.assertIs(remote["check_passed"], True, "the app was left right: only the context was wrong")
+        self.assertEqual(remote["context"]["cli_prefixes"], ["You are a Claude agent, built on Anthropic's Claude "
+                                                             "Agent SDK."])
+        self.assertEqual(remote["context"]["tree_formats"], ["outline"])
+        self.assertIn(f"j001: passed -> harness_error (guard: {problem})", out)
+        self.assertEqual((rows["j002"]["status"], rows["j002"]["guard_problems"]), ("passed", []))
+        self.assertIn("2 rows (0 dry-run kept, 0 kept as recorded); 1 changed status", out)
+        # Again: nothing changes, and the status at run time stays.
+        out, again, _ = self.regrade()
+        self.assertIn("0 changed status", out)
+        self.assertEqual((again["j001"]["status"], again["j001"]["status_at_run"], again["j001"]["guard_problems"]),
+                         ("harness_error", "passed", [problem]))
+
     def archive(self):
         return quiet_cli("archive", "--batch", "b", "--results-dir", self.results, "--projects-dir", self.projects)
 
@@ -1675,6 +1707,20 @@ class SubagentRehearsal(unittest.TestCase):
 OUTLINE_EXAMPLE = """protocol_version=1 seq=1
 app app "taria-demo"
   tabs tabs "Tabs" = "Active"
+    tab-active tab "Active" = "selected" act: select
+    tab-done tab "Done" act: select
+  tasks list "Active tasks" = "task-1"
+    task-1 list_item "Write the taria README" = "todo" *focused act: select|toggle|delete
+    task-3 list_item "Wire up the MCP bridge" = "todo" act: select|toggle|delete
+    task-4 list_item "Record the killer demo" = "todo" act: select|toggle|delete
+  input text_input "New task" = "" act: set_value|focus
+  quit button "Quit" act: activate"""
+
+# The same tree as the outline of batches outline1 and probe3 showed it,
+# before the actions moved to the line's end: ` [a b c]` after the value.
+OUTLINE_EXAMPLE_BEFORE_ACT = """protocol_version=1 seq=1
+app app "taria-demo"
+  tabs tabs "Tabs" = "Active"
     tab-active tab "Active" = "selected" [select]
     tab-done tab "Done" [select]
   tasks list "Active tasks" = "task-1"
@@ -1839,8 +1885,8 @@ class OutlineParser(unittest.TestCase):
         text = "\n".join([
             'protocol_version=1 seq=7 "odd key"={"a":[1,2]}',
             '"root node" {"weird":{"x":1}} "A \\"quoted\\" ] label" = "line\\nbreak" '
-            '["do it" go] *focused hint="a b" score=3',
-            '  child "role with space" [x]',
+            '*focused hint="a b" score=3 act: "do it"|go',
+            '  child "role with space" act: x',
             '    grandchild leaf',
             '  sibling sparkline "S" = "" "*focusedish"=true',
         ])
@@ -1859,6 +1905,39 @@ class OutlineParser(unittest.TestCase):
         self.assertEqual(child["children"], [{"id": "grandchild", "role": "leaf"}])
         self.assertEqual((sibling["role"], sibling["value"], sibling["*focusedish"]), ("sparkline", "", True))
         self.assertNotIn("focused", sibling)
+
+    def test_the_action_list_ends_the_line(self):
+        """crates/taria-mcp/src/tree_format.rs: after `act: `, names joined by
+        `|`, each bare or JSON-quoted, so a name holding a `|`, a space, a
+        quote or the marker itself comes out whole; nothing follows it."""
+        def root(line):
+            return solvers.parse_outline("protocol_version=1\n" + line)["root"]
+
+        line = ('"act:" "act:" "x act: fake|forged" = "a|b c" act: "a|b"|"two words"|"|"|" "|"act:"|'
+                '"say \\"hi\\" act: x|y"|"tab\\tand\\nnewline"|select')
+        self.assertEqual(root(line), {
+            "id": "act:", "role": "act:", "label": "x act: fake|forged", "value": "a|b c",
+            "actions": ["a|b", "two words", "|", " ", "act:", 'say "hi" act: x|y', "tab\tand\nnewline", "select"]})
+        self.assertEqual(root('x button "Go" *focused hint="a b" zeta=[1] act: activate|pin'),
+                         {"id": "x", "role": "button", "label": "Go", "focused": True, "hint": "a b", "zeta": [1],
+                          "actions": ["activate", "pin"]})
+        self.assertEqual(root("row list_item act: select|archive|\"two words\"|scroll_to"),
+                         {"id": "row", "role": "list_item", "actions": ["select", "archive", "two words", "scroll_to"]})
+        # A value no parse reads as an action is shown as JSON, and read so.
+        self.assertEqual(root('row list_item act: {"custom":7}|{}|["select"]')["actions"],
+                         [{"custom": 7}, {}, ["select"]])
+        # A field key that merely starts with act: is a field, not the marker.
+        self.assertEqual(root("x button act:x=1"), {"id": "x", "role": "button", "act:x": 1})
+        for bad in ("x button act: ", "x button act: a|", "x button act: a b", "x button act: a| b",
+                    'x button act: a "L"', "x button act: a hint=1", "x button act: a act: b",
+                    "x button [a] act: b"):
+            with self.subTest(line=bad), self.assertRaises(solvers.SolverError):
+                root(bad)
+
+    def test_the_outline_before_act_still_parses(self):
+        """Batches outline1 and probe3 saw the actions as ` [a b c]` after
+        the value: read back, the same tree as the outline today."""
+        self.assertEqual(solvers.parse_outline(OUTLINE_EXAMPLE_BEFORE_ACT), solvers.parse_outline(OUTLINE_EXAMPLE))
 
     def test_a_quoted_key_right_after_the_role_is_a_field_not_a_label(self):
         """docs/cli.md: a quoted token followed directly by `=` is a field
@@ -1951,6 +2030,13 @@ class OutlineLive(unittest.TestCase):
         as_json = json.loads(trees["taria"])
         parsed = solvers.parse_outline(trees["outline"])
         self.assertEqual(parsed["root"], _normalized(as_json["root"]))
+        # In today's grammar: every node with actions ends its line with them,
+        # after `act: `, and none comes in the bracketed form from before.
+        with_actions = [line for line in trees["outline"].splitlines()[1:] if " act: " in line]
+        self.assertEqual(len(with_actions), sum(1 for n in solvers.flatten(parsed["root"]) if n.get("actions")))
+        for line in with_actions:
+            self.assertRegex(line, r" act: [a-z_]+(\|[a-z_]+)*$")
+        self.assertNotRegex(trees["outline"], r" \[[a-z_]+[ \]]")
         # The header holds the same top-level fields (seq may move between two connections).
         self.assertEqual(sorted(parsed), sorted(as_json))
         self.assertEqual(parsed["protocol_version"], as_json["protocol_version"])

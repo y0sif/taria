@@ -18,10 +18,15 @@ agent a set of tools). All are registered as `tui`, so the agent sees
   bridge's default.
 - **outline**: the same binary and the same four tools, started with
   `--tree-format outline`. The bridge shows the same tree as one indented
-  line per node, `id role "label" = "value" [actions] *focused` (the grammar
-  is in `docs/cli.md`, The outline), and its instructions and its `read_tree`
-  and `act` descriptions describe the outline instead of the JSON. It
-  measures whether the outline cuts tokens without hurting pass rates.
+  line per node, `id role "label" = "value" *focused act: a|b|c`, the
+  actions last, absent when a node has none, as in
+  `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`
+  (the grammar is in `docs/cli.md`, The outline), and its instructions and
+  its `read_tree` and `act` descriptions describe the outline instead of the
+  JSON. It measures whether the outline cuts tokens without hurting pass
+  rates. Batches outline1 and probe3 ran the outline before the actions
+  moved to the line's end (` [a b c]` after the value); the dry-run solver
+  still reads that form.
 - **tmux**: `bench/tmux_mcp.py`, with `screen` (the pane as plain text) and
   `send_keys` (tmux key names, or text with `literal: true`). Key names go
   30 ms apart, so `"Escape d"` is not alt+d, and the settle wait is capped at
@@ -227,7 +232,37 @@ driven like any other. Then check that every row has an empty
 `["tui"]`.
 
 What every run still receives, identical across arms: the environment block
-(working directory), the date, the model identity and the session context.
+(working directory), the date, the model identity, the session context (the
+user's e-mail and the orchestrating repo's git status), the tokens left in
+the context window, and the organization id (recorded, never shown to the
+model).
+
+Each of those arrives as an attachment, and every attachment type has
+exactly one rule in `bench/transcript.py`, since an attachment is context
+added to the agent's prompt:
+
+| rule | types | the guard |
+|---|---|---|
+| verified | `prompt_snapshot`, `mcp_instructions_delta`, `deferred_tools_delta`, `deferred_tools_record`, `max_turns_reached`, `instructions` | reads what they carry and holds the run to it (below) |
+| harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `total_tokens_reminder` | holds each to the shape it is known in: a snapshot object, session context of `userEmail` and `gitStatus` only, a date string, a model text and identity, no rendered text for `credential_org`, a `<total_tokens>` count and nothing else |
+| flagged | `remote_session_change`, `skill_listing` | refuses it by name |
+
+Any other type, an attachment line with no type, or one whose attachment is
+not an object makes the run a harness error, and the guard's sentence names
+the type, how many arrived and how many characters of them were rendered.
+That is how `remote_session_change` was caught after the fact: with
+`/remote-control` on in the orchestrating session, Claude Code put a
+~710-character attribution note, as a user-role reminder beside a tool
+result, into every subagent run of outline1 and probe3, and the guard of
+the day read only the types it knew. Turn `/remote-control` off before a
+batch. A new Claude Code version that adds a type stops a batch at its
+first run, which is the point: give the type its rule, then resume.
+
+The agent's identity line, the first line of its system prompt
+(`prompt_snapshot.cliPrefix`), is Claude Code's choice and changed between
+full1 ("You are Claude Code, ...") and outline1 ("You are a Claude agent,
+..."). It is recorded in `context.cli_prefixes`, not checked, and the
+summary's run conditions compare it between batches.
 
 What each row proves, from the transcript: `model_resolved` (the models its
 turns ran on), `efforts_resolved` (the efforts Claude Code recorded on every
@@ -252,6 +287,12 @@ assistant line), and the guard. The guard makes a run a harness error if it:
   problem too;
 - ever got the instructions of an MCP server other than `tui`, got none
   from `tui`, or lost `tui`'s mid-run;
+- was given an attachment without a rule, one flagged by name, or a
+  harmless one in a shape it is not known in (the table above);
+- has a transcript line whose type is not `user`, `assistant` or
+  `attachment`;
+- was given more than one prompt (a message sent to the agent mid-run, a
+  hook);
 - never took a turn.
 
 A run is also a harness error when it did not end on its own: Claude Code's
@@ -282,7 +323,7 @@ execute), not by the guard.
 | `passed` | the check passed and the demo still runs | a pass |
 | `failed` | the check said no, or the demo exited | a failure |
 | `max_turns` | the transcript ends on a tool call (stop_reason `tool_use`, or null) at the batch's max turns | a failure whatever the dump says |
-| `harness_error` | infrastructure, not the agent: a failed setup, a server or solver failure, an unreadable transcript, the guard (offered tools, deferred tools, MCP instruction servers, model, effort, instruction files), a run that did not end on its own (a trailing synthetic message, a stop other than `end_turn`, a tool call under the cap), a grading failure, an abort | left out, counted on its own |
+| `harness_error` | infrastructure, not the agent: a failed setup, a server or solver failure, an unreadable transcript, the guard (offered tools, deferred tools, MCP instruction servers, model, effort, instruction files, attachments, line types, prompts), a run that did not end on its own (a trailing synthetic message, a stop other than `end_turn`, a tool call under the cap), a grading failure, an abort | left out, counted on its own |
 
 A final text reply with a null stop_reason is not a harness error: it ended
 on its own (`end_inferred`, above).
@@ -347,7 +388,7 @@ One JSON object per run, the same keys in both modes, null where none applies.
 | `tokens` | `input`, `cache_creation`, `cache_read`, `output`, summed over messages |
 | `output_tokens_lower_bound`, `unclosed_messages` | `tokens.output` is a lower bound because a message never got its closing line; how many messages did not |
 | `final_text` | the agent's last text, up to 500 characters |
-| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers (at the end, and every one ever added), environment cwd, skill listing, attachment types, and `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description) |
+| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers (at the end, and every one ever added), environment cwd, skill listing, attachment types, `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description); `cli_prefixes`, the agent's identity line; `refused_attachments`, one entry per type, rule (`unknown`, `flagged` or `shape`) and detail the guard refused, with its count and rendered characters; `unknown_line_types`; and `prompts`, the user lines that are not tool results |
 | `status_at_run`, `regraded_at`, `regrade_git_sha`, `regrade_git_dirty`, `regrade_note` | added by `regrade` only: see Regrading |
 
 ## Summaries
@@ -364,10 +405,12 @@ python3 bench/summarize.py FILE ...                 # exactly these files
 ```
 
 - **Run conditions**, first, when the rows come from more than one batch:
-  per batch the git SHA (and dirty flag), claude versions, models requested
-  and resolved, effort, max turns, seed, arms, graded n and harness errors,
-  then which of SHA, claude, models resolved, effort, max turns and seed
-  differ between the batches with agent runs (read from their agent rows).
+  per batch the git SHA (and dirty flag), claude versions, the agents'
+  identity line (`context.cli_prefixes`, `not recorded` for a row graded
+  before it existed), models requested and resolved, effort, max turns,
+  seed, arms, graded n and harness errors, then which of SHA, claude,
+  identity line, models resolved, effort, max turns and seed differ between
+  the batches with agent runs (read from their agent rows).
   A batch of dry runs only has no claude, model, effort or max turns, so it
   is listed but left out of that comparison, and the header names it.
   Merged batches are compared as if they ran together, so read this
