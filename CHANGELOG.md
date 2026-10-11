@@ -13,7 +13,68 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
-## [Unreleased]
+## [0.2.1] - 2026-10-11
+
+**Adopting taria no longer widens the host app's ratatui.** `taria-ratatui`
+took ratatui with its default features while using only the crossterm event
+types, `Buffer`, `Rect` and `Widget`, and cargo unions features across a
+build, so an app that had trimmed its own ratatui got `all-widgets`,
+`widget-calendar`, `layout-cache` and `macros` back the moment it added the
+adapter, and compiled `time`, `ratatui-macros` and `critical-section` along
+with them. Found adopting taria into ramvamp, whose manifest asks for
+`default-features = false, features = ["crossterm"]`.
+
+Nothing on the wire moved and no crate's Rust API changed. `PROTOCOL_VERSION`
+stays 1. All three crates move to 0.2.1 together: they share one workspace
+version, and the `taria-mcp` binaries the v0.2.1 tag builds should report the
+release they came from.
+
+### For an app author adopting taria
+
+- **The adapter asks ratatui for `crossterm` and nothing else.** A crossterm
+  host's ratatui now resolves to what the host asked for, which for a trimmed
+  app is `crossterm` and `std`. A host on another backend still gets
+  `crossterm`, which the adapter's key conversion needs.
+- **The bytes on the terminal do not change.** `underline-color` is in
+  `ratatui-crossterm`'s own default set and arrives through the `crossterm`
+  feature the host selected itself, so a crossterm host has it with or
+  without taria. Measured on a pty in ramvamp, the reset sequence is
+  identical either way. What does change is speed: a trimmed host's
+  `Layout::split` no longer caches.
+- **One kind of build can break, and it was relying on taria by accident.** An
+  app that used the calendar widget, a ratatui macro, `Layout::init_cache` or
+  `Layout::DEFAULT_CACHE_SIZE` without asking for `widget-calendar`, `macros`
+  or `layout-cache` compiled only because the adapter had switched it on. It
+  now has to name that feature in its own manifest.
+
+### For whoever drives an app
+
+- **`install.sh` installs the bridge without a Rust toolchain.** It resolves
+  the latest tag, or the one `TARIA_VERSION` pins, downloads the tarball for
+  the platform it runs on, checks it against the sha256 the release already
+  publishes, and installs `taria-mcp` into `/usr/local/bin` when that is
+  writable and `~/.local/bin` otherwise. A checksum mismatch is a refusal, not
+  a warning. If the checksum cannot be fetched, or neither `shasum` nor
+  `sha256sum` is installed, it says so and installs anyway. Windows gets the
+  reason rather than a missing-artifact error: the transport is a Unix domain
+  socket.
+
+  ```bash
+  curl -sSf https://y0sif.github.io/taria/install.sh | sh
+  ```
+
+- **The copy on the site follows the repository.** A workflow copies
+  `install.sh` to `gh-pages` on every push to `main` that changes it, so the
+  `curl` recipe fetches the file in the repository.
+
+### The demo is a trimmed host
+
+`taria-demo` now takes ratatui with `default-features = false` and `features =
+["crossterm"]`, the way a careful host does, and builds unchanged. It shares a
+workspace with the adapter, so this repository resolves ratatui the way an
+adopter's app does, and `cargo tree -e features -i ratatui -p taria-demo`
+shows `crossterm` and `std` and nothing else. The check is manual: no CI step
+runs it yet.
 
 ### Docs for someone landing on the repository
 
@@ -442,6 +503,6 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
-[Unreleased]: https://github.com/y0sif/taria/compare/v0.2.0...HEAD
+[0.2.1]: https://github.com/y0sif/taria/releases/tag/v0.2.1
 [0.2.0]: https://github.com/y0sif/taria/releases/tag/v0.2.0
 [0.1.0]: https://github.com/y0sif/taria/releases/tag/v0.1.0
