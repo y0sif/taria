@@ -549,6 +549,63 @@ class Guard(Variant, unittest.TestCase):
         self.assertEqual(stats["context"]["tree_formats"], ["json", "unknown"])
         self.assertTrue(transcript.guard(stats, "taria", "sonnet", ARM_TOOLS["taria"], tree_format="json"))
 
+    def test_a_deferred_read_tree_is_held_to_its_format_or_refused(self):
+        """read_tree offered only as a deferred tool: its format comes from
+        the deferred-tool records when they carry its description, and a run
+        whose format cannot be told is refused, never passed unchecked."""
+        def guard(stats, arm):
+            return transcript.guard(stats, arm, "sonnet", ARM_TOOLS[arm], effort="medium",
+                                    tree_format=ARM_TREE_FORMAT.get(arm))
+
+        lines = lines_of(TARIA_CLEAN)
+        description = None
+        for line in lines:
+            if is_att(line, "prompt_snapshot") and line["attachment"].get("tools"):
+                tools = line["attachment"]["tools"]
+                description = next(t["description"] for t in tools if t["name"] == transcript.READ_TREE)
+                line["attachment"]["tools"] = [t for t in tools if t["name"] != transcript.READ_TREE]
+        template = next(l for l in lines if is_att(l, "environment"))
+
+        def att(body):
+            line = copy.deepcopy(template)
+            line["attachment"] = body
+            return line
+
+        delta = att({"type": "deferred_tools_delta", "addedNames": [transcript.READ_TREE], "removedNames": []})
+        deferred = lines[:3] + [delta] + lines[3:]
+        stats = self.variant(deferred)
+        self.assertEqual(stats["context"]["tree_formats"], [])
+        unchecked = ("was offered read_tree only as a deferred tool, and no record carries its description, "
+                     "so its tree format cannot be checked against the {arm} arm's {fmt}")
+        self.assertEqual(guard(stats, "taria"), [unchecked.format(arm="taria", fmt="json")])
+        self.assertEqual(guard(stats, "outline"), [unchecked.format(arm="outline", fmt="outline")])
+        # A record without a description still says nothing.
+        bare = att({"type": "deferred_tools_record", "entries": [{"name": transcript.READ_TREE}]})
+        self.assertEqual(guard(self.variant(deferred + [bare]), "taria"), [unchecked.format(arm="taria", fmt="json")])
+        # Without a tree format to hold it to (the tmux arm, or before the
+        # outline arm) there is nothing to check.
+        self.assertEqual(transcript.guard(stats, "taria", "sonnet", ARM_TOOLS["taria"], effort="medium"), [])
+
+        # A ToolSearch load records the schema, description included.
+        record = att({"type": "deferred_tools_record",
+                      "entries": [{"name": transcript.READ_TREE, "description": description, "input_schema": {}}]})
+        stats = self.variant(deferred + [record])
+        self.assertEqual(stats["context"]["tree_formats"], ["json"])
+        self.assertEqual(guard(stats, "taria"), [])
+        self.assertEqual(guard(stats, "outline"),
+                         ["was offered a read_tree that shows the tree as json, not as the outline arm's outline"])
+        # So does a delta whose schema came loaded (surfacedDefinitions).
+        surfaced = att({"type": "deferred_tools_delta", "addedNames": [], "removedNames": [],
+                        "surfacedNames": [transcript.READ_TREE],
+                        "surfacedDefinitions": [{"name": transcript.READ_TREE, "listing": "x", "definition": {
+                            "name": transcript.READ_TREE,
+                            "description": description.replace("tree as JSON:", "tree as an outline:")}}]})
+        stats = self.variant(lines[:3] + [surfaced] + lines[3:])
+        self.assertEqual(stats["context"]["tree_formats"], ["outline"])
+        self.assertEqual(guard(stats, "outline"), [])
+        self.assertEqual(guard(stats, "taria"),
+                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json"])
+
     def test_guard_tolerates_a_sparse_stats_dict(self):
         self.assertEqual(transcript.guard({}, "taria", "sonnet", ARM_TOOLS["taria"]), [
             "has no prompt_snapshot, so the tools it was offered cannot be checked",
@@ -983,6 +1040,35 @@ class Summary(unittest.TestCase):
         self.assertIn("| Bash (1); WebFetch (1) |", row)
         self.assertIn("| other, tui (1); tui (1) |", row)
 
+    def test_the_context_table_shows_the_tree_formats(self):
+        """The read_tree format each run was offered, which is what tells a
+        taria run from an outline run; none for tmux, and `not recorded` for
+        a row graded before the field existed."""
+        base = next(r for r in self.records if r["mode"] == "subagent" and isinstance(r.get("context"), dict))
+        rows = [
+            dict(base, arm="taria", context=dict(base["context"], tree_formats=["json"])),
+            dict(base, arm="taria", context=dict(base["context"], tree_formats=["json"])),
+            dict(base, arm="outline", context=dict(base["context"], tree_formats=["outline"])),
+            dict(base, arm="tmux", context=dict(base["context"], tree_formats=[])),
+        ]
+        old = dict(base["context"])
+        old.pop("tree_formats", None)
+        rows.append(dict(base, arm="outline", context=old))
+        lines = summarize.context_section(rows)
+        header = next(l for l in lines if l.startswith("| arm |"))
+        self.assertIn("| MCP instruction servers (ever) | tree formats | skill listing |", header)
+        cell = header.split(" | ").index("tree formats")
+
+        def formats(arm):
+            return next(l for l in lines if l.startswith(f"| {arm} | {base['model']} |")).split(" | ")[cell]
+
+        self.assertEqual(formats("taria"), "json (2)")
+        self.assertEqual(formats("outline"), "not recorded (1); outline (1)")
+        self.assertEqual(formats("tmux"), "none (1)")
+        no_context = summarize.context_section([dict(base, context=None)])
+        self.assertEqual(next(l for l in no_context if l.startswith("| ")).count("|"),
+                         header.count("|"), "a row without context keeps every column")
+
     def test_records_are_selected_explicitly(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
@@ -1094,6 +1180,39 @@ class MultiBatchSummary(unittest.TestCase):
         text = summarize.render(changed)
         self.assertIn("| hi | agent | hi-sha012345 (dirty) |", text)
         self.assertIn("differ in git SHA, claude, models resolved, effort:", text)
+
+    def test_dry_run_batches_are_left_out_of_the_conditions_compared(self):
+        """A dry run has no claude version, model, effort or max turns: held
+        against an agent batch, it would differ in all of them."""
+        def dry(batch, seed=7, sha="dry-sha0123456789"):
+            return {"batch": batch, "job": "j001", "task": "T1", "arm": "outline", "mode": "dry-run",
+                    "solver": "scripted", "model": None, "effort": None, "max_turns": None, "seed": seed,
+                    "git_sha": sha, "git_dirty": False, "claude_version": None, "claude_versions": None,
+                    "status": "passed", "passed": True, "check_passed": True, "demo_alive": True}
+
+        same = [dict(r, git_sha="same", claude_versions=["2.1.294"], claude_version="2.1.294") for r in self.full()]
+        text = summarize.render(same + [dry("dryb")])
+        header = text.partition("## Agent runs (headline)")[0]
+        self.assertIn("| dryb | dry-run | dry-sha01234 | - | - | - | - | - | 7 |", header)
+        self.assertIn("The batches with agent runs (full, outl) agree on git SHA, claude, models resolved, "
+                      "effort, max turns, seed.", header)
+        self.assertIn("Left out of that comparison, as dry runs only (a scripted solver, no model, so no claude "
+                      "version, model, effort or max turns): dryb.", header)
+        self.assertNotIn("differ in", header)
+        # A real difference between agent batches still shows, and only it.
+        text = summarize.render(self.full() + [dry("dryb"), dry("dryc", seed=9)])
+        self.assertIn("The batches with agent runs (full, outl) differ in git SHA, claude:", text)
+        self.assertIn("as dry runs only (a scripted solver, no model, so no claude version, model, effort or max "
+                      "turns): dryb, dryc.", text)
+        # Dry rows inside an agent batch do not add their SHA or seed to it.
+        text = summarize.render(same + [dry("full", seed=9, sha="other-sha0123456")])
+        self.assertIn("| full | agent, dry-run | same | 2.1.294 |", text)
+        self.assertIn("The batches agree on", text)
+        # One agent batch and a dry run: nothing to compare, and it says so.
+        one = [r for r in self.full() if r["batch"] == "full"] + [dry("dryb")]
+        text = summarize.render(one)
+        self.assertIn("Only full has agent runs, so no run conditions are compared between batches.", text)
+        self.assertIn("as dry runs only", text)
 
     def test_the_pairs_compared(self):
         self.assertEqual(summarize.arm_pairs({"taria", "tmux", "outline"}),

@@ -27,8 +27,9 @@ transcripts from Claude Code 2.1.294):
   instructions reached the prompt), `instructions` (`files[].path`: CLAUDE.md
   and its imports, memory), `deferred_tools_delta` (`addedNames`,
   `removedNames`, `readdedNames`, and `surfacedNames` for tools whose schema
-  came loaded), `deferred_tools_record` (`entries[].name`: a schema loaded by
-  a ToolSearch call), `environment` (`snapshot.workingDirectory`),
+  came loaded, with `surfacedDefinitions[].definition.description`),
+  `deferred_tools_record` (`entries[].name` and `entries[].description`: a
+  schema loaded by a ToolSearch call), `environment` (`snapshot.workingDirectory`),
   `skill_listing` and `max_turns_reached` (`maxTurns`, `turnCount`).
 
 The tools the agent was offered are in its `prompt_snapshot` attachments.
@@ -231,6 +232,19 @@ def _snapshot_tree_formats(att):
     } if isinstance(tools, list) else set()
 
 
+def _deferred_tree_formats(definitions):
+    """The tree format each read_tree among deferred-tool `definitions`
+    (dicts with `name` and `description`) describes ("unknown" when it names
+    none). A definition without a description says nothing, so it adds none:
+    a read_tree offered only deferred, with no description recorded
+    anywhere, leaves its format undetermined, which `guard` refuses."""
+    return {
+        tree_format_of(d["description"]) or "unknown"
+        for d in definitions
+        if isinstance(d, dict) and d.get("name") == READ_TREE and isinstance(d.get("description"), str)
+    }
+
+
 def _context(attachments):
     claude_md, deferred, loaded, servers, types = [], set(), set(), set(), set()
     deferred_added, servers_added = set(), set()  # every name ever added, removals ignored
@@ -256,12 +270,20 @@ def _context(attachments):
                 deferred.update(_names(att.get(key)))
                 deferred_added.update(_names(att.get(key)))
             deferred.difference_update(_names(att.get("removedNames")))
+            # A tool whose schema came loaded carries its definition here.
+            surfaced = att.get("surfacedDefinitions")
+            tree_formats.update(_deferred_tree_formats(
+                s.get("definition") for s in (surfaced if isinstance(surfaced, list) else [])
+                if isinstance(s, dict)
+            ))
         elif kind == "deferred_tools_record":
             # A schema loaded by ToolSearch: the tool was on offer.
-            for entry in att.get("entries") or []:
+            entries = att.get("entries") if isinstance(att.get("entries"), list) else []
+            for entry in entries:
                 name = entry.get("name") if isinstance(entry, dict) else None
                 if isinstance(name, str):
                     loaded.add(name)
+            tree_formats.update(_deferred_tree_formats(entries))
         elif kind == "mcp_instructions_delta":
             servers.update(_names(att.get("addedNames")))
             servers_added.update(_names(att.get("addedNames")))
@@ -290,8 +312,9 @@ def _context(attachments):
         "skill_listing": skills,
         "attachment_types": sorted(types),
         # The tree formats the offered read_tree tools described, over every
-        # snapshot: ["json"] for a taria run, ["outline"] for an outline run,
-        # [] when no read_tree was offered.
+        # snapshot and every deferred-tool record that carries a definition:
+        # ["json"] for a taria run, ["outline"] for an outline run, [] when
+        # no read_tree was offered or none of its descriptions was recorded.
         "tree_formats": sorted(tree_formats),
     }
 
@@ -457,8 +480,9 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
     arm's; MCP instructions from any server but `tui`, or none from it; a
     read_tree whose description shows the tree in another format than
     `tree_format` (when given: the taria and outline arms list the same
-    tools, so this is what holds each to its own); and a run with no
-    assistant turn.
+    tools, so this is what holds each to its own), or one offered only
+    deferred whose description no record carries, so its format cannot be
+    checked; and a run with no assistant turn.
 
     Other servers and deferred tools are held against every name ever
     added, so one that reached the agent and later left (a server that
@@ -482,13 +506,17 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
     if files:
         problems.append(f"was given {len(files)} instruction file(s) despite omitClaudeMd: {', '.join(files)}")
     problems += _offered_problems(context, allowed, arm)
-    formats = context.get("tree_formats")
-    if tree_format is not None and READ_TREE in (context.get("offered_tools") or []) \
-            and formats != [tree_format]:
-        shown = ", ".join(formats or []) or "(not recorded)"
-        problems.append(f"was offered a read_tree that shows the tree as {shown}, not as the "
-                        f"{arm} arm's {tree_format}")
     deferred_ever = sorted(set(context.get("deferred_tools_added") or []) | set(context.get("deferred_tools") or []))
+    formats = context.get("tree_formats") or []
+    read_tree_offered = READ_TREE in (context.get("offered_tools") or []) or READ_TREE in deferred_ever
+    if tree_format is not None and read_tree_offered and formats != [tree_format]:
+        if formats:
+            problems.append(f"was offered a read_tree that shows the tree as {', '.join(formats)}, not as the "
+                            f"{arm} arm's {tree_format}")
+        else:
+            problems.append(f"was offered read_tree only as a deferred tool, and no record carries its "
+                            f"description, so its tree format cannot be checked against the {arm} arm's "
+                            f"{tree_format}")
     extra = [t for t in deferred_ever if t not in allowed]
     if extra:
         problems.append(f"was offered {len(extra)} deferred tool(s) beyond the {arm} arm: {', '.join(extra)}")

@@ -212,8 +212,19 @@ def _node_line(line):
         if line[pos] != " ":
             raise SolverError(f"expected a space at column {pos} of outline line {line!r}")
         pos += 1
-        if line.startswith('"', pos) and len(node) == 2:
-            node["label"], pos = _quoted(line, pos, "label")
+        if line.startswith('"', pos):
+            # A quoted token followed directly by `=` is a field's key; the
+            # label is the quoted token right after the role, and is never
+            # followed by `=` (a value comes after a space, ` = "..."`).
+            text, end = _quoted(line, pos, "label or field key")
+            if line.startswith("=", end):
+                key, value, pos = _field(line, pos)
+                node[key] = value
+            elif len(node) == 2:
+                node["label"], pos = text, end
+            else:
+                raise SolverError(f"a quoted {text!r} at column {pos} of outline line {line!r} is "
+                                  "neither the label (right after the role) nor a field key")
         elif line.startswith('= "', pos):
             node["value"], pos = _quoted(line, pos + 2, "value")
         elif line.startswith("[", pos):

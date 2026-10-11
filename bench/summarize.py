@@ -20,8 +20,9 @@ Sections:
 
 - Run conditions, only when the rows come from more than one batch: per
   batch the git SHA, claude versions, models, effort, max turns, seed, arms
-  and n, and which of them differ, since merged batches are compared as if
-  they ran together.
+  and n, and which of them differ between the batches with agent runs,
+  since merged batches are compared as if they ran together. A batch of dry
+  runs only is listed, and named as left out of that comparison.
 - Agent runs (headline): subagent rows only, one row per (task, arm, model,
   effort, max_turns), so runs held to different settings are never pooled.
   Per row: graded runs (n), passes and the pass rate with a Wilson 95%
@@ -50,9 +51,10 @@ Sections:
 - Dry runs (a scripted solver, no model) in their own table, never headline.
 - Provenance: batch, git SHA and dirty flag, claude version, models
   requested and resolved, effort, max turns, runs; guard problems; and the
-  context each arm's agents were given (attachment types, and every
-  deferred tool and MCP instruction server that ever reached them, as the
-  guard checks), so a reader can see both arms got equivalent context.
+  context each arm's agents were given (attachment types, every deferred
+  tool and MCP instruction server that ever reached them, as the guard
+  checks, and the tree formats their read_tree descriptions named), so a
+  reader can see the arms got equivalent context.
 
 Python 3 stdlib only.
 """
@@ -715,13 +717,13 @@ def _batch_conditions(rows):
         claude.update(v for v in (versions if isinstance(versions, list) else [r.get("claude_version")]) if v)
     return {
         "kinds": ", ".join(sorted({label(r) for r in rows})),
-        "git SHA": ", ".join(sorted({_sha(r) for r in rows if _sha(r)})) or "-",
+        "git SHA": ", ".join(sorted({_sha(r) for r in agent if _sha(r)})) or "-",
         "claude": ", ".join(sorted(claude)) or "-",
         "models": _values(agent, "model"),
         "models resolved": _values(agent, "model_resolved"),
         "effort": _values(agent, "effort"),
         "max turns": _values(agent, "max_turns", _show),
-        "seed": _values(rows, "seed"),
+        "seed": _values(agent, "seed"),
         "arms": ", ".join(sorted({str(r.get("arm", "?")) for r in agent}, key=_arm_key)),
         "n": len(graded),
         "harness err": sum(1 for r in agent if r.get("status") == "harness_error"),
@@ -736,7 +738,9 @@ COMPARED_CONDITIONS = ("git SHA", "claude", "models resolved", "effort", "max tu
 
 def conditions(records):
     """Per batch, the conditions its runs had, and which differ between
-    batches: merged batches are compared as if they ran together."""
+    batches: merged batches are compared as if they ran together. Only
+    batches with agent runs are compared: a dry run has no claude version,
+    model, effort or max turns, so it would differ from any agent batch."""
     batches = group(records, lambda r: r.get("batch") or NO_BATCH)
     rows = {batch: _batch_conditions(rs) for batch, rs in batches.items()}
     lines = [
@@ -747,12 +751,22 @@ def conditions(records):
         *(_row([batch, *(rows[batch][c] for c in CONDITION_COLUMNS)]) for batch in sorted(rows)),
     ]
     notes = []
-    differ = [c for c in COMPARED_CONDITIONS if len({rows[b][c] for b in rows}) > 1]
-    if differ:
-        notes.append(f"The batches differ in {', '.join(differ)}: a difference between arms run in "
-                     "different batches may come from these as well as from the arms.")
+    compared = sorted(b for b, rs in batches.items() if any(label(r) == "agent" for r in rs))
+    scripted = sorted(b for b in rows if b not in compared)
+    which = "The batches" if not scripted else f"The batches with agent runs ({', '.join(compared)})"
+    if len(compared) < 2:
+        notes.append(f"{'No batch has' if not compared else f'Only {compared[0]} has'} agent runs, so no "
+                     "run conditions are compared between batches.")
     else:
-        notes.append("The batches agree on " + ", ".join(COMPARED_CONDITIONS) + ".")
+        differ = [c for c in COMPARED_CONDITIONS if len({rows[b][c] for b in compared}) > 1]
+        if differ:
+            notes.append(f"{which} differ in {', '.join(differ)}: a difference between arms run in "
+                         "different batches may come from these as well as from the arms.")
+        else:
+            notes.append(f"{which} agree on " + ", ".join(COMPARED_CONDITIONS) + ".")
+    if scripted:
+        notes.append(f"Left out of that comparison, as dry runs only (a scripted solver, no model, so no "
+                     f"claude version, model, effort or max turns): {', '.join(scripted)}.")
     per_arm = group([r for r in records if label(r) == "agent"], lambda r: r.get("arm", "?"))
     for arm in sorted(per_arm, key=_arm_key):
         from_batches = sorted({r.get("batch") or NO_BATCH for r in per_arm[arm]})
@@ -795,6 +809,14 @@ def _ever(context, field):
     return sorted(set(context.get(f"{field}_added") or []) | set(context.get(field) or []))
 
 
+def _tree_formats(context):
+    """The tree formats a row's read_tree descriptions named (none for an
+    arm without read_tree), or `not recorded` for a row from before
+    `tree_formats` existed."""
+    formats = context.get("tree_formats")
+    return [str(f) for f in formats] if isinstance(formats, list) else ["not recorded"]
+
+
 def context_section(records):
     """What each arm's agents were given, so the arms can be seen to match."""
     rows = []
@@ -803,7 +825,7 @@ def context_section(records):
                           key=lambda kv: _order(kv[0])):
         contexts = [r["context"] for r in rs if isinstance(r.get("context"), dict)]
         if not contexts:
-            rows.append(_row([*key, f"0/{len(rs)}", "-", "-", "-", "-", "-", "-"]))
+            rows.append(_row([*key, f"0/{len(rs)}", "-", "-", "-", "-", "-", "-", "-"]))
             continue
         types = Counter(t for c in contexts for t in set(c.get("attachment_types") or []))
         every = sorted(t for t, n in types.items() if n == len(contexts))
@@ -812,6 +834,7 @@ def context_section(records):
             *key, f"{len(contexts)}/{len(rs)}", ", ".join(every) or "-", ", ".join(some) or "-",
             _sets(_ever(c, "deferred_tools") for c in contexts),
             _sets(_ever(c, "mcp_instruction_servers") for c in contexts),
+            _sets(_tree_formats(c) for c in contexts),
             f"{sum(1 for c in contexts if c.get('skill_listing'))}/{len(contexts)}",
             f"{sum(1 for c in contexts if c.get('claude_md_files'))}/{len(contexts)}",
         ]))
@@ -821,11 +844,14 @@ def context_section(records):
         "Context the agents were given, from their transcripts (runs with a transcript / runs). "
         "Deferred tools and MCP instruction servers list every one that ever reached a run, even "
         "one later removed (what the guard checks), as each distinct set with its run count; "
-        "the arms differ there by design (each arm's own tools), and should match elsewhere.",
+        "the arms differ there by design (each arm's own tools), and should match elsewhere. "
+        "Tree formats are the formats the read_tree descriptions each run was offered named, which "
+        "the guard holds each bridge arm to (none for an arm without read_tree; `not recorded` "
+        "for rows graded before the field existed).",
         "",
         *_header(("arm", "model", "runs with context", "attachment types (every run)",
                   "attachment types (some runs)", "deferred tools (ever)", "MCP instruction servers (ever)",
-                  "skill listing", "instruction files")),
+                  "tree formats", "skill listing", "instruction files")),
         *rows,
     ]
 

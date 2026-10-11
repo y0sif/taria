@@ -1860,6 +1860,24 @@ class OutlineParser(unittest.TestCase):
         self.assertEqual((sibling["role"], sibling["value"], sibling["*focusedish"]), ("sparkline", "", True))
         self.assertNotIn("focused", sibling)
 
+    def test_a_quoted_key_right_after_the_role_is_a_field_not_a_label(self):
+        """docs/cli.md: a quoted token followed directly by `=` is a field
+        key; only one followed by a space or the line's end is the label."""
+        def root(line):
+            return solvers.parse_outline("protocol_version=1\n" + line)["root"]
+
+        self.assertEqual(root('app app "odd key"=1'), {"id": "app", "role": "app", "odd key": 1})
+        self.assertEqual(root('app app "odd key"={"a":"b c"} score=2'),
+                         {"id": "app", "role": "app", "odd key": {"a": "b c"}, "score": 2})
+        self.assertEqual(root('app app "L" "odd key"=1'), {"id": "app", "role": "app", "label": "L", "odd key": 1})
+        self.assertEqual(root('app app "L" = "V" "k"=[1]'),
+                         {"id": "app", "role": "app", "label": "L", "value": "V", "k": [1]})
+        self.assertEqual(root('app app "a=b"'), {"id": "app", "role": "app", "label": "a=b"})
+        # Once a field has come, a quoted token is no label any more.
+        for line in ('app app "k"=1 "late label"', 'app app "L" "second label"'):
+            with self.subTest(line=line), self.assertRaises(solvers.SolverError):
+                root(line)
+
     def test_what_is_not_an_outline_is_refused(self):
         for text in ("app app", "protocol_version=1\n  app app", "protocol_version=1\napp app\n   odd x",
                      "protocol_version=1\napp app\n    skipped x", "protocol_version=1\napp app\nsecond root",

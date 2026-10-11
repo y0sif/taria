@@ -245,7 +245,11 @@ assistant line), and the guard. The guard makes a run a harness error if it:
   arm's), even one later removed;
 - was offered a `read_tree` whose description shows the tree in another
   format than its arm's (json for taria, outline for outline), which is how
-  the two bridge arms, with the same tool names, are told apart;
+  the two bridge arms, with the same tool names, are told apart. A
+  `read_tree` offered only as a deferred tool is read from the deferred-tool
+  records that carry its description (a ToolSearch load, or a schema that
+  came loaded); when none does, its format cannot be checked, and that is a
+  problem too;
 - ever got the instructions of an MCP server other than `tui`, got none
   from `tui`, or lost `tui`'s mid-run;
 - never took a turn.
@@ -343,7 +347,7 @@ One JSON object per run, the same keys in both modes, null where none applies.
 | `tokens` | `input`, `cache_creation`, `cache_read`, `output`, summed over messages |
 | `output_tokens_lower_bound`, `unclosed_messages` | `tokens.output` is a lower bound because a message never got its closing line; how many messages did not |
 | `final_text` | the agent's last text, up to 500 characters |
-| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers (at the end, and every one ever added), environment cwd, skill listing, attachment types, and `tree_formats`: the tree format each offered `read_tree` described (`["json"]`, `["outline"]`, or `[]` without one) |
+| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers (at the end, and every one ever added), environment cwd, skill listing, attachment types, and `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description) |
 | `status_at_run`, `regraded_at`, `regrade_git_sha`, `regrade_git_dirty`, `regrade_note` | added by `regrade` only: see Regrading |
 
 ## Summaries
@@ -360,7 +364,10 @@ python3 bench/summarize.py FILE ...                 # exactly these files
   per batch the git SHA (and dirty flag), claude versions, models requested
   and resolved, effort, max turns, seed, arms, graded n and harness errors,
   then which of SHA, claude, models resolved, effort, max turns and seed
-  differ. Merged batches are compared as if they ran together, so read this
+  differ between the batches with agent runs (read from their agent rows).
+  A batch of dry runs only has no claude, model, effort or max turns, so it
+  is listed but left out of that comparison, and the header names it.
+  Merged batches are compared as if they ran together, so read this
   before any cross-batch comparison. An arm with runs in several batches is
   pooled, and the header says so.
 - **Agent runs**, the headline: one row per (task, arm, model, effort, max
@@ -385,7 +392,10 @@ python3 bench/summarize.py FILE ...                 # exactly these files
 - **Dry runs**, **provenance**, **guard** problems and the **agent context**
   per arm and model, so the arms can be seen to match. The context table
   lists every deferred tool and MCP instruction server that ever reached a
-  run, as the guard checks, not only those left at the end.
+  run, as the guard checks, not only those left at the end, and the tree
+  formats the runs' `read_tree` descriptions named (`json`, `outline`, none
+  for tmux, or `not recorded` for a row graded before `tree_formats`
+  existed).
 
 ## The outline arm
 
