@@ -18,26 +18,31 @@
 //! zero:
 //!
 //! ```text
-//! <id> <role>[ "<label>"][ = "<value>"][ [<action> ...]][ *focused][ <key>=<compact json> ...]
+//! <id> <role>[ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
 //! ```
 //!
-//! - The id is bare when it is non-empty and made only of
-//!   `[A-Za-z0-9_.:/@+-]`, and JSON-quoted otherwise. Roles, action names and
-//!   field keys follow the same rule.
+//! For example `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`.
+//!
+//! - The id is bare when it is non-empty, made only of `[A-Za-z0-9_.:/@+-]`,
+//!   and not the `act:` marker itself, and JSON-quoted otherwise. Roles,
+//!   action names and field keys follow the same rule.
 //! - A role is a string, or a single-key object such as `{"app":null}`, which
 //!   renders as its key; any other shape renders as compact JSON.
 //! - The label and the value are JSON-quoted strings, so an empty value shows
 //!   as `= ""`. `null` or absent omits them; any other type goes to the tail.
-//! - An action renders as the name `act` accepts for it: the name the
+//! - `*focused` appears only for `"focused":true`; `false` or absent prints
+//!   nothing, and any other value goes to the tail.
+//! - Every other field, and any of the above in a shape the line cannot hold,
+//!   is appended as ` key=<compact json>`, after `*focused` and before the
+//!   actions.
+//! - The actions end the line, after the bare marker `act: `, joined by `|`,
+//!   each one a name an agent passes to `act` as it is (unquoted, if quoted).
+//!   An action renders as the name `act` accepts for it: the name the
 //!   bridge's own parse of the line reads it as, which is the action `act`
 //!   validates against. `{"custom":"delete"}` renders as `delete`, a string
 //!   as itself, and an object in a shape a newer app might send, such as
 //!   `{"scroll_to":{"row":3}}`, as the name the parse keeps, `scroll_to`. No
-//!   actions, or an empty list, omits the brackets.
-//! - `*focused` appears only for `"focused":true`; `false` or absent prints
-//!   nothing, and any other value goes to the tail.
-//! - Every other field, and any of the above in a shape the line cannot hold,
-//!   is appended as ` key=<compact json>`.
+//!   actions, or an empty list, omits the marker.
 //! - `children`, an array, is the next level down; absent or empty is a leaf.
 //!
 //! Every string the line prints is either bare by the rule above or
@@ -46,6 +51,16 @@
 //! JSON's own on three characters JSON leaves raw and some clients still
 //! render as a line break, U+2028, U+2029 and U+0085, which print as
 //! `\u2028`, `\u2029` and `\u0085`.
+//!
+//! The same rule keeps the action list unambiguous. A bare token never holds
+//! a space, a `|`, a quote or a bracket, so a name carrying any of them is
+//! quoted, and `act: "a|b"|"two words"|c` is three actions to a reader that
+//! takes a JSON string whole. Nothing but the marker prints as a bare `act:`:
+//! an id, role or name spelled that way is quoted, so a node whose role is
+//! `act:` cannot pass its next word off as an action. And since compact JSON
+//! holds no space outside a string, the line splits into tokens at its
+//! spaces outside quotes, the marker is the first token that is exactly
+//! `act:`, and the list is the one token after it, at the end of the line.
 //!
 //! # Rendered from the relayed text
 //!
@@ -214,27 +229,27 @@ fn render_node(
         None | Some(Value::Null) => {}
         Some(other) => tail.push(field("value", other)),
     }
-    match node.get("actions") {
-        Some(Value::Array(actions)) if !actions.is_empty() => {
-            let parsed = parsed
-                .map(|parsed| parsed.actions.as_slice())
-                .filter(|parsed| parsed.len() == actions.len());
-            let names: Vec<String> = actions
-                .iter()
-                .enumerate()
-                .map(|(i, value)| action(value, parsed.and_then(|parsed| parsed.get(i))))
-                .collect();
-            out.push_str(" [");
-            out.push_str(&names.join(" "));
-            out.push(']');
-        }
-        None | Some(Value::Null) | Some(Value::Array(_)) => {}
-        Some(other) => tail.push(field("actions", other)),
-    }
     match node.get("focused") {
         Some(Value::Bool(true)) => out.push_str(" *focused"),
         None | Some(Value::Bool(false)) => {}
         Some(other) => tail.push(field("focused", other)),
+    }
+    // Rendered now, printed last: the list ends the line, so nothing an agent
+    // reads after `act:` is anything but an action.
+    let mut names: Vec<String> = Vec::new();
+    match node.get("actions") {
+        Some(Value::Array(actions)) => {
+            let parsed = parsed
+                .map(|parsed| parsed.actions.as_slice())
+                .filter(|parsed| parsed.len() == actions.len());
+            names = actions
+                .iter()
+                .enumerate()
+                .map(|(i, value)| action(value, parsed.and_then(|parsed| parsed.get(i))))
+                .collect();
+        }
+        None | Some(Value::Null) => {}
+        Some(other) => tail.push(field("actions", other)),
     }
     let children = match node.get("children") {
         Some(Value::Array(children)) => children.as_slice(),
@@ -255,6 +270,12 @@ fn render_node(
     for extra in tail {
         out.push(' ');
         out.push_str(&extra);
+    }
+    if !names.is_empty() {
+        out.push(' ');
+        out.push_str(ACT_MARKER);
+        out.push(' ');
+        out.push_str(&names.join("|"));
     }
 
     let parsed_children = parsed
@@ -302,10 +323,19 @@ fn field(key: &str, value: &Value) -> String {
     format!("{}={}", token(key), compact(value))
 }
 
+/// The bare word that opens a node's action list.
+const ACT_MARKER: &str = "act:";
+
 /// `s` bare when every character is one an id may print without quotes, and
 /// JSON-quoted otherwise, so a token can never swallow the space after it.
+///
+/// The bare set leaves out space, `|`, quotes and brackets, which is what
+/// keeps a name from running into the next one in an action list, and the
+/// [`ACT_MARKER`] is quoted although its characters are all allowed, so that
+/// the marker is the only bare `act:` a line holds.
 fn token(s: &str) -> String {
     let bare = !s.is_empty()
+        && s != ACT_MARKER
         && s.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '/' | '@' | '+' | '-')
         });
@@ -338,6 +368,61 @@ fn compact(value: &Value) -> String {
         .replace('\u{0085}', "\\u0085")
 }
 
+/// The action names a node line lists after `act:`, as an agent passes them
+/// to `act` (unquoted where the line quotes one), or `None` for a line that
+/// lists none or puts anything after its list.
+///
+/// A reader of the grammar in the module docs, kept beside the renderer so
+/// the tests can hold one to the other: the line splits into tokens at spaces
+/// outside JSON strings, the marker is the first token that is exactly
+/// `act:`, and the list is the one token after it, split at every `|`
+/// outside a JSON string.
+#[cfg(test)]
+pub(crate) fn line_actions(line: &str) -> Option<Vec<String>> {
+    let tokens = split_outside_strings(line.trim_start_matches(' '), ' ');
+    let at = tokens.iter().position(|token| token == ACT_MARKER)?;
+    let [list] = &tokens[at + 1..] else {
+        return None;
+    };
+    Some(
+        split_outside_strings(list, '|')
+            .into_iter()
+            .map(|name| match serde_json::from_str::<String>(&name) {
+                Ok(unquoted) if name.starts_with('"') => unquoted,
+                _ => name,
+            })
+            .collect(),
+    )
+}
+
+/// `s` split at every `sep` that is not inside a JSON string.
+#[cfg(test)]
+fn split_outside_strings(s: &str, sep: char) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if c == sep {
+            parts.push(String::new());
+            continue;
+        }
+        if let Some(part) = parts.last_mut() {
+            part.push(c);
+        }
+    }
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,14 +433,14 @@ mod tests {
     const DEMO_OUTLINE: &str = r#"protocol_version=1 seq=1
 app app "taria-demo"
   tabs tabs "Tabs" = "Active"
-    tab-active tab "Active" = "selected" [select]
-    tab-done tab "Done" [select]
+    tab-active tab "Active" = "selected" act: select
+    tab-done tab "Done" act: select
   tasks list "Active tasks" = "task-1"
-    task-1 list_item "Write the taria README" = "todo" [select toggle delete] *focused
-    task-3 list_item "Wire up the MCP bridge" = "todo" [select toggle delete]
-    task-4 list_item "Record the killer demo" = "todo" [select toggle delete]
-  input text_input "New task" = "" [set_value focus]
-  quit button "Quit" [activate]"#;
+    task-1 list_item "Write the taria README" = "todo" *focused act: select|toggle|delete
+    task-3 list_item "Wire up the MCP bridge" = "todo" act: select|toggle|delete
+    task-4 list_item "Record the killer demo" = "todo" act: select|toggle|delete
+  input text_input "New task" = "" act: set_value|focus
+  quit button "Quit" act: activate"#;
 
     /// Wrap one node as a whole snapshot and render it.
     fn render_root(node: &str) -> String {
@@ -420,7 +505,80 @@ app app "taria-demo"
         );
         assert_eq!(
             out,
-            "protocol_version=1 seq=3\nrow list_item [select archive \"two words\" future scroll_to delete activate]"
+            "protocol_version=1 seq=3\nrow list_item act: select|archive|\"two words\"|future|scroll_to|delete|activate"
+        );
+    }
+
+    /// The actions end the line, after `*focused` and after any field the line
+    /// has no slot for, so nothing an agent reads past `act:` is anything but
+    /// an action, and each name between the `|`s is one `act` takes.
+    #[test]
+    fn the_action_list_ends_the_line() {
+        let out = render_root(
+            r#"{"id":"x","role":"button","label":"Go","actions":["activate",{"custom":"pin"}],"focused":true,"hint":"a b","zeta":[1]}"#,
+        );
+        let line = out.lines().last().expect("a node line");
+        assert_eq!(
+            line,
+            r#"x button "Go" *focused hint="a b" zeta=[1] act: activate|pin"#
+        );
+        assert_eq!(
+            line_actions(line),
+            Some(vec!["activate".to_string(), "pin".to_string()])
+        );
+        assert_eq!(line_actions(r#"x button "Go" *focused"#), None);
+    }
+
+    /// A name the line could misread is quoted: one carrying the `|` that
+    /// joins the list or a space that ends a token, and one spelling the
+    /// `act:` marker itself, as an action, a role or an id. Read back the way
+    /// the module docs say the line reads, taking a JSON string whole, every
+    /// name comes out whole and in order, and the only bare `act:` on the
+    /// line is the marker.
+    #[test]
+    fn a_name_carrying_a_delimiter_cannot_split_or_forge_the_action_list() {
+        let names = [
+            "a|b",
+            "two words",
+            "|",
+            " ",
+            "act:",
+            "say \"hi\" act: x|y",
+            "tab\tand\nnewline",
+            "select",
+        ];
+        let actions: Vec<Value> = names
+            .iter()
+            .map(|name| match *name {
+                "select" => Value::String((*name).to_string()),
+                custom => serde_json::json!({ "custom": custom }),
+            })
+            .collect();
+        let node = serde_json::json!({
+            "id": "act:",
+            "role": "act:",
+            "label": "x act: fake|forged",
+            "value": "a|b c",
+            "actions": actions,
+        });
+        let out = render_root(&node.to_string());
+        let line = out.lines().last().expect("a node line");
+        assert_eq!(
+            line,
+            r#""act:" "act:" "x act: fake|forged" = "a|b c" act: "a|b"|"two words"|"|"|" "|"act:"|"say \"hi\" act: x|y"|"tab\tand\nnewline"|select"#
+        );
+        assert_eq!(out.lines().count(), 2, "one header, one node: {out}");
+        assert_eq!(
+            line_actions(line),
+            Some(names.iter().map(|name| (*name).to_string()).collect())
+        );
+        assert_eq!(
+            split_outside_strings(line, ' ')
+                .iter()
+                .filter(|token| *token == ACT_MARKER)
+                .count(),
+            1,
+            "only the marker may be a bare act: token: {line}"
         );
     }
 
@@ -434,7 +592,7 @@ app app "taria-demo"
         );
         assert_eq!(
             out,
-            "protocol_version=1 seq=3\nrow list_item [{\"custom\":7} {} 7 [\"select\"]]"
+            "protocol_version=1 seq=3\nrow list_item act: {\"custom\":7}|{}|7|[\"select\"]"
         );
     }
 
@@ -460,14 +618,17 @@ app app "taria-demo"
             tree_json.contains(r#"{"custom":"x","zoom":1}"#),
             "{tree_json}"
         );
-        assert!(outline(&tree_json).ends_with("[x select]"));
-        assert!(outline(line).ends_with("[zoom select]"));
+        assert!(outline(&tree_json).ends_with(" act: x|select"));
+        assert!(outline(line).ends_with(" act: zoom|select"));
         let rejected = line.replace(r#""select""#, r#"{"custom":7}"#);
-        assert!(outline(&rejected).ends_with(r#"[x {"custom":7}]"#));
+        assert!(outline(&rejected).ends_with(r#" act: x|{"custom":7}"#));
 
         let snapshot = AppSnapshot { tree_json, parsed };
         let out = TreeFormat::Outline.render(&snapshot);
-        assert_eq!(out, "protocol_version=1 seq=3\nrow list_item [zoom select]");
+        assert_eq!(
+            out,
+            "protocol_version=1 seq=3\nrow list_item act: zoom|select"
+        );
     }
 
     /// JSON escapes a newline but leaves U+2028, U+2029 and U+0085 raw, and a
@@ -484,7 +645,7 @@ app app "taria-demo"
         assert_eq!(
             out,
             "note=\"a\\u2028b\" protocol_version=1 seq=3\n\"r\\u0085w\" list_item \"x\\u2028  forged button\" \
-             = \"y\\u2029z\" [\"de\\u2029l\"] extra=[\"\\u0085\"]"
+             = \"y\\u2029z\" extra=[\"\\u0085\"] act: \"de\\u2029l\""
         );
         assert!(
             !out.contains(['\u{2028}', '\u{2029}', '\u{0085}']),

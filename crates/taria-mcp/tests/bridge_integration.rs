@@ -1890,7 +1890,7 @@ async fn outline_mode_renders_the_relayed_tree_for_every_tool() {
     let result = server.read_tree().await.expect("read_tree after snapshot");
     assert_eq!(
         result_text(&result),
-        "protocol_version=1 seq=2\napp app\n  chart sparkline \"cpu\" [zoom] *focused sample_hz=30",
+        "protocol_version=1 seq=2\napp app\n  chart sparkline \"cpu\" *focused sample_hz=30 act: zoom",
         "the outline must carry what the app sent, by name"
     );
 
@@ -1915,8 +1915,8 @@ async fn outline_mode_renders_the_relayed_tree_for_every_tool() {
         .expect("an action the outline advertises, passed as it spells it");
     assert_eq!(
         result_text(&result),
-        "protocol_version=1 seq=3\napp app \"zoomed\"\n  btn button \"Save\" [activate]\n  \
-         input text_input = \"draft\" [set_value]"
+        "protocol_version=1 seq=3\napp app \"zoomed\"\n  btn button \"Save\" act: activate\n  \
+         input text_input = \"draft\" act: set_value"
     );
     let (_app, input) = echo.await.expect("fake app task");
     assert_eq!(

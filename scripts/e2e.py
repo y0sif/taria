@@ -1685,6 +1685,52 @@ def step_u_dropped_counter(ctx):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def split_outside_strings(text, sep):
+    """`text` split at every `sep` that is not inside a JSON string."""
+    parts, part, in_string, escaped = [], "", False, False
+    for c in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                in_string = False
+        elif c == '"':
+            in_string = True
+        elif c == sep:
+            parts.append(part)
+            part = ""
+            continue
+        part += c
+    parts.append(part)
+    return parts
+
+
+def outline_tokens(line):
+    """A node line's tokens, indent dropped: compact JSON holds no space
+    outside a string, and a bare token none at all, so the outline's grammar
+    splits a line at its spaces outside JSON strings (see the module docs of
+    crates/taria-mcp/src/tree_format.rs)."""
+    return split_outside_strings(line.lstrip(" "), " ")
+
+
+def outline_actions(line):
+    """The action names a node line lists after its `act:` marker, unquoted
+    the way an agent passes them to act, or None for a line with no list or
+    with anything after it: the list has to end the line."""
+    tokens = outline_tokens(line)
+    if "act:" not in tokens or tokens.index("act:") != len(tokens) - 2:
+        return None
+    names = split_outside_strings(tokens[-1], "|")
+    return [json.loads(n) if n.startswith('"') else n for n in names]
+
+
+def outline_focused(line):
+    """Whether a node line carries the `*focused` mark."""
+    return "*focused" in outline_tokens(line)
+
+
 def step_v_outline_format(ctx):
     """`--tree-format outline` serves the same demo as an outline.
 
@@ -1717,8 +1763,9 @@ def step_v_outline_format(ctx):
         require("error" not in resp, f"tools/list failed: {resp}")
         described = {t["name"]: t.get("description", "") for t in resp["result"]["tools"]}
         require(
-            "as an outline" in described.get("read_tree", ""),
-            f"read_tree is not described as an outline: {described.get('read_tree')}",
+            "tree as an outline" in described.get("read_tree", "")
+            and "act: a|b" in described.get("read_tree", ""),
+            f"read_tree does not describe the outline: {described.get('read_tree')}",
         )
 
         text = None
@@ -1749,8 +1796,9 @@ def step_v_outline_format(ctx):
         rows = [
             line.split()[0]
             for line in lines
-            if re.match(r"^    task-\S+ list_item .*\[select\b", line)
-            and not line.endswith("*focused")
+            if re.match(r"^    task-\S+ list_item ", line)
+            and "select" in (outline_actions(line) or [])
+            and not outline_focused(line)
         ]
         require(rows, f"no unfocused selectable task in the outline:\n{text}")
         target = rows[-1]
@@ -1762,7 +1810,7 @@ def step_v_outline_format(ctx):
         )
         require(
             any(
-                line.startswith(f"    {target} list_item ") and line.endswith(" *focused")
+                line.startswith(f"    {target} list_item ") and outline_focused(line)
                 for line in after
             ),
             f"{target} is not the focused row after select:\n{answer}",
@@ -1774,11 +1822,10 @@ def step_v_outline_format(ctx):
             return found[0] if found else None
 
         def line_actions(line):
-            # The bracket list closes the line, before `*focused` if present.
-            # Demo labels carry no brackets, and the names it uses are bare.
-            match = re.search(r"\[([^\]\"]*)\](?: \*focused)?$", line)
-            require(match is not None, f"no action list on the line: {line!r}")
-            return match.group(1).split()
+            # The `act:` list closes the line, one name per action.
+            names = outline_actions(line)
+            require(names is not None, f"no action list ending the line: {line!r}")
+            return names
 
         row = node_line(answer, 2, target)
         require(
@@ -1800,7 +1847,7 @@ def step_v_outline_format(ctx):
         require(
             dialog is not None
             and dialog.startswith("  dialog dialog ")
-            and dialog.endswith(" *focused"),
+            and outline_focused(dialog),
             f"act {custom[0]} did not open the focused confirm dialog:\n{opened}",
         )
         for button in ("dialog-confirm", "dialog-cancel"):
