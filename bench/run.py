@@ -31,7 +31,8 @@ Two ways to drive a run:
             slot (bench/agents.py) starts bench/mcp_launch.py, which reads the
             slot file and execs the arm's server against that demo, once per
             job (results/slots/<K>.<job>.launched). When the agent finishes,
-            `next --agent-id` reads its transcript (bench/transcript.py),
+            `next --agent-id` copies its transcript and .meta.json into
+            results/<batch>/transcripts/, reads it (bench/transcript.py),
             grades the demo, records the row and tears the demo down. It
             refuses (exit 2, nothing recorded, the slot kept) what is the
             orchestrator's mistake rather than a run: an agent id the batch
@@ -42,9 +43,16 @@ Two ways to drive a run:
 
   regrade   grades every row of a finished batch again with the current
             code, from what persists (the recorded state and demo_alive, the
-            transcript re-read), after copying runs.jsonl to
+            transcript re-read: the batch's archived copy, else the live one
+            under ~/.claude/projects), after copying runs.jsonl to
             runs.orig-<utc>.jsonl. For after a change to the grading logic,
             so one batch keeps one logic for all its rows.
+
+  archive   copies the live transcript of every row of a batch that has no
+            archived copy yet into results/<batch>/transcripts/. Claude Code
+            deletes transcripts after cleanupPeriodDays (default 30), and
+            regrade needs them; `next` archives as it grades, so this is for
+            a batch graded before it did.
 
 Every run ends in exactly one status:
 
@@ -66,8 +74,9 @@ Rows go to results/<batch>/runs.jsonl, one JSON object per run, with the
 same keys in both modes (ROW_KEYS; null where a mode has no value).
 
 Exit codes: 0 ok (dry-run: every run passed); 1 dry-run: a run did not
-pass; 2 a harness error (a stale build, bad arguments, slot misuse, or a
-graded run that was a harness error, after which `next` claims nothing).
+pass; 2 a harness error (a stale build, bad arguments, slot misuse, a
+graded run that was a harness error, after which `next` claims nothing, or
+an `archive` that found a row's transcript neither archived nor live).
 
 Python 3 stdlib only. Never builds, never calls a model.
 
@@ -80,6 +89,7 @@ Usage:  python3 bench/run.py dry-run [--tasks T1,T3] [--arms taria,tmux] [--runs
         python3 bench/run.py status  --batch B
         python3 bench/run.py abort   --batch B --slot K [--reason TEXT]
         python3 bench/run.py regrade --batch B
+        python3 bench/run.py archive --batch B
 """
 
 import argparse
@@ -96,6 +106,7 @@ import sys
 import time
 import traceback
 import uuid
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -141,6 +152,7 @@ ROW_KEYS = (
     "end_inferred", "notes",
     "demo_alive", "demo_exit", "state",
     "turns", "tool_calls", "tool_calls_total", "toolsearch_calls", "tokens",
+    "output_tokens_lower_bound", "unclosed_messages",
     "wall_ms", "final_text", "context",
 )
 
@@ -218,7 +230,8 @@ def new_batch_id():
 
 
 class Paths:
-    """results/<batch>/{plan.json,runs.jsonl,.lock} and results/slots/<K>.json."""
+    """results/<batch>/{plan.json,runs.jsonl,.lock,transcripts/} and
+    results/slots/<K>.json."""
 
     def __init__(self, results_dir, batch=None):
         self.results = os.path.abspath(results_dir)
@@ -229,6 +242,7 @@ class Paths:
             self.plan = os.path.join(self.batch_dir, "plan.json")
             self.runs = os.path.join(self.batch_dir, "runs.jsonl")
             self.lock = os.path.join(self.batch_dir, ".lock")
+            self.transcripts = os.path.join(self.batch_dir, "transcripts")
 
     def slot(self, k):
         return os.path.join(self.slots, f"{k}.json")
@@ -266,6 +280,16 @@ def read_rows(paths):
         if isinstance(row, dict):
             rows.append(row)
     return rows
+
+
+def has_rows(paths):
+    """Whether the batch's runs.jsonl holds anything at all, a line that is
+    not a row included."""
+    try:
+        with open(paths.runs, "rb") as f:
+            return bool(f.read().strip())
+    except FileNotFoundError:
+        return False
 
 
 def append_row(paths, row):
@@ -420,11 +444,14 @@ def classify(graded, error=None, cut_off=False):
 
 
 def quit_demo(run, alive):
-    """How the demo ended: clean (quit when asked), killed, or crashed."""
-    exited = run.quit() if alive else False
-    final = run.read_state()
+    """How the demo ended: clean (it quit when asked, or had quit before
+    grading, the agent having quit it: its dump says `quit: true`), killed
+    (still running when asked, it did not quit), or crashed (gone before
+    grading, its dump not saying it quit)."""
     if not alive:
-        return "crashed"
+        return "clean" if run.read_state().get("quit") is True else "crashed"
+    exited = run.quit()
+    final = run.read_state()
     return "clean" if exited and final.get("quit") else "killed"
 
 
@@ -553,6 +580,13 @@ def cmd_plan(args):
     paths = Paths(args.results_dir, args.batch)
     if os.path.exists(paths.plan):
         raise CommandError(f"{paths.plan} exists; a plan is never replaced, name a new batch")
+    if has_rows(paths):
+        # A dry run's job ids are a plan's (jNNN), and claim takes a job with
+        # a row as done: the plan would skip those jobs without a word.
+        raise CommandError(
+            f"batch {args.batch} already has rows ({paths.runs}), from a dry run or an earlier "
+            "batch; claim would take their job ids as done, so name a new batch"
+        )
     combos = [
         (t, a, m, r) for t in args.tasks for a in args.arms for m in args.models for r in range(args.runs)
     ]
@@ -661,6 +695,40 @@ def meta_path(transcript_path):
     return base + ".meta.json"
 
 
+def archived_transcript(paths, agent_id):
+    """Where batch `paths` keeps its copy of agent `agent_id`'s transcript:
+    transcripts/agent-<id>.jsonl, with its meta file beside it as Claude
+    Code lays them out, so meta_path finds it."""
+    if not isinstance(agent_id, str) or not AGENT_ID_RE.match(agent_id):
+        raise ValueError(f"agent id {agent_id!r} is not [0-9A-Za-z_-]+")
+    return os.path.join(paths.transcripts, f"agent-{agent_id}.jsonl")
+
+
+def archive_transcript(paths, agent_id, source):
+    """Copy the transcript at `source`, and its meta file when it has one,
+    into the batch's transcripts/ dir. Returns the archived transcript's
+    path. Claude Code deletes transcripts after cleanupPeriodDays (default
+    30), and regrade needs them. Each file lands by a rename, the meta file
+    first, so an archived transcript is never a partial copy and never lacks
+    a meta file its source had. Raises OSError when a copy fails."""
+    target = archived_transcript(paths, agent_id)
+    os.makedirs(paths.transcripts, exist_ok=True)
+    pairs = [(source, target)]
+    if os.path.exists(meta_path(source)):
+        pairs.insert(0, (meta_path(source), meta_path(target)))
+    for src, dst in pairs:
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
+        tmp = f"{dst}.{os.getpid()}.tmp"
+        try:
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    return target
+
+
 def agent_type_problems(transcript_path, expected):
     """The subagent's meta file names the agent type it was spawned as: it
     must be `expected` (this slot's agent; or, given a compiled pattern, any
@@ -686,7 +754,8 @@ def agent_type_problems(transcript_path, expected):
 TRANSCRIPT_FIELDS = (
     "model_resolved", "session_id", "claude_version", "claude_versions", "efforts_resolved",
     "guard_problems", "end_inferred", "notes", "turns", "tool_calls", "tool_calls_total",
-    "toolsearch_calls", "tokens", "wall_ms", "final_text", "context",
+    "toolsearch_calls", "tokens", "output_tokens_lower_bound", "unclosed_messages", "wall_ms",
+    "final_text", "context",
 )
 
 
@@ -714,6 +783,10 @@ def transcript_verdict(transcript_mod, path, arm, model, effort, max_turns, extr
         "tool_calls_total": stats.get("tool_calls_total"),
         "toolsearch_calls": stats.get("toolsearch_calls"),
         "tokens": stats.get("tokens"),
+        # A message Claude Code never closed keeps a placeholder output count,
+        # mid-run as well as last: then tokens.output is a lower bound.
+        "output_tokens_lower_bound": stats.get("output_tokens_lower_bound"),
+        "unclosed_messages": stats.get("unclosed_messages"),
         "wall_ms": stats.get("wall_ms"),
         "final_text": stats.get("final_text"),
         "context": stats.get("context"),
@@ -809,7 +882,8 @@ def check_agent_identity(paths, plan, k, slot, agent_id, transcript_file=None, t
     transcript, a transcript with no meta file or whose meta file names
     another slot's agent, or a transcript that is another run's (another
     task, or started before the slot was prepared). A transcript that exists
-    but cannot be read is left to grading, which records the harness error."""
+    but cannot be read is left to grading, which records the harness error.
+    Returns the transcript's path."""
     reused = next((r for r in read_rows(paths) if r.get("agent_id") == agent_id), None)
     retry = (f"pass the id of the agent spawned for {slot['job']}, or "
              f"`run.py abort --batch {plan['batch']} --slot {k}`")
@@ -834,27 +908,38 @@ def check_agent_identity(paths, plan, k, slot, agent_id, transcript_file=None, t
     try:
         stats = transcript_mod.read_transcript(path)
     except Exception:  # noqa: BLE001 - grading reads it again and records why it failed
-        return
+        return path
     if stats.get("started") is None and stats.get("first_prompt") is None:
-        return  # nothing in it to be another run's; grading records the harness error
+        return path  # nothing in it to be another run's; grading records the harness error
     problems = identity_problems(slot, stats)
     if problems:
         refuse(f"agent {agent_id}'s transcript is not the run of {job_of(slot)} in slot {k}: {'; '.join(problems)}")
+    return path
 
 
 def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None):
     """Grade the agent run slot `k` holds, record it, tear the demo down and
     free the slot. Returns the row (an existing one if the job was recorded
     before a crash left the slot behind). Refuses an agent that cannot have
-    run this job (check_agent_identity) before recording anything."""
+    run this job (check_agent_identity) before recording anything.
+
+    The transcript is archived into the batch (archive_transcript) and the
+    archived copy graded, so the row and a later regrade read the same
+    bytes. A failed copy is said on stderr and the live one graded;
+    `run.py archive` copies it later."""
     existing = next((r for r in read_rows(paths) if r.get("job") == slot["job"]), None)
     if existing is not None:
         print(f"run.py: {slot['job']} was already recorded; freeing slot {k}", file=sys.stderr)
         teardown(slot)
         free_slot(paths, k)
         return existing
-    check_agent_identity(paths, plan, k, slot, agent_id, transcript_file)
-    row = grade_agent_run(plan, slot, agent_id, transcript_file=transcript_file)
+    path = check_agent_identity(paths, plan, k, slot, agent_id, transcript_file)
+    try:
+        path = archive_transcript(paths, agent_id, path)
+    except (OSError, ValueError) as err:
+        print(f"run.py: could not archive agent {agent_id}'s transcript ({err}); grading the live one. "
+              f"`run.py archive --batch {plan['batch']}` copies it later", file=sys.stderr)
+    row = grade_agent_run(plan, slot, agent_id, transcript_file=path)
     append_row(paths, row)  # before teardown: a crash from here on leaves a row, not a lost run
     teardown(slot)
     free_slot(paths, k)
@@ -1016,19 +1101,34 @@ def cmd_abort(args):
 ARM_AGENT_RE = {arm: re.compile(rf"tui-{re.escape(arm)}-[1-9][0-9]*") for arm in ARMS}
 
 
-def regrade_row(row, plan, transcript_mod, projects_dir=None):
+def locate_transcript(paths, agent_id, transcript_mod, projects_dir=None):
+    """(path, source) of agent `agent_id`'s transcript: the batch's archived
+    copy ("archive") when there is one, else the live one Claude Code wrote
+    under the projects dir ("live"), else (None, None). Raises ValueError for
+    an id that is not [0-9A-Za-z_-]+ or that matches several live ones."""
+    archived = archived_transcript(paths, agent_id)
+    if os.path.isfile(archived):
+        return archived, "archive"
+    live = (transcript_mod.find_transcript(agent_id) if projects_dir is None
+            else transcript_mod.find_transcript(agent_id, projects_dir))
+    return (live, "live") if live is not None else (None, None)
+
+
+def regrade_row(row, plan, transcript_mod, projects_dir=None, paths=None):
     """`row` graded again with the current code, from what persists: its
-    recorded state and demo_alive, and its transcript re-read. Returns a new
-    dict; `row` is not changed. A dry-run row comes back as it was. A row
-    that cannot be regraded (no agent id, no state, no transcript any more)
-    keeps its stats and status, with a `regrade_note` saying why."""
+    recorded state and demo_alive, and its transcript re-read (the archived
+    copy in batch `paths` first, else the live one). Returns (a new dict,
+    where the transcript came from: "archive", "live" or None); `row` is
+    not changed. A dry-run row comes back as it was. A row that cannot be
+    regraded (no agent id, no state, no transcript any more) keeps its stats
+    and status, with a `regrade_note` saying why."""
     if row.get("mode") != "subagent":
-        return dict(row)
+        return dict(row), None
     new = dict(row)
     new["status_at_run"] = row.get("status_at_run", row.get("status"))
     new["regrade_note"] = None
     arm, task, agent_id, state = row.get("arm"), TASKS.get(row.get("task")), row.get("agent_id"), row.get("state")
-    keep, path = None, None
+    keep, path, source = None, None, None
     if not agent_id:
         keep = "it has no agent id (a failed prepare or an abort), so there is no transcript to re-read"
     elif task is None or arm not in ARM_TOOLS:
@@ -1037,15 +1137,15 @@ def regrade_row(row, plan, transcript_mod, projects_dir=None):
         keep = "it has no recorded state to check again"
     else:
         try:
-            path = (transcript_mod.find_transcript(agent_id) if projects_dir is None
-                    else transcript_mod.find_transcript(agent_id, projects_dir))
+            path, source = locate_transcript(paths or Paths(RESULTS_DIR, plan["batch"]), agent_id,
+                                             transcript_mod, projects_dir)
         except ValueError as err:
             keep = f"its transcript cannot be told apart: {err}"
         if path is None and keep is None:
-            keep = f"no transcript for agent {agent_id} can be found any more"
+            keep = f"no transcript for agent {agent_id} can be found any more, archived or live"
     if keep is not None:
         new["regrade_note"] = f"kept as recorded: {keep}"
-        return new
+        return new, None
 
     errors, cut_off, fields = [], False, {}
     slot = row.get("slot")
@@ -1073,7 +1173,7 @@ def regrade_row(row, plan, transcript_mod, projects_dir=None):
     status, passed = classify(graded, error, cut_off)
     new.update(status=status, passed=passed, check_passed=graded["check_passed"],
                reason=graded["reason"], error=error)
-    return new
+    return new, source
 
 
 def change_reason(new):
@@ -1097,7 +1197,8 @@ def backup_path(paths, stamp):
 
 def regrade(paths, transcript_mod=None, projects_dir=None):
     """Regrade every row of the batch at `paths` in place, after a backup.
-    Returns (rows, changes, backup): changes are (job, old, new, reason)."""
+    Returns (rows, changes, backup, sources): changes are (job, old, new,
+    reason); sources counts where the regraded rows' transcripts came from."""
     plan = load_plan(paths)
     held = sorted(k for k, s in read_all_slots(paths).items() if s.get("batch") == plan["batch"])
     if held:
@@ -1113,7 +1214,7 @@ def regrade(paths, transcript_mod=None, projects_dir=None):
     with flocked(paths.lock):
         with open(paths.runs, "rb") as f:
             original = f.read()
-        out, rows, changes = [], [], []
+        out, rows, changes, sources = [], [], [], Counter()
         for raw in original.decode("utf-8", errors="surrogateescape").splitlines():
             try:
                 row = json.loads(raw)
@@ -1122,7 +1223,9 @@ def regrade(paths, transcript_mod=None, projects_dir=None):
             if not isinstance(row, dict):
                 out.append(raw)  # not a row: kept byte for byte
                 continue
-            new = regrade_row(row, plan, transcript_mod, projects_dir)
+            new, source = regrade_row(row, plan, transcript_mod, projects_dir, paths)
+            if source is not None:
+                sources[source] += 1
             if new.get("mode") == "subagent":
                 new.update(regraded_at=stamp_iso, regrade_git_sha=prov["git_sha"],
                            regrade_git_dirty=prov["git_dirty"])
@@ -1138,23 +1241,79 @@ def regrade(paths, transcript_mod=None, projects_dir=None):
         with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
             f.write("".join(line + "\n" for line in out))
         os.replace(tmp, paths.runs)
-    return rows, changes, backup
+    return rows, changes, backup, sources
 
 
 def cmd_regrade(args):
     paths = Paths(args.results_dir, args.batch)
-    rows, changes, backup = regrade(paths, projects_dir=args.projects_dir)
+    rows, changes, backup, sources = regrade(paths, projects_dir=args.projects_dir)
     kept = sum(1 for r in rows if str(r.get("regrade_note") or "").startswith("kept as recorded"))
     dry = sum(1 for r in rows if r.get("mode") != "subagent")
     print(f"run.py: regraded batch {args.batch}: {len(rows)} rows ({dry} dry-run kept, {kept} kept as "
-          f"recorded); {len(changes)} changed status; the original is {backup}")
+          f"recorded); {len(changes)} changed status; transcripts: {sources['archive']} archived, "
+          f"{sources['live']} live; the original is {backup}")
     for job, old, new, why in changes:
         print(f"  {job}: {old} -> {new} ({why})")
     for row in rows:
         note = row.get("regrade_note")
         if note:
             print(f"  {row.get('job')}: note: {note}")
+    if sources["live"]:
+        print(f"  {sources['live']} transcript(s) were read live, which Claude Code deletes after "
+              f"cleanupPeriodDays: `run.py archive --batch {args.batch}` keeps a copy")
     return EXIT_OK
+
+
+# --- Archive: keep a batch's transcripts past Claude Code's cleanup -------------------------------
+
+
+def archive_batch(paths, transcript_mod=None, projects_dir=None):
+    """Copy the live transcript (and meta file) of every agent row of the
+    batch at `paths` that has no archived copy yet. An archived copy is
+    never replaced: it is what was graded. Returns (copied, already,
+    missing, without_id): job ids, and (job, why) pairs for missing."""
+    if not os.path.exists(paths.runs):
+        raise CommandError(f"batch {paths.batch} has no rows ({paths.runs})")
+    transcript_mod = transcript_mod or load_transcript_module()
+    copied, already, missing, without_id, seen = [], [], [], [], set()
+    for row in read_rows(paths):
+        if row.get("mode") != "subagent":
+            continue
+        job, agent_id = row.get("job"), row.get("agent_id")
+        if not agent_id:
+            without_id.append(job)
+            continue
+        if agent_id in seen:
+            continue
+        seen.add(agent_id)
+        try:
+            path, source = locate_transcript(paths, agent_id, transcript_mod, projects_dir)
+        except ValueError as err:
+            missing.append((job, str(err)))
+            continue
+        if source == "archive":
+            already.append(job)
+        elif path is None:
+            missing.append((job, f"no transcript for agent {agent_id} under "
+                                 f"{projects_dir or '~/.claude/projects'} (deleted, or never written)"))
+        else:
+            try:
+                archive_transcript(paths, agent_id, path)
+                copied.append(job)
+            except OSError as err:
+                missing.append((job, f"copying {path} failed: {err}"))
+    return copied, already, missing, without_id
+
+
+def cmd_archive(args):
+    paths = Paths(args.results_dir, args.batch)
+    copied, already, missing, without_id = archive_batch(paths, projects_dir=args.projects_dir)
+    print(f"run.py: archived batch {args.batch}: {len(copied)} copied, {len(already)} already archived, "
+          f"{len(missing)} missing, {len(without_id)} row(s) without an agent id (an abort or a failed "
+          f"prepare); in {paths.transcripts}")
+    for job, why in missing:
+        print(f"  {job}: {why}")
+    return EXIT_HARNESS if missing else EXIT_OK
 
 
 # --- Command line ---------------------------------------------------------------------------
@@ -1245,6 +1404,11 @@ def parse_args(argv=None):
     p.add_argument("--batch", type=_batch, required=True)
     p.add_argument("--projects-dir", help=argparse.SUPPRESS)  # test hook: where find_transcript looks
 
+    p = sub.add_parser("archive", parents=[common],
+                       help="copy a batch's live transcripts into results/<batch>/transcripts")
+    p.add_argument("--batch", type=_batch, required=True)
+    p.add_argument("--projects-dir", help=argparse.SUPPRESS)  # test hook: where find_transcript looks
+
     args = parser.parse_args(argv)
     if args.command in ("dry-run", "plan"):
         args.tasks = list(dict.fromkeys(args.tasks or task_ids))
@@ -1266,6 +1430,7 @@ COMMANDS = {
     "status": cmd_status,
     "abort": cmd_abort,
     "regrade": cmd_regrade,
+    "archive": cmd_archive,
 }
 
 

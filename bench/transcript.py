@@ -12,7 +12,8 @@ transcripts from Claude Code 2.1.294):
   several lines that share `message.id` (`apiBlockIndex` numbers the block);
   `message.usage` repeats on each, and only the line with a non-null
   `message.stop_reason` has the final `output_tokens` (earlier lines carry a
-  partial count, e.g. 8 then 286). Input and cache counts are the same on
+  partial count, e.g. 8 then 286; see below for a message with no such
+  line). Input and cache counts are the same on
   every line of a message. Blocks are `thinking`, `text` and `tool_use`.
   Claude Code's own `<synthetic>` messages (errors it writes itself, not a
   model reply) are left out of models and turns;
@@ -37,14 +38,19 @@ of either arm has two, the second listing exactly the arm's `mcp__tui__`
 tools inline (no deferral, no ToolSearch). A run whose server never started
 has no tools in any snapshot, which is what `guard` checks.
 
+Claude Code 2.1.294 sometimes never writes the closing line of an assistant
+message, anywhere in the run, not only the final reply: every line of that
+message carries stop_reason null and a placeholder output_tokens (1 to 9).
+Its output count here is the largest partial one, so the run's output total
+is a lower bound: `unclosed_messages` counts such messages and
+`output_tokens_lower_bound` is true when there is one. Input and cache
+counts are the same on every line of a message, so they stay exact.
+
 How a run ended is read off its final assistant message: `end_turn` when
-the agent finished on its own. Claude Code 2.1.294 sometimes never writes the
-closing line of a final text reply, so every line of that message carries
-stop_reason null and a placeholder output_tokens (1 or 5, say). A final
-message whose last block is a non-empty text, with no tool_use after it,
-ended on its own all the same: `end_inferred` says the end was inferred, and
-its output tokens are a lower bound (`output_tokens_lower_bound`). Claude
-Code's own `<synthetic>` messages
+the agent finished on its own. An unclosed final message whose last block is
+a non-empty text, with no tool_use after it, ended on its own all the same:
+`end_inferred` says the end was inferred. Claude Code's own `<synthetic>`
+messages
 (`isApiErrorMessage`, `error` such as `rate_limit` or `server_error`, text
 such as "You've hit your session limit") are left out of models and turns,
 but one written last means the run died on that error. A run stopped at
@@ -359,9 +365,10 @@ def read_transcript(path):
             last_stop_reason is None and last_block_type == "text"
             and isinstance(last_block.get("text"), str) and last_block["text"].strip()
         )
-    # A message no line of which carries a stop_reason never got its final
-    # usage line: its output count is the largest partial one, a lower bound.
-    unstopped = sum(1 for e in messages.values() if not any(l["stop_reason"] is not None for l in e["lines"]))
+    # A message no line of which carries a stop_reason never got its closing
+    # line, at the end of the run or in the middle of it: its output count is
+    # the largest partial one, so the run's output total is a lower bound.
+    unclosed = sum(1 for e in messages.values() if not any(l["stop_reason"] is not None for l in e["lines"]))
 
     return {
         "agent_id": agent_id,
@@ -384,7 +391,9 @@ def read_transcript(path):
         "last_stop_reason": last_stop_reason,
         "last_block_type": last_block_type,
         "end_inferred": end_inferred,
-        "output_tokens_lower_bound": unstopped > 0,
+        # Output tokens: a lower bound when any message was never closed.
+        "unclosed_messages": unclosed,
+        "output_tokens_lower_bound": unclosed > 0,
         "ended_synthetic": bool(final and final["synthetic"]),
         "synthetic_text": synthetic_text,
         "synthetic_error": synthetic_error,
@@ -483,7 +492,7 @@ def cut_off_at_max_turns(stats, max_turns):
     """Whether the run looks stopped by maxTurns: its final message asked for
     a tool, with no text after, at `max_turns` turns or more. Its stop_reason
     is tool_use, or null when Claude Code never wrote the message's closing
-    line (as it sometimes does for a final text reply; see the module doc).
+    line (as it sometimes does for any message; see the module doc).
 
     An inference, isolated here: no real cut-off transcript exists yet. It
     rests on Claude Code 2.1.294's agent loop, which runs the last turn's

@@ -26,7 +26,7 @@ import tempfile
 import time
 import types
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -416,6 +416,22 @@ class Plan(unittest.TestCase):
         self.assertIn("exists", text)
         self.assertEqual(self.load("x"), before)
 
+    def test_a_batch_with_rows_is_refused(self):
+        """A dry run's job ids are a plan's: a plan over its rows would have
+        claim skip those jobs as done, without a word."""
+        paths = runner.Paths(self.results, "dry")
+        runner.append_row(paths, runner.new_row(job="j001", mode="dry-run", status="passed"))
+        code, text = self.plan("dry", "--tasks", "T1", "--seed", "1")
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn(f"batch dry already has rows ({paths.runs})", text)
+        self.assertFalse(os.path.exists(paths.plan), "no plan written")
+        # A line that is not a row still counts; an empty file does not.
+        with open(paths.runs, "w") as f:
+            f.write("{not a row\n")
+        self.assertEqual(self.plan("dry", "--tasks", "T1")[0], runner.EXIT_HARNESS)
+        open(paths.runs, "w").close()
+        self.assertEqual(self.plan("dry", "--tasks", "T1")[0], 0)
+
     def test_bad_arguments_exit_2(self):
         self.assertEqual(self.plan("y", "--models", "gpt")[0], runner.EXIT_HARNESS)
         self.assertEqual(self.plan("../z")[0], runner.EXIT_HARNESS)
@@ -580,6 +596,28 @@ class FakeRun:
         return self.state
 
 
+class QuitDemo(unittest.TestCase):
+    """How the demo ended, read from its dump before anything else."""
+
+    def test_a_demo_the_agent_quit_is_a_clean_exit(self):
+        run = FakeRun({**tasks.SEED_STATE, "quit": True}, alive=False)
+        self.assertEqual(runner.quit_demo(run, False), "clean")
+        self.assertEqual(run.quits, 0, "a demo already gone is not asked to quit")
+
+    def test_a_demo_gone_without_quitting_crashed(self):
+        run = FakeRun(tasks.SEED_STATE, alive=False)
+        self.assertEqual(runner.quit_demo(run, False), "crashed")
+        self.assertEqual(run.quits, 0)
+
+    def test_a_running_demo_is_quit(self):
+        run = FakeRun(tasks.SEED_STATE)
+        self.assertEqual(runner.quit_demo(run, True), "clean")
+        self.assertEqual(run.quits, 1)
+        stuck = FakeRun(tasks.SEED_STATE)
+        stuck.quit = lambda: False
+        self.assertEqual(runner.quit_demo(stuck, True), "killed")
+
+
 class GradeAgentRun(unittest.TestCase):
     PLAN = {"batch": "b", "seed": 5, "effort": "medium", "max_turns": 30}
     SLOT = {"slot": 2, "batch": "b", "job": "j004", "task": "T1", "arm": "taria", "model": "sonnet",
@@ -640,6 +678,10 @@ class GradeAgentRun(unittest.TestCase):
         self.assertIn("no new task", row["reason"])
         row, _, _ = self.grade(alive=False)
         self.assertEqual((row["status"], row["demo_exit"]), ("failed", "crashed"))
+        # The agent quit the app: a failure (the check wants it running), but a clean exit.
+        row, _, run = self.grade(state={**self.GOOD_STATE, "quit": True}, alive=False)
+        self.assertEqual((row["status"], row["demo_exit"], run.quits), ("failed", "clean", 0))
+        self.assertIn("the demo was quit", row["reason"])
 
     def test_max_turns(self):
         cut = {**self.STATS, "ended_on_tool_use": True, "last_stop_reason": "tool_use", "turns": 30}
@@ -715,6 +757,27 @@ class GradeAgentRun(unittest.TestCase):
         self.assertIs(row["end_inferred"], True)
         self.assertEqual(row["notes"], [transcript.INFERRED_END])
         self.assertEqual(row["tokens"]["output"], 421)
+
+    def test_a_real_mid_run_unclosed_message_flags_the_output_tokens(self):
+        """Job j114 of batch full1: a message in the middle of the run never
+        closed. The run passed and ended on end_turn; its output tokens are a
+        lower bound, which the row says."""
+        row = self.real("real_taria_midunclosed.jsonl", slot={**self.SLOT, "task": "T2", "model": "haiku"})
+        self.assertEqual((row["status"], row["error"], row["guard_problems"]), ("passed", None, []))
+        self.assertEqual((row["output_tokens_lower_bound"], row["unclosed_messages"]), (True, 1))
+        self.assertEqual((row["end_inferred"], row["notes"]), (False, []))
+        self.assertEqual(row["tokens"]["output"], 156)
+        row = self.real("real_taria_unclosed.jsonl", slot={**self.SLOT, "task": "T4", "model": "haiku"})
+        self.assertEqual((row["output_tokens_lower_bound"], row["unclosed_messages"], row["end_inferred"]),
+                         (True, 1, True))
+        row = self.real("real_taria_clean.jsonl")
+        self.assertEqual((row["output_tokens_lower_bound"], row["unclosed_messages"]), (False, 0))
+
+    def test_every_transcript_field_is_a_row_key_and_filled(self):
+        path = os.path.join(BENCH, "fixtures", "transcripts", "real_taria_clean.jsonl")
+        fields, _, _ = runner.transcript_verdict(transcript, path, "taria", "sonnet", "medium", 30)
+        self.assertEqual(sorted(fields), sorted(runner.TRANSCRIPT_FIELDS))
+        self.assertTrue(set(runner.TRANSCRIPT_FIELDS) <= set(runner.ROW_KEYS))
 
     def test_a_real_leaked_run_is_a_harness_error(self):
         row = self.real("real_taria_leaked.jsonl", slot={**self.SLOT, "slot": 1, "task": "T1", "model": "haiku"})
@@ -855,6 +918,46 @@ class AgentIdentity(unittest.TestCase):
         self.hold()
         error = self.refused(transcript_file=self.copy_fixture(agent_type="tui-taria-2"))
         self.assertIn("was spawned as 'tui-taria-2', not this slot's agent 'tui-taria-1'", error)
+
+    def finish(self, src, archive_error=None):
+        """finish_slot on the held slot, grading stubbed: (row, the path
+        graded, stderr)."""
+        plan, slot = self.hold()
+        seen = {}
+
+        def grade(plan, slot, agent_id, transcript_file=None, **_):
+            seen["path"] = transcript_file
+            return runner.new_row(job=slot["job"], agent_id=agent_id, status="passed", passed=True)
+
+        err = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runner, "grade_agent_run", grade))
+            stack.enter_context(mock.patch.object(runner, "teardown"))
+            if archive_error is not None:
+                stack.enter_context(mock.patch.object(runner, "archive_transcript", side_effect=archive_error))
+            stack.enter_context(redirect_stderr(err))
+            row = runner.finish_slot(self.paths, plan, 1, slot, "afixturetariaclean", src)
+        return row, seen["path"], err.getvalue()
+
+    def test_grading_archives_the_transcript_and_grades_the_copy(self):
+        src = self.copy_fixture()
+        row, graded, _ = self.finish(src)
+        archived = os.path.join(self.results, "b", "transcripts", "agent-afixturetariaclean.jsonl")
+        self.assertEqual(graded, archived, "the row is graded from the archived copy")
+        for a, b in ((src, archived), (runner.meta_path(src), runner.meta_path(archived))):
+            with open(a, "rb") as fa, open(b, "rb") as fb:
+                self.assertEqual(fa.read(), fb.read(), b)
+        self.assertEqual(runner.read_rows(self.paths), [row])
+        self.assertIsNone(runner.read_slot(self.paths, 1), "the slot is freed")
+        self.assertEqual([f for f in os.listdir(os.path.dirname(archived)) if f.endswith(".tmp")], [])
+
+    def test_a_failed_archive_grades_the_live_transcript(self):
+        src = self.copy_fixture()
+        row, graded, err = self.finish(src, archive_error=OSError("disk full"))
+        self.assertEqual(graded, src)
+        self.assertIn("could not archive agent afixturetariaclean's transcript (disk full)", err)
+        self.assertIn("run.py archive --batch b", err)
+        self.assertEqual(row["status"], "passed")
 
 
 class Regrade(unittest.TestCase):
@@ -1035,6 +1138,85 @@ class Regrade(unittest.TestCase):
         code, _, err = quiet_cli("regrade", "--batch", "nope", "--results-dir", self.results)
         self.assertEqual(code, runner.EXIT_HARNESS)
         self.assertIn("no plan for batch nope", err)
+
+    def archive_copy(self, fixture, agent_id):
+        """A fixture as agent `agent_id`'s transcript in the batch's archive."""
+        os.makedirs(self.paths.transcripts, exist_ok=True)
+        dst = runner.archived_transcript(self.paths, agent_id)
+        shutil.copy(os.path.join(self.FIXTURES, fixture), dst)
+        shutil.copy(os.path.join(self.FIXTURES, fixture[: -len(".jsonl")] + ".meta.json"), runner.meta_path(dst))
+        return dst
+
+    def test_the_archived_transcript_is_preferred_to_the_live_one(self):
+        """Claude Code deletes transcripts after cleanupPeriodDays: the
+        archived copy grades a row whose live one is gone, and wins over a
+        live one that differs."""
+        self.archive_copy("real_taria_clean.jsonl", "aarchived")  # no live copy at all
+        self.archive_copy("real_taria_clean.jsonl", "aboth")
+        self.place("real_taria_leaked.jsonl", "aboth")  # the live one would fail the guard
+        self.place("real_taria_unclosed.jsonl", "alive")  # live only: the fallback
+        self.write_rows([
+            self.row("j001", "T3", "sonnet", "aarchived", "harness_error"),
+            self.row("j002", "T3", "sonnet", "aboth", "passed"),
+            self.row("j003", "T4", "haiku", "alive", "passed"),
+        ])
+        out, rows, _ = self.regrade()
+        self.assertEqual({j: r["status"] for j, r in rows.items()}, {"j001": "passed", "j002": "passed",
+                                                                     "j003": "passed"})
+        self.assertEqual({j: r["regrade_note"] for j, r in rows.items()}, {"j001": None, "j002": None, "j003": None})
+        self.assertEqual(rows["j002"]["guard_problems"], [])
+        self.assertIn("transcripts: 2 archived, 1 live", out)
+        self.assertIn("1 transcript(s) were read live", out)
+        self.assertEqual((rows["j003"]["output_tokens_lower_bound"], rows["j003"]["unclosed_messages"]), (True, 1))
+        self.assertEqual((rows["j002"]["output_tokens_lower_bound"], rows["j002"]["unclosed_messages"]), (False, 0))
+
+    def archive(self):
+        return quiet_cli("archive", "--batch", "b", "--results-dir", self.results, "--projects-dir", self.projects)
+
+    def test_archive_backfills_a_batch_from_the_live_transcripts(self):
+        self.place("real_taria_clean.jsonl", "aone")
+        self.place("real_taria_midunclosed.jsonl", "atwo")
+        self.archive_copy("real_taria_unclosed.jsonl", "athree")  # already archived: kept
+        self.place("real_taria_leaked.jsonl", "athree")
+        self.write_rows([
+            self.row("j001", "T3", "sonnet", "aone", "passed"),
+            self.row("j002", "T2", "haiku", "atwo", "passed"),
+            self.row("j003", "T4", "haiku", "athree", "passed"),
+            self.row("j004", "T1", "sonnet", "agone", "passed"),  # deleted by Claude Code
+            self.row("j005", "T1", "haiku", None, "harness_error", error="aborted: test"),
+            dict(self.row("j006", "T1", "sonnet", None, "passed"), mode="dry-run", solver="scripted"),
+        ])
+        code, out, _ = self.archive()
+        self.assertEqual(code, runner.EXIT_HARNESS, "a row whose transcript is gone everywhere")
+        self.assertIn("2 copied, 1 already archived, 1 missing, 1 row(s) without an agent id", out)
+        self.assertIn("j004: no transcript for agent agone", out)
+        live = os.path.join(self.projects, "-proj", "sess-1", "subagents")
+        for agent_id, src in (("aone", os.path.join(live, "agent-aone.jsonl")),
+                              ("atwo", os.path.join(live, "agent-atwo.jsonl")),
+                              # Already archived: kept, not replaced by the live one.
+                              ("athree", os.path.join(self.FIXTURES, "real_taria_unclosed.jsonl"))):
+            archived = runner.archived_transcript(self.paths, agent_id)
+            for a, b in ((src, archived), (runner.meta_path(src), runner.meta_path(archived))):
+                with open(a, "rb") as fa, open(b, "rb") as fb:
+                    self.assertEqual(fa.read(), fb.read(), f"{agent_id}: {b}")
+        # Again: nothing left to copy; the missing one is still missing.
+        code, out, _ = self.archive()
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("0 copied, 3 already archived, 1 missing", out)
+        # Every row has its copy now: exit 0, and regrade reads only the archive.
+        shutil.rmtree(self.projects)
+        self.write_rows([self.row("j001", "T3", "sonnet", "aone", "passed"),
+                         self.row("j002", "T2", "haiku", "atwo", "passed")])
+        code, out, _ = self.archive()
+        self.assertEqual((code, "0 copied, 2 already archived, 0 missing" in out), (0, True), out)
+        out, rows, _ = self.regrade()
+        self.assertIn("transcripts: 2 archived, 0 live", out)
+        self.assertEqual({j: r["status"] for j, r in rows.items()}, {"j001": "passed", "j002": "passed"})
+
+    def test_archive_needs_rows(self):
+        code, _, err = self.archive()
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("has no rows", err)
 
 
 class AgentsDir(unittest.TestCase):
@@ -1381,6 +1563,9 @@ class SubagentRehearsal(unittest.TestCase):
             self.assertEqual(row["claude_version"], "2.1.294")
             self.assertGreater(row["tool_calls_total"], 0)
             self.assertTrue(row["agent_id"].startswith("rehearsalj00"))
+            self.assertEqual((row["output_tokens_lower_bound"], row["unclosed_messages"]), (False, 0))
+            archived = os.path.join(self.results, "reh", "transcripts", f"agent-{row['agent_id']}.jsonl")
+            self.assertTrue(os.path.isfile(archived) and os.path.isfile(runner.meta_path(archived)), archived)
         status = run_py("status", "--batch", "reh", *self.common)
         self.assertIn("2 recorded (passed 2, failed 0, max_turns 0, harness_error 0); 0 held; 0 pending",
                       status.stdout)

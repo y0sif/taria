@@ -22,6 +22,11 @@ Two kinds of fixture in bench/fixtures/transcripts/:
                        clean as recorded, whose final text reply Claude Code
                        never closed: its lines carry stop_reason null and a
                        placeholder output_tokens of 1. It ended on its own.
+    real_taria_midunclosed  a taria run (haiku, T2, job j114 of batch full1),
+                       clean as recorded, whose second message (thinking,
+                       then a tool call) Claude Code never closed: stop_reason
+                       null and output_tokens 2 on both its lines. Its final
+                       reply was closed (end_turn).
   The guard and ending tests use these, and variants made from them in the
   test (a line dropped, a field changed) to stand for runs not yet seen.
 - the others are synthetic and test parsing edge cases: streamed usage
@@ -54,6 +59,7 @@ FIXTURES = os.path.join(BENCH, "fixtures", "transcripts")
 RUNS = os.path.join(BENCH, "fixtures", "summary_runs.jsonl")
 TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED = "real_taria_clean.jsonl", "real_tmux_clean.jsonl", "real_taria_leaked.jsonl"
 TARIA_UNCLOSED = "real_taria_unclosed.jsonl"
+TARIA_MIDUNCLOSED = "real_taria_midunclosed.jsonl"
 CONTRACT = {
     "agent_id": (str,), "session_id": (str,), "models": (list,), "turns": (int,),
     "tool_calls": (dict,), "tool_calls_total": (int,), "toolsearch_calls": (int,),
@@ -61,6 +67,7 @@ CONTRACT = {
     "ended_on_tool_use": (bool,), "tool_errors": (int,), "context": (dict,),
     "last_model": (str, type(None)), "last_stop_reason": (str, type(None)), "ended_synthetic": (bool,),
     "last_block_type": (str, type(None)), "end_inferred": (bool,), "output_tokens_lower_bound": (bool,),
+    "unclosed_messages": (int,),
     "first_prompt": (str, type(None)), "started": (str, type(None)),
 }
 CONTEXT = {
@@ -645,6 +652,55 @@ class UnclosedReply(Variant, unittest.TestCase):
         self.assertIn("Claude Code's own message", detail)
 
 
+class UnclosedMidRun(Variant, unittest.TestCase):
+    """A real run with a message Claude Code never closed in the middle of
+    it (job j114 of batch full1), not at the end: its output count is a
+    placeholder, so the run's output total is a lower bound, while its end
+    is an ordinary end_turn."""
+
+    def test_the_fixture_as_read(self):
+        stats = read(TARIA_MIDUNCLOSED)
+        self.assertEqual((stats["models"], stats["turns"]), (["claude-haiku-5-5"], 3))
+        self.assertEqual(stats["first_prompt"], TASKS["T2"].prompt)
+        self.assertEqual((stats["unclosed_messages"], stats["output_tokens_lower_bound"]), (1, True))
+        self.assertEqual((stats["last_stop_reason"], stats["end_inferred"]), ("end_turn", False))
+        # 34 + the placeholder 2 + 120: the second message's real count is unknown.
+        self.assertEqual(stats["tokens"], {"input": 6, "cache_creation": 566, "cache_read": 11316, "output": 156})
+
+    def test_it_passes_the_guard_and_ended_on_its_own(self):
+        stats = read(TARIA_MIDUNCLOSED)
+        self.assertEqual(transcript.guard(stats, "taria", "haiku", ARM_TOOLS["taria"], effort="medium"), [])
+        self.assertEqual(transcript.ending(stats, 30), ("end_turn", None))
+
+    def test_every_fixture_counts_its_unclosed_messages(self):
+        expected = {TARIA_CLEAN: 0, TMUX_CLEAN: 0, TARIA_LEAKED: 0, TARIA_UNCLOSED: 1, TARIA_MIDUNCLOSED: 1,
+                    "tmux_streaming.jsonl": 1}
+        for name, count in expected.items():
+            with self.subTest(fixture=name):
+                stats = read(name)
+                self.assertEqual((stats["unclosed_messages"], stats["output_tokens_lower_bound"]),
+                                 (count, count > 0))
+
+    def test_closing_the_message_clears_the_flag(self):
+        lines = lines_of(TARIA_MIDUNCLOSED)
+        unclosed = assistant_ids(lines)[1]
+        own = [l for l in lines if l.get("type") == "assistant" and l["message"]["id"] == unclosed]
+        self.assertEqual([l["message"]["stop_reason"] for l in own], [None, None])
+        own[-1]["message"]["stop_reason"] = "tool_use"
+        own[-1]["message"]["usage"]["output_tokens"] = 80
+        stats = self.variant(lines)
+        self.assertEqual((stats["unclosed_messages"], stats["output_tokens_lower_bound"]), (0, False))
+        self.assertEqual(stats["tokens"]["output"], 234)
+
+    def test_several_unclosed_messages_are_each_counted(self):
+        lines = lines_of(TARIA_CLEAN)
+        for line in lines:
+            if line.get("type") == "assistant" and line["message"]["id"] in assistant_ids(lines)[:2]:
+                line["message"]["stop_reason"] = None
+        stats = self.variant(lines)
+        self.assertEqual((stats["unclosed_messages"], stats["end_inferred"]), (2, False))
+
+
 class FindTranscript(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(suffix="[glob]*")  # glob characters in the path itself
@@ -819,6 +875,51 @@ class Summary(unittest.TestCase):
         out = summarize.table([base, dict(base, effort="high"), dict(base, max_turns=10)])
         prefix = f"| {base['task']} | {base['arm']} | {base['model']} |"
         self.assertEqual(sum(1 for l in out.splitlines() if l.startswith(prefix)), 3)
+
+    def test_output_tokens_leave_out_runs_whose_count_is_a_lower_bound(self):
+        """A run with a message Claude Code never closed has a placeholder
+        output count: it stays out of the output-token median, the cell says
+        how many did, and every other statistic keeps it."""
+        base = next(r for r in self.records if r["mode"] == "subagent" and r["status"] == "passed")
+
+        def run(output, **flags):
+            return dict(base, tokens={**base["tokens"], "output": output}, **flags)
+
+        rows = [run(400), run(500), run(3, output_tokens_lower_bound=True, unclosed_messages=1),
+                run(5, end_inferred=True)]  # a row from before the field: end_inferred flags it
+        out = summarize.table(rows)
+        col = self.headline_row_in(out, base["task"], base["arm"], base["model"])
+        self.assertEqual(col["output tok med"], "450 (2 left out)")
+        self.assertEqual((col["n"], col["passed"]), ("4", "4/4"))
+        self.assertEqual(col["tokens processed med [IQR]"], summarize.fmt_tokens(summarize.tokens_processed(base)))
+        self.assertIn("2 graded run(s) had an assistant message Claude Code never closed", out)
+        self.assertIn("left out of the output-token median", out)
+        # Nothing flagged: no count in the cell, no note.
+        clean = summarize.table(rows[:2])
+        self.assertEqual(self.headline_row_in(clean, base["task"], base["arm"], base["model"])["output tok med"],
+                         "450")
+        self.assertNotIn("never closed", clean)
+        # Every run flagged: no median, and the count says why.
+        flagged = summarize.table(rows[2:])
+        self.assertEqual(self.headline_row_in(flagged, base["task"], base["arm"], base["model"])["output tok med"],
+                         "- (2 left out)")
+        self.assertFalse(summarize.output_lower_bound(dict(base, output_tokens_lower_bound=False)))
+
+    def test_the_context_table_shows_everything_that_ever_reached_a_run(self):
+        """What the guard checks: a server or deferred tool that reached the
+        agent and later left still shows."""
+        base = next(r for r in self.records if r["mode"] == "subagent" and r["arm"] == "taria"
+                    and isinstance(r.get("context"), dict))
+        context = dict(base["context"], mcp_instruction_servers=["tui"], mcp_instruction_servers_added=["other", "tui"],
+                       deferred_tools=[], deferred_tools_added=["Bash"])
+        old = dict(base["context"], mcp_instruction_servers=["tui"], deferred_tools=["WebFetch"])
+        old.pop("mcp_instruction_servers_added", None)
+        old.pop("deferred_tools_added", None)
+        lines = summarize.context_section([dict(base, context=context), dict(base, context=old)])
+        self.assertIn("deferred tools (ever)", "\n".join(lines))
+        row = next(l for l in lines if l.startswith(f"| taria | {base['model']} |"))
+        self.assertIn("| Bash (1); WebFetch (1) |", row)
+        self.assertIn("| other, tui (1); tui (1) |", row)
 
     def test_records_are_selected_explicitly(self):
         tmp = tempfile.mkdtemp()

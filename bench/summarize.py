@@ -24,7 +24,10 @@ Sections:
   cut off at max_turns (failures; how many had the right state when cut),
   and medians: tool calls [IQR] (ToolSearch excluded), ToolSearch calls,
   turns, tokens processed [IQR] (input + cache_creation + cache_read),
-  output tokens and wall time.
+  output tokens and wall time. A run with an assistant message Claude Code
+  never closed (output_tokens_lower_bound, or end_inferred on a row from
+  before that field) has a placeholder output count, so it is left out of
+  the output-token median, and the cell says how many were left out.
 - Per model, taria vs tmux per task: the pass-rate difference with a
   two-sided Fisher exact p, and the tmux/taria ratios of median tokens
   processed and median tool calls. Then each arm across all tasks: pass
@@ -35,9 +38,9 @@ Sections:
 - Dry runs (a scripted solver, no model) in their own table, never headline.
 - Provenance: batch, git SHA and dirty flag, claude version, models
   requested and resolved, effort, max turns, runs; guard problems; and the
-  context each arm's agents were given (attachment types, deferred tools,
-  MCP instruction servers), so a reader can see both arms got equivalent
-  context.
+  context each arm's agents were given (attachment types, and every
+  deferred tool and MCP instruction server that ever reached them, as the
+  guard checks), so a reader can see both arms got equivalent context.
 
 Python 3 stdlib only.
 """
@@ -201,6 +204,14 @@ def tokens_processed(record):
     return sum(legacy) if legacy else None
 
 
+def output_lower_bound(record):
+    """Whether the row's output tokens are only a lower bound: an assistant
+    message Claude Code never closed kept a placeholder count. Rows from
+    before `output_tokens_lower_bound` was recorded flag it by end_inferred,
+    which needs such a message (a mid-run one goes unseen there)."""
+    return record.get("output_tokens_lower_bound") is True or record.get("end_inferred") is True
+
+
 def tokens_output(record):
     value = _tokens(record).get("output")
     if is_num(value):
@@ -308,6 +319,8 @@ def row(key, records):
     by_status, graded, passes = counts(records)
     notes = []
     agent = [r for r in graded if label(r) == "agent"]
+    bounded = sum(1 for r in graded if output_lower_bound(r))
+    output = fmt_median([tokens_output(r) for r in graded if not output_lower_bound(r)], fmt_tokens)
     no_tokens = sum(1 for r in agent if tokens_processed(r) is None)
     if no_tokens:
         notes.append(f"{who}: tokens unknown for {no_tokens} graded run(s), left out of the medians")
@@ -322,7 +335,7 @@ def row(key, records):
         fmt_median([r.get("toolsearch_calls") for r in graded]),
         fmt_median([r.get("turns") for r in graded]),
         fmt_spread([tokens_processed(r) for r in graded], fmt_tokens),
-        fmt_median([tokens_output(r) for r in graded], fmt_tokens),
+        output + (f" ({bounded} left out)" if bounded else ""),
         fmt_median([r.get("wall_ms") for r in graded], fmt_seconds),
     ]
     return _row(cells), notes
@@ -355,6 +368,14 @@ def table(records, agent=True):
         footer.append(
             "A cut-off run hit max_turns before the agent finished on its own, so it fails "
             "whatever the demo's state; `cut off` counts how many had the right state when cut."
+        )
+    bounded = [r for r in records if r.get("status") in GRADED and output_lower_bound(r)]
+    if bounded:
+        footer.append(
+            f"{len(bounded)} graded run(s) had an assistant message Claude Code never closed, whose "
+            "output count is a placeholder: their output tokens are a lower bound, so they are left "
+            "out of the output-token median, and `(N left out)` in a cell counts them. Their input "
+            "and cache counts are exact, so tokens processed keep every run."
         )
     if agent and records:
         footer.append(
@@ -561,6 +582,13 @@ def _sets(values):
     )
 
 
+def _ever(context, field):
+    """Every name in `field` that ever reached the agent: `<field>_added`
+    (removals ignored, which is what the guard holds a run to) with the
+    net list, for rows from before the added lists were recorded."""
+    return sorted(set(context.get(f"{field}_added") or []) | set(context.get(field) or []))
+
+
 def context_section(records):
     """What each arm's agents were given, so the arms can be seen to match."""
     rows = []
@@ -576,8 +604,8 @@ def context_section(records):
         some = sorted(f"{t} ({n})" for t, n in types.items() if n < len(contexts))
         rows.append(_row([
             *key, f"{len(contexts)}/{len(rs)}", ", ".join(every) or "-", ", ".join(some) or "-",
-            _sets(sorted(c.get("deferred_tools") or []) for c in contexts),
-            _sets(sorted(c.get("mcp_instruction_servers") or []) for c in contexts),
+            _sets(_ever(c, "deferred_tools") for c in contexts),
+            _sets(_ever(c, "mcp_instruction_servers") for c in contexts),
             f"{sum(1 for c in contexts if c.get('skill_listing'))}/{len(contexts)}",
             f"{sum(1 for c in contexts if c.get('claude_md_files'))}/{len(contexts)}",
         ]))
@@ -585,11 +613,12 @@ def context_section(records):
         return ["No agent runs, so no agent context to show."]
     return [
         "Context the agents were given, from their transcripts (runs with a transcript / runs). "
-        "Deferred tools and MCP instruction servers list each distinct set with its run count; "
+        "Deferred tools and MCP instruction servers list every one that ever reached a run, even "
+        "one later removed (what the guard checks), as each distinct set with its run count; "
         "the arms differ there by design (each arm's own tools), and should match elsewhere.",
         "",
         *_header(("arm", "model", "runs with context", "attachment types (every run)",
-                  "attachment types (some runs)", "deferred tools", "MCP instruction servers",
+                  "attachment types (some runs)", "deferred tools (ever)", "MCP instruction servers (ever)",
                   "skill listing", "instruction files")),
         *rows,
     ]
