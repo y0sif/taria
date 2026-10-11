@@ -82,18 +82,17 @@ refuses a `target/debug` older than the sources.
   instructions and of the `read_tree` and `act` descriptions. Those texts are
   short because they are resent with every model call: no parameter is
   described but `repeat`'s default, the `{"custom":...}` rule is in `act`'s
-  description only, and a test pins both modes' text byte for byte. The
-  input tools promise the tree only if it changed: three answers that are not
-  errors carry a note and no tree.
-  `act` validates node ids and advertised actions and bounds `value` (4096
-  chars), `key` parses the shared grammar and bounds `repeat` (1-64),
-  `type_text` bounds the payload (4096 chars). Results are anchored on the
-  app's ack, not on whatever the tree did: dropped, ignored,
-  delivered-and-changed, delivered-and-unchanged, no ack, partial burst, lost acks, and the app
-  disconnecting. A protocol mismatch keeps `read_tree` for as long as the
-  peer's snapshots parse, and refuses every input tool. When lines from the
-  app were rejected, `read_tree` says the socket path is right and quotes the
-  reason rather than sending an adopter back to check the path.
+  description only, and a test pins both modes' text byte for byte. The input
+  tools promise the tree only if it changed: three answers that are not errors
+  carry a note and no tree. `act` validates node ids and advertised actions
+  and bounds `value` (4096 chars), `key` parses the shared grammar and bounds
+  `repeat` (1-64), `type_text` bounds the payload (4096 chars). Results are
+  anchored on the app's ack, not on whatever the tree did: dropped, ignored,
+  delivered-and-changed, delivered-and-unchanged, no ack, partial burst, lost
+  acks, and the app disconnecting. A protocol mismatch keeps `read_tree` for
+  as long as the peer's snapshots parse, and refuses every input tool. When
+  lines from the app were rejected, `read_tree` says the socket path is right
+  and quotes the reason rather than sending an adopter back to check the path.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
   identities (`IdSpace`), stable across deletes and restarts; the list
