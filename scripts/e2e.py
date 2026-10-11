@@ -241,9 +241,9 @@ class PtyApp:
 class McpClient:
     """taria-mcp over stdio: newline-delimited JSON-RPC 2.0."""
 
-    def __init__(self, sock_path):
+    def __init__(self, sock_path, extra_args=()):
         self.proc = subprocess.Popen(
-            [MCP_BIN, "--socket", sock_path],
+            [MCP_BIN, "--socket", sock_path, *extra_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1685,6 +1685,98 @@ def step_u_dropped_counter(ctx):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def step_v_outline_format(ctx):
+    """`--tree-format outline` serves the same demo as an outline.
+
+    Its own demo and its own bridge, started with the flag: the scenario's
+    bridge is the JSON default every other step parses, and the shutdown step
+    has consumed its app by now. The outline is the agent's whole view in this
+    mode, so the step reads it the way an agent would: the header line, a
+    node line per widget, and an act passed the id and action name exactly as
+    a line spells them, whose answer has to be an outline too.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="taria-e2e-outline-")
+    sock = os.path.join(tmpdir, "outline.sock")
+    app = None
+    client = None
+    try:
+        app = PtyApp(sock)
+        require(app.wait_for_socket(), f"the outline demo never bound {sock}")
+        client = McpClient(sock, ["--tree-format", "outline"])
+        init = client.initialize()
+        instructions = init.get("instructions", "")
+        require(
+            "one node per line" in instructions and '{"custom"' not in instructions,
+            f"the instructions do not describe the outline: {instructions}",
+        )
+        resp = client.request("tools/list", {})
+        require("error" not in resp, f"tools/list failed: {resp}")
+        described = {t["name"]: t.get("description", "") for t in resp["result"]["tools"]}
+        require(
+            "as an outline" in described.get("read_tree", ""),
+            f"read_tree is not described as an outline: {described.get('read_tree')}",
+        )
+
+        text = None
+        for _ in range(25):
+            try:
+                text = client.call_raw("read_tree")
+                break
+            except ToolError as err:
+                if "no snapshot" not in err.message and "disconnected" not in err.message:
+                    raise
+                time.sleep(0.2)
+        require(text is not None, "read_tree never connected in outline mode")
+        lines = text.split("\n")
+        require(
+            re.fullmatch(r"protocol_version=1 seq=\d+", lines[0]),
+            f"the outline's first line is not the snapshot header: {lines[0]!r}",
+        )
+        require(
+            any(re.match(r'^    task-1 list_item "', line) for line in lines),
+            f"no `task-1 list_item` line in the outline:\n{text}",
+        )
+        require(
+            re.match(r"^app app ", lines[1]) is not None,
+            f"the root line is not the app: {lines[1]!r}",
+        )
+
+        # An unfocused task that advertises select, named from its line.
+        rows = [
+            line.split()[0]
+            for line in lines
+            if re.match(r"^    task-\S+ list_item .*\[select\b", line)
+            and not line.endswith("*focused")
+        ]
+        require(rows, f"no unfocused selectable task in the outline:\n{text}")
+        target = rows[-1]
+        answer = client.call_raw("act", {"node": target, "action": "select"})
+        after = answer.split("\n")
+        require(
+            re.fullmatch(r"protocol_version=1 seq=\d+", after[0]),
+            f"act did not answer with an outline: {answer[:200]}",
+        )
+        require(
+            any(
+                line.startswith(f"    {target} list_item ") and line.endswith(" *focused")
+                for line in after
+            ),
+            f"{target} is not the focused row after select:\n{answer}",
+        )
+        return (
+            f"{len(text)} chars for {len(lines) - 1} nodes; act select {target} "
+            "answered with an outline"
+        )
+    finally:
+        if client is not None:
+            client.close()
+            if client.proc.poll() is None:
+                client.proc.kill()
+        if app is not None:
+            app.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # --- Runner -----------------------------------------------------------------
 
 
@@ -1859,6 +1951,17 @@ def main():
         name = "u dropped-input counter reports drops"
         try:
             evidence = step_u_dropped_counter(ctx)
+            results.append((name, True, evidence))
+            print(f"PASS {name}: {evidence}", flush=True)
+        except (StepFailure, ToolError, TimeoutError) as err:
+            results.append((name, False, str(err)))
+            print(f"FAIL {name}: {err}", flush=True)
+
+        # The opt-in outline format, on its own demo and bridge for the same
+        # reason as u: it needs neither the scenario's app nor its bridge.
+        name = "v outline tree format"
+        try:
+            evidence = step_v_outline_format(ctx)
             results.append((name, True, evidence))
             print(f"PASS {name}: {evidence}", flush=True)
         except (StepFailure, ToolError, TimeoutError) as err:

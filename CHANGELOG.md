@@ -13,6 +13,51 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [Unreleased]
+
+**`taria-mcp --tree-format outline` serves the tree as an outline.** The
+bridge relays the app's JSON line, and most of that line is repeated field
+names, `"focused":false` on nearly every node, and punctuation, which is how a
+benchmark found a taria tree costing more per call than a tmux screen of the
+same app. The outline carries the same information in under half the
+characters: the demo's first tree is 1132 characters as JSON and 525 as an
+outline. It is opt-in, and the default does not move.
+
+Nothing on the wire moved. `PROTOCOL_VERSION` stays 1 and apps send the same
+JSON; only the text the bridge hands the model changes, and only when asked.
+
+### For whoever drives an app
+
+- **`--tree-format <json|outline>`**, default `json`. The outline is a header
+  line of the snapshot's other fields (`protocol_version=1 seq=1`), then one
+  line per node, indented two spaces per level, as
+  `id role "label" = "value" [actions] *focused`, with each part present only
+  when set. `docs/cli.md` has the grammar. A missing or unknown value is a
+  usage error.
+- **Every tree goes out in the chosen format**: `read_tree`, and the tree in
+  every `act`, `key` and `type_text` answer, the ignored note's tree included.
+- **The outline is rendered from the relayed line, not from the parse**, so a
+  role, an action or a field this bridge has never heard of still reaches the
+  agent by name. An app-specific action prints as the name `act` takes,
+  `delete` rather than `{"custom":"delete"}`. An id or a label that would
+  break the line is JSON-quoted, and a line the outline cannot express is
+  served as JSON.
+- **The agent is told which format it is reading.** In outline mode the MCP
+  instructions, the `read_tree` and `act` descriptions and the description of
+  `act`'s `action` parameter describe the outline instead of the JSON. Every
+  other word is the same, and a test holds the JSON mode to the text it
+  served before, byte for byte.
+- **For a Rust caller**: `TariaMcpServer::with_tree_format` builds the handler
+  in either format, `TariaMcpServer::new` still serves JSON, the renderer is
+  `taria_mcp::tree_format`, and `args::Cli::Run` carries the parsed
+  `tree_format` beside the socket.
+
+### The end-to-end gate
+
+- `scripts/e2e.py` grows from 21 steps to 22. The new one starts a demo behind
+  a bridge run with `--tree-format outline`, reads the outline, and selects a
+  row through an `act` named from it, whose answer has to be an outline too.
+
 ## [0.2.1] - 2026-10-11
 
 **Adopting taria no longer widens the host app's ratatui.** `taria-ratatui`
@@ -503,6 +548,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[Unreleased]: https://github.com/y0sif/taria/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/y0sif/taria/releases/tag/v0.2.1
 [0.2.0]: https://github.com/y0sif/taria/releases/tag/v0.2.0
 [0.1.0]: https://github.com/y0sif/taria/releases/tag/v0.1.0

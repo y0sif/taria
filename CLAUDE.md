@@ -11,7 +11,7 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
-python3 scripts/e2e.py                      # end-to-end gate, 21 steps
+python3 scripts/e2e.py                      # end-to-end gate, 22 steps
 python3 scripts/adversarial.py              # edge-case probes, 20 of them
 ```
 
@@ -75,10 +75,14 @@ refuses a `target/debug` older than the sources.
   rebroadcasts acks. A snapshot is kept as the app's own line (minus the
   `type` framing key) beside the parse of it: the line is what the agent
   reads, so an unknown role, action or field survives by name; the parse is
-  what the bridge validates and diffs against. `act` validates node ids and
-  advertised actions and bounds `value` (4096 chars), `key` parses the shared
-  grammar and bounds `repeat` (1-64), `type_text` bounds the payload (4096
-  chars). Results are anchored on the app's ack, not on whatever the tree
+  what the bridge validates and diffs against. `--tree-format outline`
+  (default `json`) renders that line, never the parse, as one indented line
+  per node for every tree an agent receives, and swaps only the format
+  passages of the instructions and the `read_tree`/`act` descriptions; the
+  JSON mode stays byte-identical, which a test pins. `act` validates node ids
+  and advertised actions and bounds `value` (4096 chars), `key` parses the
+  shared grammar and bounds `repeat` (1-64), `type_text` bounds the payload
+  (4096 chars). Results are anchored on the app's ack, not on whatever the tree
   did: dropped, ignored, delivered-and-changed,
   delivered-and-unchanged, no ack, partial burst, lost acks, and the app
   disconnecting. A protocol mismatch keeps `read_tree` for as long as the

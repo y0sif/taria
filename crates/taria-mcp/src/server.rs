@@ -12,6 +12,7 @@ use taria::{Action, AgentInput, MAX_NODE_DEPTH, Node, NodeId, PROTOCOL_VERSION};
 use tokio::sync::{broadcast, watch};
 
 use crate::bridge::{AppSnapshot, BridgeHandle, BridgeState, LinkState};
+use crate::tree_format::TreeFormat;
 
 /// How long an input-sending tool waits for the app to answer, counting both
 /// the app's ack and any snapshot it publishes in response.
@@ -94,6 +95,70 @@ parameter sends the same key up to 64 times, so \"move down five rows\" is one c
 and type_text return the updated tree when the app reacts; call read_tree again whenever you \
 need a fresh view.";
 
+/// One passage of agent-facing text that describes the JSON tree, and what
+/// `--tree-format outline` says in its place.
+///
+/// The outline variants are made by replacing exactly this passage in the
+/// JSON text, never written out whole, so the two modes cannot drift apart
+/// anywhere but where the format is described. The tests check every
+/// passage is still found in its JSON text: one that is not would leave the
+/// outline mode describing JSON.
+struct FormatPassage {
+    /// The passage as the JSON text spells it.
+    json: &'static str,
+    /// What the outline mode says instead.
+    outline: &'static str,
+}
+
+impl FormatPassage {
+    /// `text` with this passage swapped for its outline wording.
+    fn to_outline(&self, text: &str) -> String {
+        text.replace(self.json, self.outline)
+    }
+}
+
+/// The passage of [`INSTRUCTIONS`] that is about the tree's spelling.
+const INSTRUCTIONS_PASSAGE: FormatPassage = FormatPassage {
+    json: "An action the tree spells as an object, {\"custom\":\"delete\"}, is passed to act as \
+           the inner name alone, \"delete\"; every other action is passed exactly as the tree \
+           spells it.",
+    outline: "The tree is an outline: a line of snapshot fields, then one node per line, indented \
+              two spaces per level, as id role \"label\" = \"value\" [actions] *focused, with \
+              each part present only when set. Pass act a node id and an action name exactly as \
+              the line spells them, without the quotes if one is quoted.",
+};
+
+/// The passage of the `read_tree` description that names the format.
+const READ_TREE_PASSAGE: FormatPassage = FormatPassage {
+    json: "as JSON: every node with its id, role, label, value, focus state, and advertised \
+           actions.",
+    outline: "as an outline: every node with its id, role, label, value, focus state, and \
+              advertised actions, one node per line, indented two spaces per level, as id role \
+              \"label\" = \"value\" [actions] *focused, with each part present only when set.",
+};
+
+/// The passage of the `act` description about the custom-action envelope,
+/// which the outline never shows.
+const ACT_PASSAGE: FormatPassage = FormatPassage {
+    json: "An app-specific action appears in the tree as an object, {\"custom\":\"delete\"}, and \
+           is passed here as the inner name alone, \"delete\"; every other action is passed \
+           exactly as the tree spells it.",
+    outline: "Pass the node id and the action name exactly as the tree's outline line spells \
+              them, without the quotes if one is quoted.",
+};
+
+/// The same, in the description of `act`'s `action` parameter.
+///
+/// schemars keeps the line breaks of the doc comment it builds that
+/// description from, so the passage carries them too: rewrapping the comment
+/// on [`ActParams::action`] means rewrapping this, which the tests catch.
+const ACT_ACTION_PASSAGE: FormatPassage = FormatPassage {
+    json: "An action the\ntree spells as an object, {\"custom\":\"delete\"}, is passed here as \
+           the\ninner name alone: \"delete\".",
+    outline: "Pass it exactly as the tree's outline line spells it, without the quotes if it is \
+              quoted.",
+};
+
 /// Parameters for the `act` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ActParams {
@@ -134,14 +199,40 @@ pub struct TypeTextParams {
 pub struct TariaMcpServer {
     bridge: BridgeHandle,
     tool_router: ToolRouter<Self>,
+    /// How every tree this server returns is spelled for the agent.
+    tree_format: TreeFormat,
 }
 
 impl TariaMcpServer {
-    /// Build the handler on top of a spawned bridge.
+    /// Build the handler on top of a spawned bridge, serving the tree as the
+    /// app's own JSON.
     pub fn new(handle: BridgeHandle) -> Self {
+        Self::with_tree_format(handle, TreeFormat::Json)
+    }
+
+    /// Build the handler on top of a spawned bridge, serving the tree in
+    /// `tree_format`.
+    ///
+    /// The tool descriptions come from the `#[tool]` attributes, which
+    /// describe the JSON. For the outline the router's entries are adjusted
+    /// here, once, so `tools/list` describes the format the tools return.
+    pub fn with_tree_format(handle: BridgeHandle, tree_format: TreeFormat) -> Self {
+        let mut tool_router = Self::tool_router();
+        if tree_format == TreeFormat::Outline {
+            describe_outline(&mut tool_router);
+        }
         Self {
             bridge: handle,
-            tool_router: Self::tool_router(),
+            tool_router,
+            tree_format,
+        }
+    }
+
+    /// The instructions surfaced on initialize, in this server's format.
+    fn instructions(&self) -> String {
+        match self.tree_format {
+            TreeFormat::Json => INSTRUCTIONS.to_string(),
+            TreeFormat::Outline => INSTRUCTIONS_PASSAGE.to_outline(INSTRUCTIONS),
         }
     }
 
@@ -220,7 +311,7 @@ impl TariaMcpServer {
             BridgeState::Connected(snapshot) => snapshot,
             BridgeState::Never | BridgeState::Disconnected { .. } => pre,
         };
-        report(seen, fallback, ids.len())
+        report(seen, fallback, ids.len(), self.tree_format)
     }
 
     /// Refuse to send input to a peer on another protocol version.
@@ -295,7 +386,7 @@ impl TariaMcpServer {
     pub async fn read_tree(&self) -> Result<CallToolResult, McpError> {
         let snapshot =
             available_snapshot(self.bridge.state_rx.borrow().clone(), self.link_report())?;
-        tree_result(&snapshot)
+        tree_result(&snapshot, self.tree_format)
     }
 
     /// The `act` tool: validate and forward an advertised action.
@@ -475,7 +566,41 @@ impl ServerHandler for TariaMcpServer {
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(self.instructions())
+    }
+}
+
+/// Rewrite the tool descriptions that describe the JSON tree so they describe
+/// the outline instead, leaving every other word as the attributes wrote it.
+///
+/// Only `read_tree` and `act` mention the format: `key` and `type_text` say
+/// they return "the updated tree", which is true of either. A route or a
+/// schema shaped other than expected is left alone rather than failed on; the
+/// tests pin that every passage is found.
+fn describe_outline(router: &mut ToolRouter<TariaMcpServer>) {
+    if let Some(route) = router.map.get_mut("read_tree") {
+        swap_description(&mut route.attr.description, &READ_TREE_PASSAGE);
+    }
+    if let Some(route) = router.map.get_mut("act") {
+        swap_description(&mut route.attr.description, &ACT_PASSAGE);
+        let schema = std::sync::Arc::make_mut(&mut route.attr.input_schema);
+        if let Some(serde_json::Value::Object(action)) = schema
+            .get_mut("properties")
+            .and_then(|properties| properties.get_mut("action"))
+            && let Some(serde_json::Value::String(description)) = action.get_mut("description")
+        {
+            *description = ACT_ACTION_PASSAGE.to_outline(description);
+        }
+    }
+}
+
+/// Swap `passage` for its outline wording inside one tool description.
+fn swap_description(
+    description: &mut Option<std::borrow::Cow<'static, str>>,
+    passage: &FormatPassage,
+) {
+    if let Some(text) = description.as_mut() {
+        *text = passage.to_outline(text).into();
     }
 }
 
@@ -664,9 +789,10 @@ fn no_snapshot_reason(report: LinkReport) -> String {
     )
 }
 
-/// Render a snapshot as the standard tool result: the app's own JSON.
-fn tree_result(snapshot: &AppSnapshot) -> Result<CallToolResult, McpError> {
-    Ok(text_result(snapshot_json(snapshot)))
+/// Render a snapshot as the standard tool result: the app's own JSON, or the
+/// outline of it.
+fn tree_result(snapshot: &AppSnapshot, format: TreeFormat) -> Result<CallToolResult, McpError> {
+    Ok(text_result(snapshot_text(snapshot, format)))
 }
 
 /// One text block, the shape every result of this server takes.
@@ -674,7 +800,10 @@ fn text_result(text: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
-/// The JSON agents read the tree from: the app's own snapshot, relayed.
+/// The text agents read the tree from: the app's own snapshot, relayed as
+/// JSON or rendered as an outline from that same JSON. Every tree an agent
+/// receives, from `read_tree` and inside every input tool's answer, comes
+/// through here.
 ///
 /// Not `serde_json::to_string(&snapshot.parsed)`. Round-tripping through this
 /// build's types is what turned an app's `"role":"sparkline"` into
@@ -689,8 +818,11 @@ fn text_result(text: String) -> CallToolResult {
 /// `"type":"snapshot"` key that frames the line on the wire is dropped where
 /// the snapshot is stored (see [`AppSnapshot::from_line`]), because this tool
 /// promises the app's tree and that key was never part of one.
-fn snapshot_json(snapshot: &AppSnapshot) -> String {
-    snapshot.tree_json.clone()
+///
+/// The outline is rendered from that relayed text too, never from the parse,
+/// for the same reason (see [`crate::tree_format`]).
+fn snapshot_text(snapshot: &AppSnapshot, format: TreeFormat) -> String {
+    format.render(&snapshot.tree_json)
 }
 
 /// What the app said about one burst of inputs inside [`UPDATE_WAIT`].
@@ -876,7 +1008,12 @@ async fn observe(
 /// ignored the input and published nothing newer. `sent` is how many inputs
 /// the burst carried, which the two partial answers need: a drop somewhere in
 /// the burst, and an observation with acks missing from it.
-fn report(seen: Observed, fallback: AppSnapshot, sent: usize) -> Result<CallToolResult, McpError> {
+fn report(
+    seen: Observed,
+    fallback: AppSnapshot,
+    sent: usize,
+    format: TreeFormat,
+) -> Result<CallToolResult, McpError> {
     // Acks this call never read could have been its own `Dropped` answers, so
     // none of the verdicts below can be stood behind: the drop tally is a
     // floor, and a clean tree would claim an intact burst nobody watched.
@@ -983,10 +1120,10 @@ fn report(seen: Observed, fallback: AppSnapshot, sent: usize) -> Result<CallTool
                  an act a modal dialog blocks or naming a node it no longer knows, a set_value \
                  carrying no value, or text sent while nothing is accepting typing). Re-plan \
                  from the current tree below.\n{}",
-                snapshot_json(&snapshot)
+                snapshot_text(&snapshot, format)
             )))
         }
-        (Some(InputStatus::Delivered), Some(snapshot)) => tree_result(&snapshot),
+        (Some(InputStatus::Delivered), Some(snapshot)) => tree_result(&snapshot, format),
         (Some(InputStatus::Delivered), None) => Ok(text_result(format!(
             "The app received this input, and its tree did not change within {}ms. Call \
              read_tree if you expect a delayed effect.",
@@ -994,7 +1131,7 @@ fn report(seen: Observed, fallback: AppSnapshot, sent: usize) -> Result<CallTool
         ))),
         // No ack at all is how an adapter that predates acks behaves. Its
         // changed tree is the only answer it can give, and answer enough.
-        (None, Some(snapshot)) => tree_result(&snapshot),
+        (None, Some(snapshot)) => tree_result(&snapshot, format),
         // Silence, with the one thing that can turn out not to be silence
         // at all: a line the app sent in this window that the bridge threw
         // away. An ack whose status this build cannot name is exactly that,
@@ -1040,7 +1177,7 @@ fn report(seen: Observed, fallback: AppSnapshot, sent: usize) -> Result<CallTool
                  so whether it was applied cannot be stated. This bridge is built against a \
                  taria newer than its own handling of acknowledgements; upgrading the bridge \
                  restores the full report. The current tree follows.\n{}",
-                snapshot_json(&snapshot)
+                snapshot_text(&snapshot, format)
             )))
         }
     }
@@ -1372,7 +1509,8 @@ mod tests {
         let seen = observe(acks, rx, &pre, &[1, 2, 3, 4]).await;
         assert_eq!(seen.lost, 2, "skipped acks must be counted: {seen:?}");
 
-        let err = report(seen, pre, 4).expect_err("an incomplete observation is not a success");
+        let err = report(seen, pre, 4, TreeFormat::Json)
+            .expect_err("an incomplete observation is not a success");
         assert!(
             err.message.contains("lost 2 of the app's acknowledgements"),
             "error should say how many answers went missing: {}",
@@ -1402,7 +1540,8 @@ mod tests {
             gone: None,
             rejected: None,
         };
-        let err = report(seen, snapshot("after"), 5).expect_err("lost acks are not a success");
+        let err = report(seen, snapshot("after"), 5, TreeFormat::Json)
+            .expect_err("lost acks are not a success");
         assert!(
             err.message.contains("at least 2 of them were dropped"),
             "a drop count that cannot be complete must not read as exact: {}",
@@ -1423,7 +1562,8 @@ mod tests {
             gone: None,
             rejected: None,
         };
-        let err = report(seen, snapshot("after"), 1).expect_err("lost acks are not a success");
+        let err = report(seen, snapshot("after"), 1, TreeFormat::Json)
+            .expect_err("lost acks are not a success");
         assert!(
             err.message.contains("the 1 input it sent"),
             "a single input is one input: {}",
@@ -1472,7 +1612,8 @@ mod tests {
             "two inputs were dropped however many acks said so: {seen:?}"
         );
 
-        let err = report(seen, pre, 2).expect_err("a dropped burst is not a success");
+        let err =
+            report(seen, pre, 2, TreeFormat::Json).expect_err("a dropped burst is not a success");
         assert!(
             err.message.contains("dropped 2 of the 2 inputs"),
             "the burst report must not claim more drops than inputs: {}",
@@ -1503,7 +1644,8 @@ mod tests {
             "only the input whose newest ack is a drop counts: {seen:?}"
         );
 
-        let err = report(seen, pre, 2).expect_err("a partial burst is not a success");
+        let err =
+            report(seen, pre, 2, TreeFormat::Json).expect_err("a partial burst is not a success");
         assert!(
             err.message.contains("dropped 1 of the 2 inputs")
                 && err.message.contains("at most 1 landed"),
@@ -1538,8 +1680,8 @@ mod tests {
             "a departure must be recorded: {seen:?}"
         );
 
-        let result =
-            report(seen, pre, 1).expect("an acknowledged input is not a failed call, even here");
+        let result = report(seen, pre, 1, TreeFormat::Json)
+            .expect("an acknowledged input is not a failed call, even here");
         let text = result_text(&result);
         assert!(
             text.contains("acknowledged this input and then disconnected")
@@ -1567,7 +1709,7 @@ mod tests {
             }),
             ..Observed::default()
         };
-        let err = report(seen, snapshot("after"), 1)
+        let err = report(seen, snapshot("after"), 1, TreeFormat::Json)
             .expect_err("an input with no acknowledgement has no known fate");
         assert!(
             err.message
@@ -1660,20 +1802,247 @@ mod tests {
     /// A server with no app behind it, which is all the value bound needs:
     /// an oversized value is refused before the bridge is asked for anything.
     fn detached_server() -> TariaMcpServer {
+        TariaMcpServer::new(detached_handle())
+    }
+
+    /// A bridge handle with nothing on the other end.
+    fn detached_handle() -> BridgeHandle {
         let (_state_tx, state_rx) = watch::channel(BridgeState::Never);
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
         let (ack_tx, _) = broadcast::channel(1);
         let (_protocol_tx, protocol_rx) = watch::channel(None);
         let (_rejected_tx, rejected_rx) = watch::channel(None);
         let (_link_tx, link_rx) = watch::channel(LinkState::Down);
-        TariaMcpServer::new(BridgeHandle {
+        BridgeHandle {
             state_rx,
             input_tx,
             ack_tx,
             protocol_rx,
             rejected_rx,
             link_rx,
-        })
+        }
+    }
+
+    /// The agent-facing text as it stood before `--tree-format` existed,
+    /// copied here rather than read from the constants, so that the JSON mode
+    /// is held to it byte for byte.
+    const PINNED_INSTRUCTIONS: &str = "Bridge to a live terminal (TUI) application. Call \
+        read_tree first: it returns the app's current semantic tree, including every node id and \
+        the actions each node advertises. Prefer act with a node id and one of that node's \
+        advertised actions (pass value for set_value); node ids and action names come from the \
+        tree, never guess them. An action the tree spells as an object, {\"custom\":\"delete\"}, \
+        is passed to act as the inner name alone, \"delete\"; every other action is passed \
+        exactly as the tree spells it. key and type_text lower differently: key goes into the \
+        app's key handler and lands wherever focus is, type_text goes to the app's typing \
+        surface as literal characters, where a newline arrives as Enter and submits. Type text \
+        with type_text rather than spelling it out with key, whose characters meet the app's \
+        bindings. key is the fallback for parts of the UI without semantic coverage; its repeat \
+        parameter sends the same key up to 64 times, so \"move down five rows\" is one call. \
+        act, key and type_text return the updated tree when the app reacts; call read_tree \
+        again whenever you need a fresh view.";
+
+    const PINNED_READ_TREE: &str = "Read the connected TUI app's current semantic tree as JSON: \
+        every node with its id, role, label, value, focus state, and advertised actions. Call \
+        this first; act and key depend on ids and actions from this tree.";
+
+    const PINNED_ACT: &str = "Invoke an advertised action on a node of the app's semantic tree. \
+        `node` is a node id and `action` an action name, both taken from read_tree; pass `value` \
+        for actions that need one (e.g. set_value), up to 4096 characters. An action that needs \
+        a value and arrives without one is answered ignored. An app-specific action appears in \
+        the tree as an object, {\"custom\":\"delete\"}, and is passed here as the inner name \
+        alone, \"delete\"; every other action is passed exactly as the tree spells it. Returns \
+        the updated tree once the app reacts.";
+
+    const PINNED_KEY: &str = "Send a raw key press to the app, e.g. \"q\", \"enter\", \"tab\", \
+        \"ctrl+c\", \"f5\". Pass `repeat` (1-64) to send the same key that many times, so moving \
+        down five rows is one call. For literal text use type_text instead, which types a whole \
+        string in one call. Fallback for parts of the UI without semantic coverage; prefer act \
+        with an advertised action. The key string is one press, up to 64 characters. A key that \
+        does not match the accepted grammar is rejected, with the grammar in the error. Returns \
+        the updated tree once the app reacts.";
+
+    const PINNED_TYPE_TEXT: &str = "Type literal text into the app. The characters go to \
+        whatever surface the app puts typing into, never through its key bindings, so a \
+        100-character string is 1 call, not 100 key calls. A newline arrives as Enter and a tab \
+        as Tab: ending the text with \\n submits wherever Enter submits, and characters after a \
+        submit usually have nowhere left to go, so send them in a second call. Carriage returns \
+        are dropped. read_tree names the focused node; aim this by moving focus with an \
+        advertised focus action, or with set_value on the target, which many apps focus as a \
+        side effect. With nothing accepting typing the app reports it ignored, which comes back \
+        as a result with the tree, not an error. Up to 4096 characters. Returns the updated tree \
+        once the app reacts.";
+
+    /// The description of `act`'s `action` parameter, which schemars builds
+    /// from the doc comment on [`ActParams::action`].
+    fn action_param_description(server: &TariaMcpServer) -> String {
+        let act = server.get_tool("act").expect("act is listed");
+        act.input_schema["properties"]["action"]["description"]
+            .as_str()
+            .expect("the action parameter is described")
+            .to_string()
+    }
+
+    /// A tool's description as `tools/list` serves it.
+    fn description(server: &TariaMcpServer, name: &str) -> String {
+        server
+            .get_tool(name)
+            .and_then(|tool| tool.description)
+            .unwrap_or_else(|| panic!("{name} is listed with a description"))
+            .into_owned()
+    }
+
+    /// The default mode is what every bridge before `--tree-format` served:
+    /// the same instructions, the same tool list, the same results.
+    #[test]
+    fn json_mode_serves_the_text_it_always_did() {
+        let server = TariaMcpServer::new(detached_handle());
+        assert_eq!(server.tree_format, TreeFormat::Json);
+        assert_eq!(
+            server.get_info().instructions.as_deref(),
+            Some(PINNED_INSTRUCTIONS)
+        );
+        assert_eq!(description(&server, "read_tree"), PINNED_READ_TREE);
+        assert_eq!(description(&server, "act"), PINNED_ACT);
+        assert_eq!(description(&server, "key"), PINNED_KEY);
+        assert_eq!(description(&server, "type_text"), PINNED_TYPE_TEXT);
+        assert!(
+            action_param_description(&server).ends_with(ACT_ACTION_PASSAGE.json),
+            "{}",
+            action_param_description(&server)
+        );
+        // Every other byte of the listing too: names, schemas, annotations.
+        assert_eq!(
+            server.tool_router.list_all(),
+            TariaMcpServer::tool_router().list_all(),
+            "the JSON mode must list the tools exactly as the attributes wrote them"
+        );
+        let explicit = TariaMcpServer::with_tree_format(detached_handle(), TreeFormat::Json);
+        assert_eq!(
+            explicit.tool_router.list_all(),
+            server.tool_router.list_all()
+        );
+        assert_eq!(
+            explicit.get_info().instructions,
+            server.get_info().instructions
+        );
+
+        let tree = snapshot("pinned");
+        assert_eq!(snapshot_text(&tree, TreeFormat::Json), tree.tree_json);
+    }
+
+    /// The outline mode lists the same four tools and changes only the
+    /// passages that describe the format, which are swapped back here to
+    /// prove nothing else moved.
+    #[test]
+    fn outline_mode_describes_the_outline_and_nothing_else_changes() {
+        let json = TariaMcpServer::new(detached_handle());
+        let outline = TariaMcpServer::with_tree_format(detached_handle(), TreeFormat::Outline);
+
+        let names = |server: &TariaMcpServer| {
+            server
+                .tool_router
+                .list_all()
+                .into_iter()
+                .map(|tool| tool.name.into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&outline), ["act", "key", "read_tree", "type_text"]);
+        assert_eq!(names(&outline), names(&json));
+
+        let pairs = [
+            (
+                json.get_info().instructions.unwrap_or_default(),
+                outline.get_info().instructions.unwrap_or_default(),
+                &INSTRUCTIONS_PASSAGE,
+            ),
+            (
+                description(&json, "read_tree"),
+                description(&outline, "read_tree"),
+                &READ_TREE_PASSAGE,
+            ),
+            (
+                description(&json, "act"),
+                description(&outline, "act"),
+                &ACT_PASSAGE,
+            ),
+            (
+                action_param_description(&json),
+                action_param_description(&outline),
+                &ACT_ACTION_PASSAGE,
+            ),
+        ];
+        for (json_text, outline_text, passage) in pairs {
+            assert!(
+                json_text.contains(passage.json),
+                "the JSON text no longer carries the passage the outline replaces, so the \
+                 outline mode would describe JSON: {json_text}"
+            );
+            assert!(outline_text.contains(passage.outline), "{outline_text}");
+            assert!(
+                !outline_text.contains("{\"custom\"") && !outline_text.contains("JSON"),
+                "the outline mode must not describe the JSON: {outline_text}"
+            );
+            assert_eq!(
+                outline_text.replace(passage.outline, passage.json),
+                json_text,
+                "only the format passage may differ between the modes"
+            );
+        }
+        assert!(description(&outline, "read_tree").contains("as an outline"));
+
+        // `key` and `type_text` describe no format, so they do not move at all,
+        // and neither does any schema but the one description in `act`'s.
+        for name in ["key", "type_text", "read_tree"] {
+            assert_eq!(
+                outline.get_tool(name).map(|tool| tool.input_schema),
+                json.get_tool(name).map(|tool| tool.input_schema),
+                "{name}"
+            );
+        }
+        assert_eq!(description(&outline, "key"), PINNED_KEY);
+        assert_eq!(description(&outline, "type_text"), PINNED_TYPE_TEXT);
+    }
+
+    /// Every tree an input tool hands back goes out in the server's format,
+    /// the note-and-tree answers included.
+    #[test]
+    fn input_results_carry_the_tree_in_the_servers_format() {
+        let pre = snapshot("before");
+        let after = snapshot("after");
+        let outline = "protocol_version=1 seq=1\napp app \"after\"";
+        assert_eq!(snapshot_text(&after, TreeFormat::Outline), outline);
+
+        let changed = Observed {
+            status: Some(InputStatus::Delivered),
+            changed: Some(after.clone()),
+            ..Observed::default()
+        };
+        let result = report(changed, pre.clone(), 1, TreeFormat::Outline).expect("a tree");
+        assert_eq!(result_text(&result), outline);
+
+        let ignored = Observed {
+            status: Some(InputStatus::Ignored),
+            ..Observed::default()
+        };
+        let result = report(ignored, after.clone(), 1, TreeFormat::Outline).expect("a tree");
+        let text = result_text(&result);
+        assert!(
+            text.starts_with("The app received this input and deliberately did nothing")
+                && text.ends_with(&format!(".\n{outline}")),
+            "{text}"
+        );
+
+        // And the JSON mode still answers with the app's own line.
+        let ignored = Observed {
+            status: Some(InputStatus::Ignored),
+            ..Observed::default()
+        };
+        let result = report(ignored, after.clone(), 1, TreeFormat::Json).expect("a tree");
+        assert!(
+            result_text(&result).ends_with(&format!(".\n{}", after.tree_json)),
+            "{}",
+            result_text(&result)
+        );
     }
 
     fn act_params(value: String) -> Parameters<ActParams> {

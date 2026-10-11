@@ -11,6 +11,7 @@ use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
 use taria::{Action, AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
 use taria_mcp::bridge::{self, AppSnapshot, BridgeHandle, BridgeState, LinkState};
 use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer, TypeTextParams};
+use taria_mcp::tree_format::TreeFormat;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -1869,6 +1870,63 @@ async fn a_tool_result_relays_the_tree_the_app_published() {
     );
 
     echo.await.expect("fake app task");
+}
+
+/// `--tree-format outline` changes the text an agent reads and nothing else:
+/// the outline is rendered from the relayed line, so the newer app's role,
+/// action and field reach the agent by name there too, and the tree an input
+/// tool answers with comes out in the same format as `read_tree`'s.
+#[tokio::test]
+async fn outline_mode_renders_the_relayed_tree_for_every_tool() {
+    let (_dir, path) = test_socket_path("outline-relay");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path);
+    let server = TariaMcpServer::with_tree_format(handle.clone(), TreeFormat::Outline);
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("first"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+    app.send_raw(NEWER_APP_LINE).await;
+    wait_for_snapshot(&mut handle.state_rx, 2).await;
+
+    let result = server.read_tree().await.expect("read_tree after snapshot");
+    assert_eq!(
+        result_text(&result),
+        "protocol_version=1 seq=2\napp app\n  chart sparkline \"cpu\" [zoom] *focused sample_hz=30",
+        "the outline must carry what the app sent, by name"
+    );
+
+    // The act is validated against the parse exactly as in the JSON mode,
+    // and its answer is the next tree, as an outline.
+    let echo = tokio::spawn(async move {
+        let (_id, input) = app.recv_input().await;
+        app.send(&AppToBridge::Snapshot(Snapshot::new(
+            3,
+            demo_root("zoomed"),
+        )))
+        .await;
+        (app, input)
+    });
+    let result = server
+        .act(Parameters(ActParams {
+            node: "chart".to_string(),
+            action: "zoom".to_string(),
+            value: None,
+        }))
+        .await
+        .expect("an action the outline advertises, passed as it spells it");
+    assert_eq!(
+        result_text(&result),
+        "protocol_version=1 seq=3\napp app \"zoomed\"\n  btn button \"Save\" [activate]\n  \
+         input text_input = \"draft\" [set_value]"
+    );
+    let (_app, input) = echo.await.expect("fake app task");
+    assert_eq!(
+        input,
+        AgentInput::act(
+            taria::NodeId("chart".to_string()),
+            Action::Custom("zoom".to_string()),
+            None
+        )
+    );
 }
 
 /// A line that failed to parse is still skipped, not relayed. The raw line is

@@ -17,7 +17,9 @@ one degraded field rather than the whole tree.
 Reading through the bridge keeps more than that. It relays the app's own
 snapshot instead of re-serializing its parse of it, so an unknown role, action
 or field reaches the agent under its real name; the degraded parse is what the
-bridge validates and compares against, not what the agent reads.
+bridge validates and compares against, not what the agent reads. The opt-in
+outline format, `--tree-format outline`, is rendered from that same line, so
+it keeps the names too.
 
 In Rust the same promise is `#[non_exhaustive]` on the eleven types a version-1
 addition can reach, from `Role` and `Action` to the two wire message enums,

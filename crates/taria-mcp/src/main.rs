@@ -1,11 +1,13 @@
 //! MCP bridge binary: stdio MCP server on one side, the app's taria Unix
-//! socket on the other. Run with `--socket <path>` or `--app <label>`.
+//! socket on the other. Run with `--socket <path>` or `--app <label>`, and
+//! optionally `--tree-format <json|outline>`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use rmcp::ServiceExt;
 use taria_mcp::server::TariaMcpServer;
+use taria_mcp::tree_format::TreeFormat;
 use taria_mcp::{args, bridge};
 
 fn main() -> ExitCode {
@@ -16,12 +18,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let socket = match cli {
+    let (socket, tree_format) = match cli {
         args::Cli::Help => {
             println!("{}", args::HELP);
             return ExitCode::SUCCESS;
         }
-        args::Cli::Run { socket } => socket,
+        args::Cli::Run {
+            socket,
+            tree_format,
+        } => (socket, tree_format),
     };
 
     init_tracing();
@@ -36,7 +41,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(socket)) {
+    match runtime.block_on(run(socket, tree_format)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("taria-mcp: {err}");
@@ -46,15 +51,16 @@ fn main() -> ExitCode {
 }
 
 /// Serve MCP over stdio until the harness closes the session.
-async fn run(socket: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(socket: PathBuf, tree_format: TreeFormat) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         socket = %socket.display(),
+        tree_format = tree_format.name(),
         version = env!("CARGO_PKG_VERSION"),
         taria_protocol = taria::PROTOCOL_VERSION,
         "taria-mcp starting"
     );
     let handle = bridge::spawn(socket);
-    let service = TariaMcpServer::new(handle)
+    let service = TariaMcpServer::with_tree_format(handle, tree_format)
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;

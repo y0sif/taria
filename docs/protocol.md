@@ -1328,6 +1328,8 @@ it, and hand the line to the agent. A role, an action or a field the bridge
 has never heard of then reaches the agent by name instead of flattened into
 whatever its typed view could hold: an app publishing `"role":"sparkline"` had
 the agent read `"role":"other"`, with the real name on the wire the whole time.
+`taria-mcp --tree-format outline`, which hands the agent an outline instead of
+the line, renders it from the line for the same reason.
 
 The parse stays authoritative for what the bridge **decides**, because it is
 typed: validating node ids and advertised actions, and detecting change, read

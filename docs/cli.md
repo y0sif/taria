@@ -10,6 +10,12 @@ taria-mcp --help            Show help
 
 Exactly one of `--socket` or `--app` is required.
 
+Options:
+
+| Flag | Effect |
+|---|---|
+| `--tree-format <json\|outline>` | How `read_tree`, and every input tool that answers with a tree, show the tree to the agent. `json`, the default, relays the app's own snapshot line minus its `type` framing key. `outline` renders that same line as one indented line per node (see [The outline](#the-outline)). The wire format is the same either way. A missing or unknown value is a usage error, exit status 2. |
+
 Environment variables:
 
 | Variable | Effect |
@@ -30,3 +36,52 @@ The label is interpolated into a file name, so it has to be one. Both sides
 refuse a label carrying a path separator, or `.`, `..` or empty, because the
 app-side adapter binds and unlinks whatever the label resolves to. `--socket`
 is how to name a path.
+
+## The outline
+
+With `--tree-format outline`, the demo app's first screen reads:
+
+```text
+protocol_version=1 seq=1
+app app "taria-demo"
+  tabs tabs "Tabs" = "Active"
+    tab-active tab "Active" = "selected" [select]
+    tab-done tab "Done" [select]
+  tasks list "Active tasks" = "task-1"
+    task-1 list_item "Write the taria README" = "todo" [select toggle delete] *focused
+    task-3 list_item "Wire up the MCP bridge" = "todo" [select toggle delete]
+    task-4 list_item "Record the killer demo" = "todo" [select toggle delete]
+  input text_input "New task" = "" [set_value focus]
+  quit button "Quit" [activate]
+```
+
+That is 525 characters. The same tree as JSON is 1132.
+
+The first line holds every top-level snapshot field except `root`, as
+`key=<compact json>`, space-separated. Then one line per node, depth-first,
+indented two spaces per level, the root at zero:
+
+```text
+<id> <role>[ "<label>"][ = "<value>"][ [<action> ...]][ *focused][ <key>=<compact json> ...]
+```
+
+- An id, a role, an action name or a field key prints bare when it is
+  non-empty and made only of `A-Z`, `a-z`, `0-9` and `_ . : / @ + -`, and
+  JSON-quoted otherwise. A role sent as a single-key object prints as its key.
+- The label and the value are always JSON-quoted, so an empty value shows as
+  `= ""` and a newline in a label cannot split a node across two lines.
+  `null` or absent omits them.
+- An app-specific action, `{"custom":"delete"}` in the JSON, prints as
+  `delete`, which is the name `act` takes. Pass `act` an id and an action name
+  exactly as the line spells them, without the quotes if one is quoted.
+- `*focused` appears only on a node whose `focused` is `true`.
+- Any other field, a field this bridge has never heard of included, is
+  appended as ` key=<compact json>`, and so is a known field in a shape the
+  line has no slot for.
+
+The outline is rendered from the app's line, never from the bridge's parse of
+it, so a role, an action or a field this bridge does not know reaches the
+agent by name, as it does in the JSON. A line the outline cannot express is
+served as JSON instead. In this mode the MCP instructions and the `read_tree`
+and `act` descriptions describe the outline rather than the JSON; everything
+else they say is the same.
