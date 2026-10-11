@@ -116,6 +116,6 @@ from the parse, because that is what `act` validates against, and the parse
 keeps an action it does not know under its own name. A line the outline
 cannot express is served as JSON instead. In this mode the MCP instructions
 and the `read_tree` description say the tree is an outline and how a line
-reads, and `act`'s description says to pass names as the line spells them in
-place of the `{"custom":"delete"}` rule. Every other word is the same in both
-modes.
+reads, and `act`'s description says to pass node and action as shown, a quoted
+one JSON-decoded, in place of the `{"custom":"delete"}` rule. Every other word
+is the same in both modes.

@@ -36,7 +36,8 @@
 //!   is appended as ` key=<compact json>`, after `*focused` and before the
 //!   actions.
 //! - The actions end the line, after the bare marker `act: `, joined by `|`,
-//!   each one a name an agent passes to `act` as it is (unquoted, if quoted).
+//!   each one a name an agent passes to `act` as it is (JSON-decoded, if
+//!   quoted).
 //!   An action renders as the name `act` accepts for it: the name the
 //!   bridge's own parse of the line reads it as, which is the action `act`
 //!   validates against. `{"custom":"delete"}` renders as `delete`, a string
@@ -369,8 +370,8 @@ fn compact(value: &Value) -> String {
 }
 
 /// The action names a node line lists after `act:`, as an agent passes them
-/// to `act` (unquoted where the line quotes one), or `None` for a line that
-/// lists none or puts anything after its list.
+/// to `act` (JSON-decoded where the line quotes one), or `None` for a line
+/// that lists none or puts anything after its list.
 ///
 /// A reader of the grammar in the module docs, kept beside the renderer so
 /// the tests can hold one to the other: the line splits into tokens at spaces

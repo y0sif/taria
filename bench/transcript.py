@@ -19,7 +19,9 @@ transcripts from Claude Code 2.1.294):
   model reply) are left out of models and turns;
 - `user` lines: `message.content` is the prompt string (the first user line
   is the task the agent was given, and a real run has no other), or a list
-  of `tool_result` blocks with `tool_use_id` and `is_error`;
+  of `tool_result` blocks with `tool_use_id`, `is_error` and `content` (a
+  string, or text blocks): what the tool returned, as the model read it,
+  including anything Claude Code appended to it;
 - `attachment` lines carry `attachment.type`, and `rendered[].content`, the
   text that reached the model (none for an attachment Claude Code only
   records, such as `prompt_snapshot`). Read here: `prompt_snapshot`
@@ -78,13 +80,18 @@ a `tool_use` message and its result. `ending` infers the cut-off from that
 shape and the turn count, and takes a `max_turns_reached` attachment as
 proof if a later version records one.
 
+Context can also arrive inside a tool result rather than as an attachment:
+Claude Code appends its reminders to a tool's output as `<system-reminder>`
+blocks. No real run has carried one, and none can be told harmless from its
+place, so each is counted (`tool_result_reminders`) and refused.
+
 Reading never raises: a malformed line is skipped and counted
 (`malformed_lines`), and a missing field reads as absent. What a run should
 not have is recorded in its context instead, and `guard` refuses the run for
 each: an attachment of a type with no rule, or in a shape its rule does not
 know; an attachment line with no type, or whose attachment is not an
-object; a line whose type is not `user`, `assistant` or `attachment`; and a
-second prompt.
+object; a `<system-reminder>` block inside a tool result; a line whose type
+is not `user`, `assistant` or `attachment`; and a second prompt.
 
 Python 3 stdlib only.
 """
@@ -131,6 +138,7 @@ ATTACHMENTS_HARMLESS = frozenset({
     "date",                   # today's date
     "model",                  # the model's name and id
     "credential_org",         # the organization id, recorded and never rendered
+    "thinking_drop",          # thinking blocks left out of a request: a diagnostic, never rendered
     "total_tokens_reminder",  # the tokens left in the context window
 })
 # Known, and refused by name: (what it is, what to do).
@@ -142,6 +150,20 @@ ATTACHMENTS_FLAGGED = {
 KNOWN_ATTACHMENTS = ATTACHMENTS_VERIFIED | ATTACHMENTS_HARMLESS | frozenset(ATTACHMENTS_FLAGGED)
 LINE_TYPES = frozenset({"user", "assistant", "attachment"})
 SESSION_CONTEXT_KEYS = ("gitStatus", "userEmail")
+# environment.snapshot: the keys every real run's has (a tmux run from another
+# orchestrating session had all but scratchpadDirectory), and each one's type.
+ENVIRONMENT_KEYS = {
+    "additionalWorkingDirectories": list, "isGitRepo": bool, "isWorktree": bool, "osVersion": str,
+    "platform": str, "scratchpadDirectory": str, "shell": str, "workingDirectory": str,
+}
+MODEL_IDENTITY_KEYS = ("knowledgeCutoff", "marketingName", "modelId")
+# The model attachment's text, spelled from its identity, and the date's.
+MODEL_TEXT = ("You are powered by the model named {marketingName}. The exact model ID is {modelId}. "
+              "Assistant knowledge cutoff is {knowledgeCutoff}.")
+DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+DATE_TEXT = "Today's date is {date}."
+REMINDER = re.compile(r"<system-reminder>\s*(.*?)\s*</system-reminder>", re.S)
+REMINDER_OPEN = "<system-reminder>"
 TOTAL_TOKENS = re.compile(
     r"(?:<system-reminder>\s*)?<total_tokens>\d+ tokens left</total_tokens>(?:\s*</system-reminder>)?"
 )
@@ -216,6 +238,16 @@ def _block_text(content):
     texts = [b.get("text") for b in content if isinstance(b, dict) and b.get("type") == "text"]
     texts = [t for t in texts if isinstance(t, str)]
     return "".join(texts) if texts else None
+
+
+def _result_texts(content):
+    """The text a tool_result block's `content` put in front of the model:
+    the string, or each text block's text."""
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    return [b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)]
 
 
 def _is_tool_result(content):
@@ -332,12 +364,37 @@ def _label(kind):
     return "<no type>" if kind is None else f"<type {json.dumps(kind)}>"
 
 
+def _beyond(obj, known):
+    """The keys of `obj` outside `known`, sorted, as one string, or None."""
+    extra = sorted(str(k) for k in obj if k not in known)
+    return ", ".join(extra) if extra else None
+
+
+def _unwrapped(text):
+    """`text` stripped, and out of the <system-reminder> wrapper Claude Code
+    renders an attachment in, if it is in one."""
+    text = text.strip() if isinstance(text, str) else ""
+    match = REMINDER.fullmatch(text)
+    return match.group(1) if match else text
+
+
 def _harmless_shape(kind, att, texts):
     """None when a harmless attachment has the shape it is known in, else
-    what differs. Light checks: enough that new content in a known type is
-    noticed, not a pin on every field."""
+    what differs. Each is pinned where its content is: the keys it carries,
+    and for date and model the one sentence they render, so a field or a
+    sentence Claude Code adds is noticed."""
     if kind == "environment":
-        return None if isinstance(att.get("snapshot"), dict) else "it has no snapshot object"
+        snapshot = att.get("snapshot")
+        if not isinstance(snapshot, dict):
+            return "it has no snapshot object"
+        extra = _beyond(att, ("type", "snapshot"))
+        if extra:
+            return f"fields beyond snapshot: {extra}"
+        extra = _beyond(snapshot, ENVIRONMENT_KEYS)
+        if extra:
+            return f"snapshot keys beyond the {len(ENVIRONMENT_KEYS)} a real run's has: {extra}"
+        wrong = sorted(k for k, v in snapshot.items() if not isinstance(v, ENVIRONMENT_KEYS[k]))
+        return f"snapshot values of another type than a real run's: {', '.join(wrong)}" if wrong else None
     if kind == "session_context":
         context = att.get("context")
         if not isinstance(context, dict):
@@ -345,12 +402,32 @@ def _harmless_shape(kind, att, texts):
         extra = sorted(str(k) for k in context if k not in SESSION_CONTEXT_KEYS)
         return f"context beyond {' and '.join(SESSION_CONTEXT_KEYS)}: {', '.join(extra)}" if extra else None
     if kind == "date":
-        return None if isinstance(att.get("date"), str) else "it has no date string"
+        date = att.get("date")
+        if not isinstance(date, str):
+            return "it has no date string"
+        extra = _beyond(att, ("type", "date"))
+        if extra:
+            return f"fields beyond date: {extra}"
+        if not DATE.fullmatch(date):
+            return "its date is not YYYY-MM-DD"
+        if any(_unwrapped(t) != DATE_TEXT.format(date=date) for t in texts):
+            return f"its rendered text is not {DATE_TEXT.format(date='<date>')!r}"
+        return None
     if kind == "model":
-        if isinstance(att.get("text"), str) and isinstance(att.get("identity"), dict):
-            return None
-        return "it has no model text and identity"
-    if kind == "credential_org":
+        text, identity = att.get("text"), att.get("identity")
+        if not isinstance(text, str) or not isinstance(identity, dict):
+            return "it has no model text and identity"
+        extra = _beyond(att, ("type", "identity", "text"))
+        if extra:
+            return f"fields beyond identity and text: {extra}"
+        if sorted(identity) != list(MODEL_IDENTITY_KEYS) or not all(isinstance(v, str) for v in identity.values()):
+            return f"its identity is not {', '.join(MODEL_IDENTITY_KEYS)}, as strings"
+        if text != MODEL_TEXT.format(**identity):
+            return "its text is not the model line its identity spells"
+        if any(_unwrapped(t) != text for t in texts):
+            return "its rendered text is not its text"
+        return None
+    if kind == "credential_org" or kind == "thinking_drop":
         return "it carries rendered text, which it never has" if any(t.strip() for t in texts) else None
     if kind == "total_tokens_reminder":
         shown = texts or [att.get("text")]
@@ -482,6 +559,7 @@ def read_transcript(path):
     errors = set()
     synthetic = set()
     first_prompt, seen_user, prompts = None, False, 0
+    reminders = 0  # <system-reminder> blocks inside tool results
     other_lines = Counter()  # line types other than user, assistant and attachment
     final = None  # the last assistant line's message: {"id", "synthetic", "text", "error"}
     max_turns_reached = None
@@ -509,8 +587,11 @@ def read_transcript(path):
             if _is_prompt(content):
                 prompts += 1
             for pos, block in enumerate(content if isinstance(content, list) else []):
-                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") is True:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                if block.get("is_error") is True:
                     errors.add(block.get("tool_use_id") or (number, pos))
+                reminders += sum(text.count(REMINDER_OPEN) for text in _result_texts(block.get("content")))
         elif kind == "assistant" and isinstance(line.get("message"), dict):
             msg = line["message"]
             mid = msg.get("id") if isinstance(msg.get("id"), str) else f"line-{number}"
@@ -588,6 +669,9 @@ def read_transcript(path):
     # nothing else.
     context["unknown_line_types"] = dict(sorted(other_lines.items()))
     context["prompts"] = prompts
+    # Context Claude Code appended to a tool's output, which no attachment
+    # rule sees: <system-reminder> blocks inside tool results.
+    context["tool_result_reminders"] = reminders
 
     return {
         "agent_id": agent_id,
@@ -648,8 +732,9 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
     deferred whose description no record carries, so its format cannot be
     checked; an attachment the context refuses (see ATTACHMENTS_VERIFIED and
     the rest: a type with no rule, one flagged by name, a harmless one in a
-    new shape); a transcript line of a type other than user, assistant and
-    attachment; more than one prompt; and a run with no assistant turn. The
+    new shape); a <system-reminder> block inside a tool result; a transcript
+    line of a type other than user, assistant and attachment; more than one
+    prompt; and a run with no assistant turn. The
     identity line (`cli_prefixes`) is recorded, not checked.
 
     Other servers and deferred tools are held against every name ever
@@ -701,6 +786,10 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
         problems.append(f"lost the {SERVER} server's instructions mid-run: the server was removed (it disconnected)")
     problems += [attachment_problem(entry) for entry in context.get("refused_attachments") or []
                  if isinstance(entry, dict)]
+    reminders = context.get("tool_result_reminders")
+    if isinstance(reminders, int) and reminders > 0:
+        problems.append(f"has {reminders} <system-reminder> block(s) inside tool results: context Claude Code "
+                        "added to a tool's output, which the guard cannot check")
     for kind, count in sorted((context.get("unknown_line_types") or {}).items()):
         problems.append(f"has {count} transcript line(s) of type {kind}, which the guard does not know")
     prompts = context.get("prompts")

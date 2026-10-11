@@ -82,7 +82,9 @@ refuses a `target/debug` older than the sources.
   instructions and of the `read_tree` and `act` descriptions. Those texts are
   short because they are resent with every model call: no parameter is
   described but `repeat`'s default, the `{"custom":...}` rule is in `act`'s
-  description only, and a test pins the JSON mode's text byte for byte.
+  description only, and a test pins both modes' text byte for byte. The
+  input tools promise the tree only if it changed: three answers that are not
+  errors carry a note and no tree.
   `act` validates node ids and advertised actions and bounds `value` (4096
   chars), `key` parses the shared grammar and bounds `repeat` (1-64),
   `type_text` bounds the payload (4096 chars). Results are anchored on the

@@ -28,7 +28,7 @@ takes only the name. It is opt-in, and the default stays JSON.
 **The bridge's own text is less than half as long.** The server instructions
 and the four tool definitions are resent with every model call, and at 4,788
 characters they were the bridge's largest fixed cost, against 2,787 for the
-benchmark's tmux driver. They are now 1,990 characters, and 2,195 with the
+benchmark's tmux driver. They are now 1,992 characters, and 2,199 with the
 outline. `act` also says what `activate` does, which no text said before.
 
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1 and apps send the same
@@ -54,12 +54,9 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
   when set. `docs/cli.md` has the grammar. A missing or unknown value is a
   usage error.
 - **The actions end the line, labelled `act:`**, joined by `|`, so the list
-  reads as the call to make. A benchmark of an unlabelled list,
-  `[set_value activate dismiss]`, had Sonnet submit a new task with
-  `key enter` in all 10 of its runs of the two tasks that add one, where all
-  10 JSON runs used `act activate`. A name holding a space or a `|` is
-  quoted, and so is an id, role or name spelled `act:`, so the marker cannot
-  be forged.
+  reads as the call to make rather than as a detail an agent can pass over
+  for `key`. A name holding a space or a `|` is quoted, and so is an id, role
+  or name spelled `act:`, so the marker cannot be forged.
 - **Every tree goes out in the chosen format**: `read_tree`, and the tree in
   every `act`, `key` and `type_text` answer, the ignored note's tree included.
 - **The outline is rendered from the relayed line**, so a
@@ -74,14 +71,23 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
   and a line the outline cannot express is served as JSON.
 - **The agent is told which format it is reading.** In outline mode the MCP
   instructions and the `read_tree` description say the tree is an outline and
-  how a line reads, and `act`'s description says to pass names as the line
-  spells them, minus any quotes. Every other word is the same, and a test pins
-  the JSON mode's text byte for byte.
+  how a line reads, and `act`'s description says to pass node and action as
+  shown, a quoted one JSON-decoded, since a quoted token is a JSON string.
+  Every other word is the same, and a test pins both modes' text byte for
+  byte.
 - **The instructions give the order of work and one rule.** Read the tree,
   prefer `act` with an advertised action, fall back on `key`, and type text
-  only with `type_text`, because through `key` the characters hit the app's
-  bindings. `key` and `type_text` both say it again, for a client that drops
-  the instructions.
+  with `type_text`, not `key`, because `key`'s characters hit the app's key
+  bindings. A preference rather than a "never", since an app that routes no
+  typed text leaves `key` the only way into its fields. `key` and
+  `type_text` both say it again, for a client that drops the instructions.
+- **The input tools say they return the tree if it changed.** An input the
+  app took with no change to show, one it neither acknowledged nor changed
+  anything for, and one it acknowledged on its way out each come back as a
+  note with no tree.
+- **`type_text` says a newline may act as Enter and submit**, and to send
+  text meant for after it in a second call. In a multi-line editor a
+  newline inserts a line instead.
 - **The `{"custom":"delete"}` rule lives only in `act`'s description**, in
   JSON mode. The outline prints the inner name, so it never shows the
   envelope.

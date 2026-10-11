@@ -244,7 +244,7 @@ added to the agent's prompt:
 | rule | types | the guard |
 |---|---|---|
 | verified | `prompt_snapshot`, `mcp_instructions_delta`, `deferred_tools_delta`, `deferred_tools_record`, `max_turns_reached`, `instructions` | reads what they carry and holds the run to it (below) |
-| harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `total_tokens_reminder` | holds each to the shape it is known in: a snapshot object, session context of `userEmail` and `gitStatus` only, a date string, a model text and identity, no rendered text for `credential_org`, a `<total_tokens>` count and nothing else |
+| harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `thinking_drop`, `total_tokens_reminder` | holds each to the shape it is known in: a snapshot of the 8 keys a real run's has and their types, session context of `userEmail` and `gitStatus` only, a `YYYY-MM-DD` date rendered as "Today's date is ...", a model identity of `modelId`, `marketingName` and `knowledgeCutoff` and the one line spelled from it, no rendered text for `credential_org` and `thinking_drop` (diagnostics Claude Code records and never shows the model), a `<total_tokens>` count and nothing else; any other field is refused |
 | flagged | `remote_session_change`, `skill_listing` | refuses it by name |
 
 Any other type, an attachment line with no type, or one whose attachment is
@@ -289,6 +289,10 @@ assistant line), and the guard. The guard makes a run a harness error if it:
   from `tui`, or lost `tui`'s mid-run;
 - was given an attachment without a rule, one flagged by name, or a
   harmless one in a shape it is not known in (the table above);
+- has a `<system-reminder>` block inside a tool result, which is where
+  Claude Code appends its reminders to a tool's output, out of reach of the
+  attachment rules (`context.tool_result_reminders` counts them; no real run
+  has had one);
 - has a transcript line whose type is not `user`, `assistant` or
   `attachment`;
 - was given more than one prompt (a message sent to the agent mid-run, a
