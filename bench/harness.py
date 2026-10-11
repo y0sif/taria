@@ -28,16 +28,25 @@ DEMO_BIN = os.path.join(REPO, "target", "debug", "taria-demo")
 MCP_BIN = os.path.join(REPO, "target", "debug", "taria-mcp")
 TMUX_MCP = os.path.join(BENCH, "tmux_mcp.py")
 
-SERVER_KEY = "tui"  # one name for both arms, so tool names do not name the arm
-ARMS = ("taria", "tmux")
+SERVER_KEY = "tui"  # one name for every arm, so tool names do not name the arm
+# taria: the bridge's JSON tree. tmux: the screen. outline: the same bridge
+# as taria, showing the same tree as an indented outline (--tree-format).
+ARMS = ("taria", "tmux", "outline")
 # Exactly the tools each arm's server lists. The dry run checks the live
 # servers against this, and grading holds the agent's tool calls to it
 # (transcript.guard), so the two cannot drift apart unnoticed.
 ARM_TOOLS = {
     "taria": ("read_tree", "act", "key", "type_text"),
     "tmux": ("screen", "send_keys"),
+    "outline": ("read_tree", "act", "key", "type_text"),
 }
-SERVER_NAMES = {"taria": "taria-mcp", "tmux": "tmux-mcp"}
+# How the bridge arms show the tree. taria and outline list the same tools,
+# so what tells them apart in a transcript is the read_tree description
+# their server serves (transcript.guard checks it), and in the dry run the
+# text the solver has to parse. taria runs the bridge's default (json), as
+# every batch before the outline arm did.
+ARM_TREE_FORMAT = {"taria": "json", "outline": "outline"}
+SERVER_NAMES = {"taria": "taria-mcp", "tmux": "tmux-mcp", "outline": "taria-mcp"}
 
 COLS, ROWS = 120, 40
 READY_TIMEOUT = 5.0
@@ -522,6 +531,13 @@ def server_entry(arm, run):
             "args": ["--app", "taria-demo"],
             "env": {"TARIA_SOCK": run.sock},
         }
+    if arm == "outline":
+        return {
+            "type": "stdio",
+            "command": MCP_BIN,
+            "args": ["--app", "taria-demo", "--tree-format", "outline"],
+            "env": {"TARIA_SOCK": run.sock},
+        }
     if arm == "tmux":
         return {
             "type": "stdio",
@@ -565,6 +581,7 @@ class McpStdio:
         except OSError as err:
             raise HarnessError(f"{name} could not start: {err}")
         self._next_id = 0
+        self.tools = []
         self._buf = b""
         self._stderr = bytearray()
         self._errdrain = threading.Thread(target=self._drain_stderr, daemon=True)
@@ -648,10 +665,12 @@ class McpStdio:
         return resp["result"]
 
     def tools_list(self):
+        """The tool names; `self.tools` keeps the full entries, descriptions included."""
         resp = self.request("tools/list", {})
         if "error" in resp:
             raise HarnessError(f"{self.name} refused tools/list: {resp['error']}")
-        return [tool["name"] for tool in resp["result"]["tools"]]
+        self.tools = resp["result"]["tools"]
+        return [tool["name"] for tool in self.tools]
 
     def call(self, tool, arguments=None, timeout=RPC_TIMEOUT):
         """tools/call; returns the result's text. Raises ToolError on an error result."""
@@ -696,7 +715,7 @@ def wait_ready(arm, client, timeout=READY_TIMEOUT):
     agent never meets a bridge that has not connected yet. These calls are
     the harness's, not the solver's, and are not counted.
     """
-    if arm != "taria":
+    if arm not in ARM_TREE_FORMAT:
         return
     deadline = time.monotonic() + timeout
     while True:
@@ -705,5 +724,5 @@ def wait_ready(arm, client, timeout=READY_TIMEOUT):
             return
         except ToolError as err:
             if time.monotonic() > deadline:
-                raise HarnessError(f"taria-mcp never reached the demo: {err.message}")
+                raise HarnessError(f"taria-mcp ({arm} arm) never reached the demo: {err.message}")
             time.sleep(0.1)

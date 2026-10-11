@@ -8,9 +8,11 @@ file (written by `run.py next`) and execs the arm's real server pointed at
 that slot's demo. `tools: mcp__tui` grants every tool of that server and
 nothing else.
 
-The two arms' files differ only in `name`, `description` and the launcher's
-`--arm`/`--slot`; the body, which is the agent's system prompt, is the same
-bytes in both, and its sha256 is recorded in the batch's plan.json.
+The arms' files (taria, tmux, outline) differ only in `name`, `description`
+and the launcher's `--arm`/`--slot`; the body, which is the agent's system
+prompt, is the same bytes in all of them, and its sha256 is recorded in the
+batch's plan.json. FILE_RE anchors the arm between `tui-` and `-<slot>.md`,
+so no arm's name can be read as another's.
 
 The frontmatter follows https://code.claude.com/docs/en/sub-agents.md, whose
 inline example is

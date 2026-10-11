@@ -2,9 +2,11 @@
 
 Each solver drives the demo through the same MCP server an agent would get,
 using only what that arm's tools show: the taria solver reads node ids and
-advertised actions from the tree, the tmux solver reads the screen text and
-presses keys. A task's plan is a list of steps both solvers implement; the
-sabotage plan is a plausible wrong one, which the task's check must fail.
+advertised actions from the JSON tree, the outline solver reads the same
+from the outline text (parse_outline), the tmux solver reads the screen
+text and presses keys. A task's plan is a list of steps every solver
+implements; the sabotage plan is a plausible wrong one, which the task's
+check must fail.
 
 The solvers verify little on purpose. The check on the state dump is the
 arbiter, and a solver that quietly did the wrong thing fails there.
@@ -141,6 +143,161 @@ class TariaSolver:
         # By position, re-read each time: the mistake identity exists to stop.
         for position in positions:
             self.act(self.items(self.on_tab(tab))[position]["id"], "toggle")
+
+
+# --- outline: the same tree, one line per node ------------------------------------------
+#
+# The grammar is taria-mcp's --tree-format outline (docs/cli.md, The outline):
+# a header line of top-level `key=<compact json>` fields, then one node per
+# line, indented two spaces per level,
+#
+#   <id> <role>[ "<label>"][ = "<value>"][ [<action> ...]][ *focused][ <key>=<json> ...]
+#
+# where an id, role, action or key is bare when made only of
+# [A-Za-z0-9_.:/@+-] and JSON-quoted otherwise, and label and value are
+# always JSON-quoted. This parser reads that back into the JSON tree's shape,
+# so the outline solver runs the taria solver's steps on what it parsed.
+
+BARE_RE = re.compile(r"[A-Za-z0-9_.:/@+-]+")
+_DECODER = json.JSONDecoder()
+
+
+def _quoted(line, pos, what):
+    """(the JSON string at `pos`, the position after it)."""
+    try:
+        value, end = _DECODER.raw_decode(line, pos)
+    except ValueError as err:
+        raise SolverError(f"bad {what} at column {pos} of outline line {line!r}: {err}")
+    if not isinstance(value, str):
+        raise SolverError(f"{what} at column {pos} of outline line {line!r} is not a string")
+    return value, end
+
+
+def _name(line, pos, what):
+    """(a bare or JSON-quoted name at `pos`, the position after it)."""
+    if line.startswith('"', pos):
+        return _quoted(line, pos, what)
+    match = BARE_RE.match(line, pos)
+    if match is None:
+        raise SolverError(f"no {what} at column {pos} of outline line {line!r}")
+    return match.group(0), match.end()
+
+
+def _field(line, pos):
+    """(key, value, position after) for one ` key=<compact json>` field."""
+    key, pos = _name(line, pos, "field key")
+    if not line.startswith("=", pos):
+        raise SolverError(f"field {key!r} has no '=' in outline line {line!r}")
+    try:
+        value, end = _DECODER.raw_decode(line, pos + 1)
+    except ValueError as err:
+        raise SolverError(f"field {key!r} is not JSON in outline line {line!r}: {err}")
+    return key, value, end
+
+
+def _node_line(line):
+    """One node line, indent stripped, as the JSON tree's node dict (no children)."""
+    node, pos = {}, 0
+    node["id"], pos = _name(line, pos, "id")
+    if not line.startswith(" ", pos):
+        raise SolverError(f"no role after the id in outline line {line!r}")
+    if line.startswith(("{", "["), pos + 1):  # a role in a shape the line has no name for
+        try:
+            node["role"], pos = _DECODER.raw_decode(line, pos + 1)
+        except ValueError as err:
+            raise SolverError(f"bad role in outline line {line!r}: {err}")
+    else:
+        node["role"], pos = _name(line, pos + 1, "role")
+    while pos < len(line):
+        if line[pos] != " ":
+            raise SolverError(f"expected a space at column {pos} of outline line {line!r}")
+        pos += 1
+        if line.startswith('"', pos) and len(node) == 2:
+            node["label"], pos = _quoted(line, pos, "label")
+        elif line.startswith('= "', pos):
+            node["value"], pos = _quoted(line, pos + 2, "value")
+        elif line.startswith("[", pos):
+            actions, pos = [], pos + 1
+            while not line.startswith("]", pos):
+                action, pos = _name(line, pos, "action")
+                actions.append(action)
+                if line.startswith(" ", pos):
+                    pos += 1
+            node["actions"], pos = actions, pos + 1
+        elif line.startswith("*focused", pos) and line[pos + 8:pos + 9] in ("", " "):
+            node["focused"], pos = True, pos + 8
+        else:
+            key, value, pos = _field(line, pos)
+            node[key] = value
+    return node
+
+
+def parse_outline(text):
+    """The tree an outline shows, as {**header fields, "root": node}, every
+    node with its children. Raises SolverError on text that is not one."""
+    lines = text.split("\n")
+    if len(lines) < 2:
+        raise SolverError(f"an outline has a header line and a root line, not {text[:200]!r}")
+    tree, header, pos = {}, lines[0], 0
+    while pos < len(header):
+        key, value, pos = _field(header, pos)
+        tree[key] = value
+        if header.startswith(" ", pos):
+            pos += 1
+    stack = []  # (depth, node) from the root down to the last line's node
+    for line in lines[1:]:
+        body = line.lstrip(" ")
+        indent = len(line) - len(body)
+        if not body or indent % 2:
+            raise SolverError(f"outline line {line!r} is empty or indented by an odd count")
+        depth, node = indent // 2, _node_line(body)
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        if not stack:
+            if depth or "root" in tree:
+                raise SolverError(f"outline line {line!r} has no parent")
+            tree["root"] = node
+        elif depth != stack[-1][0] + 1:
+            raise SolverError(f"outline line {line!r} skips a level")
+        else:
+            stack[-1][1].setdefault("children", []).append(node)
+        stack.append((depth, node))
+    return tree
+
+
+def outline_in(text):
+    """The tree an outline-mode result carries, or None, as tree_in does for
+    JSON: the outline on its own, or on the second line after a note. A tree
+    the bridge could not express as an outline comes as JSON, and is read so."""
+    for candidate in (text, text.partition("\n")[2]):
+        if candidate.lstrip().startswith("{"):
+            tree = tree_in(candidate)
+            if tree is not None:
+                return tree
+            continue
+        try:
+            return parse_outline(candidate)
+        except SolverError:
+            pass
+    return None
+
+
+class OutlineSolver(TariaSolver):
+    """The taria solver's steps, on the tree read from the outline text."""
+
+    def tree(self):
+        text = self.s.call("read_tree")
+        tree = outline_in(text)
+        if tree is None:
+            raise SolverError(f"read_tree returned no outline: {text[:300]!r}")
+        return tree
+
+    def act(self, node, action, value=None):
+        args = {"node": node, "action": action}
+        if value is not None:
+            args["value"] = value
+        tree = outline_in(self.s.call("act", args))
+        return tree if tree is not None else self.tree()
 
 
 # --- tmux: the screen ----------------------------------------------------------------
@@ -299,7 +456,7 @@ PLANS = {
     ),
 }
 
-SOLVERS = {"taria": TariaSolver, "tmux": TmuxSolver}
+SOLVERS = {"taria": TariaSolver, "tmux": TmuxSolver, "outline": OutlineSolver}
 
 
 def solve(task_id, arm, session, sabotage=False):

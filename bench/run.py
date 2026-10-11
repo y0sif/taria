@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Run benchmark tasks against taria-demo through one or both arms.
+"""Run benchmark tasks against taria-demo through one or more arms.
 
 Each run gets a fresh demo in its own tmux server and temp dir (see
-harness.DemoRun for the layout), and one of two MCP servers, both registered
-as `tui`, so the agent sees `mcp__tui__<tool>` either way:
+harness.DemoRun for the layout), and one of three MCP servers, all registered
+as `tui`, so the agent sees `mcp__tui__<tool>` whichever it is:
 
-  taria  the real bridge, target/debug/taria-mcp --app taria-demo
-  tmux   bench/tmux_mcp.py, screen-scraping the same pane
+  taria    the real bridge, target/debug/taria-mcp --app taria-demo (the tree as JSON)
+  outline  the same bridge with --tree-format outline (the same tree, one line per node)
+  tmux     bench/tmux_mcp.py, screen-scraping the same pane
 
 A run is graded on the demo's state dump by the task's check (bench/tasks.py),
 never on the screen or the tree, and on the demo process still running.
@@ -80,7 +81,7 @@ an `archive` that found a row's transcript neither archived nor live).
 
 Python 3 stdlib only. Never builds, never calls a model.
 
-Usage:  python3 bench/run.py dry-run [--tasks T1,T3] [--arms taria,tmux] [--runs N] [--seed S]
+Usage:  python3 bench/run.py dry-run [--tasks T1,T3] [--arms taria,tmux,outline] [--runs N] [--seed S]
                                      [--sabotage] [--batch B]
         python3 bench/run.py agents  --slots K [--dir D] [--effort E] [--max-turns N] [--remove]
         python3 bench/run.py plan    --batch B [--tasks ..] [--arms ..] [--models sonnet,haiku]
@@ -116,6 +117,7 @@ import agents  # noqa: E402
 import mcp_launch  # noqa: E402
 from harness import (  # noqa: E402
     ARM_TOOLS,
+    ARM_TREE_FORMAT,
     ARMS,
     REPO,
     SERVER_NAMES,
@@ -394,7 +396,7 @@ def teardown(slot):
 
 
 def prepare_demo(task, on_created=None):
-    """A started demo, through the task's setup, ready for either arm's server.
+    """A started demo, through the task's setup, ready for any arm's server.
 
     `on_created(run)` is called once the temp dir exists and before anything
     is started, so a caller can record what to tear down if this process dies.
@@ -469,6 +471,7 @@ def drive_scripted(task, arm, run, sabotage):
                 f"{name} lists tools {sorted(tools)}, but grading expects "
                 f"{sorted(ARM_TOOLS[arm])}; update ARM_TOOLS in bench/harness.py"
             )
+        check_tree_format(arm, name, client.tools)
         wait_ready(arm, client)
         session = CountingSession(client)
         solver_error = None
@@ -483,6 +486,23 @@ def drive_scripted(task, arm, run, sabotage):
     finally:
         client.close()
     return dict(session.calls), wall_ms, solver_error
+
+
+def check_tree_format(arm, name, tools):
+    """A bridge arm's server must describe the tree format the arm is for:
+    taria and outline list the same tools, and the read_tree description is
+    what tells them apart (transcript.guard holds an agent's run to it)."""
+    want = ARM_TREE_FORMAT.get(arm)
+    if want is None:
+        return
+    described = load_transcript_module().tree_format_of(
+        next((t.get("description") for t in tools if t.get("name") == "read_tree"), None)
+    )
+    if described != want:
+        raise HarnessError(
+            f"{name} describes read_tree as showing the tree as {described or 'nothing known'}, "
+            f"but the {arm} arm needs {want}: is target/debug/taria-mcp current?"
+        )
 
 
 def dry_run_one(task, arm, run_index, job_id, batch, seed, sabotage, prov):
@@ -765,7 +785,8 @@ def transcript_verdict(transcript_mod, path, arm, model, effort, max_turns, extr
     The one grading logic for `next` and `regrade`. Raises when the
     transcript cannot be read."""
     stats = transcript_mod.read_transcript(path)
-    problems = list(transcript_mod.guard(stats, arm, model, ARM_TOOLS[arm], effort=effort))
+    problems = list(transcript_mod.guard(stats, arm, model, ARM_TOOLS[arm], effort=effort,
+                                         tree_format=ARM_TREE_FORMAT.get(arm)))
     problems += list(extra_problems)
     kind, detail = transcript_mod.ending(stats, max_turns)
     inferred = kind == "end_turn" and detail is not None
@@ -1098,6 +1119,8 @@ def cmd_abort(args):
 
 # --- Regrade: one grading logic for every row of a batch ----------------------------------------
 
+# Matched whole (agent_type_problems uses fullmatch), so `tui-outline-1` is
+# never taken for `tui-taria-1` or the reverse.
 ARM_AGENT_RE = {arm: re.compile(rf"tui-{re.escape(arm)}-[1-9][0-9]*") for arm in ARMS}
 
 
@@ -1359,7 +1382,7 @@ def parse_args(argv=None):
     selection.add_argument(
         "--arms", "--arm", dest="arms", action="extend",
         type=lambda v: _list(v, list(ARMS), "arm"),
-        help="comma-separated arms (default: taria,tmux)",
+        help=f"comma-separated arms (default: {','.join(ARMS)})",
     )
     selection.add_argument("--runs", type=_positive, default=1, help="runs per combination (default 1)")
     selection.add_argument("--seed", type=int, help="shuffle seed (default: random, recorded)")

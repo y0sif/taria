@@ -1,24 +1,36 @@
 # taria benchmark
 
 Does an agent drive a terminal app better through taria's semantic tree than
-by scraping the screen? This benchmark answers that on `taria-demo`. Both arms
-get the same tasks, prompts and agent instructions; only the tools differ.
+by scraping the screen? This benchmark answers that on `taria-demo`. Every arm
+gets the same tasks, prompts and agent instructions; only the tools differ.
 Runs are graded on what the app holds when the agent stops, never on what
-either arm saw. Each run records verified success, turns, tool calls, tokens
+any arm saw. Each run records verified success, turns, tool calls, tokens
 and wall time. The models are Sonnet 5.5 and Haiku 5.5.
 
-## The two arms
+## The arms
 
 Each arm is an MCP server (Model Context Protocol, the standard way to hand an
-agent a set of tools). Both are registered as `tui`, so the agent sees
-`mcp__tui__<tool>` either way and no tool name gives the arm away.
+agent a set of tools). All are registered as `tui`, so the agent sees
+`mcp__tui__<tool>` whichever it gets and no tool name gives the arm away.
 
 - **taria**: the real bridge, `target/debug/taria-mcp --app taria-demo`, with
-  `read_tree`, `act`, `key` and `type_text`.
+  `read_tree`, `act`, `key` and `type_text`. The tree comes as JSON, the
+  bridge's default.
+- **outline**: the same binary and the same four tools, started with
+  `--tree-format outline`. The bridge shows the same tree as one indented
+  line per node, `id role "label" = "value" [actions] *focused` (the grammar
+  is in `docs/cli.md`, The outline), and its instructions and its `read_tree`
+  and `act` descriptions describe the outline instead of the JSON. It
+  measures whether the outline cuts tokens without hurting pass rates.
 - **tmux**: `bench/tmux_mcp.py`, with `screen` (the pane as plain text) and
   `send_keys` (tmux key names, or text with `literal: true`). Key names go
   30 ms apart, so `"Escape d"` is not alt+d, and the settle wait is capped at
   the 500 ms taria-mcp waits for an app to react.
+
+taria and outline offer the same tool names, so what tells their runs apart
+is the `read_tree` description each server serves ("the current semantic
+tree as JSON" or "as an outline"). Transcripts record it, and the guard holds
+each arm to its own (see Isolation); the dry run checks the live server's.
 
 `screen` has no colors or styles, as a screen scraper gets. The demo marks the
 active tab only as bold, so on an empty tab the tmux arm cannot tell which tab
@@ -29,7 +41,7 @@ it is on. That is a real handicap of scraping, not a harness bug.
 The demo starts with this seed: `task-1` 'Write the taria README', `task-3` 'Wire up the MCP
 bridge' and `task-4` 'Record the killer demo' are todo; `task-2` 'Sketch the
 protocol wire types' and `task-5` 'Publish a snapshot per frame' are done.
-Prompts name neither arm's tools, node ids or key bindings.
+Prompts name no arm's tools, node ids or key bindings.
 
 | id | prompt | passes when |
 |----|--------|-------------|
@@ -38,7 +50,7 @@ Prompts name neither arm's tools, node ids or key bindings.
 | T3 | Delete the task 'Wire up the MCP bridge'. | `task-3` gone; the other four seed tasks unchanged |
 | T4 | Add a new task whose title is the title of the third task on the Active tab, followed by ' (follow-up)'. | exactly one new todo task 'Record the killer demo (follow-up)'; seed unchanged |
 | T5 | Mark every task on the Active tab whose title starts with 'W' as done, then delete the task 'Sketch the protocol wire types'. | `task-1` and `task-3` done, `task-2` gone, `task-4` and `task-5` unchanged; working by position marks `task-4`, since completing the first match shifts the tab |
-| T6 | Add a task titled 'Check the dialog'. Do not delete anything. | starts inside the delete dialog for `task-1`, opened through tmux before the agent's server starts (both arms); one new task with that title, every seed task intact |
+| T6 | Add a task titled 'Check the dialog'. Do not delete anything. | starts inside the delete dialog for `task-1`, opened through tmux before the agent's server starts (every arm); one new task with that title, every seed task intact |
 
 ## Grading
 
@@ -122,21 +134,26 @@ These are the orchestrator's mistakes, not runs. A refusal exits 2, records
 nothing and keeps the slot, so pass the right id or `abort` the slot.
 
 `status` shows progress and `abort` records a harness error and frees a slot.
-`dry-run` costs nothing. It drives every task on both arms with a scripted
+`dry-run` costs nothing. It drives every task on every arm with a scripted
 solver (`bench/solvers.py`) through the same server an agent gets, no model.
-`--sabotage` swaps in a plausible wrong plan per task, so each check fails.
+The taria solver reads node ids and actions from the JSON tree; the outline
+solver parses the outline text back into the same tree (ids are the line's
+first token, JSON-quoted when not bare) and runs the same steps; the tmux
+solver reads the screen. `--sabotage` swaps in a plausible wrong plan per
+task, so each check fails. `--arms` (dry-run and plan) defaults to all three
+arms.
 
 ```bash
 python3 bench/run.py status --batch B                  # recorded, held, pending
 python3 bench/run.py abort --batch B --slot K --reason TEXT
-python3 bench/run.py dry-run                           # 12/12 pass
-python3 bench/run.py dry-run --sabotage                # 12/12 fail, exit 1 (expected)
+python3 bench/run.py dry-run                           # 18/18 pass
+python3 bench/run.py dry-run --sabotage                # 18/18 fail, exit 1 (expected)
 ```
 
 ## The subagent definitions
 
-`agents --slots K --dir D` writes `tui-<arm>-<K>.md` for both arms and slots 1
-to K. It refuses to overwrite a file it did not write; `--remove` deletes only
+`agents --slots K --dir D` writes `tui-<arm>-<K>.md` for every arm (taria,
+tmux, outline) and slots 1 to K. It refuses to overwrite a file it did not write; `--remove` deletes only
 its own. The frontmatter:
 
 - `tools: mcp__tui`: every tool of the agent's own server, nothing else.
@@ -146,9 +163,11 @@ its own. The frontmatter:
 - `omitClaudeMd: true`, and one inline stdio server, `tui`, in `mcpServers`.
 
 The arms' files differ only in name, description and the launcher's `--arm`
-and `--slot`. The body is the system prompt, the same bytes in both. Its
+and `--slot`. The body is the system prompt, the same bytes in all three. Its
 sha256 goes into `plan.json` as `agent_body_sha256`, and before each claim
-`next` checks the slot's agent files against the plan, body included:
+`next` checks the slot's agent files against the plan, body included. Names
+are matched whole (`tui-outline-1` is never read as `tui-taria-1`), and the
+launcher refuses an agent of one arm in a slot that holds another's job:
 
 > You are operating a terminal application on the user's behalf. The
 > application is already running, and the tools you have are your only way to
@@ -158,7 +177,7 @@ sha256 goes into `plan.json` as `agent_body_sha256`, and before each claim
 The inline server is `bench/mcp_launch.py`. It reads the slot file `next`
 wrote (`results/slots/<K>.json`) and execs the arm's real server against that
 slot's demo. An exec, not a proxy: the MCP stream passes straight through. A
-missing slot file, a slot not ready, or a slot holding the other arm's job
+missing slot file, a slot not ready, or a slot holding another arm's job
 exits 1, so the agent gets no tools rather than the wrong arm's.
 
 One launch per job. Before the exec, the launcher creates the marker
@@ -224,6 +243,9 @@ assistant line), and the guard. The guard makes a run a harness error if it:
   `mcp_launch` refused, offers none);
 - was ever offered a deferred tool beyond its arm's (this catches the other
   arm's), even one later removed;
+- was offered a `read_tree` whose description shows the tree in another
+  format than its arm's (json for taria, outline for outline), which is how
+  the two bridge arms, with the same tool names, are told apart;
 - ever got the instructions of an MCP server other than `tui`, got none
   from `tui`, or lost `tui`'s mid-run;
 - never took a turn.
@@ -321,31 +343,74 @@ One JSON object per run, the same keys in both modes, null where none applies.
 | `tokens` | `input`, `cache_creation`, `cache_read`, `output`, summed over messages |
 | `output_tokens_lower_bound`, `unclosed_messages` | `tokens.output` is a lower bound because a message never got its closing line; how many messages did not |
 | `final_text` | the agent's last text, up to 500 characters |
-| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers (at the end, and every one ever added), environment cwd, skill listing, attachment types |
+| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers (at the end, and every one ever added), environment cwd, skill listing, attachment types, and `tree_formats`: the tree format each offered `read_tree` described (`["json"]`, `["outline"]`, or `[]` without one) |
 | `status_at_run`, `regraded_at`, `regrade_git_sha`, `regrade_git_dirty`, `regrade_note` | added by `regrade` only: see Regrading |
 
 ## Summaries
 
 ```bash
-python3 bench/summarize.py                 # the newest batch, named on stderr
-python3 bench/summarize.py --batch B       # one batch (repeatable)
-python3 bench/summarize.py --all           # every batch, merged
-python3 bench/summarize.py FILE ...        # exactly these files
+python3 bench/summarize.py                          # the newest batch, named on stderr
+python3 bench/summarize.py --batch B                # one batch
+python3 bench/summarize.py --batch A --batch B      # several, merged (or --batch A,B)
+python3 bench/summarize.py --all                    # every batch, merged
+python3 bench/summarize.py FILE ...                 # exactly these files
 ```
 
+- **Run conditions**, first, when the rows come from more than one batch:
+  per batch the git SHA (and dirty flag), claude versions, models requested
+  and resolved, effort, max turns, seed, arms, graded n and harness errors,
+  then which of SHA, claude, models resolved, effort, max turns and seed
+  differ. Merged batches are compared as if they ran together, so read this
+  before any cross-batch comparison. An arm with runs in several batches is
+  pooled, and the header says so.
 - **Agent runs**, the headline: one row per (task, arm, model, effort, max
   turns). Pass rate with a Wilson 95% interval, harness errors (outside n),
   cut-off runs, and medians of tool calls, ToolSearch calls, turns, tokens
   processed (input + both caches), output tokens and wall seconds. The
   output-token median leaves out rows whose count is a lower bound
   (`output_tokens_lower_bound`), and the cell says how many it left out.
-- **taria vs tmux, per model**: per task, the pass-rate difference with a
-  two-sided Fisher exact p and tmux/taria ratios of median tokens and tool
-  calls; each arm across all tasks; each pair of models per arm.
+  A subagent row graded before that field existed, and not `end_inferred`,
+  cannot be checked for a message left unclosed mid-run: it stays in the
+  median, the cell counts it as `unchecked`, and a footer (and stderr) warns
+  that its output tokens may be low. `run.py regrade` records the field.
+- **Arms per model, across all tasks**: per model and arm, the pass rate
+  (Wilson 95%) and median [IQR] tokens processed, tool calls and output
+  tokens; then each pair of arms per model with the pass-rate difference, a
+  two-sided Fisher exact p and baseline/subject ratios of those medians.
+  The pairs are outline vs taria and every arm vs tmux, where both ran.
+- **Pairs per model**, headed by the pairs present (`taria vs tmux` for a
+  two-arm batch, as before): per task and pair, the pass-rate difference
+  with a Fisher exact p and baseline/subject ratios of median tokens and
+  tool calls; each arm across all tasks; then each pair of models per arm.
 - **Dry runs**, **provenance**, **guard** problems and the **agent context**
   per arm and model, so the arms can be seen to match. The context table
   lists every deferred tool and MCP instruction server that ever reached a
   run, as the guard checks, not only those left at the end.
+
+## The outline arm
+
+Run it as its own batch against `full1`, which ran taria and tmux on both
+models, and summarize the two together. Use full1's seed, effort and max
+turns (`results/full1/plan.json`: seed 42, effort medium, max turns 30); the
+seed fixes this batch's job order, not full1's.
+
+```bash
+cargo build --workspace     # target/debug/taria-mcp must take --tree-format
+python3 bench/run.py dry-run --arms outline                   # 6/6 pass
+python3 bench/run.py agents --slots 4                         # adds tui-outline-1..4
+python3 bench/run.py plan --batch outline1 --arms outline --models sonnet,haiku --runs 5 \
+    --seed 42 --effort medium --max-turns 30
+python3 bench/run.py next --batch outline1 --slot 1           # and so on, per slot
+python3 bench/summarize.py --batch full1 --batch outline1
+```
+
+A session loads new agent files only at startup, so restart the
+orchestrating session after `agents`. From the worktree, pass `--dir` and
+`--agents-dir` as in How runs execute. The 60 jobs then run like any batch.
+The two batches differ at least in git SHA (the bridge gained
+`--tree-format` after full1), and perhaps in the claude version; the run
+conditions header lists both, so the outline vs taria ratios read as a
+cross-batch comparison.
 
 ## Tests
 
@@ -370,7 +435,7 @@ compare. Batch results are written up separately.
 
 - Wall time is indicative only: slots run in parallel on one machine.
 - The environment block shows the orchestrator's working directory
-  (`~/Projects/taria`) to both arms, not the empty dir the MCP server runs in.
+  (`~/Projects/taria`) to every arm, not the empty dir the MCP server runs in.
 - The agent files hold absolute paths to the launcher and the slots dir of
   the checkout that wrote them. When the bench moves (as when
   `feat/benchmark` merges), rewrite them with `agents`.

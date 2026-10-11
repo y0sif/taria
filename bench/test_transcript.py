@@ -52,7 +52,7 @@ sys.path.insert(0, BENCH)
 
 import summarize  # noqa: E402
 import transcript  # noqa: E402
-from harness import ARM_TOOLS  # noqa: E402
+from harness import ARM_TOOLS, ARM_TREE_FORMAT  # noqa: E402
 from tasks import TASKS  # noqa: E402
 
 FIXTURES = os.path.join(BENCH, "fixtures", "transcripts")
@@ -75,6 +75,7 @@ CONTEXT = {
     "claude_md_files": (list,), "deferred_tools": (list,), "mcp_instruction_servers": (list,),
     "deferred_tools_added": (list,), "mcp_instruction_servers_added": (list,),
     "environment_cwd": (str, type(None)), "skill_listing": (bool,), "attachment_types": (list,),
+    "tree_formats": (list,),
 }
 TUI = {arm: sorted("mcp__tui__" + t for t in tools) for arm, tools in ARM_TOOLS.items()}
 
@@ -489,6 +490,65 @@ class Guard(Variant, unittest.TestCase):
         problems = self.guard(read("never_ran.jsonl"), "taria", "sonnet")
         self.assertEqual(problems[-1], "never ran: the transcript has no assistant turn")
 
+    def test_the_tree_format_is_read_off_read_trees_description(self):
+        self.assertEqual(read(TARIA_CLEAN)["context"]["tree_formats"], ["json"])
+        self.assertEqual(read(TMUX_CLEAN)["context"]["tree_formats"], [], "no read_tree offered")
+        self.assertEqual(transcript.tree_format_of("Read the connected TUI app's current semantic tree as an "
+                                                   "outline: every node ..."), "outline")
+        self.assertEqual(transcript.tree_format_of("Read the connected TUI app's current semantic tree as "
+                                                   "JSON: every node ..."), "json")
+        self.assertIsNone(transcript.tree_format_of("Read the tree."))
+        self.assertIsNone(transcript.tree_format_of(None))
+
+    def outline_variant(self):
+        """The clean taria run as the outline arm's server would have offered it."""
+        lines = lines_of(TARIA_CLEAN)
+        for line in lines:
+            if is_att(line, "prompt_snapshot"):
+                for tool in line["attachment"].get("tools") or []:
+                    if tool["name"] == "mcp__tui__read_tree":
+                        tool["description"] = tool["description"].replace("tree as JSON:", "tree as an outline:")
+        return self.variant(lines)
+
+    def test_each_bridge_arm_is_held_to_its_tree_format(self):
+        """taria and outline list the same tools: the read_tree description
+        is what tells a run of one from a run of the other."""
+        def guard(stats, arm):
+            return transcript.guard(stats, arm, "sonnet", ARM_TOOLS[arm], effort="medium",
+                                    tree_format=ARM_TREE_FORMAT.get(arm))
+
+        outline = self.outline_variant()
+        self.assertEqual(outline["context"]["tree_formats"], ["outline"])
+        self.assertEqual(guard(read(TARIA_CLEAN), "taria"), [])
+        self.assertEqual(guard(outline, "outline"), [])
+        self.assertEqual(guard(read(TARIA_CLEAN), "outline"),
+                         ["was offered a read_tree that shows the tree as json, not as the outline arm's outline"])
+        self.assertEqual(guard(outline, "taria"),
+                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json"])
+        self.assertEqual(transcript.guard(read(TMUX_CLEAN), "tmux", "haiku", ARM_TOOLS["tmux"], effort="medium",
+                                          tree_format=ARM_TREE_FORMAT.get("tmux")), [])
+        # Without a tree format (as before the outline arm) the check is off.
+        self.assertEqual(transcript.guard(outline, "taria", "sonnet", ARM_TOOLS["taria"], effort="medium"), [])
+
+    def test_a_read_tree_naming_no_format_or_both(self):
+        lines = lines_of(TARIA_CLEAN)
+        snapshots = [l for l in lines if is_att(l, "prompt_snapshot") and l["attachment"].get("tools")]
+        for tool in snapshots[0]["attachment"]["tools"]:
+            if tool["name"] == "mcp__tui__read_tree":
+                tool["description"] = "Read the tree."
+        stats = self.variant(lines)
+        self.assertEqual(stats["context"]["tree_formats"], ["unknown"])
+        self.assertEqual(transcript.guard(stats, "taria", "sonnet", ARM_TOOLS["taria"], tree_format="json"),
+                         ["was offered a read_tree that shows the tree as unknown, not as the taria arm's json"])
+        # A later snapshot that changes the format mid-run: both are recorded, and refused.
+        extra = copy.deepcopy(snapshots[0])
+        for tool in extra["attachment"]["tools"]:
+            if tool["name"] == "mcp__tui__read_tree":
+                tool["description"] = "Read the connected TUI app's current semantic tree as JSON: ..."
+        stats = self.variant(lines + [extra])
+        self.assertEqual(stats["context"]["tree_formats"], ["json", "unknown"])
+        self.assertTrue(transcript.guard(stats, "taria", "sonnet", ARM_TOOLS["taria"], tree_format="json"))
+
     def test_guard_tolerates_a_sparse_stats_dict(self):
         self.assertEqual(transcript.guard({}, "taria", "sonnet", ARM_TOOLS["taria"]), [
             "has no prompt_snapshot, so the tools it was offered cannot be checked",
@@ -764,7 +824,8 @@ class Summary(unittest.TestCase):
         self.assertEqual(col["ToolSearch med"], "1")
         self.assertEqual(col["turns med"], "6")
         self.assertEqual(col["tokens processed med [IQR]"], "22,000 [21,000-23,000]")
-        self.assertEqual(col["output tok med"], "400")
+        # The fixture predates output_tokens_lower_bound: no run can be checked mid-run.
+        self.assertEqual(col["output tok med"], "400 (5 unchecked)")
         self.assertEqual(col["wall s med"], "14.0")
         col = self.headline_row("T1", "tmux", "sonnet")
         self.assertEqual((col["n"], col["passed"], col["harness err"], col["cut off"]), ("4", "1/4", "1", "0"))
@@ -885,7 +946,8 @@ class Summary(unittest.TestCase):
         def run(output, **flags):
             return dict(base, tokens={**base["tokens"], "output": output}, **flags)
 
-        rows = [run(400), run(500), run(3, output_tokens_lower_bound=True, unclosed_messages=1),
+        rows = [run(400, output_tokens_lower_bound=False), run(500, output_tokens_lower_bound=False),
+                run(3, output_tokens_lower_bound=True, unclosed_messages=1),
                 run(5, end_inferred=True)]  # a row from before the field: end_inferred flags it
         out = summarize.table(rows)
         col = self.headline_row_in(out, base["task"], base["arm"], base["model"])
@@ -950,6 +1012,192 @@ class Summary(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(out.getvalue().startswith("## Agent runs (headline)"))
         self.assertIn("27 record(s)", err.getvalue())
+
+
+def agent_row(batch, arm, model, task="T1", passed=True, tokens=10000, calls=3, output=300, **extra):
+    """One graded subagent row, as run.py records it (the fields summarize reads)."""
+    row = {
+        "batch": batch, "job": "j001", "task": task, "arm": arm, "model": model, "mode": "subagent",
+        "solver": "agent", "effort": "medium", "max_turns": 30, "seed": 42, "git_sha": f"{batch}-sha0123456789",
+        "git_dirty": False, "claude_version": "2.1.294", "claude_versions": ["2.1.294"],
+        "model_resolved": f"claude-{model}-5-5", "status": "passed" if passed else "failed", "passed": passed,
+        "check_passed": passed, "demo_alive": True, "turns": calls + 1, "tool_calls_total": calls,
+        "toolsearch_calls": 0, "wall_ms": 5000, "end_inferred": False, "output_tokens_lower_bound": False,
+        "tokens": {"input": 10, "cache_creation": 0, "cache_read": tokens - 10, "output": output},
+        "ts": "2026-10-11T00:00:00+00:00",
+    }
+    row.update(extra)
+    return row
+
+
+class MultiBatchSummary(unittest.TestCase):
+    """Several batches merged, every arm compared, and rows whose output
+    tokens could not be checked."""
+
+    def full(self):
+        """A full1-like batch (taria, tmux) and an outline batch, both models."""
+        rows = []
+        for model in ("sonnet", "haiku"):
+            for i in range(5):
+                rows.append(agent_row("full", "taria", model, tokens=20000 + i, calls=3, output=400))
+                rows.append(agent_row("full", "tmux", model, tokens=30000 + i, calls=6, output=600,
+                                      passed=(model == "sonnet" or i < 3)))
+                rows.append(agent_row("outl", "outline", model, tokens=16000 + i, calls=3, output=400,
+                                      git_sha="outl-sha0123456789", claude_versions=["2.1.300"],
+                                      claude_version="2.1.300"))
+        return rows
+
+    def test_batches_are_merged_by_repeated_or_comma_separated_flags(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        for batch in ("full", "outl", "other"):
+            os.makedirs(os.path.join(tmp, batch))
+            with open(os.path.join(tmp, batch, "runs.jsonl"), "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in self.full() if r["batch"] == batch)
+                if batch == "other":
+                    f.write(json.dumps(agent_row("other", "taria", "sonnet")) + "\n")
+        original = summarize.RESULTS_DIR
+        summarize.RESULTS_DIR = tmp
+        self.addCleanup(setattr, summarize, "RESULTS_DIR", original)
+        pick = lambda *argv: summarize.select(summarize.parse_args(list(argv)))  # noqa: E731
+        for argv in (("--batch", "full", "--batch", "outl"), ("--batch", "full,outl"),
+                     ("--batch", "outl, full", "--batch", "full")):
+            records, note = pick(*argv)
+            self.assertEqual(sorted({r["batch"] for r in records}), ["full", "outl"], argv)
+            self.assertEqual(len(records), 30)
+        with self.assertRaises(SystemExit):
+            pick("--batch", "full,missing")
+
+    def test_the_conditions_header_lists_each_batch_and_what_differs(self):
+        out = summarize.render(self.full())
+        self.assertTrue(out.startswith("## Run conditions\n"), out[:200])
+        header = out.partition("## Agent runs (headline)")[0]
+        self.assertIn("| batch | kinds | git SHA | claude | models | models resolved | effort | max turns | seed "
+                      "| arms | n | harness err |", header)
+        self.assertIn("| full | agent | full-sha0123 | 2.1.294 | haiku, sonnet | claude-haiku-5-5, claude-sonnet-5-5 "
+                      "| medium | 30 | 42 | taria, tmux | 20 | 0 |", header)
+        self.assertIn("| outl | agent | outl-sha0123 | 2.1.300 | haiku, sonnet | claude-haiku-5-5, claude-sonnet-5-5 "
+                      "| medium | 30 | 42 | outline | 10 | 0 |", header)
+        self.assertIn("The batches differ in git SHA, claude:", header)
+        # Same conditions: said so. One batch: no header at all.
+        same = [dict(r, git_sha="same", claude_versions=["2.1.294"], claude_version="2.1.294") for r in self.full()]
+        self.assertIn("The batches agree on git SHA, claude, models resolved, effort, max turns, seed.",
+                      summarize.render(same))
+        one = [r for r in self.full() if r["batch"] == "full"]
+        self.assertTrue(summarize.render(one).startswith("## Agent runs (headline)"))
+        # An arm run in two batches is pooled, and the header says so.
+        pooled = self.full() + [agent_row("outl", "taria", "sonnet", git_sha="outl-sha0123456789")]
+        self.assertIn("- arm taria has runs in 2 batches (full, outl), pooled in every table",
+                      summarize.render(pooled))
+        # A dirty tree and a differing effort show.
+        changed = self.full() + [agent_row("hi", "outline", "sonnet", effort="high", git_dirty=True)]
+        text = summarize.render(changed)
+        self.assertIn("| hi | agent | hi-sha012345 (dirty) |", text)
+        self.assertIn("differ in git SHA, claude, models resolved, effort:", text)
+
+    def test_the_pairs_compared(self):
+        self.assertEqual(summarize.arm_pairs({"taria", "tmux", "outline"}),
+                         [("outline", "taria"), ("taria", "tmux"), ("outline", "tmux")])
+        self.assertEqual(summarize.arm_pairs({"taria", "tmux"}), [("taria", "tmux")])
+        self.assertEqual(summarize.arm_pairs({"outline", "tmux"}), [("outline", "tmux")])
+        self.assertEqual(summarize.arm_pairs({"outline", "taria"}), [("outline", "taria")])
+        self.assertEqual(summarize.arm_pairs({"outline"}), [])
+        self.assertEqual(summarize.arm_pairs({"taria", "tmux", "other"}), [("taria", "tmux"), ("other", "tmux")])
+
+    def test_every_arm_is_compared_per_model_and_per_task(self):
+        out = summarize.render(self.full())
+        self.assertIn("## outline vs taria, taria vs tmux, outline vs tmux, per model", out)
+        haiku = out.partition("### haiku")[2].partition("### sonnet")[0]
+        self.assertIn("outline vs taria per task: pass-rate difference (outline minus taria, percentage points)", haiku)
+        self.assertIn("| task | effort | max turns | outline passed | taria passed | difference | Fisher p | "
+                      "tokens processed taria/outline | tool calls taria/outline |", haiku)
+        self.assertIn("| T1 | medium | 30 | 5/5 | 5/5 | +0 pp | 1.000 | 1.25x | 1.00x |", haiku)
+        p = summarize.fisher_exact(5, 0, 3, 2)
+        self.assertIn(f"| T1 | medium | 30 | 5/5 | 3/5 | +40 pp | {p:.3f} | 1.50x | 2.00x |", haiku)  # taria vs tmux
+        self.assertIn(f"| T1 | medium | 30 | 5/5 | 3/5 | +40 pp | {p:.3f} | 1.87x | 2.00x |", haiku)  # outline vs tmux
+        self.assertIn("| outline | medium | 30 | 1 | 5 | 5/5 | 100% (57%-100%) | 16,002 | 3 | 80,010 |", haiku)
+        # The headline has a cell per task, arm and model.
+        self.assertIn("| T1 | outline | haiku | medium | 30 | 5 | 5/5 | 100% (57%-100%) | 0 | 0 | 3 | 0 | 4 | "
+                      "16,002 [16,001-16,003] | 400 | 5.0 |", out)
+
+    def test_arms_per_model_across_tasks(self):
+        rows = self.full() + [agent_row("outl", "outline", "haiku", task="T2", tokens=12000, output=3,
+                                        output_tokens_lower_bound=True, git_sha="outl-sha0123456789",
+                                        claude_versions=["2.1.300"], claude_version="2.1.300")]
+        section = summarize.render(rows).partition("## Arms per model, across all tasks")[2].partition("\n## ")[0]
+        self.assertIn("| model | arm | effort | max turns | tasks | n | passed | pass rate (95% CI) | harness err | "
+                      "tokens processed med [IQR] | tool calls med [IQR] | output tok med [IQR] |", section)
+        lines = [l for l in section.splitlines() if l.startswith("| haiku |") or l.startswith("| sonnet |")]
+        self.assertEqual([l.split(" | ")[1] for l in lines[:3]], ["taria", "tmux", "outline"])
+        self.assertIn("| haiku | outline | medium | 30 | 2 | 6 | 6/6 | 100% (61%-100%) | 0 | "
+                      "16,002 [16,000-16,003] | 3 | 400 (1 left out) |", section)
+        self.assertIn("| haiku | tmux | medium | 30 | 1 | 5 | 3/5 | 60% (23%-88%) | 0 | 30,002 [30,001-30,003] | 6 | 600 |",
+                      section)
+        pf = summarize.fisher_exact(6, 0, 5, 0)
+        self.assertIn(f"| haiku | medium | 30 | outline vs taria | 6/6 | 5/5 | +0 pp | {pf:.3f} | 1.25x | 1.00x | 1.00x |",
+                      section)
+        p = summarize.fisher_exact(5, 0, 3, 2)
+        self.assertIn(f"| haiku | medium | 30 | taria vs tmux | 5/5 | 3/5 | +40 pp | {p:.3f} | 1.50x | 2.00x | 1.50x |",
+                      section)
+        self.assertIn("| sonnet | medium | 30 | outline vs tmux | 5/5 | 5/5 | +0 pp | 1.000 | 1.87x | 2.00x | 1.50x |",
+                      section)
+
+    def test_one_arm_has_nothing_to_pair(self):
+        out = summarize.render([r for r in self.full() if r["arm"] == "outline"])
+        self.assertIn("## Arms, per model", out)
+        self.assertIn("Only one arm in these results (outline); no pair to compare.", out)
+        self.assertNotIn("Each pair of arms per model", out)
+
+    def test_two_arms_keep_the_taria_vs_tmux_wording(self):
+        out = summarize.render([r for r in self.full() if r["batch"] == "full"])
+        self.assertIn("## taria vs tmux, per model", out)
+        self.assertIn("taria vs tmux per task: pass-rate difference (taria minus tmux, percentage points) with a "
+                      "two-sided Fisher exact p, and tmux/taria ratios of the medians (above 1x: tmux used more).", out)
+        self.assertNotIn("outline", out)
+
+    def test_rows_that_cannot_be_checked_for_unclosed_messages_are_counted_and_warned(self):
+        base = [r for r in self.full() if r["arm"] == "taria" and r["model"] == "sonnet"]
+        old = [{k: v for k, v in r.items() if k != "output_tokens_lower_bound"} for r in base]
+        # Two predate the field, one of them end_inferred (so a lower bound, left out).
+        rows = base[:3] + [old[3], dict(old[4], end_inferred=True, tokens={**old[4]["tokens"], "output": 2})]
+        out = summarize.table(rows)
+        col = Summary.columns(next(l for l in out.splitlines() if l.startswith("| T1 | taria | sonnet |")))
+        self.assertEqual(col["output tok med"], "400 (1 left out, 1 unchecked)")
+        self.assertIn("Warning: 1 graded run(s) were graded before `output_tokens_lower_bound` existed and are not "
+                      "end_inferred", out)
+        self.assertIn("their output tokens may be low", out)
+        self.assertTrue(summarize.output_unchecked(old[3]))
+        self.assertFalse(summarize.output_unchecked(old[4] | {"end_inferred": True}))
+        self.assertFalse(summarize.output_unchecked(base[0]))
+        self.assertFalse(summarize.output_unchecked(dict(old[3], mode="dry-run")))
+        self.assertFalse(summarize.output_unchecked(dict(old[3], mode="spend")), "rows from before transcripts")
+        self.assertFalse(summarize.output_unchecked(dict(old[3], tokens={})), "no output count to doubt")
+        # Not graded (a harness error): not counted.
+        self.assertNotIn("Warning", summarize.table(base[:3] + [dict(old[3], status="harness_error", passed=None)]))
+        # Nothing unchecked: no count, no warning.
+        clean = summarize.table(base)
+        self.assertNotIn("unchecked", clean)
+        self.assertNotIn("Warning", clean)
+        # Every cell counts its own, and the across-tasks table too.
+        merged = summarize.render(self.full()[:-1] + [{k: v for k, v in self.full()[-1].items()
+                                                      if k != "output_tokens_lower_bound"}])
+        self.assertIn("| T1 | outline | haiku | medium | 30 | 5 | 5/5 | 100% (57%-100%) | 0 | 0 | 3 | 0 | 4 | "
+                      "16,002 [16,001-16,003] | 400 (1 unchecked) | 5.0 |", merged)
+        self.assertIn("| haiku | outline | medium | 30 | 1 | 5 | 5/5 | 100% (57%-100%) | 0 | 16,002 [16,001-16,003] | 3 | "
+                      "400 (1 unchecked) |", merged)
+
+    def test_main_warns_on_stderr(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        path = os.path.join(tmp, "runs.jsonl")
+        with open(path, "w") as f:
+            row = agent_row("b", "taria", "sonnet")
+            del row["output_tokens_lower_bound"]
+            f.write(json.dumps(row) + "\n")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(summarize.main([path]), 0)
+        self.assertIn("warning: 1 graded run(s) predate output_tokens_lower_bound", err.getvalue())
 
 
 class RealTranscriptShape(unittest.TestCase):

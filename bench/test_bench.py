@@ -401,9 +401,10 @@ class Plan(unittest.TestCase):
         strip = lambda p: [(j["task"], j["arm"], j["model"], j["run"]) for j in p["jobs"]]  # noqa: E731
         self.assertEqual(strip(a), strip(b))
         self.assertNotEqual(strip(a), strip(c))
-        self.assertEqual(len(a["jobs"]), 3 * 2 * 2 * 2)
+        self.assertEqual(a["arms"], ["taria", "tmux", "outline"], "every arm by default")
+        self.assertEqual(len(a["jobs"]), 3 * 3 * 2 * 2)
         self.assertEqual(sorted(strip(a)), sorted(strip(c)), "the same jobs, in another order")
-        self.assertEqual([j["id"] for j in a["jobs"]], [f"j{n:03d}" for n in range(1, 25)])
+        self.assertEqual([j["id"] for j in a["jobs"]], [f"j{n:03d}" for n in range(1, 37)])
         self.assertEqual((a["seed"], a["effort"], a["max_turns"]), (11, "medium", 30))
         self.assertEqual(a["agent_body_sha256"], agents.body_sha256())
         self.assertEqual(a["models"], ["sonnet", "haiku"])
@@ -637,8 +638,8 @@ class GradeAgentRun(unittest.TestCase):
     def module(self, stats=None, problems=(), path="/x/agent-a1.jsonl"):
         seen = {}
 
-        def guard(stats, arm, family, arm_tools, effort=None):
-            seen.update(arm=arm, family=family, arm_tools=arm_tools, effort=effort)
+        def guard(stats, arm, family, arm_tools, effort=None, tree_format=None):
+            seen.update(arm=arm, family=family, arm_tools=arm_tools, effort=effort, tree_format=tree_format)
             return list(problems)
 
         return types.SimpleNamespace(
@@ -658,7 +659,7 @@ class GradeAgentRun(unittest.TestCase):
         row, seen, run = self.grade()
         self.assertEqual((row["status"], row["passed"], row["check_passed"]), ("passed", True, True))
         self.assertEqual(seen, {"arm": "taria", "family": "sonnet", "arm_tools": harness.ARM_TOOLS["taria"],
-                                "effort": "medium"})
+                                "effort": "medium", "tree_format": "json"})
         self.assertEqual(list(row), list(runner.ROW_KEYS))
         self.assertEqual((row["mode"], row["solver"], row["model"], row["model_resolved"]),
                          ("subagent", "agent", "sonnet", "claude-sonnet-5-5"))
@@ -1377,7 +1378,8 @@ class AgentFiles(unittest.TestCase):
                                    "--results-dir", os.path.join(self.dir, "results"))
         self.assertEqual(code, 0, err)
         ours = sorted(f for f in os.listdir(self.dir) if f.endswith(".md"))
-        self.assertEqual(ours, ["tui-taria-1.md", "tui-taria-2.md", "tui-tmux-1.md", "tui-tmux-2.md"])
+        self.assertEqual(ours, ["tui-outline-1.md", "tui-outline-2.md", "tui-taria-1.md", "tui-taria-2.md",
+                                "tui-tmux-1.md", "tui-tmux-2.md"])
         others = {
             "reviewer.md": "---\nname: reviewer\n---\n",
             "tui-other-1.md": "---\nname: x\n---\n",
@@ -1404,14 +1406,24 @@ class AgentFiles(unittest.TestCase):
 # --- The subagent path, end to end, without a model ------------------------------------------
 
 
+# The opening of each bridge arm's read_tree description, as taria-mcp
+# serves it (what tells the taria and outline arms apart in a transcript).
+TOOL_DESCRIPTIONS = {
+    ("taria", "read_tree"): "Read the connected TUI app's current semantic tree as JSON: every node ...",
+    ("outline", "read_tree"): "Read the connected TUI app's current semantic tree as an outline: every node ...",
+}
+
+
 def write_transcript(directory, agent_id, prompt, arm, calls, agent_type,
-                     model="claude-sonnet-5-5", effort="medium"):
+                     model="claude-sonnet-5-5", effort="medium", served=None):
     """A minimal subagent transcript in the shape real ones have (see
     bench/transcript.py and fixtures/transcripts/real_*.jsonl), starting now:
     the prompt, a first prompt_snapshot without tools, one assistant message
     per tool call with its result, the snapshot listing the arm's tools and
     the tui server's instructions after the first, and a closing sentence.
-    Plus the meta file naming the agent type. Returns the transcript's path."""
+    Plus the meta file naming the agent type. `served` is the server's own
+    tools/list entries, whose descriptions the snapshot then records (else
+    TOOL_DESCRIPTIONS). Returns the transcript's path."""
     t0 = datetime.now(timezone.utc)
     session = "00000000-0000-4000-8000-00000000beef"
     lines, n = [], 0
@@ -1429,7 +1441,10 @@ def write_transcript(directory, agent_id, prompt, arm, calls, agent_type,
     line("user", message={"role": "user", "content": prompt})
     system = [agents.BODY]
     line("attachment", attachment={"type": "prompt_snapshot", "systemPrompt": system})
-    tools = [{"name": f"mcp__tui__{t}", "description": t} for t in harness.ARM_TOOLS[arm]]
+    tools = ([{"name": f"mcp__tui__{t['name']}", "description": t.get("description", "")} for t in served]
+             if served is not None else
+             [{"name": f"mcp__tui__{t}", "description": TOOL_DESCRIPTIONS.get((arm, t), t)}
+              for t in harness.ARM_TOOLS[arm]])
     for i, name in enumerate(name for name, count in sorted(calls.items()) for _ in range(count)):
         line("assistant", apiBlockIndex=0, effort=effort, message={
             "model": model, "id": f"msg_{i}", "type": "message", "role": "assistant",
@@ -1504,7 +1519,7 @@ class SubagentRehearsal(unittest.TestCase):
             client.close()
         agent_id = f"rehearsal{job['job']}"
         return agent_id, write_transcript(self.tmp, agent_id, job["prompt"], arm, dict(session.calls),
-                                          job["agent"])
+                                          job["agent"], served=client.tools)
 
     def test_two_jobs_through_one_slot(self):
         out = run_py("agents", "--slots", "1", "--dir", self.agents_dir, *self.common)
@@ -1614,6 +1629,38 @@ class SubagentRehearsal(unittest.TestCase):
         code, done, _ = self.next("err", 1)
         self.assertEqual((code, done), (0, {"done": True}))
 
+    def test_an_outline_job_through_one_slot(self):
+        """The outline arm end to end: its agent file's launcher execs the
+        bridge with --tree-format outline, the outline solver drives it, and
+        grading holds the run to the outline (the transcript records the
+        description the server served). The taria agent, whose tools have
+        the same names, gets none for this slot."""
+        run_py("agents", "--slots", "1", "--dir", self.agents_dir, *self.common)
+        out = run_py("plan", "--batch", "outl", "--tasks", "T5", "--arms", "outline", "--seed", "3",
+                     *self.common)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        code, job, err = self.next("outl", 1)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(job["agent"], "tui-outline-1")
+        slot = runner.read_slot(runner.Paths(self.results), 1)
+        self.assertEqual(slot["arm"], "outline")
+        taria = self.launcher("tui-taria-1")
+        wrong = subprocess.run([taria["command"], *taria["args"]], capture_output=True, text=True,
+                               timeout=30, stdin=subprocess.DEVNULL)
+        self.assertEqual(wrong.returncode, 1)
+        self.assertIn("for the outline arm, not taria", wrong.stderr)
+        agent_id, path = self.act_as_agent("outl", job)
+        code, done, err = self.next("outl", 1, "--agent-id", agent_id, "--transcript-file", path)
+        self.assertEqual((code, done), (0, {"done": True}), err)
+        (row,) = read_rows(self.results, "outl")
+        self.assertEqual((row["arm"], row["status"], row["guard_problems"]), ("outline", "passed", []),
+                         row["error"] or row["reason"])
+        self.assertEqual(row["context"]["tree_formats"], ["outline"])
+        # The same run, held to the taria arm, is refused by the guard.
+        fields, errors, _ = runner.transcript_verdict(transcript, path, "taria", "sonnet", "medium", 30)
+        self.assertEqual(fields["guard_problems"],
+                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json"])
+
     def test_next_refuses_agent_files_that_do_not_match_the_plan(self):
         run_py("agents", "--slots", "1", "--dir", self.agents_dir, "--effort", "high", *self.common)
         run_py("plan", "--batch", "mismatch", "--tasks", "T1", "--arms", "taria", *self.common)
@@ -1621,6 +1668,278 @@ class SubagentRehearsal(unittest.TestCase):
         self.assertEqual(code, runner.EXIT_HARNESS)
         self.assertIn("effort is 'high', the plan needs 'medium'", refused["error"])
         self.assertEqual(runner.read_all_slots(runner.Paths(self.results)), {})
+
+
+# --- The outline arm --------------------------------------------------------------------------------
+
+OUTLINE_EXAMPLE = """protocol_version=1 seq=1
+app app "taria-demo"
+  tabs tabs "Tabs" = "Active"
+    tab-active tab "Active" = "selected" [select]
+    tab-done tab "Done" [select]
+  tasks list "Active tasks" = "task-1"
+    task-1 list_item "Write the taria README" = "todo" [select toggle delete] *focused
+    task-3 list_item "Wire up the MCP bridge" = "todo" [select toggle delete]
+    task-4 list_item "Record the killer demo" = "todo" [select toggle delete]
+  input text_input "New task" = "" [set_value focus]
+  quit button "Quit" [activate]"""
+
+
+class OutlineArm(unittest.TestCase):
+    """The third arm: taria's binary and tools, the tree as an outline."""
+
+    def test_the_server_entry_is_tarias_plus_the_tree_format(self):
+        run = DemoRun.from_slot(SlotFields().fields())
+        taria, outline = harness.server_entry("taria", run), harness.server_entry("outline", run)
+        self.assertEqual(outline["command"], harness.MCP_BIN)
+        self.assertEqual(outline["command"], taria["command"])
+        self.assertEqual(outline["env"], taria["env"])
+        self.assertEqual(outline["args"], [*taria["args"], "--tree-format", "outline"])
+        self.assertNotIn("--tree-format", taria["args"], "taria keeps the bridge's default, as full1 ran")
+        self.assertEqual(mcp_config("outline", run)["mcpServers"]["tui"], outline)
+        with self.assertRaises(harness.HarnessError):
+            harness.server_entry("outlines", run)
+
+    def test_its_tools_names_and_formats(self):
+        self.assertIn("outline", harness.ARMS)
+        self.assertEqual(harness.ARM_TOOLS["outline"], harness.ARM_TOOLS["taria"])
+        self.assertEqual(harness.SERVER_NAMES["outline"], "taria-mcp")
+        self.assertEqual(harness.ARM_TREE_FORMAT, {"taria": "json", "outline": "outline"})
+        self.assertEqual(set(harness.ARMS), set(harness.ARM_TOOLS))
+        self.assertEqual(set(harness.ARMS), set(solvers.SOLVERS))
+        self.assertEqual(runner.parse_args(["dry-run"]).arms, list(harness.ARMS))
+        self.assertEqual(runner.parse_args(["plan", "--batch", "b", "--arms", "outline"]).arms, ["outline"])
+
+    def test_the_ready_wait_runs_for_both_bridge_arms(self):
+        class Client:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, tool):
+                self.calls += 1
+                if self.calls < 3:
+                    raise harness.ToolError("not connected yet")
+                return "tree"
+
+        for arm, want in (("taria", 3), ("outline", 3), ("tmux", 0)):
+            client = Client()
+            harness.wait_ready(arm, client)
+            self.assertEqual(client.calls, want, arm)
+
+    def test_the_dry_run_checks_the_served_tree_format(self):
+        def tools(description):
+            return [{"name": "act", "description": "Invoke ..."}, {"name": "read_tree", "description": description}]
+
+        json_desc = TOOL_DESCRIPTIONS[("taria", "read_tree")]
+        outline_desc = TOOL_DESCRIPTIONS[("outline", "read_tree")]
+        runner.check_tree_format("taria", "taria-mcp", tools(json_desc))
+        runner.check_tree_format("outline", "taria-mcp", tools(outline_desc))
+        runner.check_tree_format("tmux", "tmux-mcp", [])
+        for arm, desc in (("outline", json_desc), ("taria", outline_desc), ("outline", "Read the tree.")):
+            with self.subTest(arm=arm, desc=desc), self.assertRaises(harness.HarnessError) as caught:
+                runner.check_tree_format(arm, "taria-mcp", tools(desc))
+            self.assertIn(f"the {arm} arm needs {harness.ARM_TREE_FORMAT[arm]}", str(caught.exception))
+
+    def test_its_agent_file_differs_only_in_name_description_and_arm(self):
+        slots = "/tmp/slots"
+        texts = {arm: agents.render(arm, 2, slots) for arm in harness.ARMS}
+        bodies = {arm: text.split("\n---\n", 1)[1].encode() for arm, text in texts.items()}
+        self.assertEqual(len(set(bodies.values())), 1, "one body, byte for byte")
+        outline = agents.parse(texts["outline"])
+        self.assertEqual(agents.body_sha256(outline["body"]), agents.body_sha256())
+        self.assertEqual(outline["fields"]["name"], "tui-outline-2")
+        self.assertEqual(outline["fields"]["description"],
+                         "Benchmark runner, outline arm, slot 2. Spawned only by bench/run.py's orchestrator.")
+        self.assertEqual(outline["server"]["args"][1:5], ["--arm", "outline", "--slot", "2"])
+        diff = [x for x, y in zip(texts["taria"].splitlines(), texts["outline"].splitlines()) if x != y]
+        self.assertEqual([x.split(":")[0].strip() for x in diff], ["name", "description", "args"])
+
+    def test_agents_writes_the_outline_files_and_the_plan_checks_them(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        slots = os.path.join(tmp, "results", "slots")
+        written = agents.write(2, tmp, slots)
+        names = sorted(os.path.basename(p) for p in written)
+        self.assertIn("tui-outline-1.md", names)
+        self.assertIn("tui-outline-2.md", names)
+        path = os.path.join(tmp, "tui-outline-1.md")
+        self.assertTrue(agents.is_ours(path))
+        sha = agents.body_sha256()
+        self.assertEqual(agents.problems(path, "outline", 1, slots, "medium", 30, sha), [])
+        # Read as the taria arm's file, it is the wrong one: name and launcher.
+        found = agents.problems(path, "taria", 1, slots, "medium", 30, sha)
+        self.assertEqual(len(found), 2, found)
+        self.assertIn("name is 'tui-outline-1', the plan needs 'tui-taria-1'", found[0])
+        self.assertEqual(len(agents.remove(tmp)), 3 * 2)
+
+    def test_arm_names_cannot_be_read_as_each_other(self):
+        self.assertEqual(agents.FILE_RE.match("tui-outline-1.md").groups(), ("outline", "1"))
+        self.assertEqual(agents.FILE_RE.match("tui-taria-12.md").groups(), ("taria", "12"))
+        for name in ("tui-outline-0.md", "tui-outlinetaria-1.md", "tui-taria-outline-1.md", "xtui-taria-1.md",
+                     "tui-outline-1.md.bak"):
+            self.assertIsNone(agents.FILE_RE.match(name), name)
+        res = runner.ARM_AGENT_RE
+        self.assertIsNotNone(res["outline"].fullmatch("tui-outline-1"))
+        self.assertIsNotNone(res["taria"].fullmatch("tui-taria-10"))
+        for arm, other in (("taria", "tui-outline-1"), ("outline", "tui-taria-1"), ("tmux", "tui-outline-1"),
+                           ("outline", "tui-outline-1x"), ("taria", "tui-taria-1-outline")):
+            self.assertIsNone(res[arm].fullmatch(other), (arm, other))
+
+    def test_the_meta_files_agent_type_tells_the_arms_apart(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        path = os.path.join(tmp, "agent-a1.jsonl")
+        with open(runner.meta_path(path), "w") as f:
+            json.dump({"agentType": "tui-outline-1"}, f)
+        self.assertEqual(runner.agent_type_problems(path, "tui-outline-1"), [])
+        self.assertEqual(runner.agent_type_problems(path, runner.ARM_AGENT_RE["outline"]), [])
+        self.assertEqual(runner.agent_type_problems(path, "tui-taria-1"),
+                         ["was spawned as 'tui-outline-1', not this slot's agent 'tui-taria-1'"])
+        self.assertTrue(runner.agent_type_problems(path, runner.ARM_AGENT_RE["taria"]))
+        with open(runner.meta_path(path), "w") as f:
+            json.dump({"agentType": "tui-taria-1"}, f)
+        self.assertTrue(runner.agent_type_problems(path, runner.ARM_AGENT_RE["outline"]))
+        self.assertTrue(runner.agent_type_problems(path, "tui-outline-1"))
+
+    def test_the_launcher_refuses_the_other_bridge_arm(self):
+        slots = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, slots)
+        for held, launched in (("taria", "outline"), ("outline", "taria")):
+            with open(os.path.join(slots, "1.json"), "w") as f:
+                json.dump({"job": "j001", "arm": held, "state": "ready", "demo": SlotFields().fields()}, f)
+            out = subprocess.run(
+                [sys.executable, MCP_LAUNCH, "--arm", launched, "--slot", "1", "--slots-dir", slots],
+                capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            )
+            self.assertEqual(out.returncode, 1)
+            self.assertEqual(out.stdout, "")
+            self.assertIn(f"for the {held} arm, not {launched}", out.stderr)
+            self.assertEqual([f for f in os.listdir(slots) if f.endswith(".launched")], [])
+
+
+class OutlineParser(unittest.TestCase):
+    """The outline solver's reading of taria-mcp's outline (docs/cli.md)."""
+
+    def test_the_documented_example(self):
+        tree = solvers.parse_outline(OUTLINE_EXAMPLE)
+        self.assertEqual((tree["protocol_version"], tree["seq"]), (1, 1))
+        root = tree["root"]
+        self.assertEqual((root["id"], root["role"], root["label"]), ("app", "app", "taria-demo"))
+        self.assertEqual([c["id"] for c in root["children"]], ["tabs", "tasks", "input", "quit"])
+        task1 = solvers.find(tree, "task-1")
+        self.assertEqual(task1, {"id": "task-1", "role": "list_item", "label": "Write the taria README",
+                                 "value": "todo", "actions": ["select", "toggle", "delete"], "focused": True})
+        self.assertNotIn("focused", solvers.find(tree, "task-3"))
+        self.assertEqual(solvers.find(tree, "input")["value"], "")
+        self.assertNotIn("value", solvers.find(tree, "tab-done"))
+        self.assertEqual(solvers.find(tree, "tabs")["value"], "Active")
+        self.assertEqual([n["id"] for n in solvers.TariaSolver.items(tree)], ["task-1", "task-3", "task-4"])
+
+    def test_quoted_names_escapes_and_extra_fields(self):
+        text = "\n".join([
+            'protocol_version=1 seq=7 "odd key"={"a":[1,2]}',
+            '"root node" {"weird":{"x":1}} "A \\"quoted\\" ] label" = "line\\nbreak" '
+            '["do it" go] *focused hint="a b" score=3',
+            '  child "role with space" [x]',
+            '    grandchild leaf',
+            '  sibling sparkline "S" = "" "*focusedish"=true',
+        ])
+        tree = solvers.parse_outline(text)
+        self.assertEqual(tree["odd key"], {"a": [1, 2]})
+        root = tree["root"]
+        self.assertEqual(root["id"], "root node")
+        self.assertEqual(root["role"], {"weird": {"x": 1}})
+        self.assertEqual(root["label"], 'A "quoted" ] label')
+        self.assertEqual(root["value"], "line\nbreak")
+        self.assertEqual(root["actions"], ["do it", "go"])
+        self.assertIs(root["focused"], True)
+        self.assertEqual((root["hint"], root["score"]), ("a b", 3))
+        child, sibling = root["children"]
+        self.assertEqual((child["id"], child["role"], child["actions"]), ("child", "role with space", ["x"]))
+        self.assertEqual(child["children"], [{"id": "grandchild", "role": "leaf"}])
+        self.assertEqual((sibling["role"], sibling["value"], sibling["*focusedish"]), ("sparkline", "", True))
+        self.assertNotIn("focused", sibling)
+
+    def test_what_is_not_an_outline_is_refused(self):
+        for text in ("app app", "protocol_version=1\n  app app", "protocol_version=1\napp app\n   odd x",
+                     "protocol_version=1\napp app\n    skipped x", "protocol_version=1\napp app\nsecond root",
+                     "The app received this input.\napp app", 'protocol_version=1\napp app "unclosed'):
+            with self.subTest(text=text), self.assertRaises(solvers.SolverError):
+                solvers.parse_outline(text)
+
+    def test_results_carry_an_outline_a_note_and_an_outline_or_neither(self):
+        self.assertEqual(solvers.outline_in(OUTLINE_EXAMPLE), solvers.parse_outline(OUTLINE_EXAMPLE))
+        note = "The app received this input and deliberately did nothing with it. Re-plan from the current tree below."
+        self.assertEqual(solvers.outline_in(note + "\n" + OUTLINE_EXAMPLE), solvers.parse_outline(OUTLINE_EXAMPLE))
+        self.assertIsNone(solvers.outline_in("The app received this input, and its tree did not change within 500ms."))
+        # A tree the outline cannot express is served as JSON, and read so.
+        as_json = {"protocol_version": 1, "seq": 2, "root": {"id": "app", "role": "app"}}
+        self.assertEqual(solvers.outline_in(json.dumps(as_json)), as_json)
+
+    def test_the_sabotage_and_plans_cover_every_arm(self):
+        for arm in harness.ARMS:
+            solver = solvers.SOLVERS[arm](None)
+            for task_id, (plan, wrong) in solvers.PLANS.items():
+                for method, *_ in plan + wrong:
+                    self.assertTrue(callable(getattr(solver, method, None)), (arm, task_id, method))
+
+
+def _normalized(node):
+    """A JSON tree node as the outline shows it: a custom action by its
+    inner name, focused only when true, no empty lists or null strings."""
+    out = {"id": node["id"], "role": node["role"] if not isinstance(node["role"], dict) else next(iter(node["role"]))}
+    for key in ("label", "value"):
+        if node.get(key) is not None:
+            out[key] = node[key]
+    actions = [a["custom"] if isinstance(a, dict) and "custom" in a else a for a in node.get("actions") or []]
+    if actions:
+        out["actions"] = actions
+    if node.get("focused") is True:
+        out["focused"] = True
+    children = [_normalized(c) for c in node.get("children") or []]
+    if children:
+        out["children"] = children
+    for key, value in node.items():
+        if key not in ("id", "role", "label", "value", "actions", "focused", "children"):
+            out[key] = value
+    return out
+
+
+@unittest.skipUnless(HAVE_TMUX, "tmux is not on PATH")
+class OutlineLive(unittest.TestCase):
+    """The outline the real bridge serves parses to the tree its JSON mode
+    serves for the same demo, and its read_tree says it is an outline."""
+
+    @classmethod
+    def setUpClass(cls):
+        require_fresh_build()
+
+    def test_the_parsed_outline_is_the_json_tree(self):
+        demo = runner.prepare_demo(tasks.TASKS["T6"])  # the dialog open: the deepest tree
+        self.addCleanup(demo.close)
+        trees, descriptions = {}, {}
+        for arm in ("taria", "outline"):  # one after the other: the app serves one bridge at a time
+            client = McpStdio(harness.server_entry(arm, demo), cwd=demo.workdir, name=arm)
+            try:
+                client.initialize()
+                client.tools_list()
+                descriptions[arm] = next(t["description"] for t in client.tools if t["name"] == "read_tree")
+                harness.wait_ready(arm, client)
+                trees[arm] = client.call("read_tree")
+            finally:
+                client.close()
+        self.assertTrue(trees["taria"].startswith("{"), trees["taria"][:80])
+        self.assertTrue(trees["outline"].startswith("protocol_version="), trees["outline"][:80])
+        as_json = json.loads(trees["taria"])
+        parsed = solvers.parse_outline(trees["outline"])
+        self.assertEqual(parsed["root"], _normalized(as_json["root"]))
+        # The header holds the same top-level fields (seq may move between two connections).
+        self.assertEqual(sorted(parsed), sorted(as_json))
+        self.assertEqual(parsed["protocol_version"], as_json["protocol_version"])
+        self.assertIsNotNone(solvers.find(parsed, "dialog-confirm"))
+        self.assertEqual(transcript.tree_format_of(descriptions["taria"]), "json")
+        self.assertEqual(transcript.tree_format_of(descriptions["outline"]), "outline")
+        self.assertLess(len(trees["outline"]), len(trees["taria"]))
 
 
 # --- Summary statistics (the rest of summarize.py is tested in test_transcript.py) ---------------

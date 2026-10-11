@@ -21,7 +21,8 @@ transcripts from Claude Code 2.1.294):
   is the task the agent was given), or a list of `tool_result` blocks with
   `tool_use_id` and `is_error`;
 - `attachment` lines carry `attachment.type`. Read here: `prompt_snapshot`
-  (`tools[].name`: the tools the agent was offered; see below),
+  (`tools[].name`: the tools the agent was offered, see below; and the
+  `description` of `mcp__tui__read_tree`, which names the tree format),
   `mcp_instructions_delta` (`addedNames`, `removedNames`: MCP servers whose
   instructions reached the prompt), `instructions` (`files[].path`: CLAUDE.md
   and its imports, memory), `deferred_tools_delta` (`addedNames`,
@@ -34,7 +35,7 @@ The tools the agent was offered are in its `prompt_snapshot` attachments.
 Claude Code writes the first before any tool is known, without a `tools`
 key, and a new one whenever the tool list changes; each repeats the tools
 already recorded, so their union is what the agent was offered. A real run
-of either arm has two, the second listing exactly the arm's `mcp__tui__`
+of any arm has two, the second listing exactly the arm's `mcp__tui__`
 tools inline (no deferral, no ToolSearch). A run whose server never started
 has no tools in any snapshot, which is what `guard` checks.
 
@@ -204,10 +205,36 @@ def _snapshot_tools(att):
     return sorted({t["name"] for t in tools if isinstance(t, dict) and isinstance(t.get("name"), str)})
 
 
+# How taria-mcp's read_tree description names the tree's format: "... the
+# current semantic tree as JSON: ..." by default, "... as an outline: ..."
+# under --tree-format outline (crates/taria-mcp/src/server.rs,
+# READ_TREE_PASSAGE). The taria and outline arms list the same tools, so
+# this is what tells their runs apart.
+TREE_FORMAT_MARKERS = (("outline", "tree as an outline"), ("json", "tree as JSON"))
+READ_TREE = SERVER_PREFIX + "read_tree"
+
+
+def tree_format_of(description):
+    """"json", "outline" or None: the tree format a read_tree description names."""
+    if not isinstance(description, str):
+        return None
+    return next((fmt for fmt, marker in TREE_FORMAT_MARKERS if marker in description), None)
+
+
+def _snapshot_tree_formats(att):
+    """The tree format each read_tree a prompt_snapshot lists describes
+    ("unknown" when it names none)."""
+    tools = att.get("tools")
+    return {
+        tree_format_of(t.get("description")) or "unknown"
+        for t in tools if isinstance(t, dict) and t.get("name") == READ_TREE
+    } if isinstance(tools, list) else set()
+
+
 def _context(attachments):
     claude_md, deferred, loaded, servers, types = [], set(), set(), set(), set()
     deferred_added, servers_added = set(), set()  # every name ever added, removals ignored
-    snapshots, offered = [], set()
+    snapshots, offered, tree_formats = [], set(), set()
     cwd, skills = None, False
     for att in attachments:
         kind = att.get("type")
@@ -218,6 +245,7 @@ def _context(attachments):
             names = _snapshot_tools(att)
             snapshots.append(names)
             offered.update(names or [])
+            tree_formats.update(_snapshot_tree_formats(att))
         elif kind == "instructions":
             for item in att.get("files") or []:
                 path = item.get("path") if isinstance(item, dict) else None
@@ -261,6 +289,10 @@ def _context(attachments):
         "environment_cwd": cwd,
         "skill_listing": skills,
         "attachment_types": sorted(types),
+        # The tree formats the offered read_tree tools described, over every
+        # snapshot: ["json"] for a taria run, ["outline"] for an outline run,
+        # [] when no read_tree was offered.
+        "tree_formats": sorted(tree_formats),
     }
 
 
@@ -412,7 +444,7 @@ def read_transcript(path):
 # --- Was the run set up as its arm requires? ----------------------------------------------
 
 
-def guard(stats, arm, model_family, arm_tools, effort=None):
+def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
     """Problems with how the run was set up, one sentence each; empty when
     the agent ran as its arm requires.
 
@@ -422,8 +454,11 @@ def guard(stats, arm, model_family, arm_tools, effort=None):
     turn; any instruction file (agents run with omitClaudeMd); offered tools
     (the prompt_snapshots' union, plus deferred ones) that are not exactly
     the arm's, or no prompt_snapshot to tell; any deferred tool beyond the
-    arm's; MCP instructions from any server but `tui`, or none from it; and a
-    run with no assistant turn.
+    arm's; MCP instructions from any server but `tui`, or none from it; a
+    read_tree whose description shows the tree in another format than
+    `tree_format` (when given: the taria and outline arms list the same
+    tools, so this is what holds each to its own); and a run with no
+    assistant turn.
 
     Other servers and deferred tools are held against every name ever
     added, so one that reached the agent and later left (a server that
@@ -447,6 +482,12 @@ def guard(stats, arm, model_family, arm_tools, effort=None):
     if files:
         problems.append(f"was given {len(files)} instruction file(s) despite omitClaudeMd: {', '.join(files)}")
     problems += _offered_problems(context, allowed, arm)
+    formats = context.get("tree_formats")
+    if tree_format is not None and READ_TREE in (context.get("offered_tools") or []) \
+            and formats != [tree_format]:
+        shown = ", ".join(formats or []) or "(not recorded)"
+        problems.append(f"was offered a read_tree that shows the tree as {shown}, not as the "
+                        f"{arm} arm's {tree_format}")
     deferred_ever = sorted(set(context.get("deferred_tools_added") or []) | set(context.get("deferred_tools") or []))
     extra = [t for t in deferred_ever if t not in allowed]
     if extra:

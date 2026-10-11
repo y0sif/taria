@@ -1,12 +1,12 @@
 """Benchmark tasks: what the agent is told, and how its result is graded.
 
 A task is graded on the demo's state dump (`TARIA_DEMO_STATE`, see
-examples/demo-app/src/state.rs), never on the screen or the tree: both arms
-are judged by what the app actually holds when the agent stops. Every check
+examples/demo-app/src/state.rs), never on the screen or the tree: every arm
+is judged by what the app actually holds when the agent stops. Every check
 holds the dump against the seed (examples/demo-app/src/app.rs, SEED_TASKS), so
 a task passes only if the asked-for change happened and nothing else did.
 
-Prompts are identical across arms and name neither arm's tools, node ids or
+Prompts are identical across arms and name no arm's tools, node ids or
 key bindings.
 
 Python 3 stdlib only. Run this file to self-test the checkers.
@@ -43,13 +43,13 @@ def seed_active():
 
 @dataclass(frozen=True)
 class Task:
-    """One benchmark task, identical for both arms.
+    """One benchmark task, identical for every arm.
 
-    prompt  what the agent is told, phrased without naming either arm's tools
+    prompt  what the agent is told, phrased without naming any arm's tools
     check   check(state) -> (passed, reason) over the final state dump
     setup   optional prelude run on the demo before the agent's MCP server
             starts, called with the harness's DemoRun. It drives the demo
-            through its own tmux session, which both arms run in, so it is
+            through its own tmux session, which every arm runs in, so it is
             arm-neutral. None means the agent starts on the seed.
     """
 
@@ -235,7 +235,7 @@ def check_t5(state):
 def setup_t6(run):
     """Open the delete dialog on the first Active task, as a person pressing d
     on the list the demo starts with would. Arm-neutral: it goes through the
-    demo's tmux session, before either arm's MCP server starts."""
+    demo's tmux session, before any arm's MCP server starts."""
     first = seed_active()[0]["id"]
     run.send("d")
     run.wait_state(
