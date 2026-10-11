@@ -83,8 +83,10 @@ proof if a later version records one.
 A harmless attachment is held to its fields and to the text it rendered:
 the environment's and the session context's rendered text must be the
 template Claude Code 2.1.294 renders them in (ENVIRONMENT_TEXT,
-SESSION_CONTEXT_TEXT) filled with the attachment's own values, the date's
-and the model's their one sentence. An attachment whose `rendered` is there
+SESSION_CONTEXT_TEXT) filled with the attachment's own values (the
+environment's untrusted-data line, ENVIRONMENT_UNTRUSTED, may be missing,
+and is exact when there), the date's and the model's their one sentence. An
+attachment whose `rendered` is there
 but does not read as text is refused too, never taken for no text.
 
 Context can also arrive inside a tool result rather than as an attachment:
@@ -189,6 +191,12 @@ ENVIRONMENT_KEYS = {
 # snapshot has a scratchpadDirectory, as the real tmux fixture's has not. A
 # snapshot of a worktree renders more lines, which no bench run has had, so
 # its text matches no template and is refused.
+#
+# The untrusted-data line (ENVIRONMENT_UNTRUSTED) is the one optional line:
+# Claude Code 2.1.294 renders it only while a remote feature flag is false,
+# so a flip of that flag would otherwise refuse every run of a batch from its
+# first. The text may lack it, and must have it exactly when it is there;
+# anything else added or changed is still refused.
 ENVIRONMENT_TEXT = (
     "<system-reminder>\n"
     "# Environment\n"
@@ -199,12 +207,15 @@ ENVIRONMENT_TEXT = (
     " - Shell: {shell}\n"
     " - OS Version: {osVersion}\n"
     "{scratchpad}"
+    "{untrusted}"
+    "</system-reminder>"
+)
+ENVIRONMENT_UNTRUSTED = (
     " - Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, "
     "keep scripts you write in a different directory, and pass paths as arguments instead of running an "
     "interpreter or build tool from inside it. Interpreters load code from the script's directory and the "
     "current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. "
     "This does not apply to code the user asked you to build or run.\n"
-    "</system-reminder>"
 )
 ENVIRONMENT_SCRATCHPAD = (
     " - Scratchpad directory: {scratchpadDirectory} — always use it for temporary files (intermediate "
@@ -511,32 +522,43 @@ def _listed(names):
     return " and ".join(names) if len(names) < 3 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
+def _parting_line(text, expected):
+    """The number of the first line where `text` parts from `expected`."""
+    got, want = text.split("\n"), expected.split("\n")
+    return next((n for n, (a, b) in enumerate(zip(got, want), 1) if a != b), min(len(got), len(want)) + 1)
+
+
 def _first_difference(text, expected):
     """Where `text` first parts from `expected`: the line's number and the
     text's line there, cut to 80 characters."""
-    got, want = text.split("\n"), expected.split("\n")
-    number = next((n for n, (a, b) in enumerate(zip(got, want), 1) if a != b), min(len(got), len(want)) + 1)
+    got, number = text.split("\n"), _parting_line(text, expected)
     line = got[number - 1] if number <= len(got) else "<end of text>"
     return f"line {number}, {line if len(line) <= 80 else line[:77] + '...'!r}"
 
 
 def _rendered_problem(texts, expected, what):
-    """None when every rendered text is `expected`, else where one is not."""
+    """None when every rendered text is `expected`, or one of them when it
+    is a tuple of the texts it may be, else where one is not: measured
+    against the text it follows furthest, the first on a tie."""
+    accepted = expected if isinstance(expected, tuple) else (expected,)
     for text in texts:
-        if text != expected:
-            return f"its rendered text is not {what}: it differs at {_first_difference(text, expected)}"
+        if text not in accepted:
+            nearest = max(accepted, key=lambda want: _parting_line(text, want))
+            return f"its rendered text is not {what}: it differs at {_first_difference(text, nearest)}"
     return None
 
 
-def _environment_text(snapshot):
+def _environment_text(snapshot, untrusted=True):
     """The text Claude Code renders from an environment `snapshot`
-    (ENVIRONMENT_TEXT), or None when it lacks a field the text shows."""
+    (ENVIRONMENT_TEXT), with the untrusted-data line or, for `untrusted`
+    false, without it; None when the snapshot lacks a field the text shows."""
     if any(key not in snapshot for key in ENVIRONMENT_SHOWN):
         return None
     values = {key: json.dumps(snapshot[key]) if isinstance(snapshot[key], bool) else snapshot[key]
               for key in ENVIRONMENT_SHOWN}
     scratchpad = snapshot.get("scratchpadDirectory")
     values["scratchpad"] = "" if scratchpad is None else ENVIRONMENT_SCRATCHPAD.format(scratchpadDirectory=scratchpad)
+    values["untrusted"] = ENVIRONMENT_UNTRUSTED if untrusted else ""
     return ENVIRONMENT_TEXT.format(**values)
 
 
@@ -554,8 +576,9 @@ def _harmless_shape(kind, att, texts):
     line each; the session context's two keys, each value in the words a
     real run's has; the date's format; the model identity's keys and the
     line it spells. Its rendered text is then held to the one text its own
-    values fill: ENVIRONMENT_TEXT, SESSION_CONTEXT_TEXT, the date sentence,
-    the model line, a bare <total_tokens> count, or no text at all for
+    values fill: ENVIRONMENT_TEXT (with or without its one optional line,
+    ENVIRONMENT_UNTRUSTED), SESSION_CONTEXT_TEXT, the date sentence, the
+    model line, a bare <total_tokens> count, or no text at all for
     credential_org and thinking_drop. So a field or a sentence Claude Code
     adds is refused. An attachment with no rendered text put nothing in front
     of the model, and only its fields are checked."""
@@ -577,10 +600,11 @@ def _harmless_shape(kind, att, texts):
         if spanning:
             return f"snapshot values that span lines: {', '.join(spanning)}"
         expected = _environment_text(snapshot)
-        if expected is None and texts:
+        if expected is None:
             missing = [key for key in ENVIRONMENT_SHOWN if key not in snapshot]
-            return f"its rendered text cannot be checked: its snapshot has no {', '.join(missing)}"
-        return _rendered_problem(texts, expected, "the environment text its snapshot fills")
+            return f"its rendered text cannot be checked: its snapshot has no {', '.join(missing)}" if texts else None
+        return _rendered_problem(texts, (expected, _environment_text(snapshot, untrusted=False)),
+                                 "the environment text its snapshot fills")
     if kind == "session_context":
         context = att.get("context")
         if not isinstance(context, dict):

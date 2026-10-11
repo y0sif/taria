@@ -97,6 +97,10 @@ Until `feat/benchmark` merges, `run.py` lives in the `~/Projects/taria-bench`
 worktree: call it by full path, and pass `--dir ~/Projects/taria/.claude/agents`
 to `agents` and `--agents-dir ~/Projects/taria/.claude/agents` to `next`.
 
+Run the orchestrating session from the main checkout, not a worktree, and do
+not `cd` or `/add-dir` during a batch: both change the environment text, which
+the guard refuses. Call `run.py` by absolute path.
+
 `plan` writes the shuffled jobs (task x arm x model x run) and the seed to
 `results/B/plan.json`, and never replaces one. It also refuses a batch whose
 `runs.jsonl` already has rows (a dry run's, say): their job ids would match
@@ -244,7 +248,7 @@ added to the agent's prompt:
 | rule | types | the guard |
 |---|---|---|
 | verified | `prompt_snapshot`, `mcp_instructions_delta`, `deferred_tools_delta`, `deferred_tools_record`, `max_turns_reached`, `instructions` | reads what they carry and holds the run to it (below) |
-| harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `thinking_drop`, `total_tokens_reminder` | holds each to the top-level fields it is known with (any other field is refused) and to the shape it is known in: a snapshot of the 8 keys a real run's has, their types, one line each; session context of `userEmail` and `gitStatus` only, each in Claude Code's words around the data (the e-mail sentence around the address, the git status's opening sentence and section labels around the repo's branches, status and commits); a `YYYY-MM-DD` date; a model identity of `modelId`, `marketingName` and `knowledgeCutoff`; a `<total_tokens>` count. Its rendered text must be the one text its own values fill, character for character: for the environment and the session context, the template every archived run rendered them in (`ENVIRONMENT_TEXT` and `SESSION_CONTEXT_TEXT` in `bench/transcript.py`), so a sentence Claude Code adds is refused; "Today's date is ..."; the model line spelled from its identity; the count; and no text at all for `credential_org` and `thinking_drop` (diagnostics Claude Code records and never shows the model) |
+| harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `thinking_drop`, `total_tokens_reminder` | holds each to the top-level fields it is known with (any other field is refused) and to the shape it is known in: a snapshot of the 8 keys a real run's has, their types, one line each; session context of `userEmail` and `gitStatus` only, each in Claude Code's words around the data (the e-mail sentence around the address, the git status's opening sentence and section labels around the repo's branches, status and commits); a `YYYY-MM-DD` date; a model identity of `modelId`, `marketingName` and `knowledgeCutoff`; a `<total_tokens>` count. Its rendered text is then held to the text its own values fill. Only the environment's and the session context's are compared character for character, against the template every archived run rendered them in (`ENVIRONMENT_TEXT` and `SESSION_CONTEXT_TEXT` in `bench/transcript.py`), so a sentence Claude Code adds is refused; the one exception is the environment's untrusted-data line (`ENVIRONMENT_UNTRUSTED`), which Claude Code 2.1.294 renders only while a remote feature flag is false, so it may be missing, and is exact when there. The date's and the model's are compared after stripping surrounding whitespace and the `<system-reminder>` wrapper: "Today's date is ..." with the attachment's date, and the model line its identity spells (the attachment's `text` must be that line too). The token reminder's `text` and rendered text must each be a bare `<total_tokens>N tokens left</total_tokens>`, wrapper optional, with any N: the rendered count is not tied to the one in its `text`. `credential_org` and `thinking_drop` must render nothing but whitespace (diagnostics Claude Code records and never shows the model) |
 | flagged | `remote_session_change`, `skill_listing` | refuses it by name |
 
 Any other type, an attachment line with no type, or one whose attachment is
@@ -261,7 +265,10 @@ That is how `remote_session_change` was caught after the fact: with
 ~710-character attribution note, as a user-role reminder beside a tool
 result, into every subagent run of outline1 and probe3, and the guard of
 the day read only the types it knew. Turn `/remote-control` off before a
-batch. A new Claude Code version that adds a type stops a batch at its
+batch. Likewise, run the orchestrating session from the main checkout, not a
+worktree, and do not `cd` or `/add-dir` during a batch: both change the
+environment text, which the guard refuses. Call `run.py` by absolute path.
+A new Claude Code version that adds a type stops a batch at its
 first run, which is the point: give the type its rule, then resume.
 
 The agent's identity line, the first line of its system prompt
