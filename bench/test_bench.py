@@ -592,19 +592,22 @@ class GradeAgentRun(unittest.TestCase):
         "toolsearch_calls": 1, "tokens": {"input": 1, "cache_creation": 2, "cache_read": 3, "output": 4},
         "wall_ms": 9000, "final_text": "Added it.", "ended_on_tool_use": False, "tool_errors": 0,
         "context": {"claude_md_files": []}, "efforts": ["medium"], "claude_versions": ["2.1.294"],
+        "last_model": "claude-sonnet-5-5", "last_stop_reason": "end_turn", "ended_synthetic": False,
+        "synthetic_text": None, "synthetic_error": None, "max_turns_reached": None,
     }
 
     def module(self, stats=None, problems=(), path="/x/agent-a1.jsonl"):
         seen = {}
 
-        def guard(stats, arm, family, arm_tools):
-            seen.update(arm=arm, family=family, arm_tools=arm_tools)
+        def guard(stats, arm, family, arm_tools, effort=None):
+            seen.update(arm=arm, family=family, arm_tools=arm_tools, effort=effort)
             return list(problems)
 
         return types.SimpleNamespace(
             find_transcript=lambda agent_id: path,
             read_transcript=lambda p: dict(stats or self.STATS),
             guard=guard,
+            ending=transcript.ending,
         ), seen
 
     def grade(self, state=None, alive=True, **module_args):
@@ -616,7 +619,8 @@ class GradeAgentRun(unittest.TestCase):
     def test_passed(self):
         row, seen, run = self.grade()
         self.assertEqual((row["status"], row["passed"], row["check_passed"]), ("passed", True, True))
-        self.assertEqual(seen, {"arm": "taria", "family": "sonnet", "arm_tools": harness.ARM_TOOLS["taria"]})
+        self.assertEqual(seen, {"arm": "taria", "family": "sonnet", "arm_tools": harness.ARM_TOOLS["taria"],
+                                "effort": "medium"})
         self.assertEqual(list(row), list(runner.ROW_KEYS))
         self.assertEqual((row["mode"], row["solver"], row["model"], row["model_resolved"]),
                          ("subagent", "agent", "sonnet", "claude-sonnet-5-5"))
@@ -637,12 +641,26 @@ class GradeAgentRun(unittest.TestCase):
         self.assertEqual((row["status"], row["demo_exit"]), ("failed", "crashed"))
 
     def test_max_turns(self):
-        cut = {**self.STATS, "ended_on_tool_use": True, "turns": 30}
+        cut = {**self.STATS, "ended_on_tool_use": True, "last_stop_reason": "tool_use", "turns": 30}
         row, _, _ = self.grade(stats=cut)
         self.assertEqual((row["status"], row["passed"], row["check_passed"]), ("max_turns", False, True))
-        # Under the cap, ending on a tool call is the agent's choice, graded as usual.
+        self.assertIsNone(row["error"])
+        # Under the cap, a run that stopped on a tool call did not end on its own.
         row, _, _ = self.grade(stats={**cut, "turns": 29})
-        self.assertEqual(row["status"], "passed")
+        self.assertEqual((row["status"], row["passed"]), ("harness_error", None))
+        self.assertIn("did not end on its own: its last message stopped on 'tool_use'", row["error"])
+        self.assertIs(row["check_passed"], True, "the dump is still graded")
+
+    def test_a_run_that_died_on_claude_codes_error_is_a_harness_error(self):
+        died = {**self.STATS, "last_model": "<synthetic>", "last_stop_reason": "stop_sequence",
+                "ended_synthetic": True, "synthetic_text": "You've hit your session limit",
+                "synthetic_error": "rate_limit"}
+        row, _, _ = self.grade(stats=died)
+        self.assertEqual((row["status"], row["passed"]), ("harness_error", None))
+        self.assertIn("not a model reply (rate_limit): \"You've hit your session limit\"", row["error"])
+        row, _, _ = self.grade(stats={**self.STATS, "last_stop_reason": None})
+        self.assertEqual(row["status"], "harness_error")
+        self.assertIn("never finished streaming", row["error"])
 
     def test_guard_problems_are_a_harness_error(self):
         row, _, _ = self.grade(problems=["called Bash (1x), which is not a taria arm tool"])
@@ -676,12 +694,119 @@ class GradeAgentRun(unittest.TestCase):
         self.assertEqual(row["status"], "harness_error")
         self.assertIn("'tui-taria-1', not this slot's agent 'tui-taria-2'", row["error"])
 
+    def real(self, name, slot=None, state=None, **plan):
+        """Grade a real (scrubbed) fixture through the real transcript module."""
+        path = os.path.join(BENCH, "fixtures", "transcripts", name)
+        slot = slot or {**self.SLOT, "slot": 1, "task": "T3", "model": "sonnet"}
+        state = state if state is not None else tasks.self_test_cases()[slot["task"]][0][0]
+        return runner.grade_agent_run({**self.PLAN, **plan}, slot, "a1", run=FakeRun(state),
+                                      transcript_mod=transcript, transcript_file=path, prov=self.PROV)
+
+    def test_a_real_clean_run_passes(self):
+        row = self.real("real_taria_clean.jsonl")
+        self.assertEqual((row["status"], row["guard_problems"], row["error"]), ("passed", [], None))
+        self.assertEqual(row["context"]["offered_tools"], sorted("mcp__tui__" + t for t in harness.ARM_TOOLS["taria"]))
+        row = self.real("real_tmux_clean.jsonl",
+                        slot={**self.SLOT, "slot": 1, "task": "T1", "arm": "tmux", "model": "haiku"})
+        self.assertEqual((row["status"], row["guard_problems"]), ("passed", []))
+
+    def test_a_real_leaked_run_is_a_harness_error(self):
+        row = self.real("real_taria_leaked.jsonl", slot={**self.SLOT, "slot": 1, "task": "T1", "model": "haiku"})
+        self.assertEqual(row["status"], "harness_error")
+        self.assertIn("instructions of 4 MCP server(s) besides tui: furcule, plugin:context7:context7, "
+                      "plugin:posthog:posthog, taria", row["error"])
+
+    def test_the_plans_effort_is_held_against_a_real_run(self):
+        row = self.real("real_taria_clean.jsonl", effort="high")
+        self.assertEqual(row["status"], "harness_error")
+        self.assertEqual(row["guard_problems"], ["ran at effort medium, not the plan's high"])
+
+    def test_an_agent_mcp_launch_refused_is_a_harness_error(self):
+        """mcp_launch refusing (a second launch of a job) leaves the agent
+        without tools: the first snapshot only, no tui instructions."""
+        with open(os.path.join(BENCH, "fixtures", "transcripts", "real_taria_clean.jsonl")) as f:
+            lines = [json.loads(line) for line in f]
+        first = next(i for i, l in enumerate(lines)
+                     if l["type"] == "attachment" and l["attachment"]["type"] == "prompt_snapshot")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        path = os.path.join(tmp, "agent-a1.jsonl")
+        with open(path, "w") as f:
+            f.writelines(json.dumps(l) + "\n" for l in lines[: first + 1] + [lines[-1]])
+        row = runner.grade_agent_run(self.PLAN, {**self.SLOT, "slot": 1, "task": "T3"}, "a1",
+                                     run=FakeRun(tasks.SEED_STATE), transcript_mod=transcript,
+                                     transcript_file=path, prov=self.PROV)
+        self.assertEqual(row["status"], "harness_error")
+        self.assertIn("was not offered mcp__tui__act, mcp__tui__key, mcp__tui__read_tree, mcp__tui__type_text",
+                      row["error"])
+
     def test_the_stub_route_through_load_transcript_module(self):
         mod, _ = self.module()
         with mock.patch.object(runner, "load_transcript_module", return_value=mod):
             row = runner.grade_agent_run(self.PLAN, self.SLOT, "a1", run=FakeRun(self.GOOD_STATE),
                                          prov=self.PROV)
         self.assertEqual(row["status"], "passed")
+
+
+class AgentIdentity(unittest.TestCase):
+    """`next --agent-id` refuses an agent that cannot have run the slot's
+    job, before recording anything, and keeps the slot for the right one."""
+
+    FIXTURE = os.path.join(BENCH, "fixtures", "transcripts", "real_taria_clean.jsonl")  # T3, started 05:20:26.399Z
+
+    def setUp(self):
+        self.results = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.results)
+        self.paths = runner.Paths(self.results, "b")
+
+    def hold(self, task="T3", prepared="2026-10-11T05:20:20.000+00:00"):
+        code, _, err = quiet_cli("plan", "--batch", "b", "--tasks", task, "--arms", "taria", "--seed", "1",
+                                 "--results-dir", self.results)
+        self.assertEqual(code, 0, err)
+        plan = runner.load_plan(self.paths)
+        _, slot = runner.claim(self.paths, plan, 1)
+        slot.update(state="ready", demo=SlotFields().fields(), prepared=prepared)
+        runner.write_slot(self.paths, 1, slot)
+        return plan, slot
+
+    def refused(self, agent_id="afixturetariaclean"):
+        code, out, err = quiet_cli("next", "--batch", "b", "--slot", "1", "--agent-id", agent_id,
+                                   "--transcript-file", self.FIXTURE, "--results-dir", self.results)
+        self.assertEqual(code, runner.EXIT_HARNESS, err)
+        self.assertIsNotNone(runner.read_slot(self.paths, 1), "the slot is kept for the right agent")
+        self.assertFalse(any(r.get("job") == "j001" for r in runner.read_rows(self.paths)), "nothing recorded")
+        error = json.loads(out)["error"]
+        self.assertIn("nothing recorded", error)
+        self.assertIn("run.py abort --batch b --slot 1", error)
+        return error
+
+    def test_the_right_transcript_is_this_slots_run(self):
+        _, slot = self.hold()
+        stats = transcript.read_transcript(self.FIXTURE)
+        self.assertEqual(runner.identity_problems(slot, stats), [])
+        # The same instant as the prepare is not before it.
+        self.assertEqual(runner.identity_problems({**slot, "prepared": "2026-10-11T05:20:26.399+00:00"}, stats), [])
+
+    def test_an_agent_id_the_batch_recorded_is_refused(self):
+        self.hold()
+        runner.append_row(self.paths, runner.new_row(job="j999", agent_id="afixturetariaclean", status="passed"))
+        error = self.refused()
+        self.assertIn("agent afixturetariaclean was already recorded for j999", error)
+
+    def test_another_tasks_transcript_is_refused(self):
+        self.hold(task="T1")
+        error = self.refused()
+        self.assertIn(f"its first prompt is {tasks.TASKS['T3'].prompt!r}, not the task's "
+                      f"{tasks.TASKS['T1'].prompt!r}", error)
+
+    def test_a_transcript_older_than_the_slots_demo_is_refused(self):
+        self.hold(prepared="2026-10-11T05:20:27.000+00:00")
+        error = self.refused()
+        self.assertIn("it started at 2026-10-11T05:20:26.399Z, before the slot was prepared at "
+                      "2026-10-11T05:20:27.000+00:00", error)
+
+    def test_the_prepared_time_is_recorded_to_the_millisecond(self):
+        self.assertRegex(runner.now("milliseconds"), r"T\d\d:\d\d:\d\d\.\d{3}\+00:00$")
 
 
 # --- The launcher and the agent files ------------------------------------------------------
@@ -722,6 +847,51 @@ class McpLaunch(unittest.TestCase):
         out = self.launch("taria")
         self.assertEqual(out.returncode, 1)
         self.assertIn("not ready", out.stderr)
+
+    def markers(self):
+        return sorted(f for f in os.listdir(self.slots) if f.endswith(".launched"))
+
+    def test_refusals_leave_no_launch_marker(self):
+        self.launch("taria")
+        self.write(1, job="j002", arm="tmux", state="ready", demo=SlotFields().fields())
+        self.launch("taria")
+        self.write(1, job="j002", arm="taria", state="starting", demo=SlotFields().fields())
+        self.launch("taria")
+        self.assertEqual(self.markers(), [])
+
+    def test_one_launch_per_job(self):
+        """The first agent's launcher marks the job and execs the server (the
+        tmux arm's exits at the end of its stdin); a second is refused before
+        anything reaches the MCP stream."""
+        self.write(1, job="j003", arm="tmux", state="ready", demo=SlotFields().fields())
+        first = self.launch("tmux")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.markers(), ["1.j003.launched"])
+        with open(os.path.join(self.slots, "1.j003.launched")) as f:
+            self.assertIsInstance(json.load(f)["pid"], int)
+        second = self.launch("tmux")
+        self.assertEqual(second.returncode, 1)
+        self.assertEqual(second.stdout, "", "nothing may reach the MCP stream")
+        self.assertIn("slot 1 (job j003) was already launched", second.stderr)
+        self.assertIn("one agent per job", second.stderr)
+        self.assertEqual(len(second.stderr.strip().splitlines()), 1)
+
+    def test_a_job_id_not_fit_for_a_file_name_is_refused(self):
+        self.write(1, job="../j003", arm="tmux", state="ready", demo=SlotFields().fields())
+        out = self.launch("tmux")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("not [A-Za-z0-9_-]+", out.stderr)
+        self.assertEqual(self.markers(), [])
+
+    def test_freeing_a_slot_removes_its_markers_only(self):
+        paths = runner.Paths(os.path.dirname(self.slots))
+        paths.slots = self.slots
+        for name in ("1.j003.launched", "1.j001.launched", "11.j003.launched", "2.j003.launched"):
+            open(os.path.join(self.slots, name), "w").close()
+        self.write(1, job="j003", arm="tmux", state="ready")
+        runner.free_slot(paths, 1)
+        self.assertEqual(self.markers(), ["11.j003.launched", "2.j003.launched"])
+        self.assertFalse(os.path.exists(os.path.join(self.slots, "1.json")))
 
     def test_the_launcher_execs_what_the_dry_run_spawns(self):
         """One definition of each arm's server: mcp_launch execs server_entry."""
@@ -815,11 +985,13 @@ class AgentFiles(unittest.TestCase):
 
 def write_transcript(directory, agent_id, prompt, arm, calls, agent_type,
                      model="claude-sonnet-5-5", effort="medium"):
-    """A minimal subagent transcript in Claude Code's shape (see
-    bench/transcript.py): the prompt, the arm's deferred tools, one assistant
-    message per tool call with its result, and a closing sentence. Plus the
-    meta file naming the agent type. Returns the transcript's path."""
-    t0 = datetime(2026, 10, 11, 12, 0, 0, tzinfo=timezone.utc)
+    """A minimal subagent transcript in the shape real ones have (see
+    bench/transcript.py and fixtures/transcripts/real_*.jsonl), starting now:
+    the prompt, a first prompt_snapshot without tools, one assistant message
+    per tool call with its result, the snapshot listing the arm's tools and
+    the tui server's instructions after the first, and a closing sentence.
+    Plus the meta file naming the agent type. Returns the transcript's path."""
+    t0 = datetime.now(timezone.utc)
     session = "00000000-0000-4000-8000-00000000beef"
     lines, n = [], 0
 
@@ -834,8 +1006,9 @@ def write_transcript(directory, agent_id, prompt, arm, calls, agent_type,
     usage = {"input_tokens": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000,
              "output_tokens": 20}
     line("user", message={"role": "user", "content": prompt})
-    names = [f"mcp__tui__{t}" for t in harness.ARM_TOOLS[arm]]
-    line("attachment", attachment={"type": "deferred_tools_delta", "addedNames": names, "removedNames": []})
+    system = [agents.BODY]
+    line("attachment", attachment={"type": "prompt_snapshot", "systemPrompt": system})
+    tools = [{"name": f"mcp__tui__{t}", "description": t} for t in harness.ARM_TOOLS[arm]]
     for i, name in enumerate(name for name, count in sorted(calls.items()) for _ in range(count)):
         line("assistant", apiBlockIndex=0, effort=effort, message={
             "model": model, "id": f"msg_{i}", "type": "message", "role": "assistant",
@@ -843,6 +1016,10 @@ def write_transcript(directory, agent_id, prompt, arm, calls, agent_type,
             "stop_reason": "tool_use", "usage": usage})
         line("user", message={"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": f"toolu_{i}", "content": "ok", "is_error": False}]})
+        if i == 0:
+            line("attachment", attachment={"type": "prompt_snapshot", "systemPrompt": system, "tools": tools})
+            line("attachment", attachment={"type": "mcp_instructions_delta", "addedNames": ["tui"],
+                                           "addedBlocks": ["## tui\n..."], "removedNames": []})
     line("assistant", apiBlockIndex=0, effort=effort, message={
         "model": model, "id": "msg_end", "type": "message", "role": "assistant",
         "content": [{"type": "text", "text": "I did what you asked."}], "stop_reason": "end_turn",
@@ -942,8 +1119,15 @@ class SubagentRehearsal(unittest.TestCase):
             self.assertIn(f"slot 1: {job['job']} (T6/{arm}/sonnet run 0), ready", status.stdout)
 
             agent_id, path = self.act_as_agent("reh", job)
+            # The job was launched once; a second agent for it gets no tools.
+            again = subprocess.run([self.launcher(job["agent"])["command"], *self.launcher(job["agent"])["args"]],
+                                   capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            self.assertEqual(again.returncode, 1)
+            self.assertIn(f"(job {job['job']}) was already launched", again.stderr)
             code, job, err = self.next("reh", 1, "--agent-id", agent_id, "--transcript-file", path)
             self.assertIn("passed", err)
+            self.assertEqual([f for f in os.listdir(os.path.join(self.results, "slots")) if f.endswith(".launched")],
+                             [], "grading leaves no launch marker behind")
 
         self.assertEqual(code, 0, err)
         self.assertEqual(job, {"done": True})

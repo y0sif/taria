@@ -29,20 +29,27 @@ Two ways to drive a run:
             Up to K slots run at once. `next` prepares a demo in the slot and
             writes results/slots/<K>.json; the agent file for that arm and
             slot (bench/agents.py) starts bench/mcp_launch.py, which reads the
-            slot file and execs the arm's server against that demo. When the
-            agent finishes, `next --agent-id` reads its transcript
-            (bench/transcript.py), grades the demo, records the row and tears
-            the demo down.
+            slot file and execs the arm's server against that demo, once per
+            job (results/slots/<K>.<job>.launched). When the agent finishes,
+            `next --agent-id` reads its transcript (bench/transcript.py),
+            grades the demo, records the row and tears the demo down. It
+            refuses (exit 2, nothing recorded, the slot kept) an agent id the
+            batch already recorded, and a transcript whose first prompt is
+            not the job's task or that started before the slot was prepared.
 
 Every run ends in exactly one status:
 
   passed         the check passed and the demo is still running
   failed         the check said no, or the demo exited
-  max_turns      the agent stopped on a tool call at the batch's max turns:
-                 a failure, whatever the dump says (check_passed is recorded)
+  max_turns      the agent was stopped at the batch's max turns (see
+                 transcript.ending): a failure, whatever the dump says
+                 (check_passed is recorded)
   harness_error  infrastructure, not the agent: a failed setup, a server or
-                 solver failure, no transcript, or the transcript guard
-                 refusing how the agent was set up. Out of the pass rate.
+                 solver failure, no transcript, the transcript guard refusing
+                 how the agent was set up, or a run that did not end on its
+                 own (Claude Code's own error message last, or a last message
+                 that stopped on anything but end_turn outside max_turns).
+                 Out of the pass rate.
 
 Rows go to results/<batch>/runs.jsonl, one JSON object per run, with the
 same keys in both modes (ROW_KEYS; null where a mode has no value).
@@ -83,6 +90,7 @@ from datetime import datetime, timezone
 BENCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH)
 import agents  # noqa: E402
+import mcp_launch  # noqa: E402
 from harness import (  # noqa: E402
     ARM_TOOLS,
     ARMS,
@@ -143,8 +151,20 @@ def _on_signal(signum, _frame):
     raise Stopped(signum)
 
 
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def now(timespec="seconds"):
+    return datetime.now(timezone.utc).isoformat(timespec=timespec)
+
+
+def parse_time(value):
+    """An aware datetime from an ISO 8601 string (`Z` or an offset; none is
+    UTC), or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
 
 
 def new_row(**fields):
@@ -302,10 +322,12 @@ def write_slot(paths, k, slot):
 
 
 def free_slot(paths, k):
+    """Remove slot `k`'s file and its launch markers (mcp_launch.py)."""
     try:
         os.remove(paths.slot(k))
     except FileNotFoundError:
         pass
+    mcp_launch.clear_markers(paths.slots, k)
 
 
 def pid_alive(pid):
@@ -589,7 +611,9 @@ def prepare_slot(paths, k, slot):
         write_slot(paths, k, slot)
 
     run = prepare_demo(TASKS[slot["task"]], on_created=created)
-    slot.update(state="ready", demo=run.to_slot(), prepared=now())
+    mcp_launch.clear_markers(paths.slots, k)  # none can be this job's: the slot was never ready
+    # To the millisecond: a transcript that starts before it did not drive this demo.
+    slot.update(state="ready", demo=run.to_slot(), prepared=now("milliseconds"))
     write_slot(paths, k, slot)
 
 
@@ -636,7 +660,7 @@ def grade_agent_run(plan, slot, agent_id, run=None, transcript_mod=None, transcr
     arm = slot["arm"]
     prov = prov if prov is not None else git_provenance()
     row = base_agent_row(plan, slot, agent_id, {**prov, "claude_version": None})
-    errors, stats = [], None
+    errors, stats, cut_off = [], None, False
     try:
         transcript_mod = transcript_mod or load_transcript_module()
         path = transcript_file or transcript_mod.find_transcript(agent_id)
@@ -644,7 +668,7 @@ def grade_agent_run(plan, slot, agent_id, run=None, transcript_mod=None, transcr
             errors.append(f"no transcript for agent {agent_id} under ~/.claude/projects")
         else:
             stats = transcript_mod.read_transcript(path)
-            problems = list(transcript_mod.guard(stats, arm, slot["model"], ARM_TOOLS[arm]))
+            problems = list(transcript_mod.guard(stats, arm, slot["model"], ARM_TOOLS[arm], effort=plan["effort"]))
             problems += agent_type_problems(path, agents.agent_name(arm, slot["slot"]))
             row.update(
                 model_resolved=_one(stats.get("models")),
@@ -664,15 +688,15 @@ def grade_agent_run(plan, slot, agent_id, run=None, transcript_mod=None, transcr
             )
             if problems:
                 errors.append("guard: " + "; ".join(problems))
+            kind, detail = transcript_mod.ending(stats, plan["max_turns"])
+            if kind == "harness_error":
+                errors.append(detail)
+            cut_off = kind == "max_turns"
     except Exception as err:  # noqa: BLE001 - an unreadable transcript is the harness's
         errors.append(f"reading the transcript failed: {type(err).__name__}: {err}")
     try:
         run = run if run is not None else DemoRun.from_slot(slot["demo"])
         graded = grade(TASKS[slot["task"]], run)
-        cut_off = bool(
-            stats and stats.get("ended_on_tool_use")
-            and isinstance(stats.get("turns"), int) and stats["turns"] >= plan["max_turns"]
-        )
         error = "; ".join(errors) or None
         status, passed = classify(graded, error, cut_off)
         row.update(
@@ -705,16 +729,65 @@ def summary_line(row):
     )
 
 
+def identity_problems(slot, stats):
+    """Why the transcript `stats` came from cannot be this slot's run: its
+    first prompt is not the job's task, or it started before the slot's demo
+    was ready. Empty when it can be."""
+    problems = []
+    want = TASKS[slot["task"]].prompt
+    if stats.get("first_prompt") != want:
+        problems.append(f"its first prompt is {stats.get('first_prompt')!r}, not the task's {want!r}")
+    prepared, started = parse_time(slot.get("prepared")), parse_time(stats.get("started"))
+    if prepared is None:
+        problems.append("the slot records no prepared time to hold it to")
+    elif started is None:
+        problems.append("its transcript has no timestamp")
+    elif started < prepared:
+        problems.append(f"it started at {stats.get('started')}, before the slot was prepared at {slot.get('prepared')}")
+    return problems
+
+
+def check_agent_identity(paths, plan, k, slot, agent_id, transcript_file=None, transcript_mod=None):
+    """Refuse (CommandError, nothing recorded, the slot kept) an agent that
+    cannot have run the job slot `k` holds: an id the batch already
+    recorded, or a transcript that is another run's. A transcript that is
+    missing or unreadable is left to grading, which records the harness error."""
+    reused = next((r for r in read_rows(paths) if r.get("agent_id") == agent_id), None)
+    retry = (f"pass the id of the agent spawned for {slot['job']}, or "
+             f"`run.py abort --batch {plan['batch']} --slot {k}`")
+    if reused is not None:
+        raise CommandError(
+            f"agent {agent_id} was already recorded for {reused.get('job')}, so it did not run "
+            f"{job_of(slot)} in slot {k}; nothing recorded: {retry}"
+        )
+    try:
+        transcript_mod = transcript_mod or load_transcript_module()
+        path = transcript_file or transcript_mod.find_transcript(agent_id)
+        stats = transcript_mod.read_transcript(path) if path is not None else None
+    except Exception:  # noqa: BLE001 - grading reads it again and records why it failed
+        return
+    if stats is None or (stats.get("started") is None and stats.get("first_prompt") is None):
+        return  # nothing in it to be another run's; grading records the harness error
+    problems = identity_problems(slot, stats)
+    if problems:
+        raise CommandError(
+            f"agent {agent_id}'s transcript is not the run of {job_of(slot)} in slot {k}: "
+            f"{'; '.join(problems)}; nothing recorded: {retry}"
+        )
+
+
 def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None):
     """Grade the agent run slot `k` holds, record it, tear the demo down and
     free the slot. Returns the row (an existing one if the job was recorded
-    before a crash left the slot behind)."""
+    before a crash left the slot behind). Refuses an agent that cannot have
+    run this job (check_agent_identity) before recording anything."""
     existing = next((r for r in read_rows(paths) if r.get("job") == slot["job"]), None)
     if existing is not None:
         print(f"run.py: {slot['job']} was already recorded; freeing slot {k}", file=sys.stderr)
         teardown(slot)
         free_slot(paths, k)
         return existing
+    check_agent_identity(paths, plan, k, slot, agent_id, transcript_file)
     row = grade_agent_run(plan, slot, agent_id, transcript_file=transcript_file)
     append_row(paths, row)  # before teardown: a crash from here on leaves a row, not a lost run
     teardown(slot)
@@ -750,8 +823,8 @@ def _next_locked(args, paths, plan):
     k = args.slot
     slot = read_slot(paths, k)
     if slot is not None and slot.get("state") != "ready":
-        if pid_alive(slot.get("pid")) and slot.get("pid") != os.getpid():
-            raise CommandError(f"slot {k} is being prepared by pid {slot.get('pid')} ({job_of(slot)})")
+        # A prepare runs under this slot's flock, which we now hold: whoever
+        # wrote this unfinished slot is gone.
         print(f"run.py: slot {k}: a prepare of {job_of(slot)} died; tearing down what it left", file=sys.stderr)
         teardown(slot)
         free_slot(paths, k)

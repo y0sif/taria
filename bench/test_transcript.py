@@ -3,12 +3,33 @@
 
   python3 -m unittest discover -s bench -p 'test_transcript.py'
 
-The fixtures are synthetic: bench/fixtures/transcripts/*.jsonl mirror the
-shape of Claude Code subagent transcripts, bench/fixtures/summary_runs.jsonl
-the rows bench/run.py writes. No real transcript is copied into them.
+Two kinds of fixture in bench/fixtures/transcripts/:
+
+- real_*.jsonl: real subagent transcripts of this exact setup (tui-<arm>-<K>
+  agents, Claude Code 2.1.294), scrubbed by bench/fixtures/scrub_transcript.py.
+  Messages, models, usage, stop_reasons, effort, tool calls, results and
+  timestamps are as Claude Code wrote them.
+    real_taria_clean   a taria run (sonnet, T3). Every real taria run so far
+                       came from a session whose other MCP servers leaked
+                       their instructions in, so this one's
+                       mcp_instructions_delta addedNames was edited to
+                       ["tui"] (the attachment's `_fixture_note` says so);
+                       nothing else was changed.
+    real_tmux_clean    a tmux run (haiku, T1), clean as recorded.
+    real_taria_leaked  a taria run (haiku, T1) as recorded, leaked servers
+                       and all: the guard must refuse it.
+  The guard and ending tests use these, and variants made from them in the
+  test (a line dropped, a field changed) to stand for runs not yet seen.
+- the others are synthetic and test parsing edge cases: streamed usage
+  (tmux_streaming), deltas and removals (forbidden), malformed lines
+  (malformed), an agent with no assistant turn (never_ran).
+
+bench/fixtures/summary_runs.jsonl holds synthetic rows as bench/run.py
+writes them.
 """
 
 import contextlib
+import copy
 import io
 import json
 import os
@@ -23,19 +44,25 @@ sys.path.insert(0, BENCH)
 import summarize  # noqa: E402
 import transcript  # noqa: E402
 from harness import ARM_TOOLS  # noqa: E402
+from tasks import TASKS  # noqa: E402
 
 FIXTURES = os.path.join(BENCH, "fixtures", "transcripts")
 RUNS = os.path.join(BENCH, "fixtures", "summary_runs.jsonl")
+TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED = "real_taria_clean.jsonl", "real_tmux_clean.jsonl", "real_taria_leaked.jsonl"
 CONTRACT = {
     "agent_id": (str,), "session_id": (str,), "models": (list,), "turns": (int,),
     "tool_calls": (dict,), "tool_calls_total": (int,), "toolsearch_calls": (int,),
     "tokens": (dict,), "wall_ms": (int, type(None)), "final_text": (str, type(None)),
     "ended_on_tool_use": (bool,), "tool_errors": (int,), "context": (dict,),
+    "last_model": (str, type(None)), "last_stop_reason": (str, type(None)), "ended_synthetic": (bool,),
+    "first_prompt": (str, type(None)), "started": (str, type(None)),
 }
 CONTEXT = {
+    "offered_tools": (list,), "offered_tools_snapshots": (list,),
     "claude_md_files": (list,), "deferred_tools": (list,), "mcp_instruction_servers": (list,),
     "environment_cwd": (str, type(None)), "skill_listing": (bool,), "attachment_types": (list,),
 }
+TUI = {arm: sorted("mcp__tui__" + t for t in tools) for arm, tools in ARM_TOOLS.items()}
 
 
 def fixture(name):
@@ -46,10 +73,73 @@ def read(name):
     return transcript.read_transcript(fixture(name))
 
 
-class ReadTranscript(unittest.TestCase):
+def lines_of(name):
+    with open(fixture(name)) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def is_att(line, kind):
+    return line.get("type") == "attachment" and line.get("attachment", {}).get("type") == kind
+
+
+def assistant_ids(lines):
+    """Message ids of the real assistant messages, in order."""
+    seen = []
+    for line in lines:
+        if line.get("type") == "assistant" and line["message"]["id"] not in seen:
+            seen.append(line["message"]["id"])
+    return seen
+
+
+def cut_after_message(lines, n):
+    """The lines up to and including the tool results of the n-th assistant
+    message (1-based): a run that stopped after its n-th turn's tools ran."""
+    ids = assistant_ids(lines)
+    keep, last_index = ids[:n], 0
+    for i, line in enumerate(lines):
+        if line.get("type") == "assistant" and line["message"]["id"] in keep:
+            last_index = i
+    end = last_index + 1
+    while end < len(lines) and lines[end].get("type") != "assistant":
+        end += 1
+    return lines[:end]
+
+
+def synthetic_line(template, text, error):
+    """A trailing Claude Code error message, in the shape real transcripts
+    hold (model <synthetic>, stop_sequence, isApiErrorMessage, error)."""
+    line = copy.deepcopy(template)
+    line.pop("apiBlockIndex", None)
+    line.pop("requestId", None)
+    line.update(isApiErrorMessage=True, error=error, timestamp="2026-10-11T05:30:00.000Z")
+    line["message"] = {"id": "msg_synthetic", "model": transcript.SYNTHETIC_MODEL, "role": "assistant",
+                       "type": "message", "stop_reason": "stop_sequence", "stop_sequence": "",
+                       "content": [{"type": "text", "text": text}],
+                       "usage": {"input_tokens": 0, "output_tokens": 0}}
+    return line
+
+
+class Variant:
+    """Write fixture variants to a temp dir and read them back."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def write(self, lines, name="agent-avariant.jsonl"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as f:
+            f.writelines(json.dumps(line) + "\n" for line in lines)
+        return path
+
+    def variant(self, lines):
+        return transcript.read_transcript(self.write(lines))
+
+
+class ReadTranscript(Variant, unittest.TestCase):
     def test_every_fixture_has_every_contract_key(self):
         names = sorted(f for f in os.listdir(FIXTURES) if f.endswith(".jsonl"))
-        self.assertGreaterEqual(len(names), 6)
+        self.assertGreaterEqual(len(names), 7)
         for name in names:
             with self.subTest(fixture=name):
                 stats = read(name)
@@ -65,30 +155,47 @@ class ReadTranscript(unittest.TestCase):
                                  sorted(set(stats["context"]["attachment_types"])))
                 json.dumps(stats)  # a row field: it has to serialize
 
-    def test_a_clean_taria_run(self):
-        stats = read("clean_taria.jsonl")
-        self.assertEqual(stats["agent_id"], "afixtureclean01")
-        self.assertEqual(stats["session_id"], "00000000-0000-4000-8000-0000000000b1")
+    def test_a_real_taria_run(self):
+        stats = read(TARIA_CLEAN)
+        self.assertEqual(stats["agent_id"], "afixturetariaclean")
+        self.assertEqual(stats["session_id"], "00000000-0000-4000-8000-0000000000c1")
         self.assertEqual(stats["models"], ["claude-sonnet-5-5"])
         self.assertEqual(stats["turns"], 4)
-        self.assertEqual(stats["tool_calls"], {"ToolSearch": 1, "mcp__tui__act": 1, "mcp__tui__read_tree": 1})
-        self.assertEqual((stats["tool_calls_total"], stats["toolsearch_calls"]), (2, 1))
-        self.assertEqual(stats["tokens"], {"input": 9, "cache_creation": 5800, "cache_read": 14100, "output": 385})
-        self.assertEqual(stats["wall_ms"], 6180)
-        self.assertEqual(stats["final_text"], "Done: 'Write docs' is marked done.")
+        self.assertEqual(stats["tool_calls"], {"mcp__tui__act": 2, "mcp__tui__read_tree": 1})
+        self.assertEqual((stats["tool_calls_total"], stats["toolsearch_calls"]), (3, 0))
+        self.assertEqual(stats["tokens"], {"input": 8, "cache_creation": 7281, "cache_read": 16036, "output": 248})
+        self.assertEqual(stats["wall_ms"], 6497)
+        self.assertTrue(stats["final_text"].startswith('I deleted the task "Wire up the MCP bridge"'))
         self.assertIs(stats["ended_on_tool_use"], False)
         self.assertEqual(stats["tool_errors"], 0)
+        self.assertEqual((stats["last_model"], stats["last_stop_reason"], stats["ended_synthetic"]),
+                         ("claude-sonnet-5-5", "end_turn", False))
+        self.assertIsNone(stats["max_turns_reached"])
+        self.assertEqual(stats["first_prompt"], TASKS["T3"].prompt)
+        self.assertEqual(stats["started"], "2026-10-11T05:20:26.399Z")
         ctx = stats["context"]
+        # Two snapshots: the first written before any tool was known.
+        self.assertEqual(ctx["offered_tools_snapshots"], [None, TUI["taria"]])
+        self.assertEqual(ctx["offered_tools"], TUI["taria"])
+        self.assertEqual(ctx["deferred_tools"], [])
         self.assertEqual(ctx["claude_md_files"], [])
-        self.assertEqual(ctx["deferred_tools"], sorted("mcp__tui__" + t for t in ARM_TOOLS["taria"]))
-        self.assertEqual(ctx["loaded_tools"], ["mcp__tui__act", "mcp__tui__read_tree"])
         self.assertEqual(ctx["mcp_instruction_servers"], ["tui"])
-        self.assertEqual(ctx["environment_cwd"], "/tmp/bench-work")
+        self.assertEqual(ctx["environment_cwd"], "/home/user/project")
         self.assertIs(ctx["skill_listing"], False)
-        self.assertEqual(ctx["attachment_types"], ["date", "deferred_tools_delta", "deferred_tools_record",
-                                                   "environment", "mcp_instructions_delta", "model"])
+        self.assertEqual(ctx["attachment_types"], ["credential_org", "environment", "mcp_instructions_delta",
+                                                   "prompt_snapshot", "session_context"])
         self.assertEqual(stats["efforts"], ["medium"])
         self.assertEqual(stats["claude_versions"], ["2.1.294"])
+
+    def test_a_real_tmux_run(self):
+        stats = read(TMUX_CLEAN)
+        self.assertEqual((stats["models"], stats["turns"]), (["claude-haiku-5-5"], 10))
+        self.assertEqual(stats["tool_calls"], {"mcp__tui__screen": 2, "mcp__tui__send_keys": 9})
+        self.assertEqual(stats["context"]["offered_tools_snapshots"], [None, TUI["tmux"]])
+        self.assertEqual(stats["context"]["mcp_instruction_servers"], ["tui"])
+        self.assertEqual(stats["first_prompt"], TASKS["T1"].prompt)
+        self.assertEqual((stats["last_stop_reason"], stats["ended_synthetic"]), ("end_turn", False))
+        self.assertEqual(stats["tokens"]["output"], 2169)
 
     def test_streamed_usage_counts_each_message_once_at_its_final_count(self):
         stats = read("tmux_streaming.jsonl")
@@ -112,20 +219,34 @@ class ReadTranscript(unittest.TestCase):
         self.assertEqual(stats["models"], ["claude-haiku-5-5"])
         self.assertEqual(stats["final_text"], "Deleted 'Old idea'.")
 
+    def test_a_real_message_streamed_over_lines_counts_once(self):
+        # The leaked run's second and third messages each stream over two
+        # lines (thinking then tool_use, text then tool_use).
+        lines = lines_of(TARIA_LEAKED)
+        self.assertEqual(sum(1 for l in lines if l["type"] == "assistant"), 6)
+        stats = read(TARIA_LEAKED)
+        self.assertEqual(stats["turns"], 4)
+        self.assertEqual(stats["tool_calls"], {"mcp__tui__act": 1, "mcp__tui__key": 1, "mcp__tui__read_tree": 1})
+
     def test_toolsearch_is_counted_apart_from_the_total(self):
-        for name in ("clean_taria.jsonl", "tmux_streaming.jsonl", "cutoff.jsonl", "wrong_model.jsonl"):
+        stats = read("tmux_streaming.jsonl")
+        self.assertEqual((stats["toolsearch_calls"], stats["tool_calls"]["ToolSearch"]), (1, 1))
+        self.assertEqual(stats["tool_calls_total"], sum(stats["tool_calls"].values()) - 1)
+        for name in (TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED):  # real runs load nothing
             with self.subTest(fixture=name):
                 stats = read(name)
-                self.assertEqual(stats["toolsearch_calls"], 1)
-                self.assertEqual(stats["tool_calls_total"], sum(stats["tool_calls"].values()) - 1)
-                self.assertEqual(stats["tool_calls"]["ToolSearch"], 1)
+                self.assertEqual(stats["toolsearch_calls"], 0)
+                self.assertEqual(stats["tool_calls_total"], sum(stats["tool_calls"].values()))
 
     def test_a_run_cut_off_on_a_tool_use(self):
-        stats = read("cutoff.jsonl")
+        # The leaked run, stopped after its third turn's tool ran: it said
+        # something, then asked for a key.
+        stats = self.variant(cut_after_message(lines_of(TARIA_LEAKED), 3))
         self.assertIs(stats["ended_on_tool_use"], True)
-        self.assertEqual(stats["final_text"], "Reading the tree first.")  # earlier text survives
+        self.assertEqual(stats["last_stop_reason"], "tool_use")
+        self.assertEqual(stats["final_text"], "The text is in the input and it is focused. Submitting with Enter now.")
         self.assertEqual(stats["turns"], 3)
-        for name in ("clean_taria.jsonl", "tmux_streaming.jsonl", "forbidden.jsonl", "wrong_model.jsonl",
+        for name in (TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED, "tmux_streaming.jsonl", "forbidden.jsonl",
                      "malformed.jsonl", "never_ran.jsonl"):
             self.assertIs(read(name)["ended_on_tool_use"], False, name)
 
@@ -138,6 +259,34 @@ class ReadTranscript(unittest.TestCase):
         self.assertTrue(transcript.ended_on_tool_use([text, tool]))
         self.assertTrue(transcript.ended_on_tool_use([tool, think]))
 
+    def test_a_trailing_synthetic_message_is_recorded(self):
+        lines = cut_after_message(lines_of(TARIA_CLEAN), 3)
+        lines.append(synthetic_line(lines[-2], "You've hit your session limit", "rate_limit"))
+        stats = self.variant(lines)
+        self.assertEqual((stats["last_model"], stats["last_stop_reason"]), ("<synthetic>", "stop_sequence"))
+        self.assertIs(stats["ended_synthetic"], True)
+        self.assertEqual((stats["synthetic_text"], stats["synthetic_error"]),
+                         ("You've hit your session limit", "rate_limit"))
+        self.assertEqual((stats["synthetic_messages"], stats["turns"]), (1, 3))
+        self.assertEqual(stats["models"], ["claude-sonnet-5-5"], "<synthetic> is not a model")
+
+    def test_a_synthetic_message_the_run_recovered_from_is_not_its_end(self):
+        lines = lines_of(TARIA_CLEAN)
+        cut = len(cut_after_message(lines, 2))
+        lines.insert(cut, synthetic_line(lines[cut - 2], "Request timed out", "server_error"))
+        stats = self.variant(lines)
+        self.assertEqual((stats["synthetic_messages"], stats["ended_synthetic"]), (1, False))
+        self.assertEqual(stats["last_stop_reason"], "end_turn")
+
+    def test_snapshots_are_unioned_and_each_kept(self):
+        lines = lines_of(TARIA_CLEAN)
+        later = copy.deepcopy(next(l for l in lines if is_att(l, "prompt_snapshot") and "tools" in l["attachment"]))
+        later["attachment"]["tools"] = [{"name": "Bash", "description": "x"}]
+        lines.append(later)
+        ctx = self.variant(lines)["context"]
+        self.assertEqual(ctx["offered_tools_snapshots"], [None, TUI["taria"], ["Bash"]])
+        self.assertEqual(ctx["offered_tools"], sorted(TUI["taria"] + ["Bash"]))
+
     def test_context_follows_the_deltas(self):
         ctx = read("forbidden.jsonl")["context"]
         self.assertEqual(ctx["claude_md_files"], ["/home/someone/project/CLAUDE.md"])
@@ -147,6 +296,7 @@ class ReadTranscript(unittest.TestCase):
         self.assertEqual(ctx["mcp_instruction_servers"], ["tui"])
         self.assertIs(ctx["skill_listing"], True)
         self.assertIn("instructions", ctx["attachment_types"])
+        self.assertEqual((ctx["offered_tools"], ctx["offered_tools_snapshots"]), ([], []))
 
     def test_malformed_and_unknown_lines_are_skipped(self):
         stats = read("malformed.jsonl")
@@ -157,7 +307,7 @@ class ReadTranscript(unittest.TestCase):
         self.assertEqual(stats["tool_calls"], {"mcp__tui__act": 1, "mcp__tui__read_tree": 1})
         self.assertEqual(stats["tokens"]["output"], 57)
         self.assertEqual(stats["final_text"], "All set.")
-        self.assertEqual(stats["context"]["deferred_tools"], sorted("mcp__tui__" + t for t in ARM_TOOLS["taria"]))
+        self.assertEqual(stats["context"]["deferred_tools"], TUI["taria"])
         self.assertNotIn("progress", stats["context"]["attachment_types"])
 
     def test_an_agent_that_never_ran(self):
@@ -165,11 +315,10 @@ class ReadTranscript(unittest.TestCase):
         self.assertEqual((stats["turns"], stats["models"], stats["final_text"]), (0, [], None))
         self.assertEqual(stats["tool_calls"], {})
         self.assertEqual(stats["tokens"], {"input": 0, "cache_creation": 0, "cache_read": 0, "output": 0})
+        self.assertEqual((stats["last_model"], stats["last_stop_reason"]), (None, None))
 
     def test_an_empty_file(self):
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp)
-        path = os.path.join(tmp, "agent-aempty.jsonl")
+        path = os.path.join(self.tmp, "agent-aempty.jsonl")
         with open(path, "w") as f:
             f.write("\n{not json\n")
         stats = transcript.read_transcript(path)
@@ -177,11 +326,10 @@ class ReadTranscript(unittest.TestCase):
         self.assertIsNone(stats["session_id"])
         self.assertIsNone(stats["wall_ms"])
         self.assertEqual((stats["turns"], stats["malformed_lines"]), (0, 1))
+        self.assertEqual((stats["first_prompt"], stats["started"]), (None, None))
 
     def test_final_text_is_truncated(self):
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp)
-        path = os.path.join(tmp, "agent-along.jsonl")
+        path = os.path.join(self.tmp, "agent-along.jsonl")
         line = {"type": "assistant", "timestamp": "2026-10-11T12:00:00.000Z",
                 "message": {"id": "m1", "model": "claude-sonnet-5-5", "stop_reason": "end_turn",
                             "content": [{"type": "text", "text": "x" * 900}], "usage": {"output_tokens": 3}}}
@@ -192,43 +340,179 @@ class ReadTranscript(unittest.TestCase):
         self.assertEqual(stats["tokens"]["output"], 3)
 
 
-class Guard(unittest.TestCase):
-    def guard(self, name, arm, family):
-        return transcript.guard(read(name), arm, family, ARM_TOOLS[arm])
+class Guard(Variant, unittest.TestCase):
+    """The guard over real runs, and variants of them."""
 
-    def test_clean_runs_pass(self):
-        self.assertEqual(self.guard("clean_taria.jsonl", "taria", "sonnet"), [])
-        self.assertEqual(self.guard("tmux_streaming.jsonl", "tmux", "haiku"), [])
-        self.assertEqual(self.guard("cutoff.jsonl", "taria", "sonnet"), [])
-        self.assertEqual(self.guard("malformed.jsonl", "taria", "sonnet"), [])
+    def guard(self, stats, arm, family, effort="medium"):
+        return transcript.guard(stats, arm, family, ARM_TOOLS[arm], effort=effort)
 
-    def test_a_forbidden_tool_a_claude_md_and_extra_deferred_tools(self):
-        problems = self.guard("forbidden.jsonl", "taria", "sonnet")
-        self.assertEqual(len(problems), 3, problems)
-        called, files, offered = problems
-        self.assertIn("called Read (1x)", called)
-        self.assertIn("/home/someone/project/CLAUDE.md", files)
-        self.assertIn("2 deferred tool(s) beyond the taria arm: WebFetch, mcp__other__lookup", offered)
+    def test_clean_real_runs_pass(self):
+        self.assertEqual(self.guard(read(TARIA_CLEAN), "taria", "sonnet"), [])
+        self.assertEqual(self.guard(read(TMUX_CLEAN), "tmux", "haiku"), [])
+
+    def test_other_servers_instructions_are_named(self):
+        problems = self.guard(read(TARIA_LEAKED), "taria", "haiku")
+        self.assertEqual(problems, ["was given the instructions of 4 MCP server(s) besides tui: furcule, "
+                                    "plugin:context7:context7, plugin:posthog:posthog, taria"])
+
+    def test_instruction_servers_are_counted_net_of_removals(self):
+        lines = lines_of(TARIA_LEAKED)
+        delta = copy.deepcopy(next(l for l in lines if is_att(l, "mcp_instructions_delta")))
+        delta["attachment"].update(addedNames=[], addedBlocks=[], removedNames=[
+            "furcule", "plugin:context7:context7", "plugin:posthog:posthog", "taria"])
+        self.assertEqual(self.guard(self.variant(lines + [delta]), "taria", "haiku"), [])
+
+    def test_no_tui_instructions(self):
+        lines = [l for l in lines_of(TARIA_CLEAN) if not is_att(l, "mcp_instructions_delta")]
+        problems = self.guard(self.variant(lines), "taria", "sonnet")
+        self.assertEqual(problems, ["never got the tui server's instructions: it did not start, or was refused"])
+
+    def test_an_agent_offered_no_tools(self):
+        """What an agent whose server never started (or mcp_launch refused)
+        leaves: the first snapshot only, no tui instructions, and a reply."""
+        lines = lines_of(TARIA_CLEAN)
+        first_snapshot = next(i for i, l in enumerate(lines) if is_att(l, "prompt_snapshot"))
+        lines = lines[: first_snapshot + 1] + [lines[-1]]
+        stats = self.variant(lines)
+        self.assertEqual((stats["context"]["offered_tools"], stats["tool_calls"]), ([], {}))
+        problems = self.guard(stats, "taria", "sonnet")
+        self.assertEqual(problems, [
+            "was not offered mcp__tui__act, mcp__tui__key, mcp__tui__read_tree, mcp__tui__type_text: "
+            "the tui server did not start, or mcp_launch refused it",
+            "never got the tui server's instructions: it did not start, or was refused",
+        ])
+
+    def test_no_prompt_snapshot(self):
+        lines = [l for l in lines_of(TARIA_CLEAN) if not is_att(l, "prompt_snapshot")]
+        self.assertEqual(self.guard(self.variant(lines), "taria", "sonnet"),
+                         ["has no prompt_snapshot, so the tools it was offered cannot be checked"])
+
+    def test_a_tool_beyond_the_arm_on_offer(self):
+        lines = lines_of(TARIA_CLEAN)
+        snapshot = next(l for l in lines if is_att(l, "prompt_snapshot") and "tools" in l["attachment"])
+        snapshot["attachment"]["tools"].append({"name": "Bash", "description": "Run a command"})
+        self.assertEqual(self.guard(self.variant(lines), "taria", "sonnet"),
+                         ["was offered 1 tool(s) beyond the taria arm: Bash"])
+
+    def test_the_other_arms_run(self):
+        problems = self.guard(read(TMUX_CLEAN), "taria", "haiku")
+        self.assertEqual(problems, [
+            "called mcp__tui__screen (2x), which is not a taria arm tool",
+            "called mcp__tui__send_keys (9x), which is not a taria arm tool",
+            "was not offered mcp__tui__act, mcp__tui__key, mcp__tui__read_tree, mcp__tui__type_text: "
+            "the tui server did not start, or mcp_launch refused it",
+            "was offered 2 tool(s) beyond the taria arm: mcp__tui__screen, mcp__tui__send_keys",
+        ])
 
     def test_the_wrong_model(self):
-        problems = self.guard("wrong_model.jsonl", "tmux", "haiku")
-        self.assertEqual(problems, ["ran on claude-sonnet-5-5, not the requested claude-haiku-*"])
-        self.assertEqual(self.guard("wrong_model.jsonl", "tmux", "sonnet"), [])
+        self.assertEqual(self.guard(read(TARIA_CLEAN), "taria", "haiku"),
+                         ["ran on claude-sonnet-5-5, not the requested claude-haiku-*"])
 
-    def test_the_other_arms_tools(self):
-        problems = self.guard("clean_taria.jsonl", "tmux", "sonnet")
-        self.assertTrue(any(p.startswith("called mcp__tui__act (1x)") for p in problems), problems)
-        self.assertTrue(any(p.startswith("called mcp__tui__read_tree (1x)") for p in problems), problems)
-        self.assertTrue(any("4 deferred tool(s) beyond the tmux arm" in p for p in problems), problems)
-        self.assertFalse(any("ToolSearch" in p for p in problems), "ToolSearch is always allowed")
+    def test_the_effort_must_be_the_plans(self):
+        self.assertEqual(self.guard(read(TARIA_CLEAN), "taria", "sonnet", effort="high"),
+                         ["ran at effort medium, not the plan's high"])
+        lines = lines_of(TARIA_CLEAN)
+        next(l for l in lines if l["type"] == "assistant")["effort"] = "high"
+        self.assertEqual(self.guard(self.variant(lines), "taria", "sonnet"),
+                         ["ran at effort high, medium, not the plan's medium"])
+        for line in lines:
+            line.pop("effort", None)
+        self.assertEqual(self.guard(self.variant(lines), "taria", "sonnet"),
+                         ["ran at effort (none recorded), not the plan's medium"])
+        self.assertEqual(self.guard(read(TARIA_CLEAN), "taria", "sonnet", effort=None), [])
+
+    def test_a_forbidden_tool_and_an_instruction_file(self):
+        lines = lines_of(TARIA_CLEAN)
+        call = next(l for l in lines if l["type"] == "assistant" and l["message"]["content"][0]["type"] == "tool_use")
+        call["message"]["content"][0]["name"] = "Read"
+        instructions = copy.deepcopy(next(l for l in lines if is_att(l, "environment")))
+        instructions["attachment"] = {"type": "instructions", "files": [{"path": "/home/user/project/CLAUDE.md"}]}
+        lines.insert(2, instructions)
+        problems = self.guard(self.variant(lines), "taria", "sonnet")
+        self.assertEqual(problems, [
+            "called Read (1x), which is not a taria arm tool",
+            "was given 1 instruction file(s) despite omitClaudeMd: /home/user/project/CLAUDE.md",
+        ])
+
+    def test_deferred_tools_beyond_the_arm(self):
+        problems = self.guard(read("forbidden.jsonl"), "taria", "sonnet")
+        self.assertIn("was offered 2 deferred tool(s) beyond the taria arm: WebFetch, mcp__other__lookup", problems)
+        self.assertNotIn("ToolSearch", " ".join(problems))
 
     def test_an_agent_that_never_ran(self):
-        problems = self.guard("never_ran.jsonl", "taria", "sonnet")
-        self.assertEqual(problems, ["never ran: the transcript has no assistant turn"])
+        problems = self.guard(read("never_ran.jsonl"), "taria", "sonnet")
+        self.assertEqual(problems[-1], "never ran: the transcript has no assistant turn")
 
     def test_guard_tolerates_a_sparse_stats_dict(self):
-        self.assertEqual(transcript.guard({}, "taria", "sonnet", ARM_TOOLS["taria"]),
-                         ["never ran: the transcript has no assistant turn"])
+        self.assertEqual(transcript.guard({}, "taria", "sonnet", ARM_TOOLS["taria"]), [
+            "has no prompt_snapshot, so the tools it was offered cannot be checked",
+            "never got the tui server's instructions: it did not start, or was refused",
+            "never ran: the transcript has no assistant turn",
+        ])
+
+
+class Ending(Variant, unittest.TestCase):
+    """How a run ended, from real runs and variants of them."""
+
+    def test_real_runs_ended_on_their_own(self):
+        for name in (TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED):
+            with self.subTest(fixture=name):
+                self.assertEqual(transcript.ending(read(name), 30), ("end_turn", None))
+
+    def test_a_usage_limit_is_a_harness_error(self):
+        lines = cut_after_message(lines_of(TARIA_CLEAN), 3)
+        # As in real transcripts: the reply cut off mid-stream, then Claude
+        # Code's own message.
+        partial = copy.deepcopy(lines[-2])
+        partial["message"].update(id="msg_partial", stop_reason=None,
+                                  content=[{"type": "text", "text": "Now I will"}])
+        lines += [partial, synthetic_line(partial, "You've hit your session limit", "rate_limit")]
+        kind, detail = transcript.ending(self.variant(lines), 30)
+        self.assertEqual(kind, "harness_error")
+        self.assertEqual(detail, "the run ended on Claude Code's own message, not a model reply (rate_limit): "
+                                 "\"You've hit your session limit\"")
+
+    def test_stopping_on_a_tool_call_under_the_cap_is_a_harness_error(self):
+        stats = self.variant(cut_after_message(lines_of(TARIA_CLEAN), 3))
+        kind, detail = transcript.ending(stats, 30)
+        self.assertEqual(kind, "harness_error")
+        self.assertIn("its last message stopped on 'tool_use'", detail)
+        self.assertIn("at turn 3, under maxTurns 30", detail)
+
+    def test_stopping_on_a_tool_call_at_the_cap_is_max_turns(self):
+        stats = self.variant(cut_after_message(lines_of(TARIA_CLEAN), 3))
+        self.assertTrue(transcript.cut_off_at_max_turns(stats, 3))
+        self.assertEqual(transcript.ending(stats, 3), ("max_turns", "stopped on a tool call at turn 3 of maxTurns 3"))
+        self.assertEqual(transcript.ending(stats, 2)[0], "max_turns")
+        # A run that finished on its own at the cap is not cut off.
+        self.assertEqual(transcript.ending(read(TARIA_CLEAN), 4), ("end_turn", None))
+
+    def test_a_recorded_max_turns_reached_is_proof(self):
+        lines = cut_after_message(lines_of(TARIA_CLEAN), 3)
+        reached = copy.deepcopy(next(l for l in lines if is_att(l, "environment")))
+        reached["attachment"] = {"type": "max_turns_reached", "maxTurns": 30, "turnCount": 31}
+        stats = self.variant(lines + [reached])
+        self.assertEqual(stats["max_turns_reached"], {"max_turns": 30, "turn_count": 31})
+        self.assertEqual(transcript.ending(stats, 30),
+                         ("max_turns", "Claude Code recorded max_turns_reached (turn 31 of 30)"))
+
+    def test_a_reply_that_never_finished_streaming(self):
+        lines = lines_of(TARIA_CLEAN)
+        lines[-1]["message"]["stop_reason"] = None
+        kind, detail = transcript.ending(self.variant(lines), 30)
+        self.assertEqual(kind, "harness_error")
+        self.assertIn("stopped on None (it never finished streaming", detail)
+
+    def test_any_other_stop_reason(self):
+        lines = lines_of(TARIA_CLEAN)
+        lines[-1]["message"]["stop_reason"] = "max_tokens"
+        kind, detail = transcript.ending(self.variant(lines), 30)
+        self.assertEqual(kind, "harness_error")
+        self.assertIn("'max_tokens'", detail)
+
+    def test_never_ran(self):
+        self.assertEqual(transcript.ending(read("never_ran.jsonl"), 30)[0], "never_ran")
+        self.assertEqual(transcript.ending({}, 30)[0], "never_ran")
 
 
 class FindTranscript(unittest.TestCase):
@@ -442,14 +726,14 @@ class RealTranscriptShape(unittest.TestCase):
     built from a fixture's stats feeds the summary without loss."""
 
     def test_stats_feed_a_summary_row(self):
-        stats = read("clean_taria.jsonl")
-        row = {"task": "T1", "arm": "taria", "mode": "subagent", "model": "sonnet", "effort": "medium",
+        stats = read(TARIA_CLEAN)
+        row = {"task": "T3", "arm": "taria", "mode": "subagent", "model": "sonnet", "effort": "medium",
                "max_turns": 30, "batch": "b", "status": "passed", "passed": True,
                **{k: stats[k] for k in ("turns", "tool_calls", "tool_calls_total", "toolsearch_calls",
                                         "tokens", "wall_ms", "context")}}
-        col = Summary.columns(next(l for l in summarize.table([row]).splitlines() if l.startswith("| T1 |")))
-        self.assertEqual(col["tokens processed med [IQR]"], "19,909")
-        self.assertEqual((col["tool calls med [IQR]"], col["ToolSearch med"], col["turns med"]), ("2", "1", "4"))
+        col = Summary.columns(next(l for l in summarize.table([row]).splitlines() if l.startswith("| T3 |")))
+        self.assertEqual(col["tokens processed med [IQR]"], "23,325")  # 8 + 7,281 + 16,036
+        self.assertEqual((col["tool calls med [IQR]"], col["ToolSearch med"], col["turns med"]), ("3", "0", "4"))
 
 
 if __name__ == "__main__":

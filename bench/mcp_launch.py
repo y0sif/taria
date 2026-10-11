@@ -17,21 +17,67 @@ A missing slot file, a slot still being prepared, or a slot whose job is for
 the other arm (the wrong agent was spawned for the slot) is one line on
 stderr and exit 1, so the agent gets no tools rather than another arm's.
 
+One launch per job: before the exec it creates `<slots-dir>/<K>.<job>.launched`
+with O_CREAT|O_EXCL, and refuses (exit 1) when that file exists, so a second
+agent cannot drive a demo another agent already used. `run.py` removes the
+marker when it frees the slot (graded, aborted, or a dead prepare). A refused
+agent is offered no tools, which the transcript guard reports as a harness
+error.
+
 Usage:  python3 bench/mcp_launch.py --arm taria|tmux --slot K [--slots-dir D]
 
 Python 3 stdlib only.
 """
 
 import argparse
+import glob
 import json
 import os
+import re
 import sys
+from datetime import datetime, timezone
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BENCH)
 from harness import ARMS, DemoRun, HarnessError, server_entry  # noqa: E402
 
 DEFAULT_SLOTS_DIR = os.path.join(BENCH, "results", "slots")
+JOB_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def marker_path(slots_dir, slot, job):
+    """The file whose existence says job `job` in slot `slot` was launched."""
+    return os.path.join(slots_dir, f"{slot}.{job}.launched")
+
+
+def clear_markers(slots_dir, slot):
+    """Remove every launch marker of slot `slot`. Returns the paths removed."""
+    removed = []
+    for path in glob.glob(os.path.join(glob.escape(slots_dir), f"{int(slot)}.*.launched")):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        removed.append(path)
+    return removed
+
+
+def claim_launch(slots_dir, slot, job):
+    """Create the job's launch marker, or refuse when it exists."""
+    if not isinstance(job, str) or not JOB_RE.match(job):
+        refuse(f"slot {slot} names job {job!r}, which is not [A-Za-z0-9_-]+")
+    path = marker_path(slots_dir, slot, job)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        refuse(
+            f"slot {slot} (job {job}) was already launched ({path} exists): one agent per job, "
+            "so this one gets no tools"
+        )
+    except OSError as err:
+        refuse(f"cannot create {path}: {err}")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"pid": os.getpid(), "launched": datetime.now(timezone.utc).isoformat()}, f)
 
 
 def refuse(message):
@@ -68,6 +114,7 @@ def main(argv=None):
     except HarnessError as err:
         refuse(f"slot {args.slot}: {err}")
 
+    claim_launch(args.slots_dir, args.slot, slot.get("job"))
     env = dict(os.environ)
     env.update(entry.get("env", {}))
     workdir = slot["demo"]["workdir"]

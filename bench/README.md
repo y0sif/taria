@@ -1,265 +1,35 @@
 # taria benchmark
 
-Measures taria against tmux screen-scraping on the same agent tasks, run
-against `taria-demo`: verified task success, tokens, tool calls, turns, wall
-time and cost.
+Does an agent drive a terminal app better through taria's semantic tree than
+by scraping the screen? This benchmark answers that on `taria-demo`. Both arms
+get the same tasks, prompts and agent instructions; only the tools differ.
+Runs are graded on what the app holds when the agent stops, never on what
+either arm saw. Each run records verified success, turns, tool calls, tokens
+and wall time. The models are Sonnet 5.5 and Haiku 5.5.
 
-Both arms hand the agent an MCP server, registered under the same name
-(`tui`), so the only difference is what the tools see:
+## The two arms
 
-- **taria**: the real bridge, `target/debug/taria-mcp`, with `read_tree`,
-  `act`, `key` and `type_text`.
-- **tmux**: `bench/tmux_mcp.py`, with `screen` (the pane as text) and
-  `send_keys` (tmux key names or literal text). Each key name is its own
-  `tmux send-keys`, 30 ms apart, so `"Escape d"` is Escape then d; sent in
-  one command the two bytes arrive together and the app reads alt+d. After
-  sending, it waits for the screen to differ from the one before the keys,
-  then for two captures 50 ms apart to agree, within the 500 ms taria-mcp
-  waits for an app to react. A key that changes nothing costs the full
-  500 ms, as an unchanged tree does in taria-mcp. A test reads `UPDATE_WAIT`
-  from `crates/taria-mcp/src/server.rs` and fails if the two caps drift.
+Each arm is an MCP server (Model Context Protocol, the standard way to hand an
+agent a set of tools). Both are registered as `tui`, so the agent sees
+`mcp__tui__<tool>` either way and no tool name gives the arm away.
 
-Each run starts a fresh demo in its own tmux server and temp dir. The
-server's only config turns the status line off, so the demo gets the whole
-120x40 terminal in both arms (a test checks the pane size). Success is never
-read off the screen or the tree: the demo writes its state to the file
-`TARIA_DEMO_STATE` names, and each task in `bench/tasks.py` checks that file
-against the seed, every field of every task included, so a run passes only if
-the asked-for change happened and nothing else did. The demo process must
-also still be running when the run is graded: a crashed demo leaves a dump
-that says `quit: false`, so the harness asks the process, and a dead one
-fails the run with the reason `demo exited`.
+- **taria**: the real bridge, `target/debug/taria-mcp --app taria-demo`, with
+  `read_tree`, `act`, `key` and `type_text`.
+- **tmux**: `bench/tmux_mcp.py`, with `screen` (the pane as plain text) and
+  `send_keys` (tmux key names, or text with `literal: true`). Key names go
+  30 ms apart, so `"Escape d"` is not alt+d, and the settle wait is capped at
+  the 500 ms taria-mcp waits for an app to react.
 
-## What the agent sees
-
-The agent runs in an empty working directory, `<tmp>/work`. The state dump,
-the MCP config and both sockets live outside it, and `<tmp>` has a neutral
-`tui-` prefix: the demo prints its socket path (`<tmp>/s/app.sock`) on its
-header line, which the tmux arm reads, so nothing on screen names the
-benchmark. Prompts are identical across arms and never mention taria, tmux,
-node ids or key bindings.
-
-## The baseline's honest limits
-
-`screen` returns text without colours or styles, which is what a
-screen-scraping agent gets, and some of the demo's state is drawn only as
-style:
-
-- The active tab is bold and the other dim (`ui.rs`, `render_tabs`); the
-  text reads ` Active │ Done ` either way. On a non-empty tab the
-  checkboxes give it away (a tab holds only `[ ]` or only `[x]` rows), but
-  on an empty tab, `(no tasks here)`, the tmux arm cannot tell which tab it
-  is on.
-- Which region holds the keyboard is drawn as a bold border on the input box
-  or a bold cursor row (`render_input`, `render_tasks`). The footer's hint
-  line changes with focus, so the text does say it, less directly.
-
-These are the baseline's real handicaps, not harness bugs: they are why the
-tasks are graded on the state dump rather than on what either arm saw.
-
-## Run it
-
-Build first (`cargo build --workspace`); `run.py` never builds. It refuses a
-missing binary, a `taria-demo` or `taria-mcp` older than any source cargo's
-dep-info file (`target/debug/<bin>.d`) says it is built from, and a last
-build older than a manifest or the lock file, so a freshly rebuilt demo
-cannot hide a stale bridge. Needs `tmux` and Python 3.
-
-```bash
-python3 bench/run.py --dry-run                        # every task, both arms
-python3 bench/run.py --dry-run --tasks T3,T5 --arms tmux --runs 3
-python3 bench/run.py --dry-run --sabotage             # every run must fail
-python3 bench/summarize.py                            # the newest batch
-python3 bench/summarize.py --batch <id>               # one batch by id
-python3 bench/summarize.py --all                      # every batch, merged
-python3 bench/summarize.py results.jsonl              # exactly these files
-python3 bench/tasks.py                                # checker self-test
-python3 bench/test_bench.py                           # harness tests, live tmux and fake claude
-```
-
-`--dry-run` drives each task with a scripted solver (`bench/solvers.py`), no
-model involved, through the same MCP server and config an agent would get.
-It proves the harness end to end and costs nothing. `--sabotage` swaps in a
-plausible wrong plan per task (the wrong task, an off-by-one read, toggling
-by position) so each check is seen to fail. Jobs are shuffled with `--seed`
-(recorded), so neither arm always runs first. Each run prints one JSON line
-and appends it to `bench/results/<batch>.jsonl` (gitignored), or to
-`--results`.
-
-## Outcomes
-
-Every run ends in exactly one `status`:
-
-| status | means | pass rate |
-|---|---|---|
-| `passed` | the check passed and the demo is still running | a pass |
-| `failed` | the check said no, or the demo exited | a failure |
-| `timeout` | the agent ran out of wall clock (`--timeout`) | a failure, counted in its own column |
-| `budget` | the agent hit `--budget-usd` (result subtype `error_max_budget_usd`) | a failure, counted in its own column |
-| `max_turns` | the agent hit `--max-turns` (result subtype `error_max_turns`) | a failure, counted in its own column |
-| `harness_error` | infrastructure, not the agent | left out, counted in its own column |
-
-The three limits are one rule: an agent that hit any of them did not finish
-on its own, so the run fails, whatever its dump says. The dump is still
-graded and the verdict recorded in `check_passed` (and `demo_alive`), and the
-summary's `cut off` column says, per row, how many cut-off runs had the right
-state when they were stopped, for example `2 (1 with correct state)`.
-
-A harness error is a failed setup, a server crash, the init guard, a stale
-build, an exception in the solver or the harness, claude exiting without a
-result event, a result with `is_error` set other than a limit (an API or
-auth error, an unknown `--model`), a stream event the harness cannot read,
-or any permission denial (the agent was refused a tool the arm should have
-approved). The reason is recorded in `error`; the dump's verdict is still
-recorded in `check_passed` and `reason` for diagnosis. An exception while
-grading or quitting the demo still writes the record, with the run's cost,
-usage and tool calls. A timed-out run keeps what it streamed before it was
-killed: its usage is summed from the assistant messages (`usage_source:
-"stream"`), or is null when none arrived. Its cost and turns are null, since
-only a result event carries them.
-
-Exit codes: `0` every run passed; `1` a run did not pass (failed, or cut off
-by a limit); `2` a harness error (including a stale or missing build, the
-guard, SIGTERM or SIGHUP). A harness error wins. SIGTERM, SIGHUP and Ctrl-C
-tear down the run's demo, tmux server and temp dir before exiting.
-
-## Provenance
-
-Every record carries `batch` (one id per `run.py` invocation, `--batch` to
-name it), `git_sha` and `git_dirty` of the tree, `claude_version` (`claude
---version`, free), the requested `model` and `effort`, the limits the run
-was held to (`timeout_s`, `budget_usd`, and `max_turns`, null when
-`--max-turns` was not passed; all five are null for a dry run), and `seed`;
-a spend record adds the `agent_model` system/init reported and
-`env_dropped`. That is every flag that changes a run; the rest is the code
-at `git_sha`. `summarize.py` reads only what it is told to (files,
-`--batch`, `--all`, or else the newest batch, named on stderr), prints a
-provenance table of every batch it read (limits included), and warns when
-agent rows pool more than one git SHA or claude version, when records come
-from a dirty tree or from before limits were recorded, or when the agent
-reported a model other than the one asked for.
-
-## Spend runs
-
-`--spend` runs one real agent per (task, arm, run) and costs money. It
-requires `ANTHROPIC_API_KEY`, because `--bare` reads no other credential;
-without it `run.py` exits 2 (a subscription run is not wired yet). Each agent
-is, from `<tmp>/work`:
-
-```
-claude -p "<prompt>" --bare --setting-sources= \
-  --strict-mcp-config --mcp-config <tmp>/mcp.json \
-  --tools "" --allowedTools mcp__tui --permission-mode dontAsk \
-  --disable-slash-commands --output-format stream-json --verbose \
-  --no-session-persistence --max-budget-usd <--budget-usd, default 1> \
-  --model <--model, default claude-sonnet-5-5> --effort <--effort, default medium> \
-  [--max-turns <--max-turns, only when given>]
-```
-
-with a wall-clock limit (`--timeout`, default 600 s), in its own process
-group: a timeout sends the group SIGTERM, then SIGKILL 5 s later, so a child
-that ignores SIGTERM goes too.
-
-**Isolation.** The child's environment is an allowlist: `PATH`, `HOME`,
-`USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `TMPDIR`, `SHELL` and
-`ANTHROPIC_API_KEY`, plus whatever the harness sets itself (`HARNESS_ENV` in
-`run.py`, empty today). Everything else is dropped and its name (never its
-value) recorded in `env_dropped`: a Claude Code session's markers
-(`CLAUDECODE=1`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_EFFORT`, ...), which mark
-a child as nested in that session, and anything that would steer the agent
-(`CLAUDE_CODE_EFFORT_LEVEL` overrides `--effort`; `ANTHROPIC_MODEL`,
-`ANTHROPIC_BASE_URL`, `NODE_OPTIONS`, `CLAUDE_CONFIG_DIR`). A proxy or CA
-variable (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`) is dropped too; a network
-that needs one needs it added to `ENV_ALLOW`, or every run ends in an API
-error. `claude --version` runs under the same environment.
-`--setting-sources=` loads no user, project or local settings file, so an
-`effortLevel: xhigh`, a `model`, an `outputStyle` or `enabledPlugins` in
-`~/.claude/settings.json` does not apply; managed (policy) settings still
-would. `--effort` is always passed, so the effort is the flag's, not a
-default's.
-
-**The init guard.** The `system/init` event must show exactly the arm's
-`mcp__tui__*` tools, no plugins, no skills, one MCP server (`tui`,
-`connected`), permission mode `dontAsk`, and the default output style (or
-none). Anything else records a harness error with the reasons, kills the
-agent at that event, and stops the batch with exit 2. Init and the agent's
-first model request can overlap, so the stopped run may already have spent;
-it ends before any result event, so that spend is not known, and the summary
-counts such runs. The init's `model`, `tools`, `mcp_servers`, `plugins`,
-`skills`, `output_style`, `permissionMode`, `claude_code_version`,
-`apiKeySource`, `plugin_errors`, `mcp_server_errors` and `memory_paths` are
-recorded in `agent_env` on every spend record.
-
-**Permission denials.** A result carrying any permission denial is a harness
-error and stops the batch too: a misconfigured `--allowedTools` refuses
-every run alike, so one paid run is enough to say so. Its cost is recorded.
-
-From the stream it records the `result` subtype, `num_turns`, `duration_ms`,
-`duration_api_ms`, `total_cost_usd`, tokens (`input_tokens`,
-`output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, plus
-`tokens_in` for input and both caches, and `tokens_out`), tool calls by name
-and permission denials, then grades the dump.
-
-### What is verified without a paid call, and what is not
-
-Verified free:
-
-- Every flag above exists in `claude --help` (2.1.294) but `--max-turns`,
-  which that version hides from `--help` and still parses (`--max-turns
-  <turns>`, "only works with --print", in the binary); `--effort` takes
-  low, medium, high, xhigh or max; `dontAsk` is a `--permission-mode` choice.
-- In the 2.1.294 binary, `--setting-sources` with an empty value parses to
-  an empty source list (the same path `--restricted` takes), leaving only
-  flag and policy settings; `CLAUDE_CODE_EFFORT_LEVEL` overrides effort for
-  the session; `error_max_budget_usd` and `error_max_turns` results carry
-  `is_error: true`, the latter with `Reached maximum number of turns (N)`
-  in `errors`; init
-  reports `permissionMode: "dontAsk"` for that mode and lists `plugins`,
-  `skills` and `output_style`.
-- `claude --version` runs under the allowlisted environment.
-- The process handling, the guard, the outcome mapping, the env allowlist,
-  the limits and the provenance, against a fake `claude` on PATH
-  (`bench/fixtures/fake_claude.py`, driven by `bench/test_bench.py`, steered
-  through a file since no test variable reaches it): success, a solved run,
-  timeout with a SIGTERM-ignoring child, no result, an extra tool, a plugin,
-  a permission denial, an error result, the budget and max-turns stops
-  graded with `check_passed`, the limits recorded and splitting rows, the
-  agent's environment against the allowlist, a grading or quit exception
-  keeping the run's cost, the guard and a permission denial each stopping
-  the batch, and `--spend` without a key.
-
-Not verifiable without a paid call:
-
-- That the real init event reports the `tui` server `connected` and its
-  tools, rather than still pending. If it does not, the guard stops the
-  batch at that init event, with the stopped run's spend unknown (see the
-  init guard above).
-- That `--effort medium` is the effort the model ran at: init does not
-  report effort, and Claude Code may lower a level a model does not offer.
-- That `--bare` with `--setting-sources=` loads no plugin or skill in
-  practice (the guard checks the init's lists, so a failure aborts).
-- The real stream's exact usage fields per assistant message, which the
-  partial-usage recovery for timeouts relies on.
-
-`summarize.py` prints one markdown row per (task, arm, model, effort,
-limits), so runs held to a different `timeout_s`, `budget_usd` or
-`max_turns` are never pooled: runs, passed of graded, failed, timeout,
-budget, max turns, `cut off` (how many of those had the right state when
-stopped), harness errors, pass rate with a Wilson 95% interval over the
-graded runs, medians and IQRs of input+cache tokens, output tokens, tool
-calls, turns and wall time, summed cost, cost per passed run (`n/a (0
-passes)` when a row spent but never passed), and the result subtypes seen.
-Below each table, per task and limits, a two-sided Fisher exact test on pass
-counts between the arms, and a note when a row has fewer than 5 graded runs,
-where the IQR and the test are weak. A cost sum that leaves out runs without
-a known cost is marked `*` and explained; runs whose tokens or turns could
-not be recovered (a timeout has no result event, so no `num_turns`) are
-counted in a note rather than silently dropped from the medians; harness-error
-runs' cost, and how many of them have none known, are noted under the table.
-Agent runs make the headline table; dry runs get their own, labelled, and
-never feed a headline number. CI never runs the benchmark in either mode.
+`screen` has no colors or styles, as a screen scraper gets. The demo marks the
+active tab only as bold, so on an empty tab the tmux arm cannot tell which tab
+it is on. That is a real handicap of scraping, not a harness bug.
 
 ## Tasks
+
+The seed: `task-1` 'Write the taria README', `task-3` 'Wire up the MCP
+bridge' and `task-4` 'Record the killer demo' are todo; `task-2` 'Sketch the
+protocol wire types' and `task-5` 'Publish a snapshot per frame' are done.
+Prompts name neither arm's tools, node ids or key bindings.
 
 | id | prompt | passes when |
 |----|--------|-------------|
@@ -267,8 +37,230 @@ never feed a headline number. CI never runs the benchmark in either mode.
 | T2 | Mark the task 'Record the killer demo' as done. | `task-4` done; nothing else changed |
 | T3 | Delete the task 'Wire up the MCP bridge'. | `task-3` gone; the other four seed tasks unchanged |
 | T4 | Add a new task whose title is the title of the third task on the Active tab, followed by ' (follow-up)'. | exactly one new todo task 'Record the killer demo (follow-up)'; seed unchanged |
-| T5 | Mark every task on the Active tab whose title starts with 'W' as done, then delete the task 'Sketch the protocol wire types'. | `task-1` and `task-3` done, `task-2` gone, `task-4` and `task-5` unchanged (derived from the seed; completing the first match shifts the tab, so working by position marks `task-4`) |
-| T6 | Add a task titled 'Check the dialog'. Do not delete anything. | starts inside the delete dialog for `task-1` (opened through tmux before the agent's server starts, for both arms); one new task with that title, every seed task intact |
+| T5 | Mark every task on the Active tab whose title starts with 'W' as done, then delete the task 'Sketch the protocol wire types'. | `task-1` and `task-3` done, `task-2` gone, `task-4` and `task-5` unchanged; working by position marks `task-4`, since completing the first match shifts the tab |
+| T6 | Add a task titled 'Check the dialog'. Do not delete anything. | starts inside the delete dialog for `task-1`, opened through tmux before the agent's server starts (both arms); one new task with that title, every seed task intact |
 
-Every task also requires no open dialog, no leftover draft and a demo
-process still running at grading time. Which tab is showing does not count.
+## Grading
+
+The demo writes its state as JSON to the file `TARIA_DEMO_STATE` names. Each
+check in `bench/tasks.py` holds that dump against the seed, every field of
+every task, so a run passes only if the asked-for change happened and nothing
+else did: no open dialog, no leftover draft, app not quit. Which tab shows
+does not count. The demo process must also still run, or the run fails with
+the reason `demo exited`. Each run gets a fresh demo in its own tmux server
+and `tui-` temp dir, 120x40. A `TMPDIR` naming taria, tmux or bench is
+refused, since the demo shows its socket path on screen.
+
+## How runs execute
+
+An interactive Claude Code session, on the user's subscription, is the
+orchestrator. It runs `bench/run.py` and spawns one subagent per run with its
+Agent tool. A subagent is a separate agent with its own system prompt, tools
+and context, which reports back when done. Python never calls a model. A slot
+is one run in flight: a demo `run.py` prepared, plus one agent file per arm
+wired to it. With K slots, up to K runs go at once.
+
+Build, write the agent files and set up isolation (below), then start the
+orchestrating session in `~/Projects/taria`; a session loads a new
+`.claude/agents` directory only at startup. From it, plan a batch and start
+each slot. Needs `tmux` and Python 3.
+
+```bash
+cargo build --workspace     # run.py never builds, and refuses a stale build
+python3 bench/run.py agents --slots 4 --dir ~/Projects/taria/.claude/agents
+python3 bench/run.py plan --batch B --models sonnet,haiku --runs 5
+python3 bench/run.py next --batch B --slot 1
+```
+
+`plan` writes the shuffled jobs (task x arm x model x run) and the seed to
+`results/B/plan.json`, and never replaces one. `next` claims the slot's next
+job, starts its demo and prints one line:
+
+```json
+{"job": "j001", "slot": 1, "agent": "tui-taria-1", "model": "haiku", "prompt": "Delete the task 'Wire up the MCP bridge'."}
+```
+
+The orchestrator spawns exactly that, with the prompt verbatim:
+`Agent(subagent_type="tui-taria-1", model="haiku", prompt="...")`. When the
+agent returns, hand its id back:
+
+```bash
+python3 bench/run.py next --batch B --slot 1 --agent-id <id>
+```
+
+This finds the transcript under `~/.claude/projects`, runs the guard, grades
+the demo, appends one row to `results/B/runs.jsonl`, tears the demo down and
+prints the slot's next job, or `{"done": true}`. Run each slot's loop side by
+side. When `next` refuses, it prints `{"error": ..., "slot": K}` and exits 2.
+A harness error stops the slot: the row is recorded, nothing is claimed. Fix
+the setup, then `next --batch B --slot K` resumes.
+
+`status` shows progress and `abort` records a harness error and frees a slot.
+The free check, `dry-run`, drives every task on both arms with a scripted
+solver (`bench/solvers.py`) through the same server an agent gets, no model.
+`--sabotage` swaps in a plausible wrong plan per task, so each check fails.
+
+```bash
+python3 bench/run.py status --batch B                  # recorded, held, pending
+python3 bench/run.py abort --batch B --slot K --reason TEXT
+python3 bench/run.py dry-run                           # 12/12 pass
+python3 bench/run.py dry-run --sabotage                # 12/12 fail
+```
+
+## The subagent definitions
+
+`agents --slots K --dir D` writes `tui-<arm>-<K>.md` for both arms and slots 1
+to K. It refuses to overwrite a file it did not write; `--remove` deletes only
+its own. The frontmatter:
+
+- `tools: mcp__tui`: every tool of the agent's own server, nothing else.
+- `model: sonnet`, a default the Agent call's `model` overrides per job.
+- `effort` and `maxTurns`, default medium and 30; pass the same `--effort`
+  and `--max-turns` to `agents` and `plan`.
+- `omitClaudeMd: true`, and one inline stdio server, `tui`, in `mcpServers`.
+
+The arms' files differ only in name, description and the launcher's `--arm`
+and `--slot`. The body is the system prompt, the same bytes in both. Its
+sha256 goes into `plan.json` as `agent_body_sha256`, and before each claim
+`next` checks the slot's agent files against the plan, body included:
+
+> You are operating a terminal application on the user's behalf. The
+> application is already running, and the tools you have are your only way to
+> see it and control it. Do what the user asks. When you are done, reply with
+> one short sentence saying what you did.
+
+The inline server is `bench/mcp_launch.py`. It reads the slot file `next`
+wrote (`results/slots/<K>.json`) and execs the arm's real server against that
+slot's demo. An exec, not a proxy: the MCP stream passes straight through. A
+missing slot file, a slot not ready, or a slot holding the other arm's job
+exits 1, so the agent gets no tools rather than the wrong arm's.
+
+## Isolation
+
+This is what makes the numbers fair. Measured on 2026-10-11 from subagent
+transcripts: a subagent receives the `instructions` text of every MCP server
+connected to the orchestrating session, not just its own, even though its
+tools are restricted. It arrives as the transcript's `mcp_instructions_delta`
+attachment. In the first probe that was about 7k characters from the claude.ai
+connectors, furcule, context7, posthog and the repo's own `taria` server, so
+the tmux arm was told to "call read_tree first".
+
+The orchestrating session must therefore run with no MCP servers but the
+subagents' own. `--strict-mcp-config` does not work: it also drops the agents'
+inline servers, so the subagent launches with zero tools. What works is this,
+in the orchestrating project's `.claude/settings.local.json`:
+
+```json
+{
+  "permissions": { "allow": ["mcp__tui"] },
+  "disableClaudeAiConnectors": true,
+  "enabledPlugins": {
+    "context7@claude-plugins-official": false,
+    "posthog@claude-plugins-official": false
+  },
+  "disabledMcpjsonServers": ["taria"],
+  "deniedMcpServers": [{"serverName": "furcule"}, {"serverName": "linear"}]
+}
+```
+
+Adjust the plugin and server names to whatever your session has connected.
+The connector switch is also the env var `ENABLE_CLAUDEAI_MCP_SERVERS=false`.
+Changes to plugins and MCP servers need a session restart; only the connector
+switch applied live. Then check a probe run's row:
+`context.mcp_instruction_servers` must be exactly `["tui"]`. The guard does
+not check this, so read it before a real batch.
+
+What every run still receives, identical across arms: the environment block
+(working directory), the date, the model identity and the session context.
+
+What each row proves, from the transcript: `model_resolved` (the models its
+turns ran on), `efforts_resolved` (the efforts Claude Code recorded on every
+assistant line), and the guard. A run is a harness error if it called a tool
+outside its arm (ToolSearch, which loads the arm's deferred tools, is
+allowed), was given a CLAUDE.md or memory file, was offered a deferred tool
+beyond its arm's (this catches the other arm's), ran on a model outside
+`claude-<family>-*`, never took a turn, or was spawned as another slot's
+agent (the transcript's `.meta.json` names the type).
+
+## Statuses
+
+| status | means | pass rate |
+|---|---|---|
+| `passed` | the check passed and the demo still runs | a pass |
+| `failed` | the check said no, or the demo exited | a failure |
+| `max_turns` | the transcript ends on a tool call at the batch's max turns | a failure whatever the dump says |
+| `harness_error` | infrastructure, not the agent: a failed setup, a server or solver failure, no transcript, the guard, a grading failure, an abort | left out, counted on its own |
+
+Exit codes: 0 ok (dry-run: every run passed); 1 dry-run only, a run did not
+pass; 2 a harness error (a stale build, bad arguments, slot misuse, or a
+graded run that was a harness error).
+
+## Rows
+
+One JSON object per run, the same keys in both modes, null where none applies.
+
+| key | meaning |
+|---|---|
+| `ts`, `batch`, `job` | when the row was written (UTC), the batch, the plan's job id |
+| `task`, `arm`, `run`, `seed` | the task, the arm, the repeat index, the shuffle seed |
+| `mode`, `solver` | `dry-run` or `subagent`; `scripted`, `scripted-sabotage` or `agent` |
+| `model`, `model_resolved` | the family asked for; the models the transcript shows |
+| `effort`, `efforts_resolved`, `max_turns` | the plan's effort; the efforts on the assistant lines; the plan's maxTurns |
+| `agent_id`, `session_id` | the subagent's id; the session id its transcript carries |
+| `git_sha`, `git_dirty` | the tree when the row was written |
+| `claude_version`, `claude_versions` | Claude Code versions in the transcript, joined and as a list |
+| `status`, `passed` | see Statuses; `passed` is null for a harness error |
+| `check_passed`, `reason` | the check's verdict and why, recorded even when the status ignores it |
+| `error`, `guard_problems` | the harness error, if any; the guard's sentences |
+| `demo_alive`, `demo_exit`, `state` | the demo ran at grading; `clean`, `killed` or `crashed` when quit; the graded dump |
+| `turns`, `wall_ms` | assistant messages (Claude Code's synthetic ones excluded); first to last transcript timestamp (dry-run: the solver's time) |
+| `tool_calls`, `tool_calls_total`, `toolsearch_calls` | calls by name; total without ToolSearch; ToolSearch calls |
+| `tokens` | `input`, `cache_creation`, `cache_read`, `output`, summed over messages |
+| `final_text` | the agent's last text, up to 500 characters |
+| `context` | CLAUDE.md files, deferred and loaded tools, MCP instruction servers, environment cwd, skill listing, attachment types |
+
+## Summaries
+
+```bash
+python3 bench/summarize.py                 # the newest batch, named on stderr
+python3 bench/summarize.py --batch B       # one batch (repeatable)
+python3 bench/summarize.py --all           # every batch, merged
+python3 bench/summarize.py FILE ...        # exactly these files
+```
+
+- **Agent runs**, the headline: one row per (task, arm, model, effort, max
+  turns). Pass rate with a Wilson 95% interval, harness errors (outside n),
+  cut-off runs, and medians of tool calls, ToolSearch calls, turns, tokens
+  processed (input + both caches), output tokens and wall seconds.
+- **taria vs tmux, per model**: per task, the pass-rate difference with a
+  two-sided Fisher exact p and tmux/taria ratios of median tokens and tool
+  calls; each arm across all tasks; each pair of models per arm.
+- **Dry runs**, **provenance**, **guard** problems and the **agent context**
+  per arm and model, so the arms can be seen to match.
+
+```bash
+python3 bench/tasks.py             # tests, none calling a model: the checkers
+python3 bench/test_bench.py        # the harness on live tmux, subagent path rehearsed
+python3 bench/test_transcript.py   # the transcript reader and summary
+```
+
+## First runs
+
+The probe, T3 on both arms and both models, passed 4/4. It ran before
+isolation was in place (its rows list six MCP instruction servers, `taria`
+among them), so it shows the pipeline works, not a fair comparison.
+
+A leak-check run of T1 on tmux with Haiku, isolated to `["tui"]`, failed. The
+agent typed the title through `send_keys` while the list held the keyboard.
+The characters hit the app's bindings and marked two tasks done. This is the
+failure mode taria's Text input exists to avoid: `type_text` goes to the app's
+typing surface, never its bindings. That is one run, not a benchmark result.
+
+## Known limits
+
+- Wall time is indicative only: slots run in parallel on one machine.
+- The environment block shows the orchestrator's working directory
+  (`~/Projects/taria`) to both arms, not the empty dir the MCP server runs in.
+- The agent files' launcher and slot paths point at this worktree until
+  `feat/benchmark` merges. Rewrite them with `agents` after the merge.
+- Tokens are subscription usage. Rows carry no dollar cost.

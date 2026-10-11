@@ -16,19 +16,38 @@ transcripts from Claude Code 2.1.294):
   every line of a message. Blocks are `thinking`, `text` and `tool_use`.
   Claude Code's own `<synthetic>` messages (errors it writes itself, not a
   model reply) are left out of models and turns;
-- `user` lines: `message.content` is the prompt string, or a list of
-  `tool_result` blocks with `tool_use_id` and `is_error`;
-- `attachment` lines carry `attachment.type`. Read here: `instructions`
-  (`files[].path`: CLAUDE.md and its imports, memory), `deferred_tools_delta`
-  (`addedNames`, `removedNames`, `readdedNames`, and `surfacedNames` for tools
-  whose schema came loaded), `deferred_tools_record` (`entries[].name`: a
-  schema loaded by a ToolSearch call), `mcp_instructions_delta`
-  (`addedNames`, `removedNames`: MCP servers whose instructions reached the
-  prompt), `environment` (`snapshot.workingDirectory`) and `skill_listing`.
+- `user` lines: `message.content` is the prompt string (the first user line
+  is the task the agent was given), or a list of `tool_result` blocks with
+  `tool_use_id` and `is_error`;
+- `attachment` lines carry `attachment.type`. Read here: `prompt_snapshot`
+  (`tools[].name`: the tools the agent was offered; see below),
+  `mcp_instructions_delta` (`addedNames`, `removedNames`: MCP servers whose
+  instructions reached the prompt), `instructions` (`files[].path`: CLAUDE.md
+  and its imports, memory), `deferred_tools_delta` (`addedNames`,
+  `removedNames`, `readdedNames`, and `surfacedNames` for tools whose schema
+  came loaded), `deferred_tools_record` (`entries[].name`: a schema loaded by
+  a ToolSearch call), `environment` (`snapshot.workingDirectory`),
+  `skill_listing` and `max_turns_reached` (`maxTurns`, `turnCount`).
 
-What a transcript does not hold: the list of non-deferred tools the agent
-was given (Bash, Read, ...). Only a call to one shows up, which is what
-`guard` checks.
+The tools the agent was offered are in its `prompt_snapshot` attachments.
+Claude Code writes the first before any tool is known, without a `tools`
+key, and a new one whenever the tool list changes; each repeats the tools
+already recorded, so their union is what the agent was offered. A real run
+of either arm has two, the second listing exactly the arm's `mcp__tui__`
+tools inline (no deferral, no ToolSearch). A run whose server never started
+has no tools in any snapshot, which is what `guard` checks.
+
+How a run ended is read off its final assistant message: `end_turn` when
+the agent finished on its own. Claude Code's own `<synthetic>` messages
+(`isApiErrorMessage`, `error` such as `rate_limit` or `server_error`, text
+such as "You've hit your session limit") are left out of models and turns,
+but one written last means the run died on that error. A run stopped at
+maxTurns leaves no trace of its own in the subagent's transcript: Claude
+Code 2.1.294 yields `max_turns_reached` to the parent and stops before
+recording it, after running the last turn's tools, so the transcript ends on
+a `tool_use` message and its result. `ending` infers the cut-off from that
+shape and the turn count, and takes a `max_turns_reached` attachment as
+proof if a later version records one.
 
 Everything here tolerates malformed lines, unknown types and missing
 fields: they are skipped and counted, never raised.
@@ -44,8 +63,10 @@ from collections import Counter
 from datetime import datetime
 
 TOOLSEARCH = "ToolSearch"
-SERVER_PREFIX = "mcp__tui__"
+SERVER = "tui"
+SERVER_PREFIX = f"mcp__{SERVER}__"
 SYNTHETIC_MODEL = "<synthetic>"
+END_TURN = "end_turn"
 FINAL_TEXT_MAX = 500
 TOKEN_KEYS = (
     ("input", "input_tokens"),
@@ -116,6 +137,24 @@ def _lines(path):
     return parsed, malformed
 
 
+def _block_text(content):
+    """The text of a message's content: the string, or its text blocks joined."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    texts = [b.get("text") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+    texts = [t for t in texts if isinstance(t, str)]
+    return "".join(texts) if texts else None
+
+
+def _prompt_text(content):
+    """The prompt a user line carries, or None for a tool result."""
+    if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+        return None
+    return _block_text(content)
+
+
 def _final_usage(lines):
     """The usage of a streamed message: the line that ended it (non-null
     stop_reason), else the one with the most output tokens."""
@@ -144,15 +183,29 @@ def ended_on_tool_use(blocks):
     return False
 
 
+def _snapshot_tools(att):
+    """The sorted tool names a prompt_snapshot lists, or None when it has no
+    `tools` key (Claude Code writes the first one before any tool is known)."""
+    tools = att.get("tools")
+    if not isinstance(tools, list):
+        return None
+    return sorted({t["name"] for t in tools if isinstance(t, dict) and isinstance(t.get("name"), str)})
+
+
 def _context(attachments):
     claude_md, deferred, loaded, servers, types = [], set(), set(), set(), set()
+    snapshots, offered = [], set()
     cwd, skills = None, False
     for att in attachments:
         kind = att.get("type")
         if not isinstance(kind, str):
             continue
         types.add(kind)
-        if kind == "instructions":
+        if kind == "prompt_snapshot":
+            names = _snapshot_tools(att)
+            snapshots.append(names)
+            offered.update(names or [])
+        elif kind == "instructions":
             for item in att.get("files") or []:
                 path = item.get("path") if isinstance(item, dict) else None
                 if isinstance(path, str) and path not in claude_md:
@@ -177,6 +230,10 @@ def _context(attachments):
         elif kind == "skill_listing":
             skills = True
     return {
+        # The union of every prompt_snapshot's tools, and each snapshot's own
+        # list (None for one without a `tools` key), in transcript order.
+        "offered_tools": sorted(offered),
+        "offered_tools_snapshots": snapshots,
         "claude_md_files": claude_md,
         "deferred_tools": sorted(deferred | loaded),
         "loaded_tools": sorted(loaded),
@@ -196,6 +253,9 @@ def read_transcript(path):
     blocks = {}  # (message id, block index) -> block, in first-seen order
     errors = set()
     synthetic = set()
+    first_prompt, seen_user = None, False
+    final = None  # the last assistant line's message: {"id", "synthetic", "text", "error"}
+    max_turns_reached = None
     for number, line in enumerate(lines):
         agent_id = agent_id or (line.get("agentId") if isinstance(line.get("agentId"), str) else None)
         session_id = session_id or (line.get("sessionId") if isinstance(line.get("sessionId"), str) else None)
@@ -207,8 +267,14 @@ def read_transcript(path):
         kind = line.get("type")
         if kind == "attachment" and isinstance(line.get("attachment"), dict):
             attachments.append(line["attachment"])
+            if line["attachment"].get("type") == "max_turns_reached":
+                att = line["attachment"]
+                max_turns_reached = {"max_turns": att.get("maxTurns"), "turn_count": att.get("turnCount")}
         elif kind == "user" and isinstance(line.get("message"), dict):
             content = line["message"].get("content")
+            if not seen_user:
+                seen_user = True
+                first_prompt = _prompt_text(content)
             for pos, block in enumerate(content if isinstance(content, list) else []):
                 if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error") is True:
                     errors.add(block.get("tool_use_id") or (number, pos))
@@ -218,7 +284,10 @@ def read_transcript(path):
             model = msg.get("model") if isinstance(msg.get("model"), str) else None
             if model == SYNTHETIC_MODEL:
                 synthetic.add(mid)
+                final = {"id": mid, "synthetic": True, "stop_reason": msg.get("stop_reason"),
+                         "text": _block_text(msg.get("content")), "error": line.get("error")}
                 continue
+            final = {"id": mid, "synthetic": False}
             if isinstance(line.get("effort"), str):
                 efforts.add(line["effort"])
             entry = messages.setdefault(mid, {"model": None, "lines": []})
@@ -256,6 +325,17 @@ def read_transcript(path):
         if base.startswith("agent-") and base.endswith(".jsonl"):
             agent_id = base[len("agent-"):-len(".jsonl")]
 
+    last_model = last_stop_reason = synthetic_text = synthetic_error = None
+    if final is not None and final["synthetic"]:
+        last_model, last_stop_reason = SYNTHETIC_MODEL, final["stop_reason"]
+        synthetic_text = (final["text"] or "")[:FINAL_TEXT_MAX] or None
+        synthetic_error = final["error"] if isinstance(final["error"], str) else None
+    elif final is not None:
+        entry = messages[final["id"]]
+        last_model = entry["model"]
+        reasons = [l["stop_reason"] for l in entry["lines"] if isinstance(l["stop_reason"], str)]
+        last_stop_reason = reasons[-1] if reasons else None
+
     return {
         "agent_id": agent_id,
         "session_id": session_id,
@@ -270,6 +350,18 @@ def read_transcript(path):
         "ended_on_tool_use": ended_on_tool_use(ordered),
         "tool_errors": len(errors),
         "context": _context(attachments),
+        # How the run ended (see `ending`): the final assistant message's
+        # model and stop_reason, synthetic or not, and whether Claude Code
+        # recorded a max_turns_reached.
+        "last_model": last_model,
+        "last_stop_reason": last_stop_reason,
+        "ended_synthetic": bool(final and final["synthetic"]),
+        "synthetic_text": synthetic_text,
+        "synthetic_error": synthetic_error,
+        "max_turns_reached": max_turns_reached,
+        # Who ran it: the task it was given and when it started.
+        "first_prompt": first_prompt,
+        "started": min(stamps).isoformat(timespec="milliseconds").replace("+00:00", "Z") if stamps else None,
         # Beyond the contract, for provenance and diagnosis.
         "efforts": sorted(efforts),
         "claude_versions": sorted(versions),
@@ -281,15 +373,18 @@ def read_transcript(path):
 # --- Was the run set up as its arm requires? ----------------------------------------------
 
 
-def guard(stats, arm, model_family, arm_tools):
+def guard(stats, arm, model_family, arm_tools, effort=None):
     """Problems with how the run was set up, one sentence each; empty when
     the agent ran as its arm requires.
 
     Allowed: the arm's `mcp__tui__<tool>` tools and ToolSearch (which loads
-    them). Every tool called outside that, every model not
-    `claude-<family>-*`, any instruction file (agents run with omitClaudeMd),
-    any deferred tool on offer outside the arm's own (this also catches the
-    other arm's `mcp__tui__` tools), and a run with no assistant turn.
+    deferred tools). A problem is: a tool called outside that; a model not
+    `claude-<family>-*`; an effort other than `effort` (when given) on any
+    turn; any instruction file (agents run with omitClaudeMd); offered tools
+    (the prompt_snapshots' union, plus deferred ones) that are not exactly
+    the arm's, or no prompt_snapshot to tell; any deferred tool beyond the
+    arm's; MCP instructions from any server but `tui`, or none from it; and a
+    run with no assistant turn.
     """
     allowed = {SERVER_PREFIX + t for t in arm_tools}
     problems = []
@@ -300,16 +395,104 @@ def guard(stats, arm, model_family, arm_tools):
     for model in stats.get("models") or []:
         if not model.startswith(prefix):
             problems.append(f"ran on {model}, not the requested {prefix}*")
+    efforts = stats.get("efforts") or []
+    if effort is not None and stats.get("turns") and efforts != [effort]:
+        problems.append(f"ran at effort {', '.join(efforts) or '(none recorded)'}, not the plan's {effort}")
     context = stats.get("context") or {}
     files = context.get("claude_md_files") or []
     if files:
         problems.append(f"was given {len(files)} instruction file(s) despite omitClaudeMd: {', '.join(files)}")
+    problems += _offered_problems(context, allowed, arm)
     extra = [t for t in context.get("deferred_tools") or [] if t not in allowed]
     if extra:
         problems.append(f"was offered {len(extra)} deferred tool(s) beyond the {arm} arm: {', '.join(extra)}")
+    servers = context.get("mcp_instruction_servers") or []
+    others = [s for s in servers if s != SERVER]
+    if others:
+        problems.append(
+            f"was given the instructions of {len(others)} MCP server(s) besides {SERVER}: {', '.join(others)}"
+        )
+    if SERVER not in servers:
+        problems.append(f"never got the {SERVER} server's instructions: it did not start, or was refused")
     if not stats.get("turns"):
         problems.append("never ran: the transcript has no assistant turn")
     return problems
+
+
+def _offered_problems(context, allowed, arm):
+    """The offered tools against the arm's: none known, missing, or extra."""
+    snapshots = context.get("offered_tools_snapshots")
+    if not snapshots:
+        return ["has no prompt_snapshot, so the tools it was offered cannot be checked"]
+    offered = set(context.get("offered_tools") or [])
+    found = []
+    missing = sorted(allowed - offered - set(context.get("deferred_tools") or []))
+    if missing:
+        found.append(
+            f"was not offered {', '.join(missing)}: the {SERVER} server did not start, or mcp_launch refused it"
+        )
+    extra = sorted(offered - allowed - {TOOLSEARCH})
+    if extra:
+        found.append(f"was offered {len(extra)} tool(s) beyond the {arm} arm: {', '.join(extra)}")
+    return found
+
+
+# --- How did the run end? -------------------------------------------------------------------
+
+
+def cut_off_at_max_turns(stats, max_turns):
+    """Whether the run looks stopped by maxTurns: its final message asked for
+    a tool, with no text after, at `max_turns` turns or more.
+
+    An inference, isolated here: no real cut-off transcript exists yet. It
+    rests on Claude Code 2.1.294's agent loop, which runs the last turn's
+    tools and then stops, yielding max_turns_reached to the parent without
+    writing it to the subagent's transcript.
+    """
+    turns = stats.get("turns")
+    return bool(
+        stats.get("last_stop_reason") == "tool_use" and stats.get("ended_on_tool_use")
+        and isinstance(turns, int) and isinstance(max_turns, int) and turns >= max_turns
+    )
+
+
+def ending(stats, max_turns):
+    """(kind, detail) for how the run ended.
+
+    kind is "end_turn" (it finished on its own), "max_turns" (stopped at the
+    turn limit), "harness_error" (it died on Claude Code's own error message,
+    or its last message stopped on anything but end_turn outside the
+    max-turns case: an API error, a usage limit, an interruption, or a run
+    still going), or "never_ran" (no assistant message at all; `guard` says
+    so). detail is one sentence, or None for end_turn.
+    """
+    reached = stats.get("max_turns_reached")
+    if isinstance(reached, dict):
+        return "max_turns", (
+            f"Claude Code recorded max_turns_reached (turn {reached.get('turn_count')} "
+            f"of {reached.get('max_turns')})"
+        )
+    if stats.get("ended_synthetic"):
+        error = stats.get("synthetic_error")
+        return "harness_error", (
+            "the run ended on Claude Code's own message, not a model reply"
+            f"{f' ({error})' if error else ''}: {stats.get('synthetic_text')!r}"
+        )
+    if not stats.get("turns"):
+        return "never_ran", "the transcript has no assistant message"
+    reason = stats.get("last_stop_reason")
+    if cut_off_at_max_turns(stats, max_turns):
+        return "max_turns", f"stopped on a tool call at turn {stats.get('turns')} of maxTurns {max_turns}"
+    if reason == END_TURN:
+        return "end_turn", None
+    if reason is None:
+        why = "it never finished streaming: an API error, a usage limit or an interruption cut it off"
+    elif reason == "tool_use":
+        why = (f"it asked for a tool at turn {stats.get('turns')}, under maxTurns {max_turns}: "
+               "interrupted, or still running")
+    else:
+        why = "the model did not end its turn"
+    return "harness_error", f"the run did not end on its own: its last message stopped on {reason!r} ({why})"
 
 
 if __name__ == "__main__":
