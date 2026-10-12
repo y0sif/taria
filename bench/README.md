@@ -153,9 +153,9 @@ making the run a harness error (see Isolation). It is acceptable only when
 every arm of the batch carries the same note, which holds when one session
 with remote control on orchestrates the whole batch: then the arms of the
 batch compare with each other as fairly as in a clean one. What it costs:
-about 710 characters beside the first tool result, carried in every call
-after it, so the batch's absolute token counts include the note, and it is
-not a clean batch. Do not hold its absolute numbers against a clean batch's;
+about 710 characters beside the task, before the agent's first model call,
+carried in every call, so the batch's absolute token counts include the
+note, and it is not a clean batch. Do not hold its absolute numbers against a clean batch's;
 `summarize.py` marks every table built from it. Only
 `remote_session_change` can be tolerated: `plan` refuses `skill_listing`
 (nothing shows it would be the same for every run), a type the guard holds
@@ -324,9 +324,9 @@ read as no text, which would skip every check of the text and count 0
 characters. Its characters are counted as JSON.
 That is how `remote_session_change` was caught after the fact: with
 `/remote-control` on in the orchestrating session, Claude Code put a
-~710-character attribution note, as a user-role reminder beside a tool
-result, into every subagent run of outline1 and probe3, and the guard of
-the day read only the types it knew. Turn `/remote-control` off before a
+~710-character attribution note, as a user-role reminder beside the task,
+before the first model call, into every subagent run of outline1 and
+probe3, and the guard of the day read only the types it knew. Turn `/remote-control` off before a
 batch.
 
 Do not orchestrate in auto mode either. When the orchestrating session's
@@ -370,7 +370,11 @@ The agent's identity line, the first line of its system prompt
 (`prompt_snapshot.cliPrefix`), is Claude Code's choice and changed between
 full1 ("You are Claude Code, ...") and outline1 ("You are a Claude agent,
 ..."). It is recorded in `context.cli_prefixes`, not checked, and the
-summary's run conditions compare it between batches.
+summary's run conditions compare it between batches. The change is 32
+characters. The tmux arm's first-call context fell 4 tokens between full1
+and cycle2a, and that change is attributed to the identity line, about 4
+tokens per call: it is the only text before that call whose length
+changed (RESULTS.md).
 
 What each row proves, from the transcript: `model_resolved` (the models its
 turns ran on), `efforts_resolved` (the efforts Claude Code recorded on every
@@ -425,7 +429,8 @@ call included, which the error says comes from auto mode).
 
 Claude Code 2.1.294 sometimes never writes the closing line of an assistant
 message, in the middle of a run as well as at its end, so that message's
-lines carry stop_reason null and a placeholder output count of 1 to 9. One
+lines carry stop_reason null and an output count cut short: 1 to 80 tokens
+in full1, outline1, cycle2a and cycle2b. One
 such shape counts as ended: a final text reply whose stop_reason is null.
 The reply arrived, so the run ended. The row says `end_inferred: true`, and
 its `notes` say that message's output tokens are a lower bound.
@@ -584,30 +589,33 @@ python3 bench/summarize.py FILE ...                 # exactly these files
 
 ## The outline arm
 
-Run it as its own batch against `full1`, which ran taria and tmux on both
-models, and summarize the two together. Run it from an orchestrating session
-that has run no taria job, and restart before a taria batch after it (see
-How runs execute). Use full1's seed, effort and max
-turns (`results/full1/plan.json`: seed 42, effort medium, max turns 30); the
-seed fixes this batch's job order, not full1's.
+Run it as its own batch beside a taria and tmux batch at the same commit,
+as cycle2b ran beside cycle2a, and summarize the two together. Run it from
+its own orchestrating session, one that has run no taria job, and restart
+before a taria batch after it (see How runs execute). Use the other batch's
+seed, effort and max turns (`results/cycle2a/plan.json`: seed 42, effort
+medium, max turns 30); the seed fixes this batch's job order, not the
+other's.
 
 ```bash
 cargo build --workspace     # target/debug/taria-mcp must take --tree-format
 python3 bench/run.py dry-run --arms outline                   # 6/6 pass
 python3 bench/run.py agents --slots 4                         # adds tui-outline-1..4
-python3 bench/run.py plan --batch outline1 --arms outline --models sonnet,haiku --runs 5 \
+python3 bench/run.py plan --batch cycle2b --arms outline --models sonnet,haiku --runs 5 \
     --seed 42 --effort medium --max-turns 30
-python3 bench/run.py next --batch outline1 --slot 1           # and so on, per slot
-python3 bench/summarize.py --batch full1 --batch outline1
+python3 bench/run.py next --batch cycle2b --slot 1            # and so on, per slot
+python3 bench/summarize.py --batch cycle2a --batch cycle2b
 ```
 
 A session loads new agent files only at startup, so restart the
 orchestrating session after `agents`. From the worktree, pass `--dir` and
 `--agents-dir` as in How runs execute. The 60 jobs then run like any batch.
-The two batches differ at least in git SHA (the bridge gained
-`--tree-format` after full1), and perhaps in the claude version; the run
-conditions header lists both, so the outline vs taria ratios read as a
-cross-batch comparison.
+At one commit, with remote control off in both sessions, the run conditions
+header lists the two batches as agreeing on everything it compares, as it
+does for cycle2a and cycle2b. The first outline batch, outline1, ran
+against full1 at another commit, with another identity line and with
+remote control's note, so its ratios against full1 read as a cross-batch
+comparison (RESULTS.md, History).
 
 ## Tests
 
@@ -625,8 +633,27 @@ Two probes ran T3 on both arms and both models. Each recorded 4/4 passed.
 The first (`results/probe`) ran before isolation was in place: its rows list
 six MCP instruction servers, `taria` among them, and today's guard refuses
 all four. The second (`results/probe2`) ran isolated, and every row lists
-only `tui`. They show the pipeline works end to end, not how the arms
-compare. Batch results are written up separately.
+only `tui`.
+
+Four more ran one job per arm and model before a batch:
+
+- `probe3`: the outline on T3, at aed04c3. 2/2 passed, both with remote
+  control's note, as in outline1.
+- `probe4`: all three arms on T3, at c81cc4d, from a session in auto mode.
+  The guard refused the four runs that were graded, for auto mode's
+  `SubagentHandback`, and probe4's taria job j002 also for the outline's
+  descriptions (see How runs execute). A fifth was aborted and the sixth never ran.
+- `c2probe-a`: taria and tmux on T1, at 3e66fbb. 3 of 4 passed. Haiku on
+  tmux typed the title into the list's key bindings and left two tasks
+  done, the failure RESULTS.md describes.
+- `c2probe-b`: the outline on T1, at 3e66fbb. 2/2 passed.
+
+c2probe-a and c2probe-b passed the guard with no tolerated attachment.
+Each finished under a minute before its batch started, from the
+orchestrating session that then ran it: c2probe-a before cycle2a,
+c2probe-b before cycle2b. Probes show the
+pipeline works end to end, not how the arms compare. Batch results are in
+RESULTS.md.
 
 ## Known limits
 

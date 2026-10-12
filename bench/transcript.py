@@ -45,9 +45,9 @@ known in, and flagged ones are refused by name. A type with no rule is
 context nobody checked, and the guard refuses the run, naming the type, how
 many arrived and how many characters of them were rendered. That is what
 caught `remote_session_change`: with /remote-control on in the orchestrating
-session, Claude Code added a ~710-character attribution note beside a tool
-result in every subagent run, and a guard that only read the types it knew
-let it through.
+session, Claude Code added a ~710-character attribution note, in the user
+role before the first model call, to every subagent run, and a guard that
+only read the types it knew let it through.
 
 A flagged type known to be the same for every run of a batch
 (ATTACHMENTS_TOLERABLE: `remote_session_change` only) can be tolerated by
@@ -69,7 +69,8 @@ has no tools in any snapshot, which is what `guard` checks.
 
 Claude Code 2.1.294 sometimes never writes the closing line of an assistant
 message, anywhere in the run, not only the final reply: every line of that
-message carries stop_reason null and a placeholder output_tokens (1 to 9).
+message carries stop_reason null and an output_tokens cut short (1 to 80
+across the four archived batches, full1, outline1, cycle2a and cycle2b).
 Its output count here is the largest partial one, so the run's output total
 is a lower bound: `unclosed_messages` counts such messages and
 `output_tokens_lower_bound` is true when there is one. Input and cache
@@ -205,8 +206,8 @@ ENVIRONMENT_KEYS = {
     "platform": str, "scratchpadDirectory": str, "shell": str, "workingDirectory": str,
 }
 # The text the environment and session_context attachments render, as Claude
-# Code 2.1.294 wrote it in every archived run (full1, outline1 and probe3,
-# every arm) and in every fixture: the rendered text must be the template
+# Code 2.1.294 wrote it in every archived run (full1, outline1, probe3,
+# cycle2a and cycle2b, every arm) and in every fixture: the rendered text must be the template
 # filled with the attachment's own values, character for character, so a
 # sentence Claude Code adds is refused. Each {field} is the snapshot's value
 # (a bool as true or false); the scratchpad line is there only when the
@@ -521,8 +522,8 @@ def _snapshot_tools(att):
 # How taria-mcp's read_tree description names the tree's format: "Read the
 # TUI app's current semantic tree as JSON. Call this first." by default, "...
 # semantic tree as an outline, one node per line, ..." under --tree-format
-# outline (crates/taria-mcp/src/server.rs, READ_TREE_PASSAGE). The batches
-# archived so far (full1, outline1, probe3) were served the longer texts of
+# outline (crates/taria-mcp/src/server.rs, READ_TREE_PASSAGE). The first
+# round's batches (full1, outline1, probe3) were served the longer texts of
 # the day, "... the connected TUI app's current semantic tree as JSON: every
 # node ...", which carry the same markers. The taria and outline arms list
 # the same tools, so this is what tells their runs apart.
