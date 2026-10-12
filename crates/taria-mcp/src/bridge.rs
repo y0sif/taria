@@ -103,7 +103,8 @@ pub struct AppSnapshot {
     /// removes anything.
     pub tree_json: String,
     /// The same message decoded into this build's types. For validation and
-    /// change detection only, never for output.
+    /// change detection, never for output, except the action names in an
+    /// outline, which have to be the names validation accepts.
     pub parsed: Snapshot,
 }
 

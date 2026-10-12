@@ -9,6 +9,8 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
+use crate::tree_format::TreeFormat;
+
 /// Help text printed for `--help` and appended to argument errors.
 pub const HELP: &str = "\
 taria-mcp - MCP bridge for taria-enabled TUI apps
@@ -29,17 +31,34 @@ Usage:
 
 Exactly one of --socket or --app is required.
 
+Options:
+  --tree-format <json|outline>
+                              How read_tree and the input tools show the
+                              tree: json (the default) relays the app's own
+                              snapshot line; outline renders the same
+                              snapshot as one indented line per node, in
+                              fewer characters. It names each action as act
+                              takes it, without other keys in its object.
+
 Environment:
   TARIA_LOG    Log filter (tracing env-filter syntax), default `info`.
                Logs go to stderr; stdout is the MCP channel.";
 
 /// Parsed command line.
+///
+/// `#[non_exhaustive]`, and so is [`Run`](Self::Run), so that the next flag
+/// is a field and the next mode a variant without breaking a caller's build:
+/// match with a wildcard arm and destructure `Run` with `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Cli {
     /// Run the bridge against this socket path.
+    #[non_exhaustive]
     Run {
         /// Path of the app's taria Unix socket.
         socket: PathBuf,
+        /// How the tree is shown to the agent (`--tree-format`).
+        tree_format: TreeFormat,
     },
     /// `--help` was requested.
     Help,
@@ -51,6 +70,7 @@ pub enum Cli {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut socket: Option<String> = None;
     let mut app: Option<String> = None;
+    let mut tree_format = TreeFormat::default();
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -66,6 +86,17 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                     iter.next()
                         .ok_or_else(|| "--app requires a label argument".to_string())?,
                 );
+            }
+            "--tree-format" => {
+                let name = iter.next().ok_or_else(|| {
+                    format!("--tree-format requires a value: {}", TreeFormat::NAMES)
+                })?;
+                tree_format = TreeFormat::from_name(&name).ok_or_else(|| {
+                    format!(
+                        "unknown --tree-format `{name}`; expected {}",
+                        TreeFormat::NAMES
+                    )
+                })?;
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -86,7 +117,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     // refusal names neither the path nor the limit, and it would surface from
     // inside the reconnect loop, where it reads as "the app is not running".
     taria::socket::check_path_len(&socket).map_err(|err| err.to_string())?;
-    Ok(Cli::Run { socket })
+    Ok(Cli::Run {
+        socket,
+        tree_format,
+    })
 }
 
 /// Resolve the default socket path for `app_label` from the environment.
@@ -130,6 +164,7 @@ mod tests {
             cli,
             Cli::Run {
                 socket: PathBuf::from("/run/user/1000/taria/demo.sock"),
+                tree_format: TreeFormat::Json,
             }
         );
     }
@@ -137,7 +172,7 @@ mod tests {
     #[test]
     fn app_label_resolves_a_path_ending_in_label_sock() {
         let cli = parse_strs(&["--app", "demo"]).unwrap();
-        let Cli::Run { socket } = cli else {
+        let Cli::Run { socket, .. } = cli else {
             panic!("expected Run");
         };
         assert!(
@@ -195,6 +230,56 @@ mod tests {
     fn unknown_arguments_are_errors() {
         let err = parse_strs(&["--frobnicate"]).unwrap_err();
         assert!(err.contains("--frobnicate"), "err: {err}");
+    }
+
+    /// The default is the JSON every bridge before the flag served, and the
+    /// flag works on either side of the socket selector.
+    #[test]
+    fn tree_format_defaults_to_json_and_takes_outline() {
+        let format = |args: &[&str]| match parse_strs(args) {
+            Ok(Cli::Run { tree_format, .. }) => tree_format,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        assert_eq!(format(&["--socket", "/x.sock"]), TreeFormat::Json);
+        assert_eq!(
+            format(&["--socket", "/x.sock", "--tree-format", "json"]),
+            TreeFormat::Json
+        );
+        assert_eq!(
+            format(&["--tree-format", "outline", "--socket", "/x.sock"]),
+            TreeFormat::Outline
+        );
+        assert_eq!(
+            format(&["--app", "demo", "--tree-format", "outline"]),
+            TreeFormat::Outline
+        );
+    }
+
+    #[test]
+    fn tree_format_without_a_known_value_is_an_error() {
+        let err = parse_strs(&["--socket", "/x.sock", "--tree-format"]).unwrap_err();
+        assert!(
+            err.contains("--tree-format") && err.contains("json or outline"),
+            "a missing value names the flag and its values: {err}"
+        );
+
+        for value in ["xml", "JSON", ""] {
+            let err = parse_strs(&["--socket", "/x.sock", "--tree-format", value]).unwrap_err();
+            assert!(
+                err.contains(&format!("`{value}`")) && err.contains("json or outline"),
+                "an unknown value names itself and the accepted ones: {err}"
+            );
+        }
+
+        // A value is required even when the next word looks like a flag: the
+        // flag consumes it, and the word is then refused as a format.
+        let err = parse_strs(&["--tree-format", "--socket", "/x.sock"]).unwrap_err();
+        assert!(err.contains("`--socket`"), "err: {err}");
+    }
+
+    #[test]
+    fn help_names_the_tree_format_flag() {
+        assert!(HELP.contains("--tree-format <json|outline>"), "{HELP}");
     }
 
     /// A path the kernel would refuse must be caught while the user is still

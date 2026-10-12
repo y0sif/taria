@@ -170,8 +170,10 @@ nothing.
 The envelope is a wire encoding, not an argument. `act` takes the name alone,
 so a node advertising `{"custom":"delete"}` is invoked with `"delete"`. An
 agent told never to guess an action name meets that difference on its first
-custom action, so the tool description and the server's instructions both
-state it rather than leaving it to be inferred.
+custom action, so in the default JSON mode the tool description and the
+server's instructions both state it rather than leaving it to be inferred.
+With `--tree-format outline` the outline prints the name `act` takes,
+`delete`, so an agent reading it never meets the envelope at all.
 
 ### Version 1 is frozen
 
@@ -213,7 +215,11 @@ read `"role":"other"`, with the real name on the wire the whole time. The
 parse stays authoritative for what the bridge decides, because it is typed:
 `act` validates node ids and advertised actions against it, and change
 detection compares parses rather than text. A line is relayed only after it
-parsed, so a malformed one is still skipped.
+parsed, so a malformed one is still skipped. `taria-mcp --tree-format outline`
+hands the agent an indented outline instead of the line, and renders it from
+the line for the same reason, so the outline keeps every role, action and
+field name the JSON would have shown. It drops only the extra keys inside an
+action object, since `act` takes the action's name alone.
 
 Additive on the wire is not automatically additive in Rust. A peer skips a
 message variant it cannot parse, but a peer rebuilt against the version that

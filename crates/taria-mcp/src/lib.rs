@@ -7,6 +7,10 @@
 //! action on a node), `type_text` (a literal string in one call), and `key`
 //! (raw key fallback, with a repeat count).
 //!
+//! The tree reaches the agent as the app's own JSON line by default, or with
+//! `--tree-format outline` as an indented outline rendered from that same
+//! line (see [`tree_format`]). The wire format is the same either way.
+//!
 //! Every input the bridge sends carries an id, and the app answers it with an
 //! ack, so a tool call can tell an input the app applied from one it ignored
 //! or dropped rather than guessing from whether the tree happened to change.
@@ -14,3 +18,4 @@
 pub mod args;
 pub mod bridge;
 pub mod server;
+pub mod tree_format;
