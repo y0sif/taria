@@ -1145,6 +1145,8 @@ name = "taria-demo"
 version = "0.2.1"
 dependencies = [
  "ratatui",
+ "serde",
+ "serde_json",
  "taria",
  "taria-ratatui",
 ]
