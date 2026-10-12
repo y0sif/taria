@@ -65,7 +65,8 @@ text written to, or read back from, the model's prompt cache). A model
 call is one assistant turn; it can carry several tool calls. Each model
 call rereads the whole context so far, so a run's tokens grow with its
 calls and with what each one carries. Output tokens are left out; see
-Caveats.
+Caveats. How long the runs took is under Speed: on Haiku, tmux took 2.27x
+taria JSON's time, and on Sonnet the two showed no detectable difference.
 
 ## Findings
 
@@ -210,6 +211,143 @@ taria's fixed text is 795 characters shorter than tmux's. What still puts
 JSON above tmux on Sonnet is the result, 1.74x a tmux screen, and the
 extra model call on T1, T4 and T6. The outline's result is below a screen.
 
+## Speed
+
+How long each agent took, from the task prompt to its final reply. Claude
+Code stamps every transcript line with the time it was written, and the
+times here are read from those stamps. `speed.py` in the analysis scripts
+computes every number below; `speed.md` is its output.
+
+Median per run, cycle 2, 30 runs per cell:
+
+| | taria JSON | taria outline | tmux |
+|---|---|---|---|
+| **Haiku** wall time, s | 4.7 | 4.3 | 10.6 |
+| Haiku model calls | 4 | 4 | 6 |
+| Haiku model seconds per model call | 1.13 | 1.02 | 1.36 |
+| **Sonnet** wall time, s | 6.5 | 7.8 | 6.1 |
+| Sonnet model calls | 4 | 4 | 4 |
+| Sonnet model seconds per model call | 1.54 | 1.84 | 1.50 |
+
+The outline ran in cycle2b and the other two arms in cycle2a, which
+changes how it compares (item 3 below).
+
+Wall time is a run's elapsed time, in three parts that add up exactly.
+Startup runs from the prompt to the last line Claude Code writes before
+the first model call. Model time is time spent waiting for the model: from
+the moment a request is complete (the end of startup, or the last tool
+result) to the model's last line of answer. It also holds about 0.03 s per
+run of Claude Code writing its attachments (see Setup) after tool
+results, and any tool that answered while its message was still streaming
+(11 of Sonnet's 87 `send_keys` calls, for one). Tool time is time spent
+waiting for a tool while no model call is in flight. Model seconds per
+model call is a run's model time divided by its model calls.
+
+1. **On Haiku, tmux takes more than twice as long.** It took 2.27x taria
+   JSON's wall time, 2.22x over passed runs alone. tmux made 1.5x the model
+   calls (6 to 4), and in cycle 2 each took 1.2x as long: 1.8x together.
+   Tool waits and the long runs make up the rest. tmux's tool time was
+   0.76 s per run against JSON's 0.14 s. And tmux runs with more calls
+   also had slower calls. Their rank correlation was 0.63 (Spearman's,
+   from -1 to 1, positive when one rises with the other), so tmux's median
+   model time, 9.54 s, is above its median calls times its median time per
+   call, 8.14 s. In cycle 2, tmux's calls also wrote more: a median 120
+   output tokens per call after the first, against JSON's 97 (calls with a
+   complete output count; see Caveats). A call took
+   3.7 to 4.9 ms longer per output token, depending on the arm, and output
+   tokens alone predict 1.16x of the 1.20x. T1 is the largest part of the
+   gap. There, tmux took 23.5 s and 13 model calls against JSON's 4.0 s
+   and 4, the typing failure of finding 2. Without T1, tmux still took
+   1.87x JSON's time.
+
+2. **On Sonnet, tmux and JSON show no detectable difference.** 6.1 s
+   against 6.5 s, 0.94x. Resampling each arm's 30 runs at random 20,000
+   times (a bootstrap) puts that ratio between 0.80 and 1.09 in 95% of the
+   resamples. A Mann-Whitney test, which asks whether one arm's times tend
+   to run longer than the other's, gives p=0.41: the chance of a gap at
+   least this large if both arms' times came from the same distribution.
+   Both made 4 model calls, and in cycle 2 their calls took the same time
+   (0.97x). Per task, where each cell is 5 runs, tmux was faster on T1,
+   T3, T4 and T6 (0.86x to 0.91x) and slower on T2 (1.26x) and T5 (1.11x).
+   On T1 and T4, tmux made 3 model calls in every run to JSON's 4. On T2
+   it made one more, 4 to 3, which explains its 1.26x. On T6 tmux made 4
+   in every run; 2 of the 5 JSON runs made 4 too, and 3 made 5.
+
+3. **The outline cannot be compared directly with the other arms.** It
+   ran in another batch, about 71 minutes after cycle2a, and the model
+   answered at a different speed then. The first model call is nearly the
+   same work on every arm. It reads the task and the arm's tool
+   definitions (2,347 to 2,554 tokens, with the same cache use on every
+   arm: in 5 of 30 runs per cell the first call wrote about 1,000 tokens
+   to the cache) and asks for one read (32 to 34 output tokens). In
+   cycle2a, where taria and tmux ran interleaved, it took the same time on
+   both: tmux/JSON 0.98x on Haiku and 0.97x on Sonnet. Between the batches
+   it moved. Sonnet's first call took 1.74 s in cycle2b against 1.47 s in
+   cycle2a. Haiku's took 0.83 s against 1.01 s, 18% shorter. Sonnet's
+   outline runs took 7.81 s against JSON's 6.48 s, a gap the same size as
+   the first call's (JSON/outline 0.83x against 0.84x). Haiku's outline
+   runs were 7% shorter than JSON's (4.32 s against 4.67 s), less than the
+   18% of the first call. Dividing out the first call's ratio, as the
+   difference between the batches, gives estimates, not measurements: the
+   outline would take about 1.13x JSON's time on Haiku (JSON's runs about
+   12% shorter) and 1.02x on Sonnet (about equal). Against tmux, the same
+   adjustment turns the raw tmux/outline ratios, 2.45x on Haiku and 0.78x
+   on Sonnet, into 2.04x and 0.95x. The yardstick is rough. In full1,
+   where taria and tmux also ran interleaved, Sonnet's first call took
+   1.12x as long on tmux as on JSON.
+
+4. **Almost all the time is the model's.** Model time was 91% to 96% of
+   wall time on every arm and model, and tool time 2% to 7%. Per run, tool
+   time was 0.13 to 0.16 s on taria, 0.35 s on Sonnet tmux and 0.76 s on
+   Haiku tmux. Startup took 0.14 to 0.15 s on taria and 0.19 s on tmux,
+   which probably starts a second Python for its server (inferred from the
+   gap, not measured).
+
+5. **The tools' waits are part of the cost.** Each input tool waits for
+   the app to react, for at most 500 ms, on both arms. taria's `act`
+   returns once the app has acknowledged the input (its ack) and published
+   the new tree; its median call took 50 to 60 ms. tmux's `send_keys`
+   sleeps 30 ms between key names, then captures the screen every 50 ms
+   until it has changed and two captures agree. A call with key names took
+   a median 137 ms on Haiku and 138 ms on Sonnet, and typed text 194 ms.
+   Reads are quick: `read_tree` took 23 to 31 ms and `screen` 22 to 27 ms.
+   The 500 ms limit was reached by 0 of 306 `act` calls, 2 of 247
+   `send_keys` calls and 1 of 2 outline `type_text` calls. These are per
+   call, and leave out any wait behind an earlier tool of the same message:
+   the tools of one message run one after another.
+
+Conditions:
+
+- **Parallel runs.** The orchestrator, the Claude Code session that
+  spawned the agents, ran several at a time. At each run's start a median
+  of 2 bench agents were in flight: the run itself and typically one
+  other. Averaged over each run's life it was 1.95 to 2.38, depending on
+  arm and model. Pooled per batch and model, its rank correlation with
+  time per call was -0.05 to 0.24, and with wall time up to 0.42 (cycle2a
+  Sonnet). Within one arm it reached 0.33 with time per call (cycle2a Haiku tmux
+  and Sonnet JSON) and 0.54 with wall time (cycle2a Sonnet tmux).
+- **Other activity.** Other Claude Code sessions on the same machine and
+  subscription were writing during both batches: 4 other sessions, with 3
+  of their subagents, during cycle2a; 3 other sessions, with 2 subagents,
+  during cycle2b.
+- **Time of day.** cycle2a ran from 10:54 to 11:02 UTC and cycle2b from
+  12:13 to 12:18. Inside cycle2a, taria and tmux interleave: their median
+  runs started 3.7 to 4.4 minutes into the batch.
+- **The orchestrator agrees.** Its own record of each agent's duration is
+  the transcript's wall time plus a median 0.07 to 0.08 s, the gap between
+  the final line and the completion notice. summarize.py's wall column is
+  the same first-to-last timestamp span as here.
+
+The first round bears out the wall times, not the per-call findings. In
+full1, Haiku on tmux took 1.74x JSON's wall time (1.62x over passed runs),
+and Sonnet on tmux 1.07x, with a bootstrap interval of 0.96 to 1.16 and
+p=0.23. But there tmux's calls took 1.02x JSON's on Haiku (p=0.13) and
+1.16x on Sonnet (p<0.001), and output tokens do not explain the Sonnet
+gap: they predict only 1.04x of the 1.16x, and tmux's median call after
+the first wrote fewer tokens, 69 to JSON's 77. So tmux's longer calls on
+Haiku in item 1, and the equal calls on Sonnet in item 2, are cycle 2
+findings.
+
 ## History: the first round
 
 The first round ran on 2026-10-11 as two batches: full1 (taria and tmux,
@@ -335,6 +473,10 @@ abort, not to the agent).
   `cycle2.md` is its output as it ran. `toolsize.py` measures the fixed
   text from the live servers. `prefix.py`, `adjust.py` and `three-way.md`
   are the first round's; `adjust.py`'s estimates are superseded.
+  `speed.py` reads the archive and the orchestrating sessions' own
+  transcripts (under `~/.claude/projects`, on this machine only) and prints
+  every number in Speed; `speed.md` is its output as it ran, and
+  `speed_runs.csv`, which it writes beside itself, holds each run's times.
 
 The tables, from a checkout that has `bench/` (until `feat/cycle2` merges,
 the `~/Projects/taria-cycle2` worktree):
@@ -344,6 +486,7 @@ python3 bench/summarize.py --batch cycle2a --batch cycle2b
 python3 bench/summarize.py ~/Projects/taria/bench/results/full1/runs.jsonl \
     ~/Projects/taria/bench/results/outline1/runs.jsonl
 python3 ~/Projects/taria/bench/results/analysis/cycle2.py
+python3 ~/Projects/taria/bench/results/analysis/speed.py
 cargo build --workspace
 python3 ~/Projects/taria/bench/results/analysis/toolsize.py
 ```
