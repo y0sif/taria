@@ -19,8 +19,12 @@ use std::str::FromStr;
 
 /// Human-readable summary of the key grammar, phrased to follow "expected".
 ///
-/// Shared so the parser's error message and an agent-facing tool description
-/// cannot describe different grammars.
+/// [`KeyParseError`]'s message is built from it, so a refused key names the
+/// grammar it was checked against. That error is where an agent meets the
+/// grammar: `taria-mcp`'s `key` tool returns it for a key it refuses, and its
+/// description gives a few examples rather than the grammar, because it is
+/// resent with every model call. The protocol spec quotes this text verbatim
+/// as the normative grammar.
 pub const KEY_GRAMMAR: &str = "a single character (`a`, `Q`, `?`, `+`), or a named key (enter, \
      esc, tab, backtab, backspace, delete, up, down, left, right, home, end, pageup, pagedown, \
      space, f1 through f12, plus the aliases return, escape, del), optionally prefixed with \

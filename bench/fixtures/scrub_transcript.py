@@ -6,23 +6,33 @@
 
 Kept as Claude Code wrote it: every user and assistant line, message ids,
 models, usage, stop_reasons, effort, tool_use / tool_result structure and
-timestamps, and the attachments bench/transcript.py reads (prompt_snapshot,
-mcp_instructions_delta, deferred_tools_delta, deferred_tools_record,
-instructions, environment, skill_listing, max_turns_reached), plus
-session_context and credential_org with their content replaced. Every other
-attachment type (date, model, total_tokens_reminder, ...) is dropped.
+timestamps, and every attachment whose type bench/transcript.py has a rule
+for (KNOWN_ATTACHMENTS: verified, harmless or flagged), session_context and
+credential_org with their content replaced. An attachment of any other type,
+or one with no type, is refused (exit 1, nothing written): give the type its
+rule in bench/transcript.py first, so no fixture holds context the guard
+has never judged, and none silently loses it either.
 
 Replaced:
-  - session_context: every context value, and its rendered text;
+  - session_context: the orchestrating repo's git status (branch, user,
+    status lines, commits) after Claude Code's opening sentence, in the
+    context and in its rendered text alike; the e-mail address, as below;
+    any other context value whole. So the attachment keeps the shape
+    bench/transcript.py pins, and its rendered text stays the one its values
+    fill;
   - credential_org: organizationUuid (zeroes);
+  - remote_session_change and anywhere else: a claude.ai session URL's
+    session id (https://claude.ai/code/session_FIXTURE);
   - mcp_instructions_delta: each addedBlocks entry by a placeholder naming its
     server (addedNames are kept), and its rendered text;
-  - environment: workingDirectory and scratchpadDirectory (the latter in
-    every string too);
+  - environment: workingDirectory (in its rendered text too, which shows
+    it) and scratchpadDirectory (in every string too);
   - every line: cwd (/home/user/project), gitBranch, slug, sessionId, agentId;
   - in every string anywhere: the session ids, the agent id, the
     organization uuid, a /home/<user> prefix (/home/user), the user name,
-    e-mail addresses, and each --redact word (case-insensitive).
+    e-mail addresses (but Claude Code's own noreply@anthropic.com, which
+    remote control's note carries and bench/transcript.py pins), and each
+    --redact word (case-insensitive).
 
 --servers NAME[,NAME] rewrites every mcp_instructions_delta's addedNames to
 exactly those names (with their placeholder blocks) and marks the attachment
@@ -46,17 +56,23 @@ import os
 import re
 import sys
 
-KEEP = {
-    "prompt_snapshot", "mcp_instructions_delta", "deferred_tools_delta", "deferred_tools_record",
-    "instructions", "environment", "skill_listing", "max_turns_reached",
-    "session_context", "credential_org",
-}
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from transcript import KNOWN_ATTACHMENTS  # noqa: E402  (bench/transcript.py)
+
 FAKE_ORG = "00000000-0000-0000-0000-000000000000"
 FAKE_CWD = "/home/user/project"
 FAKE_SCRATCH = "/tmp/scratchpad"
+FAKE_GIT_BODY = ("Current branch: fixture\n\nMain branch (you will usually use this for PRs): main\n\n"
+                 "Git user: user\n\nStatus:\n(clean)\n\nRecent commits:\n0000000 (scrubbed from the fixture)")
+SCRUBBED = "(scrubbed from the fixture)"
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 HOME = re.compile(r"/home/([^/\s\"']+)")
 SAFE_EMAIL = "user@example.com"
+# Claude Code's own attribution address, the same for everyone: kept, since
+# bench/transcript.py pins remote control's note to it.
+KEPT_EMAILS = ("noreply@anthropic.com",)
+SESSION_URL = re.compile(r"(https://claude\.ai/code/session_)([0-9A-Za-z]+)")
+FAKE_SESSION_URL = "https://claude.ai/code/session_FIXTURE"
 META_KEYS = ("agentType", "description", "model")
 
 
@@ -106,7 +122,8 @@ class Scrubber:
         for old, new in self.exact:
             value = value.replace(old, new)
         value = HOME.sub("/home/user", value)
-        value = EMAIL.sub(SAFE_EMAIL, value)
+        value = EMAIL.sub(lambda m: m.group(0) if m.group(0) in KEPT_EMAILS else SAFE_EMAIL, value)
+        value = SESSION_URL.sub(FAKE_SESSION_URL, value)
         for word in self.users + self.words:
             value = re.sub(re.escape(word), "user", value, flags=re.IGNORECASE)
         return value
@@ -122,22 +139,51 @@ class Scrubber:
 
     def leaks(self, text):
         found = [s for s in self.secrets if s.lower() in text.lower()]
-        found += [m for m in EMAIL.findall(text) if m != SAFE_EMAIL]
+        found += [m for m in EMAIL.findall(text) if m != SAFE_EMAIL and m not in KEPT_EMAILS]
+        found += [m.group(0) for m in SESSION_URL.finditer(text) if m.group(0) != FAKE_SESSION_URL]
         return found
+
+
+def scrub_context_value(key, value):
+    """A session context value with the orchestrating session's data out:
+    the git status after its opening sentence, which Claude Code wrote and
+    the guard pins; the e-mail line as it is (the address is replaced with
+    every other one); anything else whole."""
+    if key == "userEmail" and isinstance(value, str):
+        return value
+    if key == "gitStatus" and isinstance(value, str):
+        head, sep, _ = value.partition("\n\nCurrent branch: ")
+        if sep:
+            return f"{head}\n\n{FAKE_GIT_BODY}"
+    return SCRUBBED
+
+
+def replace_in_rendered(line, old, new, what):
+    """Replace `old` with `new` in the line's rendered text, refusing when a
+    rendered text does not hold `old`: what it rendered would then be kept
+    unscrubbed, or lost."""
+    for item in line.get("rendered") or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, str) or old not in content:
+            raise ValueError(f"{what}: its rendered text does not hold the value verbatim; scrub it by hand")
+        item["content"] = content.replace(old, new)
 
 
 def scrub_attachment(line, att, servers, note):
     kind = att.get("type")
     if kind == "session_context":
         context = att.get("context") if isinstance(att.get("context"), dict) else {}
-        att["context"] = {key: "(scrubbed from the fixture)" for key in context}
-        line["rendered"] = rendered("(session context scrubbed from the fixture)")
+        att["context"] = {key: scrub_context_value(key, value) for key, value in context.items()}
+        for key, value in context.items():
+            if att["context"][key] != value:
+                replace_in_rendered(line, value, att["context"][key], f"session_context {key}")
     elif kind == "credential_org":
         att["organizationUuid"] = FAKE_ORG
     elif kind == "environment":
         snapshot = att.get("snapshot")
         if isinstance(snapshot, dict):
-            if "workingDirectory" in snapshot:
+            if isinstance(snapshot.get("workingDirectory"), str):
+                replace_in_rendered(line, snapshot["workingDirectory"], FAKE_CWD, "environment workingDirectory")
                 snapshot["workingDirectory"] = FAKE_CWD
             if "scratchpadDirectory" in snapshot:
                 snapshot["scratchpadDirectory"] = FAKE_SCRATCH
@@ -159,11 +205,18 @@ def scrub(src, dst, agent_id, session_id, servers=None, note=None, redact=()):
         lines = [json.loads(raw) for raw in f if raw.strip()]
     scrubber = Scrubber(lines, src, agent_id, session_id, redact)
     out = []
+    unknown = sorted({
+        repr(att.get("type")) if isinstance(att, dict) else "(not an object)"
+        for line in lines if line.get("type") == "attachment"
+        for att in [line.get("attachment")]
+        if not isinstance(att, dict) or att.get("type") not in KNOWN_ATTACHMENTS
+    })
+    if unknown:
+        raise ValueError(f"attachment type(s) bench/transcript.py has no rule for: {', '.join(unknown)}; "
+                         "give each its rule there first")
     for line in lines:
         att = line.get("attachment")
-        if line.get("type") == "attachment" and isinstance(att, dict):
-            if att.get("type") not in KEEP:
-                continue
+        if line.get("type") == "attachment":
             scrub_attachment(line, att, servers, note)
         for key, value in (("cwd", FAKE_CWD), ("gitBranch", "fixture"), ("slug", "fixture-slug"),
                            ("sessionId", session_id), ("agentId", agent_id)):

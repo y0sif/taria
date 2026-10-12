@@ -18,11 +18,21 @@ older flat layout) are searched.
 
 Sections:
 
+- Not a clean batch, first, when any batch's plan tolerated an attachment
+  (run.py plan --tolerate-attachment; its rows' context.tolerated_attachments):
+  per such batch what its plan tolerated and how many runs got it (that it
+  carries it in every call only when every run got it), and, merged with
+  clean batches, that the conditions differ. Every agent
+  section repeats the marker under its heading, and every table row built
+  from such runs has `[not clean]` beside the arm, task or pair it is about
+  (`[not clean: X only]` for a comparison where only X's side carries it).
 - Run conditions, only when the rows come from more than one batch: per
-  batch the git SHA, claude versions, models, effort, max turns, seed, arms
-  and n, and which of them differ between the batches with agent runs,
-  since merged batches are compared as if they ran together. A batch of dry
-  runs only is listed, and named as left out of that comparison.
+  batch the git SHA, claude versions, the agents' identity line (the first
+  line of their system prompt, prompt_snapshot.cliPrefix, which Claude Code
+  chooses), models, effort, max turns, seed, arms, n and the attachments its
+  plan tolerated, and which of them differ between the batches with agent
+  runs, since merged batches are compared as if they ran together. A batch
+  of dry runs only is listed, and named as left out of that comparison.
 - Agent runs (headline): subagent rows only, one row per (task, arm, model,
   effort, max_turns), so runs held to different settings are never pooled.
   Per row: graded runs (n), passes and the pass rate with a Wilson 95%
@@ -53,8 +63,9 @@ Sections:
   requested and resolved, effort, max turns, runs; guard problems; and the
   context each arm's agents were given (attachment types, every deferred
   tool and MCP instruction server that ever reached them, as the guard
-  checks, and the tree formats their read_tree descriptions named), so a
-  reader can see the arms got equivalent context.
+  checks, the tree formats their read_tree descriptions named, and how many
+  runs got each attachment their plan tolerated), so a reader can see the
+  arms got equivalent context.
 
 Python 3 stdlib only.
 """
@@ -87,6 +98,14 @@ ARM_ORDER = ("taria", "tmux", "outline")
 BASELINE = "tmux"
 EXTRA_PAIRS = (("outline", "taria"),)
 NO_BATCH = "(none)"
+# Attachment types a batch's plan tolerated (run.py plan
+# --tolerate-attachment), which each of its rows records in
+# context.tolerated_attachments, and how the marker names what such an
+# attachment put in front of the agent. A batch that tolerated one is not a
+# clean batch: where every arm got the same note its arms compare with each
+# other, but its absolute token counts include the note.
+TOLERATED_WHAT = {"remote_session_change": "remote control's note"}
+NOT_CLEAN = "[not clean]"
 
 
 # --- Statistics ---------------------------------------------------------------------------
@@ -286,6 +305,129 @@ def load(paths):
     return records
 
 
+# --- Batches that tolerated an attachment ------------------------------------------------------
+
+
+def _context_of(record):
+    return record.get("context") if isinstance(record.get("context"), dict) else {}
+
+
+def tolerated_types(record):
+    """The attachment types the row's plan tolerated, from its context
+    (none for a row of a clean batch, or graded before the field existed)."""
+    tolerated = _context_of(record).get("tolerated_attachments")
+    return sorted(str(t) for t in tolerated) if isinstance(tolerated, dict) else []
+
+
+def not_clean(records):
+    """Whether any of `records` comes from a batch that tolerated an attachment."""
+    return any(tolerated_types(r) for r in records)
+
+
+def _marked(cell, records):
+    """`cell`, with NOT_CLEAN after it when `records` include a run of a
+    batch that tolerated an attachment, so the row cannot pass for clean."""
+    return f"{cell} {NOT_CLEAN}" if not_clean(records) else cell
+
+
+def _marked_pair(cell, sides):
+    """`cell` for a comparison of two `sides`, (name, records) each: NOT_CLEAN
+    after it when both include runs of a batch that is not clean, and
+    `[not clean: <name> only]` when one does, since then the two were run
+    under different conditions."""
+    dirty = [name for name, records in sides if not_clean(records)]
+    if not dirty:
+        return cell
+    return f"{cell} {NOT_CLEAN}" if len(dirty) == len(sides) else f"{cell} [not clean: {dirty[0]} only]"
+
+
+def _what(types):
+    return " and ".join(TOLERATED_WHAT.get(t, f"a {t} attachment") for t in types)
+
+
+def _carried(rows, kind):
+    """(runs that got a `kind` attachment, each one's rendered characters)."""
+    chars = []
+    for r in rows:
+        tolerated = _context_of(r).get("tolerated_attachments")
+        tally = tolerated.get(kind) if isinstance(tolerated, dict) else None
+        if isinstance(tally, dict) and is_num(tally.get("count")) and tally["count"] > 0:
+            chars.append(tally.get("rendered_chars") if is_num(tally.get("rendered_chars")) else 0)
+    return len(chars), chars
+
+
+def _tolerance_head(batch, types, rows):
+    """What a batch that tolerated `types` carries, true to how many of its
+    `rows` got each: "B carries X in every call" when every run got every
+    type, else "B tolerated X; N of M runs got it"."""
+    counts = [(kind, _carried(rows, kind)[0]) for kind in types]
+    if all(n == len(rows) for _, n in counts):
+        return f"{batch} carries {_what(types)} in every call"
+    if len(counts) == 1:
+        return f"{batch} tolerated {_what(types)}; {counts[0][1]} of {len(rows)} runs got it"
+    return f"{batch} tolerated " + "; ".join(f"{_what([kind])}, which {n} of {len(rows)} runs got"
+                                             for kind, n in counts)
+
+
+def tolerance_banner(records):
+    """The marker for results with runs of a batch that tolerated an
+    attachment: per such batch what it carries and how many of its runs got
+    it, then, when clean batches are merged in, that the conditions differ,
+    and what NOT_CLEAN marks. Empty when every batch is clean. A batch is
+    said to carry the note in every call only when every run got it."""
+    agent = [r for r in records if label(r) == "agent"]
+    batches = group(agent, lambda r: r.get("batch") or NO_BATCH)
+    tolerating = {b: sorted({t for r in rs for t in tolerated_types(r)}) for b, rs in batches.items()}
+    tolerating = {b: types for b, types in tolerating.items() if types}
+    if not tolerating:
+        return []
+    lines = []
+    for batch in sorted(tolerating):
+        types, rows = tolerating[batch], batches[batch]
+        got, counts = [], []
+        for kind in types:
+            n, chars = _carried(rows, kind)
+            counts.append(n)
+            size = "" if not chars else f", {min(chars)}" + (f"-{max(chars)}" if max(chars) != min(chars) else "")
+            got.append(f"{kind}: {n} of {len(rows)} runs got it{size}{' characters each' if size else ''}")
+        if all(n == len(rows) for n in counts):
+            what = ("Where every arm got the same note, its arms compare with each other, but its absolute token "
+                    "counts include the note.")
+        elif not any(counts):
+            what = ("No run got it, so no token count includes it, but its plan would have let it through, so it "
+                    "is not a clean batch.")
+        else:
+            what = ("Only some runs got it, so its arms may not have carried it alike (the agent context table "
+                    "counts them per arm and model), and the token counts of the runs that got it include it.")
+        lines.append(f"> **{_tolerance_head(batch, types, rows)}: not a clean batch.** Its plan tolerated "
+                     f"{'; '.join(got)}. {what}")
+    clean = sorted(b for b in batches if b not in tolerating)
+    if clean:
+        lines.append(f"> Mixed conditions: {', '.join(clean)} tolerated nothing. An arm from "
+                     f"{', '.join(sorted(tolerating))} held against one from {', '.join(clean)} differs in this "
+                     "too: the note's tokens count on one side only.")
+    lines.append(f"> Rows marked `{NOT_CLEAN}` include runs of a batch that is not clean, and a comparison "
+                 "marked `[not clean: X only]` holds X's such runs against runs that are clean.")
+    out = []
+    for line in lines:
+        out += [line, ">"]  # one quote, its paragraphs apart
+    return out[:-1]
+
+
+def tolerance_marker(records):
+    """One line under each agent section's heading when `records` include
+    a batch that is not clean (the banner at the top says which)."""
+    if not not_clean(records):
+        return []
+    batches = group([r for r in records if tolerated_types(r)], lambda r: r.get("batch") or NO_BATCH)
+    heads = [_tolerance_head(b, sorted({t for r in rs for t in tolerated_types(r)}), rs)
+             for b, rs in sorted(batches.items())]
+    one = len(heads) == 1
+    where = "" if all(h.endswith(" in every call") for h in heads) else " where a run got it"
+    return [f"> {'; '.join(heads)}: not {'a clean batch' if one else 'clean batches'}. Rows marked `{NOT_CLEAN}` "
+            f"include {'its' if one else 'their'} runs, whose absolute token counts include the note{where}.", ""]
+
+
 # --- Grouping -----------------------------------------------------------------------------
 
 
@@ -381,7 +523,7 @@ def row(key, records):
         count = sum(n for s, n in by_status.items() if s not in KNOWN)
         notes.append(f"{who}: {count} row(s) with unknown status {others}, outside n and the pass rate")
     cells = [
-        task, arm, model, effort, _show(max_turns), len(graded), f"{passes}/{len(graded)}",
+        task, _marked(arm, records), model, effort, _show(max_turns), len(graded), f"{passes}/{len(graded)}",
         fmt_rate(passes, len(graded)), by_status["harness_error"], cut_off(graded),
         fmt_spread([r.get("tool_calls_total") for r in graded]),
         fmt_median([r.get("toolsearch_calls") for r in graded]),
@@ -495,8 +637,9 @@ def arm_comparison(records, subject="taria", baseline=BASELINE):
         t, m = _arm_stats(arms[subject]), _arm_stats(arms[baseline])
         diff, p = _difference(t, m)
         task, effort, max_turns = key
+        sides = ((subject, arms[subject]), (baseline, arms[baseline]))
         lines.append(_row([
-            task, effort, _show(max_turns), f"{t['passes']}/{t['n']}", f"{m['passes']}/{m['n']}",
+            _marked_pair(task, sides), effort, _show(max_turns), f"{t['passes']}/{t['n']}", f"{m['passes']}/{m['n']}",
             diff, fmt_p(p), fmt_ratio(m["tokens"], t["tokens"]), fmt_ratio(m["calls"], t["calls"]),
         ]))
     if not lines:
@@ -533,7 +676,8 @@ def arms_per_model(records):
         by_status, graded, passes = counts(cells[key])
         model, arm, effort, max_turns = key
         lines.append(_row([
-            model, arm, effort, _show(max_turns), len({r.get("task") for r in graded}), len(graded),
+            model, _marked(arm, cells[key]), effort, _show(max_turns), len({r.get("task") for r in graded}),
+            len(graded),
             f"{passes}/{len(graded)}", fmt_rate(passes, len(graded)), by_status["harness_error"],
             fmt_spread([tokens_processed(r) for r in graded], fmt_tokens),
             fmt_spread([r.get("tool_calls_total") for r in graded]),
@@ -555,8 +699,9 @@ def arms_per_model(records):
             s, b = _arm_stats(arms[subject]), _arm_stats(arms[baseline])
             diff, p = _difference(s, b)
             model, effort, max_turns = key
+            sides = ((subject, arms[subject]), (baseline, arms[baseline]))
             pair_lines.append(_row([
-                model, effort, _show(max_turns), f"{subject} vs {baseline}",
+                model, effort, _show(max_turns), _marked_pair(f"{subject} vs {baseline}", sides),
                 f"{s['passes']}/{s['n']}", f"{b['passes']}/{b['n']}", diff, fmt_p(p),
                 fmt_ratio(b["tokens"], s["tokens"]), fmt_ratio(b["calls"], s["calls"]),
                 fmt_ratio(b["output"], s["output"]),
@@ -584,7 +729,7 @@ def arm_overall(records):
         s = _arm_stats(cells[key])
         arm, effort, max_turns = key
         lines.append(_row([
-            arm, effort, _show(max_turns), s["tasks"], s["n"], f"{s['passes']}/{s['n']}",
+            _marked(arm, cells[key]), effort, _show(max_turns), s["tasks"], s["n"], f"{s['passes']}/{s['n']}",
             fmt_rate(s["passes"], s["n"]),
             "-" if s["tokens"] is None else fmt_tokens(s["tokens"]),
             "-" if s["calls"] is None else fmt_count(s["calls"]),
@@ -635,7 +780,7 @@ def model_comparison(records):
                 p = fisher_exact(sa["passes"], sa["n"] - sa["passes"], sb["passes"], sb["n"] - sb["passes"])
             arm, effort, max_turns = key
             lines.append(_row([
-                arm, effort, _show(max_turns),
+                _marked_pair(arm, ((a, cells[key][a]), (b, cells[key][b]))), effort, _show(max_turns),
                 f"{sa['passes']}/{sa['n']} {fmt_rate(sa['passes'], sa['n'])}",
                 f"{sb['passes']}/{sb['n']} {fmt_rate(sb['passes'], sb['n'])}", fmt_p(p),
                 "-" if sa["tokens"] is None else fmt_tokens(sa["tokens"]),
@@ -706,6 +851,24 @@ def _sha(row):
     return None if not sha else str(sha)[:12] + (" (dirty)" if row.get("git_dirty") else "")
 
 
+NOT_RECORDED = "not recorded"
+
+
+def _identity_lines(rows):
+    """The agents' identity lines (context.cli_prefixes) over `rows`, each
+    distinct one quoted, plus `not recorded` when a row predates the field
+    (or has no transcript)."""
+    seen = set()
+    for r in rows:
+        context = r.get("context") if isinstance(r.get("context"), dict) else {}
+        prefixes = context.get("cli_prefixes")
+        if isinstance(prefixes, list):
+            seen.update(json.dumps(str(p)) for p in prefixes)
+        else:
+            seen.add(NOT_RECORDED)
+    return "; ".join(sorted(seen)) or "-"
+
+
 def _batch_conditions(rows):
     """What one batch ran under, as display strings: the settings an agent
     run depends on, read from its rows (agent rows where there are any)."""
@@ -719,6 +882,7 @@ def _batch_conditions(rows):
         "kinds": ", ".join(sorted({label(r) for r in rows})),
         "git SHA": ", ".join(sorted({_sha(r) for r in agent if _sha(r)})) or "-",
         "claude": ", ".join(sorted(claude)) or "-",
+        "identity line": _identity_lines([r for r in agent if label(r) == "agent"]),
         "models": _values(agent, "model"),
         "models resolved": _values(agent, "model_resolved"),
         "effort": _values(agent, "effort"),
@@ -727,13 +891,20 @@ def _batch_conditions(rows):
         "arms": ", ".join(sorted({str(r.get("arm", "?")) for r in agent}, key=_arm_key)),
         "n": len(graded),
         "harness err": sum(1 for r in agent if r.get("status") == "harness_error"),
+        "tolerated attachments": ", ".join(sorted({t for r in agent for t in tolerated_types(r)})) or "none",
     }
 
 
-CONDITION_COLUMNS = ("kinds", "git SHA", "claude", "models", "models resolved", "effort", "max turns",
-                     "seed", "arms", "n", "harness err")
-# The conditions that can change a result; arms and n differ by design.
-COMPARED_CONDITIONS = ("git SHA", "claude", "models resolved", "effort", "max turns", "seed")
+CONDITION_COLUMNS = ("kinds", "git SHA", "claude", "identity line", "models", "models resolved", "effort",
+                     "max turns", "seed", "arms", "n", "harness err", "tolerated attachments")
+# The conditions that can change a result; arms and n differ by design. The
+# identity line is the first line of the agent's system prompt
+# (prompt_snapshot.cliPrefix), which Claude Code chooses, so two batches can
+# differ in it with nothing in the bench changed. The tolerated attachments
+# are what the batch's plan let through (run.py plan --tolerate-attachment):
+# a batch with one is not clean, and its token counts include it.
+COMPARED_CONDITIONS = ("git SHA", "claude", "identity line", "models resolved", "effort", "max turns", "seed",
+                       "tolerated attachments")
 
 
 def conditions(records):
@@ -764,6 +935,11 @@ def conditions(records):
                          "different batches may come from these as well as from the arms.")
         else:
             notes.append(f"{which} agree on " + ", ".join(COMPARED_CONDITIONS) + ".")
+    unrecorded = [b for b in compared if NOT_RECORDED in rows[b]["identity line"]]
+    if unrecorded:
+        notes.append(f"The identity line is {NOT_RECORDED} for some agent rows of {', '.join(unrecorded)} "
+                     "(graded before the field existed, or without a transcript), so it cannot be compared "
+                     "there; `run.py regrade` records it.")
     if scripted:
         notes.append(f"Left out of that comparison, as dry runs only (a scripted solver, no model, so no "
                      f"claude version, model, effort or max turns): {', '.join(scripted)}.")
@@ -817,6 +993,13 @@ def _tree_formats(context):
     return [str(f) for f in formats] if isinstance(formats, list) else ["not recorded"]
 
 
+def _tolerated_cell(rows):
+    """`remote_session_change 10/10`: per type the rows' plans tolerated, how
+    many of the rows got one; `-` for none."""
+    types = sorted({t for r in rows for t in tolerated_types(r)})
+    return "; ".join(f"{t} {_carried(rows, t)[0]}/{len(rows)}" for t in types) or "-"
+
+
 def context_section(records):
     """What each arm's agents were given, so the arms can be seen to match."""
     rows = []
@@ -825,7 +1008,7 @@ def context_section(records):
                           key=lambda kv: _order(kv[0])):
         contexts = [r["context"] for r in rs if isinstance(r.get("context"), dict)]
         if not contexts:
-            rows.append(_row([*key, f"0/{len(rs)}", "-", "-", "-", "-", "-", "-", "-"]))
+            rows.append(_row([*key, f"0/{len(rs)}", "-", "-", "-", "-", "-", "-", "-", "-"]))
             continue
         types = Counter(t for c in contexts for t in set(c.get("attachment_types") or []))
         every = sorted(t for t, n in types.items() if n == len(contexts))
@@ -837,6 +1020,7 @@ def context_section(records):
             _sets(_tree_formats(c) for c in contexts),
             f"{sum(1 for c in contexts if c.get('skill_listing'))}/{len(contexts)}",
             f"{sum(1 for c in contexts if c.get('claude_md_files'))}/{len(contexts)}",
+            _tolerated_cell(rs),
         ]))
     if not rows:
         return ["No agent runs, so no agent context to show."]
@@ -847,11 +1031,12 @@ def context_section(records):
         "the arms differ there by design (each arm's own tools), and should match elsewhere. "
         "Tree formats are the formats the read_tree descriptions each run was offered named, which "
         "the guard holds each bridge arm to (none for an arm without read_tree; `not recorded` "
-        "for rows graded before the field existed).",
+        "for rows graded before the field existed). Tolerated attachments are those the batch's plan "
+        "let through, with how many runs got one: every arm of a batch should get the same.",
         "",
         *_header(("arm", "model", "runs with context", "attachment types (every run)",
                   "attachment types (some runs)", "deferred tools (ever)", "MCP instruction servers (ever)",
-                  "tree formats", "skill listing", "instruction files")),
+                  "tree formats", "skill listing", "instruction files", "tolerated attachments (runs that got one)")),
         *rows,
     ]
 
@@ -862,15 +1047,18 @@ def context_section(records):
 def render(records):
     agent = [r for r in records if label(r) == "agent"]
     scripted = [r for r in records if label(r) != "agent"]
-    out = []
+    # A batch that tolerated an attachment is marked first, then under each
+    # agent section's heading, and in every table row built from its runs.
+    banner, marker = tolerance_banner(records), tolerance_marker(agent)
+    out = [*banner, ""] if banner else []
     if len({r.get("batch") or NO_BATCH for r in records}) > 1:
         out += ["## Run conditions", "", *conditions(records), ""]
-    out += ["## Agent runs (headline)", ""]
+    out += ["## Agent runs (headline)", "", *marker]
     if agent:
         out.append(table(agent))
-        out += ["", "## Arms per model, across all tasks", ""] + arms_per_model(agent)
-        out += ["", f"## {pairs_title(agent)}, per model"] + per_model(agent)
-        out += ["", "## Model comparison", ""] + model_comparison(agent)
+        out += ["", "## Arms per model, across all tasks", "", *marker] + arms_per_model(agent)
+        out += ["", f"## {pairs_title(agent)}, per model", *(["", marker[0]] if marker else [])] + per_model(agent)
+        out += ["", "## Model comparison", "", *marker] + model_comparison(agent)
     else:
         out.append("No agent runs in these results.")
     if scripted:

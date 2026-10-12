@@ -55,6 +55,29 @@ Two ways to drive a run:
             regrade needs them; `next` archives as it grades, so this is for
             a batch graded before it did.
 
+`plan --tolerate-attachment TYPE` (repeatable; only remote_session_change,
+Claude Code's remote-control attribution note) records the type in the
+plan's tolerated_attachments, and grading (next and regrade) reads every
+transcript of the batch with it: such an attachment in the shape it is known
+in is recorded in the row's context.tolerated_attachments instead of making
+the run a harness error. With one orchestrating session every arm of the
+batch gets the same note, so its arms still compare with each other, but
+its absolute token counts include the note, and it is not a clean batch
+(summarize.py marks it).
+
+taria and outline serve the same tool names, and a Claude Code session keeps
+the first definitions it sees for a tool name, so the two never share an
+orchestrating session: `plan` refuses a batch with both (its arms default to
+taria,tmux), and `next` refuses to hand out a job of a batch whose arm shares
+tool names with another arm the same session was already handed or graded
+a run of (whoever claimed it), in any batch, telling the operator to restart
+the session. It knows the session by CLAUDE_PID, which Claude Code sets for
+its Bash commands, and records each hand-out and each grading in
+results/slots/handouts.jsonl. When it cannot tell (outside Claude Code, in
+a PID namespace of its own, off Linux) it says so in one stderr line, and
+only the procedure (one session per arm family, restarted between) protects
+the batch.
+
 Every run ends in exactly one status:
 
   passed         the check passed and the demo is still running
@@ -64,7 +87,9 @@ Every run ends in exactly one status:
                  (check_passed is recorded)
   harness_error  infrastructure, not the agent: a failed setup, a server or
                  solver failure, an unreadable transcript, the transcript
-                 guard refusing how the agent was set up, or a run that did
+                 guard refusing how the agent was set up or context that
+                 reached it (an attachment it has no rule for, say), or a
+                 run that did
                  not end on its own (Claude Code's own error message last, an
                  explicit stop other than end_turn, or a tool call under
                  max_turns). A final text reply whose closing line Claude
@@ -86,6 +111,7 @@ Usage:  python3 bench/run.py dry-run [--tasks T1,T3] [--arms taria,tmux,outline]
         python3 bench/run.py agents  --slots K [--dir D] [--effort E] [--max-turns N] [--remove]
         python3 bench/run.py plan    --batch B [--tasks ..] [--arms ..] [--models sonnet,haiku]
                                      [--runs N] [--seed S] [--effort E] [--max-turns N]
+                                     [--tolerate-attachment remote_session_change]
         python3 bench/run.py next    --batch B --slot K [--agent-id ID] [--agents-dir D]
         python3 bench/run.py status  --batch B
         python3 bench/run.py abort   --batch B --slot K [--reason TEXT]
@@ -120,6 +146,7 @@ from harness import (  # noqa: E402
     ARM_TREE_FORMAT,
     ARMS,
     REPO,
+    SERVER_KEY,
     SERVER_NAMES,
     DemoRun,
     HarnessError,
@@ -140,6 +167,14 @@ STATUSES = ("passed", "failed", "max_turns", "harness_error")
 EXIT_OK, EXIT_FAILED, EXIT_HARNESS = 0, 1, 2
 BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 AGENT_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")
+# A plan's arms when --arms is not given: two that share no tool name (see
+# colliding_arms). The dry run, which spawns no agent, runs every arm.
+PLAN_DEFAULT_ARMS = ("taria", "tmux")
+# How `next` tells which orchestrating session runs it: Claude Code 2.1.294
+# puts its own pid in CLAUDE_PID for the commands its Bash tool runs (and its
+# session id in CLAUDE_CODE_SESSION_ID, recorded for the reader).
+SESSION_PID_ENV = "CLAUDE_PID"
+SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID"
 
 # One row per run, in this order, in both modes. From an agent's transcript:
 # model_resolved (the models it ran on), efforts_resolved (the effort Claude
@@ -232,12 +267,16 @@ def new_batch_id():
 
 
 class Paths:
-    """results/<batch>/{plan.json,runs.jsonl,.lock,transcripts/} and
-    results/slots/<K>.json."""
+    """results/<batch>/{plan.json,runs.jsonl,.lock,transcripts/},
+    results/slots/<K>.json and results/slots/handouts.jsonl."""
 
     def __init__(self, results_dir, batch=None):
         self.results = os.path.abspath(results_dir)
         self.slots = os.path.join(self.results, "slots")
+        # Which arms each orchestrating session was handed, across batches
+        # (see claim_in_session).
+        self.handouts = os.path.join(self.slots, "handouts.jsonl")
+        self.handouts_lock = os.path.join(self.slots, ".handouts.lock")
         self.batch = batch
         if batch is not None:
             self.batch_dir = os.path.join(self.results, batch)
@@ -598,6 +637,12 @@ def cmd_agents(args):
 
 def cmd_plan(args):
     paths = Paths(args.results_dir, args.batch)
+    collisions = colliding_arms(args.arms)
+    if collisions:
+        raise CommandError(
+            f"{_collision(*collisions[0])}: plan them as separate batches, and run each from its own "
+            "orchestrating session, restarting the session between them"
+        )
     if os.path.exists(paths.plan):
         raise CommandError(f"{paths.plan} exists; a plan is never replaced, name a new batch")
     if has_rows(paths):
@@ -625,6 +670,9 @@ def cmd_plan(args):
         "seed": args.seed,
         "effort": args.effort,
         "max_turns": args.max_turns,
+        # Attachment types the guard flags that this batch lets through,
+        # recorded per run instead (see plan_tolerated): not a clean batch.
+        "tolerated_attachments": sorted(set(args.tolerate_attachments)),
         "agent_body_sha256": agents.body_sha256(),
         **git_provenance(),
         "jobs": jobs,
@@ -639,9 +687,187 @@ def cmd_plan(args):
     print(
         f"run.py: batch {args.batch}: {len(jobs)} jobs ({len(args.tasks)} tasks x "
         f"{len(args.arms)} arms x {len(args.models)} models x {args.runs} runs), seed "
-        f"{args.seed}, effort {args.effort}, max {args.max_turns} turns; {paths.plan}"
+        f"{args.seed}, effort {args.effort}, max {args.max_turns} turns{tolerance_note(plan)}; {paths.plan}"
     )
     return EXIT_OK
+
+
+def plan_tolerated(plan):
+    """The attachment types `plan` tolerates (`plan --tolerate-attachment`),
+    sorted; [] for a plan from before the option. Raises CommandError when
+    the plan names one a plan may not tolerate (a plan edited by hand), so
+    nothing is graded under a tolerance the guard does not know."""
+    try:
+        return load_transcript_module().check_tolerated(plan.get("tolerated_attachments", []))
+    except ValueError as err:
+        raise CommandError(f"the plan of batch {plan.get('batch')} tolerates what no plan may: {err}")
+
+
+def tolerance_note(plan):
+    """`, tolerating T (not a clean batch)` for a plan that tolerates
+    attachments, else nothing."""
+    tolerated = plan.get("tolerated_attachments") or []
+    return f", tolerating {', '.join(map(str, tolerated))} (not a clean batch)" if tolerated else ""
+
+
+# --- Arms that share tool names ------------------------------------------------------------------
+#
+# taria and outline list the same tools (mcp__tui__read_tree, act, key,
+# type_text) with different descriptions, and a Claude Code session keeps the
+# first definitions it sees for a tool name for the rest of the session. In
+# probe4, outline's j001 started first, and taria's j002 and j005 (j005
+# spawned alone, after every other run had finished) were offered the
+# outline's descriptions while their own bridge served JSON. So `plan`
+# refuses a batch whose arms share a tool name, and `next` refuses to hand
+# out a job of a batch with an arm that shares a tool name with another arm
+# the same orchestrating session was already handed or graded a run of, in
+# any batch (claim_in_session, finish_slot). tmux shares no name with either.
+
+
+def _shared_tools(a, b):
+    """The tool names arms `a` and `b` both list, sorted; [] for one arm."""
+    return [] if a == b else sorted(set(ARM_TOOLS.get(a, ())) & set(ARM_TOOLS.get(b, ())))
+
+
+def colliding_arms(arms):
+    """(a, b, shared tool names) for each pair of different arms in `arms`
+    whose tools share a name."""
+    arms = list(dict.fromkeys(arms))
+    pairs = [(a, b) for i, a in enumerate(arms) for b in arms[i + 1:]]
+    return [(a, b, _shared_tools(a, b)) for a, b in pairs if _shared_tools(a, b)]
+
+
+def _collision(a, b, shared):
+    names = ", ".join(f"mcp__{SERVER_KEY}__{tool}" for tool in shared)
+    return (f"arms {a} and {b} share tool names ({names}) with different descriptions, and a Claude Code session "
+            "keeps the first definitions it sees for a tool name, so the agents of the arm spawned second are "
+            "offered the other's")
+
+
+def orchestrator(environ=None, proc="/proc"):
+    """The Claude Code process this run.py runs under, as {"key", "pid",
+    "session_id"}, or None when it cannot be told. Claude Code puts its pid
+    in CLAUDE_PID for the commands its Bash tool runs; the key adds the
+    process's start time from /proc, so a pid a later process reuses is
+    another session. None without CLAUDE_PID (run outside Claude Code), with
+    one that is not a pid, or with one whose /proc/<pid>/stat cannot be read:
+    the process is gone, run.py runs in a PID namespace of its own (as a
+    sandbox may run it), or there is no /proc (off Linux). Then the session
+    check is off, and one line on stderr says why, never silently."""
+    environ = os.environ if environ is None else environ
+    pid = environ.get(SESSION_PID_ENV)
+    if pid is None:
+        return _unidentified(f"{SESSION_PID_ENV} is not set (run.py was not run by Claude Code's Bash tool)")
+    if not re.fullmatch(r"[0-9]+", pid):
+        return _unidentified(f"{SESSION_PID_ENV} is {pid!r}, not a pid")
+    pid = int(pid)
+    stat = os.path.join(proc, str(pid), "stat")
+    try:
+        with open(stat, "rb") as f:
+            # The fields after the command name's closing paren start at
+            # field 3 (state); the start time is field 22.
+            start = f.read().rpartition(b")")[2].split()[19].decode("ascii")
+    except FileNotFoundError:
+        if not os.path.isdir(os.path.join(proc, "self")):
+            cause = f"there is no {proc} to find it in (not Linux, or {proc} is not mounted)"
+        else:
+            cause = (f"no process {pid} is visible in {proc}: it is gone, or run.py runs in a PID namespace of its "
+                     "own, as a sandbox may run it")
+        return _unidentified(f"{SESSION_PID_ENV} is {pid}, but {cause}")
+    except OSError as err:
+        return _unidentified(f"{SESSION_PID_ENV} is {pid}, but {stat} cannot be read ({err.strerror or err})")
+    except (IndexError, ValueError):
+        return _unidentified(f"{SESSION_PID_ENV} is {pid}, but {stat} has no start time to read")
+    return {"key": f"{pid}@{start}", "pid": pid, "session_id": environ.get(SESSION_ID_ENV)}
+
+
+def _unidentified(why):
+    """Say on stderr, in one line, that `why` leaves the orchestrating
+    session unknown and the session check off. Returns None."""
+    print(f"run.py: {why}, so the orchestrating session cannot be told and the session check is off: only the "
+          "procedure in bench/README.md (taria and outline from separate orchestrating sessions, restarted "
+          "between) keeps one session from being handed both", file=sys.stderr)
+    return None
+
+
+def session_handouts(paths, key):
+    """{arm: its first record, a hand-out or a grading (record_handout)}
+    for the orchestrating session `key`."""
+    try:
+        with open(paths.handouts) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return {}
+    handed = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("session") == key and isinstance(record.get("arm"), str):
+            handed.setdefault(record["arm"], record)
+    return handed
+
+
+def handout_problem(paths, plan, k, session):
+    """Why no job of `plan` may be handed out to the orchestrating
+    `session` (orchestrator(); None skips the session check), or None.
+    A plan whose own arms share tool names (one written before `plan`
+    refused it, as probe4's was) is refused whoever runs it; otherwise an
+    arm of the plan that shares tool names with another arm this session
+    was already handed, or graded a run of, in any batch."""
+    collisions = colliding_arms(plan.get("arms") or [])
+    if collisions:
+        return (f"the plan of batch {plan['batch']} was written before `plan` refused it: {_collision(*collisions[0])}"
+                "; plan them as separate batches, each run from its own orchestrating session")
+    if session is None:
+        return None
+    handed = session_handouts(paths, session["key"])
+    for arm in plan.get("arms") or []:
+        for other, record in sorted(handed.items()):
+            shared = _shared_tools(arm, other)
+            if shared:
+                graded = record.get("via") == "graded"
+                had = f"already graded {other} runs" if graded else f"was already handed {other} jobs"
+                return (f"this orchestrating session (Claude Code pid {session['pid']}) {had} "
+                        f"({record.get('batch')} {record.get('job')}), and {_collision(arm, other, shared)}"
+                        f"; restart the orchestrating session, then `run.py next --batch {plan['batch']} --slot {k}` "
+                        "from the new one")
+    return None
+
+
+def record_handout(paths, session, batch, job, arm, via):
+    """Record in paths.handouts that the orchestrating `session` (None:
+    nothing is recorded) ran an agent of `arm` for `job`: `via` is "claimed"
+    when it was handed the job, "graded" when it graded the job's run, which
+    it is taken to have spawned, whoever claimed it (a restarted session
+    finishing the old one's slot). The caller holds paths.handouts_lock."""
+    if session is None:
+        return
+    record = {"ts": now(), "session": session["key"], "claude_pid": session["pid"],
+              "claude_session_id": session["session_id"], "batch": batch, "job": job, "arm": arm, "via": via}
+    with open(paths.handouts, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def claim_in_session(paths, plan, k, session):
+    """claim(), unless handout_problem refuses this plan to `session`: then
+    the slot is given back and CommandError raised, nothing claimed. A job
+    claimed for a session is recorded in paths.handouts, so a later batch
+    of an arm sharing its tool names is refused to the same session. Under
+    one lock across batches, so two slots cannot hand out colliding arms at
+    once. Nothing left to claim is never refused."""
+    os.makedirs(paths.slots, exist_ok=True)
+    with flocked(paths.handouts_lock):
+        job, slot = claim(paths, plan, k)
+        if job is None:
+            return job, slot
+        problem = handout_problem(paths, plan, k, session)
+        if problem:
+            free_slot(paths, k)
+            raise CommandError(f"{problem}; claimed nothing")
+        record_handout(paths, session, plan["batch"], job["id"], job["arm"], "claimed")
+    return job, slot
 
 
 # --- Subagent runs: next, status, abort ---------------------------------------------------
@@ -779,14 +1005,16 @@ TRANSCRIPT_FIELDS = (
 )
 
 
-def transcript_verdict(transcript_mod, path, arm, model, effort, max_turns, extra_problems=()):
+def transcript_verdict(transcript_mod, path, arm, model, effort, max_turns, extra_problems=(), tolerated=()):
     """(row fields, errors, cut_off) from the transcript at `path`: the stats
     a row records, the guard (plus `extra_problems`), and how the run ended.
+    The transcript is read and guarded with the attachment types the plan
+    tolerates (`tolerated`, plan_tolerated), which its context then records.
     The one grading logic for `next` and `regrade`. Raises when the
     transcript cannot be read."""
-    stats = transcript_mod.read_transcript(path)
+    stats = transcript_mod.read_transcript(path, tolerated=tolerated)
     problems = list(transcript_mod.guard(stats, arm, model, ARM_TOOLS[arm], effort=effort,
-                                         tree_format=ARM_TREE_FORMAT.get(arm)))
+                                         tree_format=ARM_TREE_FORMAT.get(arm), tolerated=tolerated))
     problems += list(extra_problems)
     kind, detail = transcript_mod.ending(stats, max_turns)
     inferred = kind == "end_turn" and detail is not None
@@ -835,7 +1063,8 @@ def grade_agent_run(plan, slot, agent_id, run=None, transcript_mod=None, transcr
             errors.append(f"no transcript for agent {agent_id} under ~/.claude/projects")
         else:
             fields, found, cut_off = transcript_verdict(
-                transcript_mod, path, arm, slot["model"], plan["effort"], plan["max_turns"]
+                transcript_mod, path, arm, slot["model"], plan["effort"], plan["max_turns"],
+                tolerated=plan.get("tolerated_attachments") or [],
             )
             row.update(fields)
             errors += found
@@ -938,11 +1167,16 @@ def check_agent_identity(paths, plan, k, slot, agent_id, transcript_file=None, t
     return path
 
 
-def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None):
+def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None, session=None):
     """Grade the agent run slot `k` holds, record it, tear the demo down and
     free the slot. Returns the row (an existing one if the job was recorded
     before a crash left the slot behind). Refuses an agent that cannot have
     run this job (check_agent_identity) before recording anything.
+
+    The orchestrating `session` grading it (orchestrator()) gets the slot's
+    arm on record with the row (record_handout), even when another session
+    claimed the job: a restarted session that spawned the agent for the old
+    one's slot has seen that arm's tool definitions.
 
     The transcript is archived into the batch (archive_transcript) and the
     archived copy graded, so the row and a later regrade read the same
@@ -961,7 +1195,11 @@ def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None):
         print(f"run.py: could not archive agent {agent_id}'s transcript ({err}); grading the live one. "
               f"`run.py archive --batch {plan['batch']}` copies it later", file=sys.stderr)
     row = grade_agent_run(plan, slot, agent_id, transcript_file=path)
-    append_row(paths, row)  # before teardown: a crash from here on leaves a row, not a lost run
+    # The handouts lock, then the batch lock append_row takes: claim_in_session's order.
+    os.makedirs(paths.slots, exist_ok=True)
+    with flocked(paths.handouts_lock):
+        append_row(paths, row)  # before teardown: a crash from here on leaves a row, not a lost run
+        record_handout(paths, session, plan["batch"], slot["job"], slot["arm"], "graded")
     teardown(slot)
     free_slot(paths, k)
     return row
@@ -981,6 +1219,7 @@ def check_agent_files(plan, k, agents_dir, slots_dir):
 def cmd_next(args):
     paths = Paths(args.results_dir, args.batch)
     plan = load_plan(paths)
+    plan_tolerated(plan)  # a tolerance the guard does not know grades and claims nothing
     if args.agent_id is not None and not AGENT_ID_RE.match(args.agent_id):
         raise CommandError(f"agent id {args.agent_id!r} is not [0-9A-Za-z_-]+")
     os.makedirs(paths.slots, exist_ok=True)
@@ -993,7 +1232,8 @@ def cmd_next(args):
 
 def _next_locked(args, paths, plan):
     k = args.slot
-    slot = read_slot(paths, k)
+    session = orchestrator()  # once per call; when it cannot be told, one stderr line says so
+    slot, graded = read_slot(paths, k), None
     if slot is not None and slot.get("state") != "ready":
         # A prepare runs under this slot's flock, which we now hold: whoever
         # wrote this unfinished slot is gone.
@@ -1009,7 +1249,7 @@ def _next_locked(args, paths, plan):
                 f"slot {k} holds {job_of(slot)}; pass --agent-id of the agent that ran it, "
                 f"or `run.py abort --batch {plan['batch']} --slot {k}`"
             )
-        row = finish_slot(paths, plan, k, slot, args.agent_id, args.transcript_file)
+        graded = row = finish_slot(paths, plan, k, slot, args.agent_id, args.transcript_file, session)
         print(summary_line(row), file=sys.stderr)
         if row["status"] == "harness_error":
             raise CommandError(
@@ -1021,9 +1261,15 @@ def _next_locked(args, paths, plan):
             raise CommandError(f"slot {k} holds no job, so agent {args.agent_id} did not run from it")
         print(f"run.py: agent {args.agent_id} was already graded", file=sys.stderr)
 
-    preflight()
-    check_agent_files(plan, k, args.agents_dir, paths.slots)
-    job, slot = claim(paths, plan, k)
+    try:
+        preflight()
+        check_agent_files(plan, k, args.agents_dir, paths.slots)
+        job, slot = claim_in_session(paths, plan, k, session)
+    except CommandError as err:
+        if graded is None:
+            raise
+        # Said, so the operator does not take the refusal for a lost run and grade it again.
+        raise CommandError(f"{graded['job']} was recorded ({graded['status']}) and slot {k} freed; {err}")
     if job is None:
         print(json.dumps({"done": True}), flush=True)
         return EXIT_OK
@@ -1071,7 +1317,7 @@ def cmd_status(args):
     print(
         f"batch {plan['batch']}: {len(plan['jobs'])} jobs; {len(recorded)} recorded ("
         + ", ".join(f"{s} {n}" for s, n in counts.items())
-        + f"); {len(held)} held; {len(pending)} pending"
+        + f"); {len(held)} held; {len(pending)} pending{tolerance_note(plan)}"
     )
     for k in sorted(slots):
         s = slots[k]
@@ -1180,7 +1426,8 @@ def regrade_row(row, plan, transcript_mod, projects_dir=None, paths=None):
         new["regrade_note"] = "its meta file is gone, so the agent type was not checked again"
     try:
         fields, found, cut_off = transcript_verdict(
-            transcript_mod, path, arm, row.get("model"), plan["effort"], plan["max_turns"], extra
+            transcript_mod, path, arm, row.get("model"), plan["effort"], plan["max_turns"], extra,
+            tolerated=plan.get("tolerated_attachments") or [],
         )
         errors += found
     except Exception as err:  # noqa: BLE001 - an unreadable transcript is the harness's
@@ -1223,6 +1470,7 @@ def regrade(paths, transcript_mod=None, projects_dir=None):
     Returns (rows, changes, backup, sources): changes are (job, old, new,
     reason); sources counts where the regraded rows' transcripts came from."""
     plan = load_plan(paths)
+    plan_tolerated(plan)  # a tolerance the guard does not know regrades nothing
     held = sorted(k for k, s in read_all_slots(paths).items() if s.get("batch") == plan["batch"])
     if held:
         raise CommandError(
@@ -1272,7 +1520,8 @@ def cmd_regrade(args):
     rows, changes, backup, sources = regrade(paths, projects_dir=args.projects_dir)
     kept = sum(1 for r in rows if str(r.get("regrade_note") or "").startswith("kept as recorded"))
     dry = sum(1 for r in rows if r.get("mode") != "subagent")
-    print(f"run.py: regraded batch {args.batch}: {len(rows)} rows ({dry} dry-run kept, {kept} kept as "
+    tolerating = tolerance_note(load_plan(paths))
+    print(f"run.py: regraded batch {args.batch}{tolerating}: {len(rows)} rows ({dry} dry-run kept, {kept} kept as "
           f"recorded); {len(changes)} changed status; transcripts: {sources['archive']} archived, "
           f"{sources['live']} live; the original is {backup}")
     for job, old, new, why in changes:
@@ -1358,6 +1607,17 @@ def _batch(value):
     return value
 
 
+def _tolerable(value):
+    """An attachment type a plan may tolerate (transcript.tolerable_problem)."""
+    try:
+        problem = load_transcript_module().tolerable_problem(value)
+    except HarnessError as err:
+        raise argparse.ArgumentTypeError(str(err))
+    if problem:
+        raise argparse.ArgumentTypeError(problem)
+    return value
+
+
 def _positive(value):
     number = int(value)
     if number < 1:
@@ -1382,7 +1642,8 @@ def parse_args(argv=None):
     selection.add_argument(
         "--arms", "--arm", dest="arms", action="extend",
         type=lambda v: _list(v, list(ARMS), "arm"),
-        help=f"comma-separated arms (default: {','.join(ARMS)})",
+        help=f"comma-separated arms (default: dry-run {','.join(ARMS)}, plan {','.join(PLAN_DEFAULT_ARMS)}; "
+             "a plan refuses arms that share tool names, taria and outline)",
     )
     selection.add_argument("--runs", type=_positive, default=1, help="runs per combination (default 1)")
     selection.add_argument("--seed", type=int, help="shuffle seed (default: random, recorded)")
@@ -1406,6 +1667,11 @@ def parse_args(argv=None):
     p.add_argument("--batch", type=_batch, required=True)
     p.add_argument("--models", action="extend", type=lambda v: _list(v, list(MODELS), "model"),
                    help=f"comma-separated model families (default {DEFAULT_MODELS})")
+    p.add_argument("--tolerate-attachment", dest="tolerate_attachments", action="append", default=[],
+                   type=_tolerable, metavar="TYPE",
+                   help="let the guard pass this flagged attachment type, recorded per run instead "
+                        "(repeatable; only remote_session_change, the same note for every arm): "
+                        "the batch is then not a clean batch")
 
     p = sub.add_parser("next", parents=[common], help="grade a slot's run and claim its next job")
     p.add_argument("--batch", type=_batch, required=True)
@@ -1435,7 +1701,7 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.command in ("dry-run", "plan"):
         args.tasks = list(dict.fromkeys(args.tasks or task_ids))
-        args.arms = list(dict.fromkeys(args.arms or ARMS))
+        args.arms = list(dict.fromkeys(args.arms or (ARMS if args.command == "dry-run" else PLAN_DEFAULT_ARMS)))
         if args.seed is None:
             args.seed = random.SystemRandom().randrange(2**31)
     if args.command == "plan":

@@ -81,19 +81,22 @@ const MAX_TEXT_CHARS: usize = 4096;
 const MAX_VALUE_CHARS: usize = MAX_TEXT_CHARS;
 
 /// Instructions surfaced to the agent on MCP initialize.
-const INSTRUCTIONS: &str = "Bridge to a live terminal (TUI) application. Call read_tree first: \
-it returns the app's current semantic tree, including every node id and the actions each node \
-advertises. Prefer act with a node id and one of that node's advertised actions (pass value for \
-set_value); node ids and action names come from the tree, never guess them. An action the tree \
-spells as an object, {\"custom\":\"delete\"}, is passed to act as the inner name alone, \
-\"delete\"; every other action is passed exactly as the tree spells it. key and type_text lower \
-differently: key goes into the app's key handler and lands wherever focus is, type_text goes to \
-the app's typing surface as literal characters, where a newline arrives as Enter and submits. \
-Type text with type_text rather than spelling it out with key, whose characters meet the app's \
-bindings. key is the fallback for parts of the UI without semantic coverage; its repeat \
-parameter sends the same key up to 64 times, so \"move down five rows\" is one call. act, key \
-and type_text return the updated tree when the app reacts; call read_tree again whenever you \
-need a fresh view.";
+///
+/// Short on purpose. The instructions and the tool list are sent again with
+/// every model call, so each sentence here is paid for on every step of a
+/// session, and the tool descriptions already carry each tool's own rules.
+/// What stays is the order of work and the one rule worth saying twice:
+/// `type_text`, not `key`, for text. Some clients drop instructions
+/// altogether, which is why `key`'s description says it too.
+///
+/// A preference rather than a "never": a version 1 app is free to route no
+/// typed text at all and answer every `type_text` with `Ignored`, and in such
+/// an app `key` is the only way into its fields. The reason stays, because it
+/// is what an agent weighs that against: through `key`, every character meets
+/// the app's key bindings.
+const INSTRUCTIONS: &str = "Bridge to a live terminal (TUI) app. Call read_tree first, then \
+prefer act with an action a node advertises; key is the fallback. Type text with type_text, not \
+key: key's characters hit the app's key bindings.";
 
 /// One passage of agent-facing text that describes the JSON tree, and what
 /// `--tree-format outline` says in its place.
@@ -117,68 +120,55 @@ impl FormatPassage {
     }
 }
 
-/// The passage of [`INSTRUCTIONS`] that is about the tree's spelling.
+/// The passage of [`INSTRUCTIONS`] that the outline mode extends with a
+/// pointer to its line format and to where a line lists its actions.
 const INSTRUCTIONS_PASSAGE: FormatPassage = FormatPassage {
-    json: "An action the tree spells as an object, {\"custom\":\"delete\"}, is passed to act as \
-           the inner name alone, \"delete\"; every other action is passed exactly as the tree \
-           spells it.",
-    outline: "The tree is an outline: a line of snapshot fields, then one node per line, indented \
-              two spaces per level, as id role \"label\" = \"value\" [actions] *focused, with \
-              each part present only when set. Pass act a node id and an action name exactly as \
-              the line spells them, without the quotes if one is quoted.",
+    json: "first,",
+    outline: "first (an outline, one node per line, actions after act:),",
 };
 
-/// The passage of the `read_tree` description that names the format.
+/// The passage of the `read_tree` description that names the format, and in
+/// the outline mode spells out the line and what to do with its action list.
 const READ_TREE_PASSAGE: FormatPassage = FormatPassage {
-    json: "as JSON: every node with its id, role, label, value, focus state, and advertised \
-           actions.",
-    outline: "as an outline: every node with its id, role, label, value, focus state, and \
-              advertised actions, one node per line, indented two spaces per level, as id role \
-              \"label\" = \"value\" [actions] *focused, with each part present only when set.",
+    json: "as JSON.",
+    outline: "as an outline, one node per line, indented by depth: id role \"label\" = \
+              \"value\" *focused act: a|b, parts only when set. Each name after act: is one \
+              action to pass to act.",
 };
 
 /// The passage of the `act` description about the custom-action envelope,
-/// which the outline never shows.
-const ACT_PASSAGE: FormatPassage = FormatPassage {
-    json: "An app-specific action appears in the tree as an object, {\"custom\":\"delete\"}, and \
-           is passed here as the inner name alone, \"delete\"; every other action is passed \
-           exactly as the tree spells it.",
-    outline: "Pass the node id and the action name exactly as the tree's outline line spells \
-              them, without the quotes if one is quoted.",
-};
-
-/// The same, in the description of `act`'s `action` parameter.
+/// which the outline never shows: it prints the inner name, and quotes a name
+/// or an id only when the line could not hold it bare.
 ///
-/// schemars keeps the line breaks of the doc comment it builds that
-/// description from, so the passage carries them too: rewrapping the comment
-/// on [`ActParams::action`] means rewrapping this, which the tests catch.
-const ACT_ACTION_PASSAGE: FormatPassage = FormatPassage {
-    json: "An action the\ntree spells as an object, {\"custom\":\"delete\"}, is passed here as \
-           the\ninner name alone: \"delete\".",
-    outline: "Pass it exactly as the tree's outline line spells it, without the quotes if it is \
-              quoted.",
-};
-
-/// The same for `act`'s `node` parameter: an id the outline quotes is passed
-/// without the quotes, which "exactly as it appears" would contradict.
-const ACT_NODE_PASSAGE: FormatPassage = FormatPassage {
-    json: "exactly as it appears in the tree from read_tree.",
-    outline: "exactly as the tree's outline line spells it, without the quotes if it is quoted.",
+/// A quoted token is a JSON string literal, escapes and all (`"a\"b"` is the
+/// name `a"b`), so "decoded" rather than "minus the quotes": stripping the
+/// quotes alone hands `act` a backslash the node never advertised. Named as
+/// "node and action" rather than "both", which read as the button and field
+/// the sentence before it mentions.
+const ACT_PASSAGE: FormatPassage = FormatPassage {
+    json: "An action shown as {\"custom\":\"delete\"} is passed as \"delete\".",
+    outline: "Pass node and action as shown, a quoted one JSON-decoded.",
 };
 
 /// Parameters for the `act` tool.
+///
+/// The fields carry no schema description, because the tool's description
+/// already says where each comes from and the schema states the bound: a
+/// description per field was the same sentence sent a second time on every
+/// model call. `#[schemars(description = "")]` keeps these doc comments out
+/// of the schema, since schemars leaves out an empty description.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ActParams {
-    /// Id of the target node, exactly as it appears in the tree from read_tree.
+    /// Id of the target node, as the tree from read_tree spells it.
+    #[schemars(description = "")]
     pub node: String,
-    /// Action name advertised by that node (e.g. "activate", "toggle",
-    /// "set_value", or an app-specific custom action name). An action the
-    /// tree spells as an object, {"custom":"delete"}, is passed here as the
-    /// inner name alone: "delete".
+    /// Action name advertised by that node, as the tree spells it, or the
+    /// inner name of an action the JSON tree spells as `{"custom":"delete"}`.
+    #[schemars(description = "")]
     pub action: String,
     /// Value for actions that take one (e.g. the text for "set_value"), up to
     /// 4096 characters.
-    #[schemars(length(max = 4096))]
+    #[schemars(length(max = 4096), description = "")]
     pub value: Option<String>,
 }
 
@@ -186,10 +176,15 @@ pub struct ActParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct KeyParams {
     /// Key to press, e.g. "q", "enter", "tab", "ctrl+c", up to 64 characters.
-    #[schemars(length(min = 1, max = 64))]
+    ///
+    /// Undescribed in the schema, like every field of [`ActParams`]: the
+    /// tool's description already gives these examples.
+    #[schemars(length(min = 1, max = 64), description = "")]
     pub key: String,
     /// How many times to send this key, 1 to 64. Defaults to 1.
-    #[schemars(range(min = 1, max = 64))]
+    ///
+    /// The schema states the bounds; the default is the one thing it cannot.
+    #[schemars(range(min = 1, max = 64), description = "Defaults to 1.")]
     pub repeat: Option<u32>,
 }
 
@@ -197,7 +192,9 @@ pub struct KeyParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct TypeTextParams {
     /// Literal text to type, up to 4096 characters.
-    #[schemars(length(min = 1, max = 4096))]
+    ///
+    /// Undescribed in the schema, like every field of [`ActParams`].
+    #[schemars(length(min = 1, max = 4096), description = "")]
     pub text: String,
 }
 
@@ -385,11 +382,7 @@ impl TariaMcpServer {
 #[tool_router]
 impl TariaMcpServer {
     /// The `read_tree` tool: latest snapshot as compact JSON.
-    #[tool(
-        description = "Read the connected TUI app's current semantic tree as JSON: every node \
-                       with its id, role, label, value, focus state, and advertised actions. \
-                       Call this first; act and key depend on ids and actions from this tree."
-    )]
+    #[tool(description = "Read the TUI app's current semantic tree as JSON. Call this first.")]
     pub async fn read_tree(&self) -> Result<CallToolResult, McpError> {
         let snapshot =
             available_snapshot(self.bridge.state_rx.borrow().clone(), self.link_report())?;
@@ -397,15 +390,17 @@ impl TariaMcpServer {
     }
 
     /// The `act` tool: validate and forward an advertised action.
+    ///
+    /// "Returns the tree if it changed", like `key` and `type_text`, because
+    /// three of the answers `report` gives in place of an error carry a note
+    /// and no tree: an input the app took that changed nothing, one it neither
+    /// acknowledged nor answered with a change, and one it took on its way
+    /// out. "Returns the updated tree" promised a tree every time.
     #[tool(
-        description = "Invoke an advertised action on a node of the app's semantic tree. `node` \
-                       is a node id and `action` an action name, both taken from read_tree; pass \
-                       `value` for actions that need one (e.g. set_value), up to 4096 \
-                       characters. An action that needs a value and arrives without one is \
-                       answered ignored. An app-specific action appears in the tree as an \
-                       object, {\"custom\":\"delete\"}, and is passed here as the inner name \
-                       alone, \"delete\"; every other action is passed exactly as the tree \
-                       spells it. Returns the updated tree once the app reacts."
+        description = "Invoke an action a node advertises; node and action come from \
+                       read_tree, value is for actions like set_value. activate presses a button \
+                       or submits a field. An action shown as {\"custom\":\"delete\"} is passed \
+                       as \"delete\". Returns the tree if it changed."
     )]
     pub async fn act(
         &self,
@@ -474,15 +469,15 @@ impl TariaMcpServer {
     }
 
     /// The `key` tool: raw key fallback, with an optional repeat count.
+    ///
+    /// The examples are bare, not quoted: every quote is two characters once
+    /// the description is JSON, and the list reads the same without them. The
+    /// text rule is a preference, for the reason on [`INSTRUCTIONS`].
     #[tool(
-        description = "Send a raw key press to the app, e.g. \"q\", \"enter\", \"tab\", \
-                       \"ctrl+c\", \"f5\". Pass `repeat` (1-64) to send the same key that many \
-                       times, so moving down five rows is one call. For literal text use \
-                       type_text instead, which types a whole string in one call. Fallback for \
-                       parts of the UI without semantic coverage; prefer act with an advertised \
-                       action. The key string is one press, up to 64 characters. A key that does \
-                       not match the accepted grammar is rejected, with the grammar in the error. \
-                       Returns the updated tree once the app reacts."
+        description = "Send one raw key press (q, enter, tab, ctrl+c, f5) to wherever focus \
+                       is; repeat sends it up to 64 times. A fallback where no advertised action \
+                       fits. Type text with type_text, not key: key's characters hit the app's \
+                       key bindings. Returns the tree if it changed."
     )]
     pub async fn key(
         &self,
@@ -528,18 +523,18 @@ impl TariaMcpServer {
     }
 
     /// The `type_text` tool: a whole string in one call.
+    ///
+    /// A newline "may" act as Enter and submit: an adapter that feeds typing in
+    /// as key events lowers it to Enter by convention, an app that reads the
+    /// characters itself decides what it means, and Enter submits only where
+    /// the focused widget submits on it, not in a multi-line editor. What
+    /// holds everywhere is the advice: text meant for after a submit belongs
+    /// in a second call, once the tree shows where typing goes next.
     #[tool(
-        description = "Type literal text into the app. The characters go to whatever surface the \
-                       app puts typing into, never through its key bindings, so a 100-character \
-                       string is 1 call, not 100 key calls. A newline arrives as Enter and a tab \
-                       as Tab: ending the text with \\n submits wherever Enter submits, and \
-                       characters after a submit usually have nowhere left to go, so send them \
-                       in a second call. Carriage returns are dropped. read_tree names the \
-                       focused node; aim this by moving focus with an advertised focus action, \
-                       or with set_value on the target, which many apps focus as a side effect. \
-                       With nothing accepting typing the app reports it ignored, which comes \
-                       back as a result with the tree, not an error. Up to 4096 characters. \
-                       Returns the updated tree once the app reacts."
+        description = "Type literal text into the app, never through its key bindings: it goes \
+                       where the app takes typing, usually the focused field. A newline may act \
+                       as Enter and submit; send text after it in a second call. Returns the tree \
+                       if it changed."
     )]
     pub async fn type_text(
         &self,
@@ -581,26 +576,16 @@ impl ServerHandler for TariaMcpServer {
 /// the outline instead, leaving every other word as the attributes wrote it.
 ///
 /// Only `read_tree` and `act` mention the format: `key` and `type_text` say
-/// they return "the updated tree", which is true of either. A route or a
-/// schema shaped other than expected is left alone rather than failed on; the
-/// tests pin that every passage is found.
+/// they return "the tree if it changed", which is true of either, and no
+/// parameter carries a description to swap. A route shaped other than
+/// expected is left alone rather than failed on; the tests pin that every
+/// passage is found.
 fn describe_outline(router: &mut ToolRouter<TariaMcpServer>) {
     if let Some(route) = router.map.get_mut("read_tree") {
         swap_description(&mut route.attr.description, &READ_TREE_PASSAGE);
     }
     if let Some(route) = router.map.get_mut("act") {
         swap_description(&mut route.attr.description, &ACT_PASSAGE);
-        let schema = std::sync::Arc::make_mut(&mut route.attr.input_schema);
-        for (param, passage) in [("node", &ACT_NODE_PASSAGE), ("action", &ACT_ACTION_PASSAGE)] {
-            if let Some(serde_json::Value::Object(property)) = schema
-                .get_mut("properties")
-                .and_then(|properties| properties.get_mut(param))
-                && let Some(serde_json::Value::String(description)) =
-                    property.get_mut("description")
-            {
-                *description = passage.to_outline(description);
-            }
-        }
     }
 }
 
@@ -1834,63 +1819,55 @@ mod tests {
         }
     }
 
-    /// The agent-facing text as it stood before `--tree-format` existed,
-    /// copied here rather than read from the constants, so that the JSON mode
-    /// is held to it byte for byte.
-    const PINNED_INSTRUCTIONS: &str = "Bridge to a live terminal (TUI) application. Call \
-        read_tree first: it returns the app's current semantic tree, including every node id and \
-        the actions each node advertises. Prefer act with a node id and one of that node's \
-        advertised actions (pass value for set_value); node ids and action names come from the \
-        tree, never guess them. An action the tree spells as an object, {\"custom\":\"delete\"}, \
-        is passed to act as the inner name alone, \"delete\"; every other action is passed \
-        exactly as the tree spells it. key and type_text lower differently: key goes into the \
-        app's key handler and lands wherever focus is, type_text goes to the app's typing \
-        surface as literal characters, where a newline arrives as Enter and submits. Type text \
-        with type_text rather than spelling it out with key, whose characters meet the app's \
-        bindings. key is the fallback for parts of the UI without semantic coverage; its repeat \
-        parameter sends the same key up to 64 times, so \"move down five rows\" is one call. \
-        act, key and type_text return the updated tree when the app reacts; call read_tree \
-        again whenever you need a fresh view.";
+    /// The JSON mode's agent-facing text, copied here rather than read from
+    /// the constants, so that the JSON mode is held to it byte for byte and a
+    /// change to what an agent reads is made here too, on purpose. All of it
+    /// is resent with every model call, which is why it is this short.
+    const PINNED_INSTRUCTIONS: &str = "Bridge to a live terminal (TUI) app. Call read_tree first, \
+        then prefer act with an action a node advertises; key is the fallback. Type text with \
+        type_text, not key: key's characters hit the app's key bindings.";
 
-    const PINNED_READ_TREE: &str = "Read the connected TUI app's current semantic tree as JSON: \
-        every node with its id, role, label, value, focus state, and advertised actions. Call \
-        this first; act and key depend on ids and actions from this tree.";
+    const PINNED_READ_TREE: &str =
+        "Read the TUI app's current semantic tree as JSON. Call this first.";
 
-    const PINNED_ACT: &str = "Invoke an advertised action on a node of the app's semantic tree. \
-        `node` is a node id and `action` an action name, both taken from read_tree; pass `value` \
-        for actions that need one (e.g. set_value), up to 4096 characters. An action that needs \
-        a value and arrives without one is answered ignored. An app-specific action appears in \
-        the tree as an object, {\"custom\":\"delete\"}, and is passed here as the inner name \
-        alone, \"delete\"; every other action is passed exactly as the tree spells it. Returns \
-        the updated tree once the app reacts.";
+    const PINNED_ACT: &str = "Invoke an action a node advertises; node and action come from \
+        read_tree, value is for actions like set_value. activate presses a button or submits a \
+        field. An action shown as {\"custom\":\"delete\"} is passed as \"delete\". Returns the \
+        tree if it changed.";
 
-    const PINNED_KEY: &str = "Send a raw key press to the app, e.g. \"q\", \"enter\", \"tab\", \
-        \"ctrl+c\", \"f5\". Pass `repeat` (1-64) to send the same key that many times, so moving \
-        down five rows is one call. For literal text use type_text instead, which types a whole \
-        string in one call. Fallback for parts of the UI without semantic coverage; prefer act \
-        with an advertised action. The key string is one press, up to 64 characters. A key that \
-        does not match the accepted grammar is rejected, with the grammar in the error. Returns \
-        the updated tree once the app reacts.";
+    const PINNED_KEY: &str = "Send one raw key press (q, enter, tab, ctrl+c, f5) to wherever \
+        focus is; repeat sends it up to 64 times. A fallback where no advertised action fits. \
+        Type text with type_text, not key: key's characters hit the app's key bindings. Returns \
+        the tree if it changed.";
 
-    const PINNED_TYPE_TEXT: &str = "Type literal text into the app. The characters go to \
-        whatever surface the app puts typing into, never through its key bindings, so a \
-        100-character string is 1 call, not 100 key calls. A newline arrives as Enter and a tab \
-        as Tab: ending the text with \\n submits wherever Enter submits, and characters after a \
-        submit usually have nowhere left to go, so send them in a second call. Carriage returns \
-        are dropped. read_tree names the focused node; aim this by moving focus with an \
-        advertised focus action, or with set_value on the target, which many apps focus as a \
-        side effect. With nothing accepting typing the app reports it ignored, which comes back \
-        as a result with the tree, not an error. Up to 4096 characters. Returns the updated tree \
-        once the app reacts.";
+    const PINNED_TYPE_TEXT: &str = "Type literal text into the app, never through its key \
+        bindings: it goes where the app takes typing, usually the focused field. A newline may \
+        act as Enter and submit; send text after it in a second call. Returns the tree if it \
+        changed.";
 
-    /// The description of one of `act`'s parameters, which schemars builds
-    /// from the doc comment on that field of [`ActParams`].
-    fn act_param_description(server: &TariaMcpServer, param: &str) -> String {
-        let act = server.get_tool("act").expect("act is listed");
-        act.input_schema["properties"][param]["description"]
-            .as_str()
-            .unwrap_or_else(|| panic!("the {param} parameter is described"))
-            .to_string()
+    /// The outline mode's three swapped texts, pinned the same way, so that a
+    /// change to a format passage is made here on purpose too.
+    const PINNED_OUTLINE_INSTRUCTIONS: &str = "Bridge to a live terminal (TUI) app. Call \
+        read_tree first (an outline, one node per line, actions after act:), then prefer act \
+        with an action a node advertises; key is the fallback. Type text with type_text, not \
+        key: key's characters hit the app's key bindings.";
+
+    const PINNED_OUTLINE_READ_TREE: &str = "Read the TUI app's current semantic tree as an \
+        outline, one node per line, indented by depth: id role \"label\" = \"value\" *focused \
+        act: a|b, parts only when set. Each name after act: is one action to pass to act. Call \
+        this first.";
+
+    const PINNED_OUTLINE_ACT: &str = "Invoke an action a node advertises; node and action come \
+        from read_tree, value is for actions like set_value. activate presses a button or \
+        submits a field. Pass node and action as shown, a quoted one JSON-decoded. Returns the \
+        tree if it changed.";
+
+    /// A tool's input schema as `tools/list` serves it.
+    fn input_schema(server: &TariaMcpServer, name: &str) -> serde_json::Value {
+        let tool = server
+            .get_tool(name)
+            .unwrap_or_else(|| panic!("{name} is listed"));
+        serde_json::Value::Object((*tool.input_schema).clone())
     }
 
     /// A tool's description as `tools/list` serves it.
@@ -1902,10 +1879,11 @@ mod tests {
             .into_owned()
     }
 
-    /// The default mode is what every bridge before `--tree-format` served:
-    /// the same instructions, the same tool list, the same results.
+    /// The default mode serves the pinned text: the instructions, every tool
+    /// description, and every schema, whose parameters carry no description
+    /// but `repeat`'s default and keep every bound.
     #[test]
-    fn json_mode_serves_the_text_it_always_did() {
+    fn json_mode_serves_the_pinned_text() {
         let server = TariaMcpServer::new(detached_handle());
         assert_eq!(server.tree_format, TreeFormat::Json);
         assert_eq!(
@@ -1916,14 +1894,52 @@ mod tests {
         assert_eq!(description(&server, "act"), PINNED_ACT);
         assert_eq!(description(&server, "key"), PINNED_KEY);
         assert_eq!(description(&server, "type_text"), PINNED_TYPE_TEXT);
-        assert!(
-            act_param_description(&server, "action").ends_with(ACT_ACTION_PASSAGE.json),
-            "{}",
-            act_param_description(&server, "action")
+        let draft = "https://json-schema.org/draft/2020-12/schema";
+        assert_eq!(
+            input_schema(&server, "act"),
+            serde_json::json!({
+                "$schema": draft,
+                "properties": {
+                    "action": {"type": "string"},
+                    "node": {"type": "string"},
+                    "value": {"maxLength": 4096, "type": ["string", "null"]},
+                },
+                "required": ["node", "action"],
+                "type": "object",
+            })
         );
         assert_eq!(
-            act_param_description(&server, "node"),
-            "Id of the target node, exactly as it appears in the tree from read_tree."
+            input_schema(&server, "key"),
+            serde_json::json!({
+                "$schema": draft,
+                "properties": {
+                    "key": {"maxLength": 64, "minLength": 1, "type": "string"},
+                    "repeat": {
+                        "description": "Defaults to 1.",
+                        "format": "uint32",
+                        "maximum": 64,
+                        "minimum": 1,
+                        "type": ["integer", "null"],
+                    },
+                },
+                "required": ["key"],
+                "type": "object",
+            })
+        );
+        assert_eq!(
+            input_schema(&server, "type_text"),
+            serde_json::json!({
+                "$schema": draft,
+                "properties": {
+                    "text": {"maxLength": 4096, "minLength": 1, "type": "string"},
+                },
+                "required": ["text"],
+                "type": "object",
+            })
+        );
+        assert_eq!(
+            input_schema(&server, "read_tree"),
+            serde_json::json!({"properties": {}, "type": "object"})
         );
         // Every other byte of the listing too: names, schemas, annotations.
         assert_eq!(
@@ -1980,27 +1996,21 @@ mod tests {
                 description(&outline, "act"),
                 &ACT_PASSAGE,
             ),
-            (
-                act_param_description(&json, "node"),
-                act_param_description(&outline, "node"),
-                &ACT_NODE_PASSAGE,
-            ),
-            (
-                act_param_description(&json, "action"),
-                act_param_description(&outline, "action"),
-                &ACT_ACTION_PASSAGE,
-            ),
         ];
         for (json_text, outline_text, passage) in pairs {
-            assert!(
-                json_text.contains(passage.json),
-                "the JSON text no longer carries the passage the outline replaces, so the \
-                 outline mode would describe JSON: {json_text}"
+            assert_eq!(
+                json_text.matches(passage.json).count(),
+                1,
+                "the JSON text must carry the passage the outline replaces exactly once, or \
+                 the outline mode would describe JSON or swap the wrong words: {json_text}"
             );
             assert!(outline_text.contains(passage.outline), "{outline_text}");
+            // "JSON" alone may appear: a quoted outline token is a JSON
+            // string, and act says to decode it as one. What may not is a
+            // description of the tree as JSON.
             assert!(
                 !outline_text.contains("{\"custom\"")
-                    && !outline_text.contains("JSON")
+                    && !outline_text.contains("as JSON")
                     && !outline_text.contains("as it appears"),
                 "the outline mode must not describe the JSON: {outline_text}"
             );
@@ -2010,60 +2020,54 @@ mod tests {
                 "only the format passage may differ between the modes"
             );
         }
-        assert!(description(&outline, "read_tree").contains("as an outline"));
+        assert_eq!(
+            outline.get_info().instructions.as_deref(),
+            Some(PINNED_OUTLINE_INSTRUCTIONS)
+        );
+        assert_eq!(description(&outline, "read_tree"), PINNED_OUTLINE_READ_TREE);
+        assert_eq!(description(&outline, "act"), PINNED_OUTLINE_ACT);
+        // The markers the benchmark reads a session's format from, and the
+        // phrase the end-to-end gate checks the instructions for.
+        assert!(description(&json, "read_tree").contains("tree as JSON"));
+        assert!(description(&outline, "read_tree").contains("tree as an outline"));
+        assert!(
+            outline
+                .get_info()
+                .instructions
+                .is_some_and(|text| text.contains("one node per line"))
+        );
 
-        // `key` and `type_text` describe no format, so they do not move at all,
-        // and neither does any schema but the two descriptions in `act`'s.
-        for name in ["key", "type_text", "read_tree"] {
+        // The legend is the renderer's own line for a node with every part
+        // set, so the two cannot drift apart.
+        let legend = crate::tree_format::outline(
+            r#"{"protocol_version":1,"seq":1,"root":{"id":"id","role":"role","label":"label","value":"value","focused":true,"actions":["a","b"]}}"#,
+        );
+        let legend = legend.lines().last().expect("a node line");
+        assert_eq!(legend, "id role \"label\" = \"value\" *focused act: a|b");
+        assert!(
+            description(&outline, "read_tree").contains(legend),
+            "{}",
+            description(&outline, "read_tree")
+        );
+
+        // `key` and `type_text` describe no format, so they do not move at
+        // all, and no schema does either: no parameter is described in terms
+        // of the format.
+        for name in ["act", "key", "read_tree", "type_text"] {
             assert_eq!(
-                outline.get_tool(name).map(|tool| tool.input_schema),
-                json.get_tool(name).map(|tool| tool.input_schema),
+                input_schema(&outline, name),
+                input_schema(&json, name),
                 "{name}"
             );
         }
         assert_eq!(description(&outline, "key"), PINNED_KEY);
         assert_eq!(description(&outline, "type_text"), PINNED_TYPE_TEXT);
-        let mut act_schema = outline.get_tool("act").expect("act is listed").input_schema;
-        for (param, passage) in [("node", &ACT_NODE_PASSAGE), ("action", &ACT_ACTION_PASSAGE)] {
-            let schema = std::sync::Arc::make_mut(&mut act_schema);
-            let description = &mut schema["properties"][param]["description"];
-            *description = description
-                .as_str()
-                .map(|text| text.replace(passage.outline, passage.json))
-                .into();
-        }
-        assert_eq!(
-            Some(act_schema),
-            json.get_tool("act").map(|tool| tool.input_schema),
-            "act's schema differs only in the two descriptions"
-        );
     }
 
-    /// The action names in an outline line, in order, unquoted the way the
-    /// outline tells an agent to pass them.
+    /// The action names in an outline line, in order, JSON-decoded where
+    /// quoted, the way the outline tells an agent to pass them.
     fn outline_action_names(line: &str) -> Vec<String> {
-        let start = line.find(" [").expect("the line lists actions") + 2;
-        let mut rest = &line[start..];
-        let mut names = Vec::new();
-        loop {
-            rest = rest.trim_start_matches(' ');
-            if rest.starts_with(']') {
-                return names;
-            }
-            if rest.starts_with('"') {
-                let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<String>();
-                let name = stream
-                    .next()
-                    .expect("a quoted name")
-                    .expect("a JSON string");
-                rest = &rest[stream.byte_offset()..];
-                names.push(name);
-            } else {
-                let end = rest.find([' ', ']']).expect("the list is closed");
-                names.push(rest[..end].to_string());
-                rest = &rest[end..];
-            }
-        }
+        crate::tree_format::line_actions(line).expect("the line ends in an action list")
     }
 
     /// The outline tells the agent to pass an action exactly as the line
@@ -2071,15 +2075,18 @@ mod tests {
     /// validation and reach the app as the action the node advertised. The
     /// shapes here are the ones a plain envelope rule got wrong: a longer
     /// envelope, an object a newer app might send, an envelope naming a
-    /// built-in, a name that needs quoting, and an object whose first key on
-    /// the wire is not the first in the relayed, key-sorted text.
+    /// built-in, an object whose first key on the wire is not the first in the
+    /// relayed, key-sorted text, and names that need quoting, one of them
+    /// carrying the `|` that joins the list and one a quote, which prints
+    /// escaped: stripping the quotes alone would pass `a\"b` for `a"b`.
     #[tokio::test]
     async fn every_action_name_the_outline_prints_is_one_act_accepts() {
         let line = concat!(
             r#"{"type":"snapshot","protocol_version":1,"seq":4,"root":{"id":"app","role":"app","#,
             r#""children":[{"id":"row","role":"list_item","actions":["select","#,
             r#"{"custom":"delete","icon":"x"},{"scroll_to":{"row":3}},{"custom":"activate"},"#,
-            r#"{"custom":"two words"},"frobnicate",{"zoom":1,"custom":"x"}]}]}}"#
+            r#"{"custom":"two words"},"frobnicate",{"zoom":1,"custom":"x"},{"custom":"a|b"},"#,
+            r#"{"custom":"a\"b"}]}]}}"#
         );
         let Ok(taria::wire::AppToBridge::Snapshot(parsed)) = serde_json::from_str(line) else {
             panic!("the line is a snapshot");
@@ -2089,7 +2096,7 @@ mod tests {
         assert_eq!(
             outline,
             "protocol_version=1 seq=4\napp app\n  row list_item \
-             [select delete scroll_to activate \"two words\" frobnicate zoom]"
+             act: select|delete|scroll_to|activate|\"two words\"|frobnicate|zoom|\"a|b\"|\"a\\\"b\""
         );
         let names = outline_action_names(outline.lines().last().expect("a node line"));
         let row = find_node(&tree.parsed.root, "row").expect("the row parsed");

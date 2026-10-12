@@ -21,12 +21,20 @@ names, `"focused":false` on nearly every node, and punctuation, which is how a
 benchmark found a taria tree costing more per call than a tmux screen of the
 same app. The outline carries every node, id, role, label, value, focus
 state and field, and every action by the name `act` takes, in under half the
-characters: the demo's first tree is 1132 characters as JSON and 525 as an
+characters: the demo's first tree is 1,132 characters as JSON and 546 as an
 outline. Extra keys inside an action object are not shown, because `act`
-takes only the name. It is opt-in, and the default does not move.
+takes only the name. It is opt-in, and the default stays JSON.
+
+**The bridge's own text is less than half as long.** The server instructions
+and the four tool definitions are resent with every model call. Counted as the
+instructions plus each tool's `tools/list` entry as Python's `json.dumps`
+prints it, they came to 4,788 characters, the bridge's largest fixed cost,
+against 2,787 for the benchmark's tmux driver. They are now 1,992 characters,
+and 2,199 with the outline. `act` also says what `activate` does, which no
+text said before.
 
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1 and apps send the same
-JSON; only the text the bridge hands the model changes, and only when asked.
+JSON; only the text the bridge hands the model changes.
 
 **This breaks the Rust API of `taria-mcp`, so the next release is 0.3.0.**
 `args::Cli::Run` gained a field, and `Cli`, its `Run` variant and the new
@@ -44,9 +52,13 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
 - **`--tree-format <json|outline>`**, default `json`. The outline is a header
   line of the snapshot's other fields (`protocol_version=1 seq=1`), then one
   line per node, indented two spaces per level, as
-  `id role "label" = "value" [actions] *focused`, with each part present only
+  `id role "label" = "value" *focused act: a|b`, with each part present only
   when set. `docs/cli.md` has the grammar. A missing or unknown value is a
   usage error.
+- **The actions end the line, labelled `act:`**, joined by `|`, so the list
+  reads as the call to make rather than as a detail an agent can pass over
+  for `key`. A name holding a space or a `|` is quoted, and so is an id, role
+  or name spelled `act:`, so the marker cannot be forged.
 - **Every tree goes out in the chosen format**: `read_tree`, and the tree in
   every `act`, `key` and `type_text` answer, the ignored note's tree included.
 - **The outline is rendered from the relayed line**, so a
@@ -60,10 +72,41 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
   JSON-quoted, with U+2028, U+2029 and U+0085 escaped as well as the newline,
   and a line the outline cannot express is served as JSON.
 - **The agent is told which format it is reading.** In outline mode the MCP
-  instructions, the `read_tree` and `act` descriptions and the descriptions of
-  `act`'s `node` and `action` parameters describe the outline instead of the
-  JSON. Every other word is the same, and a test holds the JSON mode to the
-  text it served before, byte for byte.
+  instructions and the `read_tree` description say the tree is an outline and
+  how a line reads, and `act`'s description says to pass node and action as
+  shown, a quoted one JSON-decoded, since a quoted token is a JSON string.
+  Every other word is the same in both modes, and a test pins each mode's
+  text byte for byte.
+- **The instructions give the order of work and one rule.** Read the tree,
+  prefer `act` with an advertised action, fall back on `key`, and type text
+  with `type_text`, not `key`, because `key`'s characters hit the app's key
+  bindings. Where an app routes no typed text, `key` remains the way into its
+  fields. `key`'s description says the rule again, for a client that drops
+  the instructions, and `type_text`'s says the text never goes through the
+  key bindings.
+- **The input tools say they return the tree if it changed.** An input the
+  app took with no change to show, one it neither acknowledged nor changed
+  anything for, and one it acknowledged on its way out each come back as a
+  note with no tree.
+- **`type_text` says a newline may act as Enter and submit**, and to send
+  text meant for after it in a second call. In a multi-line editor a
+  newline inserts a line instead.
+- **The `{"custom":"delete"}` rule lives only in `act`'s description**, in
+  JSON mode. The outline prints the inner name, so it never shows the
+  envelope.
+- **`act` says `activate` presses a button or submits a field.**
+- **Parameters carry no description but `repeat`'s "Defaults to 1."** The
+  tool descriptions already cover them, and the schema still states every
+  bound: 4096 characters for `value` and `text`, 64 for `key`, and 1 to 64
+  presses for `repeat`.
+- **Some of what the texts said is now left to the answers.** A key outside
+  the grammar is still refused with the grammar in the error, and an input
+  the app ignored still comes back as a result carrying the tree, not as an
+  error, whose text names a `set_value` sent without a value among the
+  causes. Some is no longer in any text the agent sees: how to aim
+  `type_text` (an advertised focus action, or `set_value` on the target),
+  that a tab arrives as Tab and carriage returns are dropped, and the
+  instructions' "never guess them" about node ids and action names.
 - **For a Rust caller**: `TariaMcpServer::with_tree_format` builds the handler
   in either format, `TariaMcpServer::new` still serves JSON, the renderer is
   `taria_mcp::tree_format`, and `args::Cli::Run` carries the parsed
@@ -74,10 +117,9 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
 - `scripts/e2e.py` grows from 21 steps to 22. The new one starts a demo behind
   a bridge run with `--tree-format outline`, reads the outline, and selects a
   row through an `act` named from it, whose answer has to be an outline too.
-  It then deletes that row through the custom action as its line spells it,
-  `delete`, checks the confirm dialog opened, and closes it through the
-  dialog's advertised `dismiss`, so the demo ends with no modal and the row
-  intact.
+  It then invokes `delete` on that row, the custom action as its line spells
+  it, checks the confirm dialog opened, and closes it through the dialog's
+  advertised `dismiss`, so the demo ends with no modal and the row intact.
 
 ## [0.2.1] - 2026-10-11
 

@@ -169,11 +169,13 @@ nothing.
 
 The envelope is a wire encoding, not an argument. `act` takes the name alone,
 so a node advertising `{"custom":"delete"}` is invoked with `"delete"`. An
-agent told never to guess an action name meets that difference on its first
-custom action, so in the default JSON mode the tool description and the
-server's instructions both state it rather than leaving it to be inferred.
-With `--tree-format outline` the outline prints the name `act` takes,
-`delete`, so an agent reading it never meets the envelope at all.
+agent told to take action names from the tree meets that difference on its
+first custom action, so in the default JSON mode `act`'s description states it
+rather than leaving it to be inferred. The server's instructions do not repeat
+it: they and the tool definitions are both resent with every model call, so
+the rule is said once, in the tool it governs. With `--tree-format outline`
+the outline prints the name `act` takes, `delete`, so an agent reading it
+never meets the envelope at all.
 
 ### Version 1 is frozen
 
