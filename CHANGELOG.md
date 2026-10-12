@@ -102,11 +102,11 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
 - **Some of what the texts said is now left to the answers.** A key outside
   the grammar is still refused with the grammar in the error, and an input
   the app ignored still comes back as a result carrying the tree, not as an
-  error. Some is no longer said anywhere: how to aim `type_text` (an
-  advertised focus action, or `set_value` on the target), that a tab arrives
-  as Tab and carriage returns are dropped, that an `act` needing a value and
-  sent without one is answered ignored, and the instructions' "never guess
-  them" about node ids and action names.
+  error, whose text names a `set_value` sent without a value among the
+  causes. Some is no longer in any text the agent sees: how to aim
+  `type_text` (an advertised focus action, or `set_value` on the target),
+  that a tab arrives as Tab and carriage returns are dropped, and the
+  instructions' "never guess them" about node ids and action names.
 - **For a Rust caller**: `TariaMcpServer::with_tree_format` builds the handler
   in either format, `TariaMcpServer::new` still serves JSON, the renderer is
   `taria_mcp::tree_format`, and `args::Cli::Run` carries the parsed
