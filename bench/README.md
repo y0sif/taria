@@ -121,13 +121,21 @@ alone (outline1) never collided. So:
   defaults to `taria,tmux`;
 - `next` refuses to hand out a job of a batch with an arm that shares tool
   names with another arm the same orchestrating session was already
-  handed, in any batch: it claims nothing and says to restart the session.
-  It knows the session by `CLAUDE_PID`, the pid Claude Code sets for the
-  commands its Bash tool runs, plus that process's start time, and records
-  each hand-out in `results/slots/handouts.jsonl`. Run outside Claude Code,
-  or without `/proc`, it cannot tell, and only this procedure protects the
-  batch. It also refuses every job of a plan written with both arms before
-  `plan` refused that (probe4's).
+  handed, or graded a run of, in any batch: it claims nothing and says to
+  restart the session. It knows the session by `CLAUDE_PID`, the pid Claude
+  Code sets for the commands its Bash tool runs, plus that process's start
+  time, and records in `results/slots/handouts.jsonl` each job it hands out
+  and each run it grades. A graded run's arm goes on record for the session
+  that grades it, whoever claimed the job: a restarted session that spawned
+  the agent for the old session's slot has seen that arm's tools. A
+  `next --agent-id` that grades a slot and is then refused the next job
+  keeps the row and frees the slot, and its error says so. When it cannot
+  tell the session, it says so in one line on stderr every time, and only
+  this procedure protects the batch: `CLAUDE_PID` unset (run outside Claude
+  Code), or set but naming no process it can see in `/proc` (the process is
+  gone, or run.py runs in a PID namespace of its own, as a sandbox may run
+  it), or no `/proc` at all (off Linux). It also refuses every job of a plan
+  written with both arms before `plan` refused that (probe4's).
 
 `plan` writes the shuffled jobs (task x arm x model x run) and the seed to
 `results/B/plan.json`, and never replaces one. It also refuses a batch whose

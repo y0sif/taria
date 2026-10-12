@@ -597,17 +597,75 @@ class SessionArms(unittest.TestCase):
         with open(runner.Paths(self.results).handouts) as f:
             return [json.loads(line) for line in f]
 
+    OFF = ("so the orchestrating session cannot be told and the session check is off: only the procedure in "
+           "bench/README.md")
+
+    def orchestrator(self, environ, **kw):
+        """runner.orchestrator, with what it said on stderr."""
+        err = io.StringIO()
+        with redirect_stderr(err):
+            session = runner.orchestrator(environ, **kw)
+        return session, err.getvalue()
+
     def test_a_session_is_known_by_its_claude_code_process(self):
-        me = runner.orchestrator({"CLAUDE_PID": str(os.getpid()), "CLAUDE_CODE_SESSION_ID": "s1"})
+        me, said = self.orchestrator({"CLAUDE_PID": str(os.getpid()), "CLAUDE_CODE_SESSION_ID": "s1"})
+        self.assertEqual(said, "", "a session it can tell is not remarked on")
         self.assertEqual((me["pid"], me["session_id"]), (os.getpid(), "s1"))
         self.assertRegex(me["key"], rf"^{os.getpid()}@\d+$")
         self.assertEqual(runner.orchestrator({"CLAUDE_PID": str(os.getpid())})["key"], me["key"],
                          "the same process is the same session, whatever its session id")
         self.assertNotEqual(runner.orchestrator({"CLAUDE_PID": str(os.getppid())})["key"], me["key"])
-        # Outside Claude Code, or a process that is gone: it cannot tell.
-        for environ in ({}, {"CLAUDE_PID": ""}, {"CLAUDE_PID": "abc"}, {"CLAUDE_PID": "999999999"}):
-            with self.subTest(environ=environ):
-                self.assertIsNone(runner.orchestrator(environ))
+
+    def test_a_session_it_cannot_tell_is_said_in_one_stderr_line(self):
+        """Outside Claude Code, with a CLAUDE_PID that is no pid, a process
+        that is gone or out of sight (a PID namespace of its own), no /proc
+        (off Linux), or a stat without a start time: no session, and one
+        stderr line saying why the check is off, never silence."""
+        proc = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, proc)
+        os.mkdir(os.path.join(proc, "self"))  # a /proc in which process 4242 is not to be seen
+        os.mkdir(os.path.join(proc, "77"))
+        with open(os.path.join(proc, "77", "stat"), "w") as f:
+            f.write("77 (claude) S 1\n")
+        no_proc = os.path.join(proc, "absent")
+        cases = [
+            ({}, {}, "run.py: CLAUDE_PID is not set (run.py was not run by Claude Code's Bash tool), "),
+            ({"CLAUDE_PID": ""}, {}, "run.py: CLAUDE_PID is '', not a pid, "),
+            ({"CLAUDE_PID": "abc"}, {}, "run.py: CLAUDE_PID is 'abc', not a pid, "),
+            ({"CLAUDE_PID": "²"}, {}, "not a pid"),  # str.isdigit() takes it; int() does not
+            ({"CLAUDE_PID": "999999999"}, {}, "run.py: CLAUDE_PID is 999999999, but no process 999999999 is "
+                                              "visible in /proc: it is gone, or run.py runs in a PID namespace "
+                                              "of its own, as a sandbox may run it, "),
+            ({"CLAUDE_PID": "4242"}, {"proc": proc}, f"but no process 4242 is visible in {proc}: it is gone, or "),
+            ({"CLAUDE_PID": str(os.getpid())}, {"proc": no_proc},
+             f"but there is no {no_proc} to find it in (not Linux, or {no_proc} is not mounted), "),
+            ({"CLAUDE_PID": "77"}, {"proc": proc}, f"but {os.path.join(proc, '77', 'stat')} has no start time"),
+        ]
+        for environ, kw, why in cases:
+            with self.subTest(environ=environ, **kw):
+                session, said = self.orchestrator(environ, **kw)
+                self.assertIsNone(session)
+                self.assertEqual(len(said.splitlines()), 1, said)
+                self.assertIn(why, said)
+                self.assertIn(self.OFF, said)
+
+    @unittest.skipUnless(shutil.which("unshare"), "unshare is not on PATH")
+    def test_a_pid_namespace_of_its_own_is_said_in_one_stderr_line(self):
+        """run.py in a PID namespace of its own, as a sandbox may run it: the
+        CLAUDE_PID it inherits names a process it cannot see."""
+        unshare = ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc"]
+        probe = subprocess.run([*unshare, "true"], capture_output=True, text=True, timeout=30)
+        if probe.returncode != 0:
+            self.skipTest(f"cannot unshare a PID namespace here: {probe.stderr.strip()}")
+        script = "import sys; sys.path.insert(0, sys.argv[1]); import run; print(run.orchestrator())"
+        out = subprocess.run([*unshare, sys.executable, "-c", script, BENCH], capture_output=True, text=True,
+                             timeout=60, stdin=subprocess.DEVNULL,
+                             env={**os.environ, runner.SESSION_PID_ENV: str(os.getpid())})
+        self.assertEqual(out.stdout, "None\n", out.stderr)
+        self.assertEqual(len(out.stderr.splitlines()), 1, out.stderr)
+        self.assertIn(f"CLAUDE_PID is {os.getpid()}, but no process {os.getpid()} is visible in /proc: it is gone, "
+                      "or run.py runs in a PID namespace of its own", out.stderr)
+        self.assertIn(self.OFF, out.stderr)
 
     def test_one_session_is_never_handed_both_bridge_arms(self):
         (t_paths, t), (o_paths, o), (x_paths, x) = self.batch("t"), self.batch("o"), self.batch("x")
@@ -679,9 +737,99 @@ class SessionArms(unittest.TestCase):
         self.assertIn(f"this orchestrating session (Claude Code pid {os.getpid()}) was already handed taria jobs",
                       json.loads(out)["error"])
         self.assertIn("restart the orchestrating session", err)
+        self.assertNotIn("session check is off", err, "a session it can tell is not remarked on")
         self.assertEqual(sorted(runner.read_all_slots(runner.Paths(self.results))), [1])
         (record,) = self.handouts()
-        self.assertEqual((record["claude_pid"], record["batch"], record["arm"]), (os.getpid(), "t", "taria"))
+        self.assertEqual((record["claude_pid"], record["batch"], record["arm"], record["via"]),
+                         (os.getpid(), "t", "taria", "claimed"))
+
+    REAL = object()  # next(): leave orchestrator() unpatched
+
+    def next(self, batch, k, *argv, session=REAL):
+        """`next` in process as orchestrating `session` (REAL: whatever
+        CLAUDE_PID says), with no build check, no demo and no transcript:
+        an agent id is taken for the slot's run and graded passed.
+        (code, stdout JSON, stderr)."""
+        def prepared(paths, k, slot):
+            slot.update(state="ready", prepared=runner.now("milliseconds"))
+            runner.write_slot(paths, k, slot)
+
+        def grade(plan, slot, agent_id, **_):
+            return runner.new_row(batch=plan["batch"], job=slot["job"], task=slot["task"], arm=slot["arm"],
+                                  model=slot["model"], run=slot["run"], agent_id=agent_id, status="passed")
+
+        with ExitStack() as stack:
+            for name in ("preflight", "check_agent_files", "teardown"):
+                stack.enter_context(mock.patch.object(runner, name))
+            stack.enter_context(mock.patch.object(runner, "prepare_slot", prepared))
+            stack.enter_context(mock.patch.object(runner, "check_agent_identity", return_value="t.jsonl"))
+            stack.enter_context(mock.patch.object(runner, "archive_transcript", return_value="t.jsonl"))
+            stack.enter_context(mock.patch.object(runner, "grade_agent_run", grade))
+            if session is not self.REAL:
+                stack.enter_context(mock.patch.object(runner, "orchestrator", return_value=session))
+            code, out, err = quiet_cli("next", "--batch", batch, "--slot", str(k), "--results-dir", self.results,
+                                       *argv)
+        return code, json.loads(out), err
+
+    def test_next_says_once_that_the_check_is_off(self):
+        """Without CLAUDE_PID (popped for every test), a `next` that grades
+        and claims says the check is off in one stderr line, and its JSON is
+        what it always was."""
+        code, job, err = self.next("t", 1)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(set(job), {"job", "slot", "agent", "model", "prompt"})
+        self.assertEqual(err.count("session check is off"), 1, err)
+        code, job, err = self.next("t", 1, "--agent-id", "a1")
+        self.assertEqual((code, set(job)), (0, {"job", "slot", "agent", "model", "prompt"}), err)
+        self.assertEqual(err.count("session check is off"), 1, err)
+        self.assertIn("run.py: CLAUDE_PID is not set", err)
+        self.assertFalse(os.path.exists(runner.Paths(self.results).handouts), "no session, nothing recorded")
+
+    def test_grading_records_the_arm_for_the_grading_session(self):
+        """A restarted session that spawned the agent for a slot the old one
+        claimed has seen that arm: grading puts it on record for the new
+        session, which is then refused the arm sharing its tool names."""
+        code, _, err = quiet_cli("plan", "--batch", "t1", "--results-dir", self.results, "--tasks", "T1",
+                                 "--arms", "taria", "--seed", "1")
+        self.assertEqual(code, 0, err)
+        code, job, err = self.next("t1", 1, session=self.ONE)
+        self.assertEqual(code, 0, err)
+        code, done, err = self.next("t1", 1, "--agent-id", "a1", session=self.TWO)
+        self.assertEqual((code, done), (0, {"done": True}), err)
+        self.assertEqual([(r["session"], r["batch"], r["job"], r["arm"], r["via"]) for r in self.handouts()],
+                         [("100@1", "t1", job["job"], "taria", "claimed"),
+                          ("200@2", "t1", job["job"], "taria", "graded")])
+        code, refused, err = self.next("o", 2, session=self.TWO)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertTrue(refused["error"].startswith(
+            f"this orchestrating session (Claude Code pid 200) already graded taria runs (t1 {job['job']}), and "
+            "arms outline and taria share tool names"), refused["error"])
+        self.assertEqual(runner.read_all_slots(runner.Paths(self.results)), {})
+
+    def test_grading_then_a_refusal_keeps_the_row_and_frees_the_slot(self):
+        """One `next --agent-id` that grades a slot and is then refused the
+        next job: the graded row is recorded, the slot freed and nothing
+        claimed, and the error says the row was recorded."""
+        code, held, err = self.next("o", 2, session=self.TWO)
+        self.assertEqual(code, 0, err)
+        code, job, err = self.next("t", 1, session=self.ONE)
+        self.assertEqual(code, 0, err)
+        # The old session is restarted; the new one, already handed outline, grades the taria slot.
+        code, refused, err = self.next("t", 1, "--agent-id", "a1", session=self.TWO)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertTrue(refused["error"].startswith(
+            f"{job['job']} was recorded (passed) and slot 1 freed; this orchestrating session (Claude Code pid "
+            f"200) was already handed outline jobs (o {held['job']}), and arms taria and outline share tool names"),
+            refused["error"])
+        self.assertTrue(refused["error"].endswith("; claimed nothing"), refused["error"])
+        t_paths = runner.Paths(self.results, "t")
+        self.assertEqual([(r["job"], r["agent_id"], r["status"]) for r in runner.read_rows(t_paths)],
+                         [(job["job"], "a1", "passed")])
+        self.assertIsNone(runner.read_slot(t_paths, 1), "the graded slot is free")
+        self.assertEqual(sorted(runner.read_all_slots(t_paths)), [2], "only outline's slot is held")
+        self.assertEqual([(r["session"], r["batch"], r["arm"], r["via"]) for r in self.handouts()],
+                         [("200@2", "o", "outline", "claimed"), ("100@1", "t", "taria", "claimed"),
+                          ("200@2", "t", "taria", "graded")])
 
 
 class SlotFields(unittest.TestCase):

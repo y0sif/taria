@@ -69,12 +69,14 @@ taria and outline serve the same tool names, and a Claude Code session keeps
 the first definitions it sees for a tool name, so the two never share an
 orchestrating session: `plan` refuses a batch with both (its arms default to
 taria,tmux), and `next` refuses to hand out a job of a batch whose arm shares
-tool names with another arm the same session was already handed, in any
-batch, telling the operator to restart the session. It knows the session by
-CLAUDE_PID, which Claude Code sets for its Bash commands, and records each
-hand-out in results/slots/handouts.jsonl; outside Claude Code it cannot
-tell, and only the procedure (one session per arm family, restarted between)
-protects the batch.
+tool names with another arm the same session was already handed or graded
+a run of (whoever claimed it), in any batch, telling the operator to restart
+the session. It knows the session by CLAUDE_PID, which Claude Code sets for
+its Bash commands, and records each hand-out and each grading in
+results/slots/handouts.jsonl. When it cannot tell (outside Claude Code, in
+a PID namespace of its own, off Linux) it says so in one stderr line, and
+only the procedure (one session per arm family, restarted between) protects
+the batch.
 
 Every run ends in exactly one status:
 
@@ -718,8 +720,8 @@ def tolerance_note(plan):
 # outline's descriptions while their own bridge served JSON. So `plan`
 # refuses a batch whose arms share a tool name, and `next` refuses to hand
 # out a job of a batch with an arm that shares a tool name with another arm
-# the same orchestrating session was already handed, in any batch
-# (claim_in_session). tmux shares no name with either.
+# the same orchestrating session was already handed or graded a run of, in
+# any batch (claim_in_session, finish_slot). tmux shares no name with either.
 
 
 def _shared_tools(a, b):
@@ -742,29 +744,55 @@ def _collision(a, b, shared):
             "offered the other's")
 
 
-def orchestrator(environ=None):
+def orchestrator(environ=None, proc="/proc"):
     """The Claude Code process this run.py runs under, as {"key", "pid",
     "session_id"}, or None when it cannot be told. Claude Code puts its pid
     in CLAUDE_PID for the commands its Bash tool runs; the key adds the
     process's start time from /proc, so a pid a later process reuses is
-    another session. Without CLAUDE_PID (run outside Claude Code) or /proc,
-    or with a pid that is gone, None: the session check is then skipped."""
+    another session. None without CLAUDE_PID (run outside Claude Code), with
+    one that is not a pid, or with one whose /proc/<pid>/stat cannot be read:
+    the process is gone, run.py runs in a PID namespace of its own (as a
+    sandbox may run it), or there is no /proc (off Linux). Then the session
+    check is off, and one line on stderr says why, never silently."""
     environ = os.environ if environ is None else environ
-    pid = environ.get(SESSION_PID_ENV) or ""
-    if not pid.isdigit():
-        return None
+    pid = environ.get(SESSION_PID_ENV)
+    if pid is None:
+        return _unidentified(f"{SESSION_PID_ENV} is not set (run.py was not run by Claude Code's Bash tool)")
+    if not re.fullmatch(r"[0-9]+", pid):
+        return _unidentified(f"{SESSION_PID_ENV} is {pid!r}, not a pid")
+    pid = int(pid)
+    stat = os.path.join(proc, str(pid), "stat")
     try:
-        with open(f"/proc/{int(pid)}/stat") as f:
+        with open(stat, "rb") as f:
             # The fields after the command name's closing paren start at
             # field 3 (state); the start time is field 22.
-            start = f.read().rpartition(")")[2].split()[19]
-    except (OSError, IndexError):
-        return None
-    return {"key": f"{int(pid)}@{start}", "pid": int(pid), "session_id": environ.get(SESSION_ID_ENV)}
+            start = f.read().rpartition(b")")[2].split()[19].decode("ascii")
+    except FileNotFoundError:
+        if not os.path.isdir(os.path.join(proc, "self")):
+            cause = f"there is no {proc} to find it in (not Linux, or {proc} is not mounted)"
+        else:
+            cause = (f"no process {pid} is visible in {proc}: it is gone, or run.py runs in a PID namespace of its "
+                     "own, as a sandbox may run it")
+        return _unidentified(f"{SESSION_PID_ENV} is {pid}, but {cause}")
+    except OSError as err:
+        return _unidentified(f"{SESSION_PID_ENV} is {pid}, but {stat} cannot be read ({err.strerror or err})")
+    except (IndexError, ValueError):
+        return _unidentified(f"{SESSION_PID_ENV} is {pid}, but {stat} has no start time to read")
+    return {"key": f"{pid}@{start}", "pid": pid, "session_id": environ.get(SESSION_ID_ENV)}
+
+
+def _unidentified(why):
+    """Say on stderr, in one line, that `why` leaves the orchestrating
+    session unknown and the session check off. Returns None."""
+    print(f"run.py: {why}, so the orchestrating session cannot be told and the session check is off: only the "
+          "procedure in bench/README.md (taria and outline from separate orchestrating sessions, restarted "
+          "between) keeps one session from being handed both", file=sys.stderr)
+    return None
 
 
 def session_handouts(paths, key):
-    """{arm: its first hand-out record} for the orchestrating session `key`."""
+    """{arm: its first record, a hand-out or a grading (record_handout)}
+    for the orchestrating session `key`."""
     try:
         with open(paths.handouts) as f:
             lines = f.read().splitlines()
@@ -787,7 +815,7 @@ def handout_problem(paths, plan, k, session):
     A plan whose own arms share tool names (one written before `plan`
     refused it, as probe4's was) is refused whoever runs it; otherwise an
     arm of the plan that shares tool names with another arm this session
-    was already handed, in any batch."""
+    was already handed, or graded a run of, in any batch."""
     collisions = colliding_arms(plan.get("arms") or [])
     if collisions:
         return (f"the plan of batch {plan['batch']} was written before `plan` refused it: {_collision(*collisions[0])}"
@@ -799,11 +827,27 @@ def handout_problem(paths, plan, k, session):
         for other, record in sorted(handed.items()):
             shared = _shared_tools(arm, other)
             if shared:
-                return (f"this orchestrating session (Claude Code pid {session['pid']}) was already handed "
-                        f"{other} jobs ({record.get('batch')} {record.get('job')}), and {_collision(arm, other, shared)}"
+                graded = record.get("via") == "graded"
+                had = f"already graded {other} runs" if graded else f"was already handed {other} jobs"
+                return (f"this orchestrating session (Claude Code pid {session['pid']}) {had} "
+                        f"({record.get('batch')} {record.get('job')}), and {_collision(arm, other, shared)}"
                         f"; restart the orchestrating session, then `run.py next --batch {plan['batch']} --slot {k}` "
                         "from the new one")
     return None
+
+
+def record_handout(paths, session, batch, job, arm, via):
+    """Record in paths.handouts that the orchestrating `session` (None:
+    nothing is recorded) ran an agent of `arm` for `job`: `via` is "claimed"
+    when it was handed the job, "graded" when it graded the job's run, which
+    it is taken to have spawned, whoever claimed it (a restarted session
+    finishing the old one's slot). The caller holds paths.handouts_lock."""
+    if session is None:
+        return
+    record = {"ts": now(), "session": session["key"], "claude_pid": session["pid"],
+              "claude_session_id": session["session_id"], "batch": batch, "job": job, "arm": arm, "via": via}
+    with open(paths.handouts, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def claim_in_session(paths, plan, k, session):
@@ -822,12 +866,7 @@ def claim_in_session(paths, plan, k, session):
         if problem:
             free_slot(paths, k)
             raise CommandError(f"{problem}; claimed nothing")
-        if session is not None:
-            record = {"ts": now(), "session": session["key"], "claude_pid": session["pid"],
-                      "claude_session_id": session["session_id"], "batch": plan["batch"], "job": job["id"],
-                      "arm": job["arm"]}
-            with open(paths.handouts, "a") as f:
-                f.write(json.dumps(record) + "\n")
+        record_handout(paths, session, plan["batch"], job["id"], job["arm"], "claimed")
     return job, slot
 
 
@@ -1128,11 +1167,16 @@ def check_agent_identity(paths, plan, k, slot, agent_id, transcript_file=None, t
     return path
 
 
-def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None):
+def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None, session=None):
     """Grade the agent run slot `k` holds, record it, tear the demo down and
     free the slot. Returns the row (an existing one if the job was recorded
     before a crash left the slot behind). Refuses an agent that cannot have
     run this job (check_agent_identity) before recording anything.
+
+    The orchestrating `session` grading it (orchestrator()) gets the slot's
+    arm on record with the row (record_handout), even when another session
+    claimed the job: a restarted session that spawned the agent for the old
+    one's slot has seen that arm's tool definitions.
 
     The transcript is archived into the batch (archive_transcript) and the
     archived copy graded, so the row and a later regrade read the same
@@ -1151,7 +1195,11 @@ def finish_slot(paths, plan, k, slot, agent_id, transcript_file=None):
         print(f"run.py: could not archive agent {agent_id}'s transcript ({err}); grading the live one. "
               f"`run.py archive --batch {plan['batch']}` copies it later", file=sys.stderr)
     row = grade_agent_run(plan, slot, agent_id, transcript_file=path)
-    append_row(paths, row)  # before teardown: a crash from here on leaves a row, not a lost run
+    # The handouts lock, then the batch lock append_row takes: claim_in_session's order.
+    os.makedirs(paths.slots, exist_ok=True)
+    with flocked(paths.handouts_lock):
+        append_row(paths, row)  # before teardown: a crash from here on leaves a row, not a lost run
+        record_handout(paths, session, plan["batch"], slot["job"], slot["arm"], "graded")
     teardown(slot)
     free_slot(paths, k)
     return row
@@ -1184,7 +1232,8 @@ def cmd_next(args):
 
 def _next_locked(args, paths, plan):
     k = args.slot
-    slot = read_slot(paths, k)
+    session = orchestrator()  # once per call; when it cannot be told, one stderr line says so
+    slot, graded = read_slot(paths, k), None
     if slot is not None and slot.get("state") != "ready":
         # A prepare runs under this slot's flock, which we now hold: whoever
         # wrote this unfinished slot is gone.
@@ -1200,7 +1249,7 @@ def _next_locked(args, paths, plan):
                 f"slot {k} holds {job_of(slot)}; pass --agent-id of the agent that ran it, "
                 f"or `run.py abort --batch {plan['batch']} --slot {k}`"
             )
-        row = finish_slot(paths, plan, k, slot, args.agent_id, args.transcript_file)
+        graded = row = finish_slot(paths, plan, k, slot, args.agent_id, args.transcript_file, session)
         print(summary_line(row), file=sys.stderr)
         if row["status"] == "harness_error":
             raise CommandError(
@@ -1212,9 +1261,15 @@ def _next_locked(args, paths, plan):
             raise CommandError(f"slot {k} holds no job, so agent {args.agent_id} did not run from it")
         print(f"run.py: agent {args.agent_id} was already graded", file=sys.stderr)
 
-    preflight()
-    check_agent_files(plan, k, args.agents_dir, paths.slots)
-    job, slot = claim_in_session(paths, plan, k, orchestrator())
+    try:
+        preflight()
+        check_agent_files(plan, k, args.agents_dir, paths.slots)
+        job, slot = claim_in_session(paths, plan, k, session)
+    except CommandError as err:
+        if graded is None:
+            raise
+        # Said, so the operator does not take the refusal for a lost run and grade it again.
+        raise CommandError(f"{graded['job']} was recorded ({graded['status']}) and slot {k} freed; {err}")
     if job is None:
         print(json.dumps({"done": True}), flush=True)
         return EXIT_OK
