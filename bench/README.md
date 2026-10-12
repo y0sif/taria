@@ -36,6 +36,9 @@ taria and outline offer the same tool names, so what tells their runs apart
 is the `read_tree` description each server serves ("the current semantic
 tree as JSON" or "as an outline"). Transcripts record it, and the guard holds
 each arm to its own (see Isolation); the dry run checks the live server's.
+For the same reason the two never share an orchestrating session: a Claude
+Code session keeps the first definitions it sees for a tool name (see How
+runs execute).
 
 `screen` has no colors or styles, as a screen scraper gets. The demo marks the
 active tab only as bold, so on an empty tab the tmux arm cannot tell which tab
@@ -99,7 +102,32 @@ to `agents` and `--agents-dir ~/Projects/taria/.claude/agents` to `next`.
 
 Run the orchestrating session from the main checkout, not a worktree, and do
 not `cd` or `/add-dir` during a batch: both change the environment text, which
-the guard refuses. Call `run.py` by absolute path.
+the guard refuses. Call `run.py` by absolute path. Run it in bypass or
+default permission mode, not auto (see Isolation).
+
+Run the taria and outline arms in separate batches, each from its own
+orchestrating session, and restart the session between them. The two serve
+the same tool names (`mcp__tui__read_tree`, `act`, `key`, `type_text`) with
+different descriptions, and a Claude Code session keeps the first
+definitions it sees for a tool name for the rest of the session. In probe4,
+outline job j001 started first, and taria jobs j002 and j005 (j005 spawned
+alone, after every other run had finished) were offered the outline's
+descriptions while their own bridge served JSON trees and JSON
+instructions. The guard caught them by their tree format, but the runs were
+lost. tmux has tool names of its own, so taria with tmux (full1) and outline
+alone (outline1) never collided. So:
+
+- `plan` refuses a batch whose arms share tool names, and its `--arms`
+  defaults to `taria,tmux`;
+- `next` refuses to hand out a job of a batch with an arm that shares tool
+  names with another arm the same orchestrating session was already
+  handed, in any batch: it claims nothing and says to restart the session.
+  It knows the session by `CLAUDE_PID`, the pid Claude Code sets for the
+  commands its Bash tool runs, plus that process's start time, and records
+  each hand-out in `results/slots/handouts.jsonl`. Run outside Claude Code,
+  or without `/proc`, it cannot tell, and only this procedure protects the
+  batch. It also refuses every job of a plan written with both arms before
+  `plan` refused that (probe4's).
 
 `plan` writes the shuffled jobs (task x arm x model x run) and the seed to
 `results/B/plan.json`, and never replaces one. It also refuses a batch whose
@@ -174,8 +202,9 @@ The taria solver reads node ids and actions from the JSON tree; the outline
 solver parses the outline text back into the same tree (ids are the line's
 first token, JSON-quoted when not bare) and runs the same steps; the tmux
 solver reads the screen. `--sabotage` swaps in a plausible wrong plan per
-task, so each check fails. `--arms` (dry-run and plan) defaults to all three
-arms.
+task, so each check fails. `--arms` defaults to all three arms for dry-run,
+which spawns no agent, and to `taria,tmux` for plan, which refuses taria and
+outline together.
 
 ```bash
 python3 bench/run.py status --batch B                  # recorded, held, pending
@@ -274,7 +303,7 @@ added to the agent's prompt:
 |---|---|---|
 | verified | `prompt_snapshot`, `mcp_instructions_delta`, `deferred_tools_delta`, `deferred_tools_record`, `max_turns_reached`, `instructions` | reads what they carry and holds the run to it (below) |
 | harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `thinking_drop`, `total_tokens_reminder` | holds each to the top-level fields it is known with (any other field is refused) and to the shape it is known in: a snapshot of the 8 keys a real run's has, their types, one line each; session context of `userEmail` and `gitStatus` only, each in Claude Code's words around the data (the e-mail sentence around the address, the git status's opening sentence and section labels around the repo's branches, status and commits); a `YYYY-MM-DD` date; a model identity of `modelId`, `marketingName` and `knowledgeCutoff`; a `<total_tokens>` count. Its rendered text is then held to the text its own values fill. Only the environment's and the session context's are compared character for character, against the template every archived run rendered them in (`ENVIRONMENT_TEXT` and `SESSION_CONTEXT_TEXT` in `bench/transcript.py`), so a sentence Claude Code adds is refused; the one exception is the environment's untrusted-data line (`ENVIRONMENT_UNTRUSTED`), which Claude Code 2.1.294 renders only while a remote feature flag is false, so it may be missing, and is exact when there. The date's and the model's are compared after stripping surrounding whitespace and the `<system-reminder>` wrapper: "Today's date is ..." with the attachment's date, and the model line its identity spells (the attachment's `text` must be that line too). The token reminder's `text` and rendered text must each be a bare `<total_tokens>N tokens left</total_tokens>`, wrapper optional, with any N: the rendered count is not tied to the one in its `text`. `credential_org` and `thinking_drop` must render nothing but whitespace (diagnostics Claude Code records and never shows the model) |
-| flagged | `remote_session_change`, `skill_listing` | refuses it by name, unless the batch's plan tolerates it (`remote_session_change` only, below): then holds it to its seven fields (`type`, `url`, `commit`, `pr`, `sendUserFileHint`, `managedCommit`, `managedPr`, no other), a `url` of null or one https URL, a `commit` that is a `Co-Authored-By` line (and the `Claude-Session` line of its url when it has one), a `pr` that is Claude Code's "Generated with" line (and its url), three booleans, and rendered text that is the note those fill (`REMOTE_SESSION_TEXT` in `bench/transcript.py`, with the SendUserFile line exactly when `sendUserFileHint` is true), and records it in `context.tolerated_attachments` |
+| flagged | `remote_session_change`, `skill_listing` | refuses it by name, unless the batch's plan tolerates it (`remote_session_change` only, below): then holds it to its seven fields (`type`, `url`, `commit`, `pr`, `sendUserFileHint`, `managedCommit`, `managedPr`, no other), a `url` of null or a claude.ai session URL (`https://claude.ai/code/session_<id>`), a `commit` that is Claude's own `Co-Authored-By` line (`Co-Authored-By: Claude <model> <noreply@anthropic.com>`, the model in letters, digits, spaces and dots; and the `Claude-Session` line of its url when it has one), a `pr` that is Claude Code's "Generated with" line (and its url), three booleans of which `managedCommit` and `managedPr` are false (a managed attribution is refused), and rendered text that is the note those fill (`REMOTE_SESSION_TEXT` in `bench/transcript.py`, with the SendUserFile line exactly when `sendUserFileHint` is true), and records it in `context.tolerated_attachments` |
 
 Any other type, an attachment line with no type, or one whose attachment is
 not an object makes the run a harness error, and the guard's sentence names
@@ -290,7 +319,22 @@ That is how `remote_session_change` was caught after the fact: with
 ~710-character attribution note, as a user-role reminder beside a tool
 result, into every subagent run of outline1 and probe3, and the guard of
 the day read only the types it knew. Turn `/remote-control` off before a
-batch. Likewise, run the orchestrating session from the main checkout, not a
+batch.
+
+Do not orchestrate in auto mode either. When the orchestrating session's
+permission mode is `auto`, Claude Code 2.1.294 gives every subagent a
+`SubagentHandback` tool and, right after its task, a `<system-reminder>`
+prompt telling it to report through that tool (gated by the mode and a
+remote flag, `tengu_lively_waffle`, or the env var
+`CLAUDE_CODE_SENDMESSAGE_HANDBACK`). The agent obeys, and the call ends its
+run without closing the message. The guard refuses such a run three ways (a
+tool beyond its arm, a second prompt, a last message that did not end on its
+own), and its first sentence says why: "the orchestrating session is in auto
+mode, which gives subagents SubagentHandback: switch it to bypass or default
+mode". Every graded run of probe4 was refused so. Switch the mode before
+a batch, as with remote control.
+
+Likewise, run the orchestrating session from the main checkout, not a
 worktree, and do not `cd` or `/add-dir` during a batch: both change the
 environment text, which the guard refuses. Call `run.py` by absolute path.
 A new Claude Code version that adds a type stops a batch at its
@@ -336,7 +380,9 @@ assistant line), and the guard. The guard makes a run a harness error if it:
   arm's), even one later removed;
 - was offered a `read_tree` whose description shows the tree in another
   format than its arm's (json for taria, outline for outline), which is how
-  the two bridge arms, with the same tool names, are told apart. A
+  the two bridge arms, with the same tool names, are told apart (the other
+  bridge arm's format is what an orchestrating session that ran that arm
+  first gives, and the sentence says so: see How runs execute). A
   `read_tree` offered only as a deferred tool is read from the deferred-tool
   records that carry its description (a ToolSearch load, or a schema that
   came loaded); when none does, its format cannot be checked, and that is a
@@ -358,10 +404,16 @@ assistant line), and the guard. The guard makes a run a harness error if it:
   `<system-reminder>`);
 - never took a turn.
 
+A run that was offered `SubagentHandback`, called it, or got auto mode's
+prompt to report through it (`context.handback_prompts` counts those
+prompts) is refused for each of those as above, and the guard's first
+sentence names the cause: the orchestrating session in auto mode (above).
+
 A run is also a harness error when it did not end on its own: Claude Code's
 own `<synthetic>` message comes last (a usage limit, an API error), its last
 message stopped on anything but `end_turn` (`max_tokens`, `refusal` and the
-like), or it stopped on a tool call under the turn cap.
+like), or it stopped on a tool call under the turn cap (a `SubagentHandback`
+call included, which the error says comes from auto mode).
 
 Claude Code 2.1.294 sometimes never writes the closing line of an assistant
 message, in the middle of a run as well as at its end, so that message's
@@ -454,7 +506,7 @@ One JSON object per run, the same keys in both modes, null where none applies.
 | `tokens` | `input`, `cache_creation`, `cache_read`, `output`, summed over messages |
 | `output_tokens_lower_bound`, `unclosed_messages` | `tokens.output` is a lower bound because a message never got its closing line; how many messages did not |
 | `final_text` | the agent's last text, up to 500 characters |
-| `context` | `offered_tools` and `offered_tools_snapshots`, the tools the prompt snapshots listed (their union, and each snapshot's list); `claude_md_files`; `deferred_tools`, `loaded_tools` and `deferred_tools_added` (at the end, loaded by ToolSearch, every one ever added); `mcp_instruction_servers` and `mcp_instruction_servers_added` (at the end, every one ever added); `environment_cwd`; `skill_listing`; `attachment_types`; `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description); `cli_prefixes`, the agent's identity line; `refused_attachments`, one entry per type, rule (`unknown`, `flagged` or `shape`) and detail the guard refused, with its count and rendered characters; `tolerated_attachments`, per type the plan tolerates, how many arrived in their known shape and their rendered characters (`{"remote_session_change": {"count": 1, "rendered_chars": 710}}`, count 0 when none came, `{}` in a clean batch); `unknown_line_types`; `prompts`, the user lines that are not tool results, plus each tool-result line with anything beside its results but reminders; and `tool_result_reminders`, the `<system-reminder>` blocks in or beside tool results |
+| `context` | `offered_tools` and `offered_tools_snapshots`, the tools the prompt snapshots listed (their union, and each snapshot's list); `claude_md_files`; `deferred_tools`, `loaded_tools` and `deferred_tools_added` (at the end, loaded by ToolSearch, every one ever added); `mcp_instruction_servers` and `mcp_instruction_servers_added` (at the end, every one ever added); `environment_cwd`; `skill_listing`; `attachment_types`; `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description); `cli_prefixes`, the agent's identity line; `refused_attachments`, one entry per type, rule (`unknown`, `flagged` or `shape`) and detail the guard refused, with its count and rendered characters; `tolerated_attachments`, per type the plan tolerates, how many arrived in their known shape and their rendered characters (`{"remote_session_change": {"count": 1, "rendered_chars": 710}}`, count 0 when none came, `{}` in a clean batch); `unknown_line_types`; `prompts`, the user lines that are not tool results, plus each tool-result line with anything beside its results but reminders; `handback_prompts`, those of them that are auto mode's `SubagentHandback` reminder; and `tool_result_reminders`, the `<system-reminder>` blocks in or beside tool results |
 | `status_at_run`, `regraded_at`, `regrade_git_sha`, `regrade_git_dirty`, `regrade_note` | added by `regrade` only: see Regrading |
 
 ## Summaries
@@ -473,10 +525,11 @@ python3 bench/summarize.py FILE ...                 # exactly these files
 - **Not a clean batch**, first of all, when a batch's plan tolerated an
   attachment (`plan --tolerate-attachment`, read from its rows'
   `context.tolerated_attachments`): per such batch "B carries remote
-  control's note in every call: not a clean batch", how many of its runs got
-  the note and its size, and, merged with clean batches, that an arm from
-  one held against an arm from the other counts the note's tokens on one
-  side only. The line repeats under every agent section's heading, and every
+  control's note in every call: not a clean batch" when every run got it,
+  else "B tolerated remote control's note; N of M runs got it: not a clean
+  batch", then how many of its runs got the note and its size, and, merged
+  with clean batches, that an arm from one held against an arm from the
+  other counts the note's tokens on one side only. The line repeats under every agent section's heading, and every
   table row built from such runs has `[not clean]` beside the arm, task or
   pair it is about, or `[not clean: X only]` for a comparison where only X's
   side carries the note. The agent context table counts the runs of each arm
@@ -524,7 +577,9 @@ python3 bench/summarize.py FILE ...                 # exactly these files
 ## The outline arm
 
 Run it as its own batch against `full1`, which ran taria and tmux on both
-models, and summarize the two together. Use full1's seed, effort and max
+models, and summarize the two together. Run it from an orchestrating session
+that has run no taria job, and restart before a taria batch after it (see
+How runs execute). Use full1's seed, effort and max
 turns (`results/full1/plan.json`: seed 42, effort medium, max turns 30); the
 seed fixes this batch's job order, not full1's.
 

@@ -46,6 +46,12 @@ try:
 except ImportError:  # Lane B's module; the rehearsal needs it
     transcript = None
 
+# Run under Claude Code, `next` would know the session from CLAUDE_PID and
+# hold every test's hand-outs to it (run.claim_in_session): out of every
+# test's environment, run.py's subprocesses included. The tests of that check
+# name a session of their own.
+os.environ.pop(runner.SESSION_PID_ENV, None)
+
 INPUT_FOCUSED = "[Enter] add task"
 HAVE_TMUX = shutil.which("tmux") is not None
 RUN_PY = os.path.join(BENCH, "run.py")
@@ -60,11 +66,12 @@ def quiet_cli(*argv):
     return code, out.getvalue(), err.getvalue()
 
 
-def run_py(*argv, timeout=120):
-    """bench/run.py in its own process, as the orchestrator runs it."""
+def run_py(*argv, timeout=120, env=None):
+    """bench/run.py in its own process, as the orchestrator runs it (with
+    `env` added to this process's environment)."""
     return subprocess.run(
         [sys.executable, RUN_PY, *argv], capture_output=True, text=True, timeout=timeout,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, env=None if env is None else {**os.environ, **env},
     )
 
 
@@ -401,10 +408,10 @@ class Plan(unittest.TestCase):
         strip = lambda p: [(j["task"], j["arm"], j["model"], j["run"]) for j in p["jobs"]]  # noqa: E731
         self.assertEqual(strip(a), strip(b))
         self.assertNotEqual(strip(a), strip(c))
-        self.assertEqual(a["arms"], ["taria", "tmux", "outline"], "every arm by default")
-        self.assertEqual(len(a["jobs"]), 3 * 3 * 2 * 2)
+        self.assertEqual(a["arms"], ["taria", "tmux"], "the two arms that share no tool name, by default")
+        self.assertEqual(len(a["jobs"]), 3 * 2 * 2 * 2)
         self.assertEqual(sorted(strip(a)), sorted(strip(c)), "the same jobs, in another order")
-        self.assertEqual([j["id"] for j in a["jobs"]], [f"j{n:03d}" for n in range(1, 37)])
+        self.assertEqual([j["id"] for j in a["jobs"]], [f"j{n:03d}" for n in range(1, 25)])
         self.assertEqual((a["seed"], a["effort"], a["max_turns"]), (11, "medium", 30))
         self.assertEqual(a["agent_body_sha256"], agents.body_sha256())
         self.assertEqual(a["models"], ["sonnet", "haiku"])
@@ -418,7 +425,7 @@ class Plan(unittest.TestCase):
         self.assertIn("max 30 turns, tolerating remote_session_change (not a clean batch);", text)
         code, out, _ = quiet_cli("status", "--batch", "rc", "--results-dir", self.results)
         self.assertEqual(code, 0)
-        self.assertIn("3 pending, tolerating remote_session_change (not a clean batch)", out)
+        self.assertIn("2 pending, tolerating remote_session_change (not a clean batch)", out)
 
     def test_a_plan_tolerates_only_remote_session_change(self):
         """Only a type the guard flags by name and that is the same for every
@@ -441,6 +448,30 @@ class Plan(unittest.TestCase):
                 self.assertEqual(code, runner.EXIT_HARNESS)
                 self.assertIn(f"argument --tolerate-attachment: {why}", text)
                 self.assertFalse(os.path.exists(os.path.join(self.results, f"x-{kind}")), "no plan written")
+
+    def test_arms_that_share_tool_names_are_refused(self):
+        """taria and outline serve the same tool names, and a session keeps
+        the first definitions it sees: never one batch. tmux goes with
+        either, and the dry run, which spawns no agent, runs all three."""
+        for arms in ("taria,outline", "outline,taria", "tmux,outline,taria"):
+            with self.subTest(arms=arms):
+                code, text = self.plan(f"x{len(arms)}", "--arms", arms, "--seed", "1")
+                self.assertEqual(code, runner.EXIT_HARNESS)
+                self.assertIn("share tool names (mcp__tui__act, mcp__tui__key, mcp__tui__read_tree, "
+                              "mcp__tui__type_text) with different descriptions, and a Claude Code session keeps the "
+                              "first definitions it sees for a tool name", text)
+                self.assertIn("plan them as separate batches, and run each from its own orchestrating session, "
+                              "restarting the session between them", text)
+                self.assertFalse(os.path.exists(os.path.join(self.results, f"x{len(arms)}")), "no plan written")
+        for arms, expected in (("outline,tmux", ["outline", "tmux"]), ("outline", ["outline"]),
+                               ("taria", ["taria"])):
+            with self.subTest(arms=arms):
+                self.assertEqual(self.plan(f"ok-{arms.replace(',', '-')}", "--arms", arms, "--seed", "1")[0], 0)
+                self.assertEqual(self.load(f"ok-{arms.replace(',', '-')}")["arms"], expected)
+        self.assertEqual(runner.parse_args(["dry-run"]).arms, ["taria", "tmux", "outline"])
+        self.assertEqual(runner.colliding_arms(["taria", "tmux", "outline"]),
+                         [("taria", "outline", ["act", "key", "read_tree", "type_text"])])
+        self.assertEqual(runner.colliding_arms(["taria", "tmux", "taria"]), [])
 
     def test_an_existing_plan_is_refused(self):
         self.assertEqual(self.plan("x", "--tasks", "T1", "--seed", "1")[0], 0)
@@ -540,6 +571,117 @@ class Claims(unittest.TestCase):
         code, out, _ = quiet_cli("next", "--batch", "b", "--slot", "3", "--agent-id", "../x",
                                  "--results-dir", self.results)
         self.assertEqual(code, runner.EXIT_HARNESS)
+
+
+class SessionArms(unittest.TestCase):
+    """`next` never hands one orchestrating session jobs of two arms that
+    share tool names, in one batch or across batches: the session keeps the
+    first definitions it sees for a name (probe4)."""
+
+    ONE = {"key": "100@1", "pid": 100, "session_id": "s1"}
+    TWO = {"key": "200@2", "pid": 200, "session_id": "s2"}
+
+    def setUp(self):
+        self.results = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.results)
+        for batch, arms in (("t", "taria"), ("o", "outline"), ("x", "tmux")):
+            code, _, err = quiet_cli("plan", "--batch", batch, "--results-dir", self.results,
+                                     "--tasks", "T1,T2,T3", "--arms", arms, "--seed", "1")
+            self.assertEqual(code, 0, err)
+
+    def batch(self, name):
+        paths = runner.Paths(self.results, name)
+        return paths, runner.load_plan(paths)
+
+    def handouts(self):
+        with open(runner.Paths(self.results).handouts) as f:
+            return [json.loads(line) for line in f]
+
+    def test_a_session_is_known_by_its_claude_code_process(self):
+        me = runner.orchestrator({"CLAUDE_PID": str(os.getpid()), "CLAUDE_CODE_SESSION_ID": "s1"})
+        self.assertEqual((me["pid"], me["session_id"]), (os.getpid(), "s1"))
+        self.assertRegex(me["key"], rf"^{os.getpid()}@\d+$")
+        self.assertEqual(runner.orchestrator({"CLAUDE_PID": str(os.getpid())})["key"], me["key"],
+                         "the same process is the same session, whatever its session id")
+        self.assertNotEqual(runner.orchestrator({"CLAUDE_PID": str(os.getppid())})["key"], me["key"])
+        # Outside Claude Code, or a process that is gone: it cannot tell.
+        for environ in ({}, {"CLAUDE_PID": ""}, {"CLAUDE_PID": "abc"}, {"CLAUDE_PID": "999999999"}):
+            with self.subTest(environ=environ):
+                self.assertIsNone(runner.orchestrator(environ))
+
+    def test_one_session_is_never_handed_both_bridge_arms(self):
+        (t_paths, t), (o_paths, o), (x_paths, x) = self.batch("t"), self.batch("o"), self.batch("x")
+        job, _ = runner.claim_in_session(t_paths, t, 1, self.ONE)
+        self.assertEqual(job["arm"], "taria")
+        with self.assertRaises(runner.CommandError) as caught:
+            runner.claim_in_session(o_paths, o, 2, self.ONE)
+        self.assertEqual(str(caught.exception), (
+            f"this orchestrating session (Claude Code pid 100) was already handed taria jobs (t {job['id']}), and "
+            "arms outline and taria share tool names (mcp__tui__act, mcp__tui__key, mcp__tui__read_tree, "
+            "mcp__tui__type_text) with different descriptions, and a Claude Code session keeps the first "
+            "definitions it sees for a tool name, so the agents of the arm spawned second are offered the other's; "
+            "restart the orchestrating session, then `run.py next --batch o --slot 2` from the new one; claimed "
+            "nothing"))
+        self.assertEqual(sorted(runner.read_all_slots(o_paths)), [1], "the refused slot is given back")
+        # tmux shares no tool name: the same session may run it, and more taria.
+        self.assertEqual(runner.claim_in_session(x_paths, x, 3, self.ONE)[0]["arm"], "tmux")
+        self.assertEqual(runner.claim_in_session(t_paths, t, 4, self.ONE)[0]["arm"], "taria")
+        # Another session (the restarted one) may run outline, and then not taria.
+        self.assertEqual(runner.claim_in_session(o_paths, o, 2, self.TWO)[0]["arm"], "outline")
+        with self.assertRaises(runner.CommandError):
+            runner.claim_in_session(t_paths, t, 5, self.TWO)
+        self.assertNotIn(5, runner.read_all_slots(t_paths))
+        self.assertEqual(runner.claim_in_session(t_paths, t, 6, self.ONE)[0]["arm"], "taria")
+        # Nothing left to claim is never refused; without a session nothing is
+        # held against it, and nothing recorded.
+        self.assertEqual(runner.claim_in_session(t_paths, t, 7, self.TWO), (None, None))
+        self.assertEqual(runner.claim_in_session(o_paths, o, 8, None)[0]["arm"], "outline")
+        self.assertEqual([(r["session"], r["claude_pid"], r["claude_session_id"], r["batch"], r["arm"])
+                          for r in self.handouts()],
+                         [("100@1", 100, "s1", "t", "taria"), ("100@1", 100, "s1", "x", "tmux"),
+                          ("100@1", 100, "s1", "t", "taria"), ("200@2", 200, "s2", "o", "outline"),
+                          ("100@1", 100, "s1", "t", "taria")])
+
+    def test_a_plan_with_both_bridge_arms_is_refused_to_anyone(self):
+        """A plan written before `plan` refused both (probe4's): no job of
+        it is handed out, with or without a session, unless none is left."""
+        paths, plan = self.batch("t")
+        with open(paths.plan, "w") as f:
+            json.dump(dict(plan, arms=["taria", "outline"]), f)
+        plan = runner.load_plan(paths)
+        for session in (None, self.ONE):
+            with self.subTest(session=session), self.assertRaises(runner.CommandError) as caught:
+                runner.claim_in_session(paths, plan, 1, session)
+            self.assertTrue(str(caught.exception).startswith(
+                "the plan of batch t was written before `plan` refused it: arms taria and outline share tool names"))
+            self.assertEqual(runner.read_all_slots(paths), {})
+        for job in plan["jobs"]:
+            runner.append_row(paths, runner.new_row(job=job["id"], status="passed"))
+        self.assertEqual(runner.claim_in_session(paths, plan, 1, self.ONE), (None, None))
+
+    def test_next_refuses_the_other_bridge_arm_to_the_session(self):
+        """`next` itself, run as Claude Code runs it (CLAUDE_PID set): the
+        refusal is its JSON error, exit 2, nothing claimed."""
+        def prepared(paths, k, slot):
+            slot.update(state="ready", prepared=runner.now("milliseconds"))
+            runner.write_slot(paths, k, slot)
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {runner.SESSION_PID_ENV: str(os.getpid())}))
+            for name in ("preflight", "check_agent_files"):
+                stack.enter_context(mock.patch.object(runner, name))
+            stack.enter_context(mock.patch.object(runner, "prepare_slot", prepared))
+            code, out, err = quiet_cli("next", "--batch", "t", "--slot", "1", "--results-dir", self.results)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(out)["agent"], "tui-taria-1")
+            code, out, err = quiet_cli("next", "--batch", "o", "--slot", "2", "--results-dir", self.results)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn(f"this orchestrating session (Claude Code pid {os.getpid()}) was already handed taria jobs",
+                      json.loads(out)["error"])
+        self.assertIn("restart the orchestrating session", err)
+        self.assertEqual(sorted(runner.read_all_slots(runner.Paths(self.results))), [1])
+        (record,) = self.handouts()
+        self.assertEqual((record["claude_pid"], record["batch"], record["arm"]), (os.getpid(), "t", "taria"))
 
 
 class SlotFields(unittest.TestCase):
@@ -1275,11 +1417,17 @@ class Regrade(unittest.TestCase):
         control's note: the run that got it is graded on its merits, the note
         in its context; the clean run is unchanged. Then a plan edited to
         tolerate what no plan may refuses both regrade and next."""
-        code, _, err = quiet_cli("plan", "--batch", "rc", "--tasks", "T2,T3", "--arms", "outline,taria",
+        code, _, err = quiet_cli("plan", "--batch", "rc", "--tasks", "T2,T3", "--arms", "outline",
                                  "--models", "sonnet", "--seed", "1", "--results-dir", self.results,
                                  "--tolerate-attachment", "remote_session_change")
         self.assertEqual(code, 0, err)
         self.paths = runner.Paths(self.results, "rc")
+        # Both bridge arms, as a plan from before `plan` refused that (probe4's)
+        # holds them: regrade reads it all the same.
+        with open(self.paths.plan) as f:
+            plan = json.load(f)
+        with open(self.paths.plan, "w") as f:
+            json.dump(dict(plan, arms=["outline", "taria"]), f)
         self.archive_copy("real_outline_remote.jsonl", "aremote")
         self.archive_copy("real_taria_clean.jsonl", "aclean")
         self.write_rows([
@@ -1652,9 +1800,9 @@ class SubagentRehearsal(unittest.TestCase):
         for k, slot in runner.read_all_slots(runner.Paths(self.results)).items():
             runner.teardown(slot)
 
-    def next(self, batch, slot, *argv):
+    def next(self, batch, slot, *argv, env=None):
         out = run_py("next", "--batch", batch, "--slot", str(slot), "--agents-dir", self.agents_dir,
-                     *self.common, *argv)
+                     *self.common, *argv, env=env)
         lines = out.stdout.splitlines()
         self.assertEqual(len(lines), 1, f"next printed {lines!r}; stderr: {out.stderr}")
         return out.returncode, json.loads(lines[0]), out.stderr
@@ -1820,7 +1968,32 @@ class SubagentRehearsal(unittest.TestCase):
         # The same run, held to the taria arm, is refused by the guard.
         fields, errors, _ = runner.transcript_verdict(transcript, path, "taria", "sonnet", "medium", 30)
         self.assertEqual(fields["guard_problems"],
-                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json"])
+                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json, "
+                          + transcript.TREE_FORMAT_CAUSE])
+
+    def test_one_orchestrating_session_gets_one_bridge_arm(self):
+        """`next` as Claude Code runs it, CLAUDE_PID naming the orchestrating
+        process: once it handed that process a taria job, it refuses it an
+        outline batch, preparing no demo, and hands the batch to another
+        process, as a restarted session is."""
+        run_py("agents", "--slots", "2", "--dir", self.agents_dir, *self.common)
+        for batch, arm in (("tar", "taria"), ("out", "outline")):
+            out = run_py("plan", "--batch", batch, "--tasks", "T1", "--arms", arm, "--seed", "1", *self.common)
+            self.assertEqual(out.returncode, 0, out.stderr)
+        sessions = [subprocess.Popen(["sleep", "60"]) for _ in range(2)]
+        for proc in sessions:
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+        first, second = ({runner.SESSION_PID_ENV: str(proc.pid)} for proc in sessions)
+        code, job, err = self.next("tar", 1, env=first)
+        self.assertEqual((code, job.get("agent")), (0, "tui-taria-1"), err)
+        code, refused, err = self.next("out", 2, env=first)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn(f"this orchestrating session (Claude Code pid {sessions[0].pid}) was already handed taria jobs "
+                      "(tar j001)", refused["error"])
+        self.assertIsNone(runner.read_slot(runner.Paths(self.results), 2), "nothing claimed, no demo started")
+        code, job, err = self.next("out", 2, env=second)
+        self.assertEqual((code, job.get("agent")), (0, "tui-outline-2"), err)
 
     def test_next_refuses_agent_files_that_do_not_match_the_plan(self):
         run_py("agents", "--slots", "1", "--dir", self.agents_dir, "--effort", "high", *self.common)

@@ -65,6 +65,17 @@ batch gets the same note, so its arms still compare with each other, but
 its absolute token counts include the note, and it is not a clean batch
 (summarize.py marks it).
 
+taria and outline serve the same tool names, and a Claude Code session keeps
+the first definitions it sees for a tool name, so the two never share an
+orchestrating session: `plan` refuses a batch with both (its arms default to
+taria,tmux), and `next` refuses to hand out a job of a batch whose arm shares
+tool names with another arm the same session was already handed, in any
+batch, telling the operator to restart the session. It knows the session by
+CLAUDE_PID, which Claude Code sets for its Bash commands, and records each
+hand-out in results/slots/handouts.jsonl; outside Claude Code it cannot
+tell, and only the procedure (one session per arm family, restarted between)
+protects the batch.
+
 Every run ends in exactly one status:
 
   passed         the check passed and the demo is still running
@@ -133,6 +144,7 @@ from harness import (  # noqa: E402
     ARM_TREE_FORMAT,
     ARMS,
     REPO,
+    SERVER_KEY,
     SERVER_NAMES,
     DemoRun,
     HarnessError,
@@ -153,6 +165,14 @@ STATUSES = ("passed", "failed", "max_turns", "harness_error")
 EXIT_OK, EXIT_FAILED, EXIT_HARNESS = 0, 1, 2
 BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 AGENT_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")
+# A plan's arms when --arms is not given: two that share no tool name (see
+# colliding_arms). The dry run, which spawns no agent, runs every arm.
+PLAN_DEFAULT_ARMS = ("taria", "tmux")
+# How `next` tells which orchestrating session runs it: Claude Code 2.1.294
+# puts its own pid in CLAUDE_PID for the commands its Bash tool runs (and its
+# session id in CLAUDE_CODE_SESSION_ID, recorded for the reader).
+SESSION_PID_ENV = "CLAUDE_PID"
+SESSION_ID_ENV = "CLAUDE_CODE_SESSION_ID"
 
 # One row per run, in this order, in both modes. From an agent's transcript:
 # model_resolved (the models it ran on), efforts_resolved (the effort Claude
@@ -245,12 +265,16 @@ def new_batch_id():
 
 
 class Paths:
-    """results/<batch>/{plan.json,runs.jsonl,.lock,transcripts/} and
-    results/slots/<K>.json."""
+    """results/<batch>/{plan.json,runs.jsonl,.lock,transcripts/},
+    results/slots/<K>.json and results/slots/handouts.jsonl."""
 
     def __init__(self, results_dir, batch=None):
         self.results = os.path.abspath(results_dir)
         self.slots = os.path.join(self.results, "slots")
+        # Which arms each orchestrating session was handed, across batches
+        # (see claim_in_session).
+        self.handouts = os.path.join(self.slots, "handouts.jsonl")
+        self.handouts_lock = os.path.join(self.slots, ".handouts.lock")
         self.batch = batch
         if batch is not None:
             self.batch_dir = os.path.join(self.results, batch)
@@ -611,6 +635,12 @@ def cmd_agents(args):
 
 def cmd_plan(args):
     paths = Paths(args.results_dir, args.batch)
+    collisions = colliding_arms(args.arms)
+    if collisions:
+        raise CommandError(
+            f"{_collision(*collisions[0])}: plan them as separate batches, and run each from its own "
+            "orchestrating session, restarting the session between them"
+        )
     if os.path.exists(paths.plan):
         raise CommandError(f"{paths.plan} exists; a plan is never replaced, name a new batch")
     if has_rows(paths):
@@ -676,6 +706,129 @@ def tolerance_note(plan):
     attachments, else nothing."""
     tolerated = plan.get("tolerated_attachments") or []
     return f", tolerating {', '.join(map(str, tolerated))} (not a clean batch)" if tolerated else ""
+
+
+# --- Arms that share tool names ------------------------------------------------------------------
+#
+# taria and outline list the same tools (mcp__tui__read_tree, act, key,
+# type_text) with different descriptions, and a Claude Code session keeps the
+# first definitions it sees for a tool name for the rest of the session. In
+# probe4, outline's j001 started first, and taria's j002 and j005 (j005
+# spawned alone, after every other run had finished) were offered the
+# outline's descriptions while their own bridge served JSON. So `plan`
+# refuses a batch whose arms share a tool name, and `next` refuses to hand
+# out a job of a batch with an arm that shares a tool name with another arm
+# the same orchestrating session was already handed, in any batch
+# (claim_in_session). tmux shares no name with either.
+
+
+def _shared_tools(a, b):
+    """The tool names arms `a` and `b` both list, sorted; [] for one arm."""
+    return [] if a == b else sorted(set(ARM_TOOLS.get(a, ())) & set(ARM_TOOLS.get(b, ())))
+
+
+def colliding_arms(arms):
+    """(a, b, shared tool names) for each pair of different arms in `arms`
+    whose tools share a name."""
+    arms = list(dict.fromkeys(arms))
+    pairs = [(a, b) for i, a in enumerate(arms) for b in arms[i + 1:]]
+    return [(a, b, _shared_tools(a, b)) for a, b in pairs if _shared_tools(a, b)]
+
+
+def _collision(a, b, shared):
+    names = ", ".join(f"mcp__{SERVER_KEY}__{tool}" for tool in shared)
+    return (f"arms {a} and {b} share tool names ({names}) with different descriptions, and a Claude Code session "
+            "keeps the first definitions it sees for a tool name, so the agents of the arm spawned second are "
+            "offered the other's")
+
+
+def orchestrator(environ=None):
+    """The Claude Code process this run.py runs under, as {"key", "pid",
+    "session_id"}, or None when it cannot be told. Claude Code puts its pid
+    in CLAUDE_PID for the commands its Bash tool runs; the key adds the
+    process's start time from /proc, so a pid a later process reuses is
+    another session. Without CLAUDE_PID (run outside Claude Code) or /proc,
+    or with a pid that is gone, None: the session check is then skipped."""
+    environ = os.environ if environ is None else environ
+    pid = environ.get(SESSION_PID_ENV) or ""
+    if not pid.isdigit():
+        return None
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            # The fields after the command name's closing paren start at
+            # field 3 (state); the start time is field 22.
+            start = f.read().rpartition(")")[2].split()[19]
+    except (OSError, IndexError):
+        return None
+    return {"key": f"{int(pid)}@{start}", "pid": int(pid), "session_id": environ.get(SESSION_ID_ENV)}
+
+
+def session_handouts(paths, key):
+    """{arm: its first hand-out record} for the orchestrating session `key`."""
+    try:
+        with open(paths.handouts) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return {}
+    handed = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("session") == key and isinstance(record.get("arm"), str):
+            handed.setdefault(record["arm"], record)
+    return handed
+
+
+def handout_problem(paths, plan, k, session):
+    """Why no job of `plan` may be handed out to the orchestrating
+    `session` (orchestrator(); None skips the session check), or None.
+    A plan whose own arms share tool names (one written before `plan`
+    refused it, as probe4's was) is refused whoever runs it; otherwise an
+    arm of the plan that shares tool names with another arm this session
+    was already handed, in any batch."""
+    collisions = colliding_arms(plan.get("arms") or [])
+    if collisions:
+        return (f"the plan of batch {plan['batch']} was written before `plan` refused it: {_collision(*collisions[0])}"
+                "; plan them as separate batches, each run from its own orchestrating session")
+    if session is None:
+        return None
+    handed = session_handouts(paths, session["key"])
+    for arm in plan.get("arms") or []:
+        for other, record in sorted(handed.items()):
+            shared = _shared_tools(arm, other)
+            if shared:
+                return (f"this orchestrating session (Claude Code pid {session['pid']}) was already handed "
+                        f"{other} jobs ({record.get('batch')} {record.get('job')}), and {_collision(arm, other, shared)}"
+                        f"; restart the orchestrating session, then `run.py next --batch {plan['batch']} --slot {k}` "
+                        "from the new one")
+    return None
+
+
+def claim_in_session(paths, plan, k, session):
+    """claim(), unless handout_problem refuses this plan to `session`: then
+    the slot is given back and CommandError raised, nothing claimed. A job
+    claimed for a session is recorded in paths.handouts, so a later batch
+    of an arm sharing its tool names is refused to the same session. Under
+    one lock across batches, so two slots cannot hand out colliding arms at
+    once. Nothing left to claim is never refused."""
+    os.makedirs(paths.slots, exist_ok=True)
+    with flocked(paths.handouts_lock):
+        job, slot = claim(paths, plan, k)
+        if job is None:
+            return job, slot
+        problem = handout_problem(paths, plan, k, session)
+        if problem:
+            free_slot(paths, k)
+            raise CommandError(f"{problem}; claimed nothing")
+        if session is not None:
+            record = {"ts": now(), "session": session["key"], "claude_pid": session["pid"],
+                      "claude_session_id": session["session_id"], "batch": plan["batch"], "job": job["id"],
+                      "arm": job["arm"]}
+            with open(paths.handouts, "a") as f:
+                f.write(json.dumps(record) + "\n")
+    return job, slot
 
 
 # --- Subagent runs: next, status, abort ---------------------------------------------------
@@ -1061,7 +1214,7 @@ def _next_locked(args, paths, plan):
 
     preflight()
     check_agent_files(plan, k, args.agents_dir, paths.slots)
-    job, slot = claim(paths, plan, k)
+    job, slot = claim_in_session(paths, plan, k, orchestrator())
     if job is None:
         print(json.dumps({"done": True}), flush=True)
         return EXIT_OK
@@ -1434,7 +1587,8 @@ def parse_args(argv=None):
     selection.add_argument(
         "--arms", "--arm", dest="arms", action="extend",
         type=lambda v: _list(v, list(ARMS), "arm"),
-        help=f"comma-separated arms (default: {','.join(ARMS)})",
+        help=f"comma-separated arms (default: dry-run {','.join(ARMS)}, plan {','.join(PLAN_DEFAULT_ARMS)}; "
+             "a plan refuses arms that share tool names, taria and outline)",
     )
     selection.add_argument("--runs", type=_positive, default=1, help="runs per combination (default 1)")
     selection.add_argument("--seed", type=int, help="shuffle seed (default: random, recorded)")
@@ -1492,7 +1646,7 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.command in ("dry-run", "plan"):
         args.tasks = list(dict.fromkeys(args.tasks or task_ids))
-        args.arms = list(dict.fromkeys(args.arms or ARMS))
+        args.arms = list(dict.fromkeys(args.arms or (ARMS if args.command == "dry-run" else PLAN_DEFAULT_ARMS)))
         if args.seed is None:
             args.seed = random.SystemRandom().randrange(2**31)
     if args.command == "plan":

@@ -30,7 +30,9 @@ Replaced:
   - every line: cwd (/home/user/project), gitBranch, slug, sessionId, agentId;
   - in every string anywhere: the session ids, the agent id, the
     organization uuid, a /home/<user> prefix (/home/user), the user name,
-    e-mail addresses, and each --redact word (case-insensitive).
+    e-mail addresses (but Claude Code's own noreply@anthropic.com, which
+    remote control's note carries and bench/transcript.py pins), and each
+    --redact word (case-insensitive).
 
 --servers NAME[,NAME] rewrites every mcp_instructions_delta's addedNames to
 exactly those names (with their placeholder blocks) and marks the attachment
@@ -66,6 +68,9 @@ SCRUBBED = "(scrubbed from the fixture)"
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 HOME = re.compile(r"/home/([^/\s\"']+)")
 SAFE_EMAIL = "user@example.com"
+# Claude Code's own attribution address, the same for everyone: kept, since
+# bench/transcript.py pins remote control's note to it.
+KEPT_EMAILS = ("noreply@anthropic.com",)
 SESSION_URL = re.compile(r"(https://claude\.ai/code/session_)([0-9A-Za-z]+)")
 FAKE_SESSION_URL = "https://claude.ai/code/session_FIXTURE"
 META_KEYS = ("agentType", "description", "model")
@@ -117,7 +122,7 @@ class Scrubber:
         for old, new in self.exact:
             value = value.replace(old, new)
         value = HOME.sub("/home/user", value)
-        value = EMAIL.sub(SAFE_EMAIL, value)
+        value = EMAIL.sub(lambda m: m.group(0) if m.group(0) in KEPT_EMAILS else SAFE_EMAIL, value)
         value = SESSION_URL.sub(FAKE_SESSION_URL, value)
         for word in self.users + self.words:
             value = re.sub(re.escape(word), "user", value, flags=re.IGNORECASE)
@@ -134,7 +139,7 @@ class Scrubber:
 
     def leaks(self, text):
         found = [s for s in self.secrets if s.lower() in text.lower()]
-        found += [m for m in EMAIL.findall(text) if m != SAFE_EMAIL]
+        found += [m for m in EMAIL.findall(text) if m != SAFE_EMAIL and m not in KEPT_EMAILS]
         found += [m.group(0) for m in SESSION_URL.finditer(text) if m.group(0) != FAKE_SESSION_URL]
         return found
 

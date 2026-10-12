@@ -31,6 +31,12 @@ Two kinds of fixture in bench/fixtures/transcripts/:
                        outline1) as recorded, from a session with
                        /remote-control on: a remote_session_change attachment
                        beside its first tool result, which the guard refuses.
+    real_tmux_handback  a tmux run (sonnet, T3, job j004 of batch probe4) as
+                       recorded, from a session in auto mode with
+                       /remote-control on: SubagentHandback offered, a second
+                       prompt telling the agent to report through it, and a
+                       last message that is that call, never closed. Not in
+                       REAL, whose runs had one prompt each.
   Every attachment the run had is kept (the scrubber refuses a type
   bench/transcript.py has no rule for), ids, the working directory, the
   e-mail address and the git status's repo data replaced, in the rendered
@@ -80,6 +86,7 @@ TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED = "real_taria_clean.jsonl", "real_tmux_cle
 TARIA_UNCLOSED = "real_taria_unclosed.jsonl"
 TARIA_MIDUNCLOSED = "real_taria_midunclosed.jsonl"
 OUTLINE_REMOTE = "real_outline_remote.jsonl"
+TMUX_HANDBACK = "real_tmux_handback.jsonl"
 REAL = (TARIA_CLEAN, TMUX_CLEAN, TARIA_LEAKED, TARIA_UNCLOSED, TARIA_MIDUNCLOSED, OUTLINE_REMOTE)
 CLAUDE_CODE_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
 AGENT_SDK_PREFIX = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
@@ -90,7 +97,7 @@ CONTRACT = {
     "ended_on_tool_use": (bool,), "tool_errors": (int,), "context": (dict,),
     "last_model": (str, type(None)), "last_stop_reason": (str, type(None)), "ended_synthetic": (bool,),
     "last_block_type": (str, type(None)), "end_inferred": (bool,), "output_tokens_lower_bound": (bool,),
-    "unclosed_messages": (int,),
+    "unclosed_messages": (int,), "ended_on_handback": (bool,),
     "first_prompt": (str, type(None)), "started": (str, type(None)),
 }
 CONTEXT = {
@@ -100,7 +107,7 @@ CONTEXT = {
     "environment_cwd": (str, type(None)), "skill_listing": (bool,), "attachment_types": (list,),
     "tree_formats": (list,), "cli_prefixes": (list,), "refused_attachments": (list,),
     "unknown_line_types": (dict,), "prompts": (int,), "tool_result_reminders": (int,),
-    "tolerated_attachments": (dict,),
+    "tolerated_attachments": (dict,), "handback_prompts": (int,),
 }
 TUI = {arm: sorted("mcp__tui__" + t for t in tools) for arm, tools in ARM_TOOLS.items()}
 # Harmless types known from Claude Code transcripts outside the bench, which no
@@ -585,9 +592,11 @@ class Guard(Variant, unittest.TestCase):
         self.assertEqual(guard(read(TARIA_CLEAN), "taria"), [])
         self.assertEqual(guard(outline, "outline"), [])
         self.assertEqual(guard(read(TARIA_CLEAN), "outline"),
-                         ["was offered a read_tree that shows the tree as json, not as the outline arm's outline"])
+                         ["was offered a read_tree that shows the tree as json, not as the outline arm's outline, "
+                          + transcript.TREE_FORMAT_CAUSE])
         self.assertEqual(guard(outline, "taria"),
-                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json"])
+                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json, "
+                          + transcript.TREE_FORMAT_CAUSE])
         self.assertEqual(transcript.guard(read(TMUX_CLEAN), "tmux", "haiku", ARM_TOOLS["tmux"], effort="medium",
                                           tree_format=ARM_TREE_FORMAT.get("tmux")), [])
         # Without a tree format (as before the outline arm) the check is off.
@@ -656,7 +665,8 @@ class Guard(Variant, unittest.TestCase):
         self.assertEqual(stats["context"]["tree_formats"], ["json"])
         self.assertEqual(guard(stats, "taria"), [])
         self.assertEqual(guard(stats, "outline"),
-                         ["was offered a read_tree that shows the tree as json, not as the outline arm's outline"])
+                         ["was offered a read_tree that shows the tree as json, not as the outline arm's outline, "
+                          + transcript.TREE_FORMAT_CAUSE])
         # So does a delta whose schema came loaded (surfacedDefinitions).
         surfaced = att({"type": "deferred_tools_delta", "addedNames": [], "removedNames": [],
                         "surfacedNames": [transcript.READ_TREE],
@@ -667,7 +677,8 @@ class Guard(Variant, unittest.TestCase):
         self.assertEqual(stats["context"]["tree_formats"], ["outline"])
         self.assertEqual(guard(stats, "outline"), [])
         self.assertEqual(guard(stats, "taria"),
-                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json"])
+                         ["was offered a read_tree that shows the tree as outline, not as the taria arm's json, "
+                          + transcript.TREE_FORMAT_CAUSE])
 
     def test_guard_tolerates_a_sparse_stats_dict(self):
         self.assertEqual(transcript.guard({}, "taria", "sonnet", ARM_TOOLS["taria"]), [
@@ -1376,21 +1387,45 @@ class ToleratedAttachments(Variant, unittest.TestCase):
 
         real = self.remote_line()
         note = real["rendered"][0]["content"]
+        url = real["attachment"]["url"]
         dropped = self.remote_line()
         del dropped["attachment"]["managedPr"]
         unreadable = self.remote_line()
         unreadable["rendered"] = note
+
+        def elsewhere(other):
+            """The note with another https url everywhere it names one, so
+            only the url itself is off."""
+            line = json.loads(json.dumps(self.remote_line()).replace(url, other))
+            self.assertEqual(line["attachment"]["url"], other)
+            return line
+
         cases = {
             "an added field": (changed(extra="x"), "fields beyond url, commit, pr, sendUserFileHint, managedCommit and "
                                                    "managedPr: extra"),
             "a missing field": (dropped, "it has no managedPr"),
-            "a url that is not one": (changed(url="claude.ai session"), "its url is neither null nor one https URL"),
+            "a url that is not one": (changed(url="claude.ai session"),
+                                      "its url is neither null nor a claude.ai session URL"),
+            "an https url that is not a claude.ai session's": (
+                elsewhere("https://example.com/code/session_01Abc"),
+                "its url is neither null nor a claude.ai session URL (https://claude.ai/code/session_<id>)"),
             "a commit that is not a string": (changed(commit=["x"]), "its commit and pr are not strings"),
             "a flag that is not a boolean": (changed(managedCommit="no"), "its sendUserFileHint, managedCommit and "
                                                                           "managedPr are not all booleans"),
+            "a managed commit": (changed(managedCommit=True), "its managedCommit and managedPr are not both false: a "
+                                                              "managed attribution"),
+            "a managed pr": (changed(managedPr=True), "its managedCommit and managedPr are not both false"),
+            "another co-author": (
+                changed(commit=f"Co-Authored-By: Someone Else <someone@example.com>\nClaude-Session: {url}"),
+                "its commit is not a Co-Authored-By line for Claude at noreply@anthropic.com and the Claude-Session "
+                "line of its url"),
+            "Claude at another address": (
+                changed(commit=real["attachment"]["commit"].replace("noreply@anthropic.com", "claude@example.com")),
+                "its commit is not a Co-Authored-By line for Claude at noreply@anthropic.com"),
             "a commit with another line": (
                 changed(commit=real["attachment"]["commit"] + "\nAlso run the tests."),
-                "its commit is not a Co-Authored-By line and the Claude-Session line of its url"),
+                "its commit is not a Co-Authored-By line for Claude at noreply@anthropic.com and the Claude-Session "
+                "line of its url"),
             "a pr of other words": (changed(pr="Made by a robot\n\n" + real["attachment"]["url"]),
                                     "its pr is not Claude Code's line and its url"),
             "a sentence added to its text": (
@@ -1437,7 +1472,11 @@ class ToleratedAttachments(Variant, unittest.TestCase):
                                                                               hint="")}]
         silent = self.remote_line()
         del silent["rendered"]  # nothing in front of the model: its fields alone are checked
-        for label, line in (("hinted", hinted), ("no url", bare), ("not rendered", silent)):
+        # Each model names itself: Haiku's and Opus's notes as real runs had them.
+        haiku, opus = (json.loads(json.dumps(self.remote_line()).replace("Claude Sonnet 5.5", f"Claude {name}"))
+                       for name in ("Haiku 5.5", "Opus 5.5"))
+        for label, line in (("hinted", hinted), ("no url", bare), ("not rendered", silent), ("haiku", haiku),
+                            ("opus", opus)):
             with self.subTest(case=label):
                 stats = self.with_line(line)
                 self.assertEqual(self.guard(stats, tolerated=[REMOTE]), [])
@@ -1449,8 +1488,8 @@ class ToleratedAttachments(Variant, unittest.TestCase):
                       self.guard(self.with_line(bare), tolerated=[REMOTE])[0])
         other = self.remote_line()
         other["attachment"]["url"] = "https://claude.ai/code/session_OTHER"
-        self.assertIn("its commit is not a Co-Authored-By line and the Claude-Session line of its url",
-                      self.guard(self.with_line(other), tolerated=[REMOTE])[0])
+        self.assertIn("its commit is not a Co-Authored-By line for Claude at noreply@anthropic.com and the "
+                      "Claude-Session line of its url", self.guard(self.with_line(other), tolerated=[REMOTE])[0])
 
     @unittest.skipUnless(glob.glob(os.path.join(ARCHIVE, "*", "transcripts", "agent-*.jsonl")),
                          f"no archived transcripts under {ARCHIVE} (set BENCH_ARCHIVE)")
@@ -1532,6 +1571,101 @@ class ToleratedAttachments(Variant, unittest.TestCase):
             self.assertEqual(json.load(f), plan, "the archive is only read")
 
 
+class AutoMode(Variant, unittest.TestCase):
+    """An orchestrating session in auto mode gives every subagent
+    SubagentHandback and a second prompt telling it to report through it
+    (probe4 ran so). The guard says first that the session is in auto mode
+    and what to do, and still lists every problem it caused."""
+
+    SIGNS = "this run was offered it, called it 1x and got 1 prompt telling it to report through it"
+
+    def guard(self, stats, arm, tolerated=(REMOTE,)):
+        return transcript.guard(stats, arm, "sonnet", ARM_TOOLS[arm], effort="medium",
+                                tree_format=ARM_TREE_FORMAT.get(arm), tolerated=tolerated)
+
+    def handback_prompt(self):
+        """The reminder auto mode sent the real run, as its user line."""
+        return copy.deepcopy(next(l for l in lines_of(TMUX_HANDBACK)[1:] if l["type"] == "user"
+                                  and isinstance(l["message"]["content"], str)))
+
+    def test_the_cause_is_said_as_asked(self):
+        self.assertEqual(transcript.AUTO_MODE, "the orchestrating session is in auto mode, which gives subagents "
+                                               "SubagentHandback: switch it to bypass or default mode")
+
+    def test_the_real_auto_mode_run_names_the_cause_first(self):
+        stats = transcript.read_transcript(fixture(TMUX_HANDBACK), tolerated=[REMOTE])
+        ctx = stats["context"]
+        self.assertEqual((ctx["prompts"], ctx["handback_prompts"], ctx["tool_result_reminders"]), (2, 1, 0))
+        self.assertEqual(stats["first_prompt"], TASKS["T3"].prompt)
+        self.assertIn(transcript.HANDBACK_TOOL, ctx["offered_tools"])
+        self.assertEqual(stats["tool_calls"][transcript.HANDBACK_TOOL], 1)
+        self.assertTrue(stats["ended_on_handback"])
+        self.assertEqual(self.guard(stats, "tmux"), [
+            f"{transcript.AUTO_MODE} ({self.SIGNS})",
+            "called SubagentHandback (1x), which is not a tmux arm tool",
+            "was offered 1 tool(s) beyond the tmux arm: SubagentHandback",
+            "was given 2 prompts: the task, then 1 more from outside the run (a message sent to the agent, a hook)",
+        ])
+        # Its last message, the handback call, was never closed: the ending says why.
+        self.assertEqual(transcript.ending(stats, 30), ("harness_error", (
+            "the run did not end on its own: its last message stopped on None (its last block is a "
+            "SubagentHandback call, which ends a run without closing its message: the orchestrating session is "
+            "in auto mode)")))
+        # Read without the tolerance, its note is refused too; the cause still comes first.
+        problems = self.guard(read(TMUX_HANDBACK), "tmux", tolerated=())
+        self.assertEqual(problems[0], f"{transcript.AUTO_MODE} ({self.SIGNS})")
+        self.assertTrue(any(p.startswith("was given Claude Code's remote-control attribution note") for p in problems),
+                        problems)
+
+    def test_each_sign_alone_names_the_cause(self):
+        lines = lines_of(TARIA_CLEAN)
+        # Offered: the tool in a prompt snapshot.
+        offered = copy.deepcopy(lines)
+        snapshot = next(l for l in offered if is_att(l, "prompt_snapshot") and l["attachment"].get("tools"))
+        snapshot["attachment"]["tools"].append({"name": transcript.HANDBACK_TOOL, "description": "Report back."})
+        self.assertEqual(self.guard(self.variant(offered), "taria"), [
+            f"{transcript.AUTO_MODE} (this run was offered it)",
+            "was offered 1 tool(s) beyond the taria arm: SubagentHandback"])
+        # Offered deferred: the same.
+        stats = read(TARIA_CLEAN)
+        stats["context"]["deferred_tools_added"] = [transcript.HANDBACK_TOOL]
+        self.assertEqual(self.guard(stats, "taria"), [
+            f"{transcript.AUTO_MODE} (this run was offered it)",
+            "was offered 1 deferred tool(s) beyond the taria arm: SubagentHandback"])
+        # Called.
+        stats = read(TARIA_CLEAN)
+        stats["tool_calls"] = dict(stats["tool_calls"], **{transcript.HANDBACK_TOOL: 2})
+        self.assertEqual(self.guard(stats, "taria"), [
+            f"{transcript.AUTO_MODE} (this run called it 2x)",
+            "called SubagentHandback (2x), which is not a taria arm tool"])
+        # Told: the reminder as a second prompt, right after the task.
+        first = next(i for i, l in enumerate(lines) if l["type"] == "user")
+        stats = self.variant(lines[:first + 1] + [self.handback_prompt()] + lines[first + 1:])
+        self.assertEqual((stats["context"]["prompts"], stats["context"]["handback_prompts"]), (2, 1))
+        self.assertEqual(self.guard(stats, "taria"), [
+            f"{transcript.AUTO_MODE} (this run got 1 prompt telling it to report through it)",
+            "was given 2 prompts: the task, then 1 more from outside the run (a message sent to the agent, a hook)"])
+
+    def test_other_prompts_and_clean_runs_are_not_auto_mode(self):
+        for name in REAL:
+            with self.subTest(fixture=name):
+                stats = read(name)
+                self.assertEqual((stats["context"]["handback_prompts"], stats["ended_on_handback"]), (0, False))
+                self.assertFalse(any(p.startswith(transcript.AUTO_MODE) for p in self.guard(stats, "taria")))
+        lines = lines_of(TARIA_CLEAN)
+        first = next(i for i, l in enumerate(lines) if l["type"] == "user")
+        for text in ("<system-reminder>\nBe brief.\n</system-reminder>",
+                     "Report through SubagentHandback when done."):  # not a reminder
+            with self.subTest(text=text):
+                extra = self.handback_prompt()
+                extra["message"]["content"] = text
+                stats = self.variant(lines[:first + 1] + [extra] + lines[first + 1:])
+                self.assertEqual((stats["context"]["prompts"], stats["context"]["handback_prompts"]), (2, 0))
+                self.assertEqual(self.guard(stats, "taria"), [
+                    "was given 2 prompts: the task, then 1 more from outside the run (a message sent to the agent, "
+                    "a hook)"])
+
+
 class ScrubTranscript(Variant, unittest.TestCase):
     """bench/fixtures/scrub_transcript.py keeps every type the guard has a
     rule for, and refuses any other rather than drop it."""
@@ -1564,6 +1698,13 @@ class ScrubTranscript(Variant, unittest.TestCase):
             text = f.read()
         self.assertNotIn("session_01RealLookingId", text)
         self.assertIn("https://claude.ai/code/session_FIXTURE", text)
+        # Claude Code's own address stays (the guard pins the note to it);
+        # the user's goes. The scrubbed note keeps the shape a plan tolerates.
+        note = next(l for l in (json.loads(raw) for raw in text.splitlines()) if is_att(l, REMOTE))
+        self.assertIn("<noreply@anthropic.com>", note["attachment"]["commit"])
+        self.assertIsNone(transcript._tolerated_shape(REMOTE, note["attachment"], transcript._rendered_texts(note)[0]))
+        self.assertEqual(self.scrub.Scrubber([], "x.jsonl", "a", "s", ()).text("me@corp.example noreply@anthropic.com"),
+                         "user@example.com noreply@anthropic.com")
 
     def real_looking(self):
         """TARIA_CLEAN as a real transcript holds it: the orchestrator's own
@@ -2267,10 +2408,11 @@ class MultiBatchSummary(unittest.TestCase):
                 for r in rows]
 
     def test_a_batch_that_tolerated_an_attachment_is_marked(self):
-        """A batch whose plan tolerated remote control's note carries it in
-        every call: the summary says so first, under every agent section, and
-        in every table row built from its runs, so its numbers cannot pass for
-        a clean batch's."""
+        """A batch whose plan tolerated remote control's note is not clean:
+        the summary says so first, under every agent section, and in every
+        table row built from its runs, so its numbers cannot pass for a clean
+        batch's. It says the batch carries the note in every call only when
+        every run got it, and otherwise how many did."""
         clean = summarize.render(self.full())
         self.assertNotIn("not clean", clean)
         self.assertNotIn("remote", clean)
@@ -2278,12 +2420,14 @@ class MultiBatchSummary(unittest.TestCase):
         one[0]["context"]["tolerated_attachments"]["remote_session_change"] = {"count": 0, "rendered_chars": 0}
         out = summarize.render(one)
         self.assertTrue(out.startswith(
-            "> **rc carries remote control's note in every call: not a clean batch.** Its plan tolerated "
-            "remote_session_change: 19 of 20 runs got it, 710 characters each. Where every arm got the same note, "
-            "its arms compare with each other, but its absolute token counts include the note.\n"), out[:400])
+            "> **rc tolerated remote control's note; 19 of 20 runs got it: not a clean batch.** Its plan tolerated "
+            "remote_session_change: 19 of 20 runs got it, 710 characters each. Only some runs got it, so its arms "
+            "may not have carried it alike (the agent context table counts them per arm and model), and the token "
+            "counts of the runs that got it include it.\n"), out[:500])
+        self.assertNotIn("in every call", out, "one run did not get it")
         self.assertNotIn("Mixed conditions", out)
-        marker = ("> rc carries remote control's note in every call: not a clean batch. Rows marked `[not clean]` "
-                  "include its runs, whose absolute token counts include the note.")
+        marker = ("> rc tolerated remote control's note; 19 of 20 runs got it: not a clean batch. Rows marked "
+                  "`[not clean]` include its runs, whose absolute token counts include the note where a run got it.")
         for heading in ("## Agent runs (headline)", "## Arms per model, across all tasks",
                         "## taria vs tmux, per model", "## Model comparison"):
             self.assertIn(f"{heading}\n\n{marker}\n", out, heading)
@@ -2306,7 +2450,12 @@ class MultiBatchSummary(unittest.TestCase):
         rows = [r for r in self.full() if r["batch"] == "full"] + self.tolerating(
             [r for r in self.full() if r["batch"] == "outl"])
         out = summarize.render(rows)
-        self.assertTrue(out.startswith("> **rc carries remote control's note in every call: not a clean batch.**"))
+        self.assertTrue(out.startswith(
+            "> **rc carries remote control's note in every call: not a clean batch.** Its plan tolerated "
+            "remote_session_change: 10 of 10 runs got it, 710 characters each. Where every arm got the same note, "
+            "its arms compare with each other, but its absolute token counts include the note.\n"), out[:400])
+        self.assertIn("\n> rc carries remote control's note in every call: not a clean batch. Rows marked "
+                      "`[not clean]` include its runs, whose absolute token counts include the note.\n", out)
         self.assertIn("> Mixed conditions: full tolerated nothing. An arm from rc held against one from full differs "
                       "in this too: the note's tokens count on one side only.", out)
         header = out.partition("## Agent runs (headline)")[0]
@@ -2322,8 +2471,13 @@ class MultiBatchSummary(unittest.TestCase):
         # Two tolerating batches agree on it; a run without the note is counted.
         both = self.tolerating([r for r in self.full() if r["batch"] == "full"], batch="rc2", got=False) + rows[20:]
         out = summarize.render(both)
-        self.assertIn("rc2 carries remote control's note in every call: not a clean batch.** Its plan tolerated "
-                      "remote_session_change: 0 of 20 runs got it.", out)
+        self.assertIn("> **rc2 tolerated remote control's note; 0 of 20 runs got it: not a clean batch.** Its plan "
+                      "tolerated remote_session_change: 0 of 20 runs got it. No run got it, so no token count "
+                      "includes it, but its plan would have let it through, so it is not a clean batch.", out)
+        self.assertIn("> **rc carries remote control's note in every call: not a clean batch.**", out)
+        self.assertIn("\n> rc carries remote control's note in every call; rc2 tolerated remote control's note; 0 of "
+                      "20 runs got it: not clean batches. Rows marked `[not clean]` include their runs, whose "
+                      "absolute token counts include the note where a run got it.\n", out)
         self.assertNotIn("Mixed conditions", out)
         self.assertNotIn("differ in git SHA, claude, tolerated", out)
         self.assertIn("| haiku | medium | 30 | outline vs taria [not clean] |", out)

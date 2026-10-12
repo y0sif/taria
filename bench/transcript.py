@@ -116,6 +116,12 @@ type, or whose attachment is not an object; a `<system-reminder>` block in
 or beside a tool result; a line whose type is not `user`, `assistant` or
 `attachment`; and a second prompt, beside a tool result or on its own.
 
+An orchestrating session in auto mode gives every subagent Claude Code's
+SubagentHandback tool and a second prompt telling it to report through it,
+and the call ends the run without closing its message (HANDBACK_TOOL). The
+guard refuses such a run for each of those, and says first that the session
+is in auto mode (`handback_prompts` counts that prompt).
+
 Python 3 stdlib only.
 """
 
@@ -284,17 +290,20 @@ TOTAL_TOKENS = re.compile(
 # remote_session_change, when a plan tolerates it: the fields every real one
 # has (the 62 archived runs of outline1 and probe3, and live subagent runs of
 # Claude Code 2.1.294), and the text it renders, the attribution lines its
-# commit and pr fill. The commit is a Co-Authored-By line, plus a
-# Claude-Session line naming its url when it has one (a url of null comes
-# with neither session line, as some live subagent runs of 2.1.294 had),
-# and the pr is Claude Code's own line, plus the url. The SendUserFile line
-# is there only when sendUserFileHint is true, which an orchestrating
-# session's own transcript has had and no subagent's yet. Anything else
-# (another field, another sentence, a managed attribution) is refused.
+# commit and pr fill. The url is null or a claude.ai session URL. The commit
+# is Claude's Co-Authored-By line (`Claude <model> <noreply@anthropic.com>`),
+# plus a Claude-Session line naming its url when it has one (a url of null
+# comes with neither session line, as some live subagent runs of 2.1.294
+# had), and the pr is Claude Code's own line, plus the url. managedCommit
+# and managedPr are false in every real one. The SendUserFile line is there
+# only when sendUserFileHint is true, which an orchestrating session's own
+# transcript has had and no subagent's yet. Anything else (another field,
+# another sentence, another co-author, a managed attribution) is refused.
 REMOTE_SESSION_FIELDS = ("type", "url", "commit", "pr", "sendUserFileHint", "managedCommit", "managedPr")
 REMOTE_SESSION_FLAGS = ("sendUserFileHint", "managedCommit", "managedPr")
-REMOTE_SESSION_URL = re.compile(r"https://\S+")
-REMOTE_SESSION_COMMIT = r"Co-Authored-By: [^\n]+"
+REMOTE_SESSION_UNMANAGED = ("managedCommit", "managedPr")
+REMOTE_SESSION_URL = re.compile(r"https://claude\.ai/code/session_\w+", re.ASCII)
+REMOTE_SESSION_COMMIT = r"Co-Authored-By: Claude [A-Za-z0-9 .]+ <noreply@anthropic\.com>"
 REMOTE_SESSION_PR = "\U0001f916 Generated with [Claude Code](https://claude.com/claude-code)"
 REMOTE_SESSION_TEXT = (
     "<system-reminder>\n"
@@ -313,6 +322,22 @@ REMOTE_SESSION_HINT = (
     "\nThe user can follow this conversation from another device; to put a file in front of them there (a "
     "report, a screenshot, a built artifact), send it with SendUserFile.\n"
 )
+# Claude Code's handback tool. When the orchestrating session's permission
+# mode is auto, Claude Code 2.1.294 gives every subagent this tool and, right
+# after the task, a <system-reminder> prompt telling it to report through it
+# (gated by the mode and a remote flag, tengu_lively_waffle, or the env var
+# CLAUDE_CODE_SENDMESSAGE_HANDBACK). Its call ends the run without closing
+# the message. The guard refuses such a run for the tool, the prompt and the
+# ending alike, and names the cause first (AUTO_MODE).
+HANDBACK_TOOL = "SubagentHandback"
+AUTO_MODE = (f"the orchestrating session is in auto mode, which gives subagents {HANDBACK_TOOL}: switch it to "
+             "bypass or default mode")
+# The likely cause of a read_tree in the other bridge arm's format: taria and
+# outline serve the same tool names, and a Claude Code session keeps the
+# first definitions it sees for a name (probe4's taria runs, spawned after an
+# outline run from the same session, were offered the outline's).
+TREE_FORMAT_CAUSE = ("as when the orchestrating session saw the other bridge arm's tools first: a session keeps "
+                     "the first definitions it sees for a tool name, so run taria and outline from separate sessions")
 
 
 # --- Finding a transcript ---------------------------------------------------------------
@@ -435,6 +460,25 @@ def _is_prompt(content):
     are not tool results."""
     return isinstance(content, str) or (isinstance(content, list) and bool(content)
                                         and not _is_tool_result(content))
+
+
+def _is_handback_prompt(content):
+    """Whether a prompt is Claude Code's SubagentHandback reminder: one
+    <system-reminder> naming HANDBACK_TOOL, which auto mode sends a subagent
+    right after its task."""
+    text = _block_text(content)
+    return isinstance(text, str) and REMINDER.fullmatch(text.strip()) is not None and HANDBACK_TOOL in text
+
+
+def _last_call(blocks):
+    """The name of the tool the run's last block (thinking aside) called,
+    or None when it is not a tool_use."""
+    for block in reversed(blocks):
+        kind = block.get("type")
+        if kind == "thinking" or kind == "redacted_thinking":
+            continue
+        return block.get("name") if kind == "tool_use" else None
+    return None
 
 
 def _final_usage(lines):
@@ -697,12 +741,14 @@ def _harmless_shape(kind, att, texts):
 def _tolerated_shape(kind, att, texts):
     """None when an attachment a plan tolerates has the shape it is known
     in, else what differs. remote_session_change: exactly its seven fields
-    (REMOTE_SESSION_FIELDS), a url of null or one https URL, a commit and a
-    pr in the words real ones have (the session lines naming that url when
-    there is one), three booleans, and rendered text that is the note its
-    commit and pr fill (REMOTE_SESSION_TEXT, with the SendUserFile line
-    exactly when sendUserFileHint is true). One with no rendered text put
-    nothing in front of the model, and only its fields are checked."""
+    (REMOTE_SESSION_FIELDS), a url of null or a claude.ai session URL, a
+    commit and a pr in the words real ones have (Claude's Co-Authored-By
+    line, and the session lines naming that url when there is one), three
+    booleans of which managedCommit and managedPr are false, and rendered
+    text that is the note its commit and pr fill (REMOTE_SESSION_TEXT, with
+    the SendUserFile line exactly when sendUserFileHint is true). One with
+    no rendered text put nothing in front of the model, and only its fields
+    are checked."""
     if kind != "remote_session_change":
         return f"{kind} has no tolerated shape"
     fields = REMOTE_SESSION_FIELDS
@@ -714,14 +760,18 @@ def _tolerated_shape(kind, att, texts):
         return f"it has no {', '.join(missing)}"
     url, commit, pr = att["url"], att["commit"], att["pr"]
     if url is not None and not (isinstance(url, str) and REMOTE_SESSION_URL.fullmatch(url)):
-        return "its url is neither null nor one https URL"
+        return "its url is neither null nor a claude.ai session URL (https://claude.ai/code/session_<id>)"
     if not (isinstance(commit, str) and isinstance(pr, str)):
         return "its commit and pr are not strings"
     if not all(isinstance(att[flag], bool) for flag in REMOTE_SESSION_FLAGS):
         return f"its {_listed(REMOTE_SESSION_FLAGS)} are not all booleans"
+    if any(att[flag] for flag in REMOTE_SESSION_UNMANAGED):
+        return (f"its {_listed(REMOTE_SESSION_UNMANAGED)} are not both false: a managed attribution, which no real "
+                "note has had")
     session = "" if url is None else f"\nClaude-Session: {url}"
     if not re.fullmatch(REMOTE_SESSION_COMMIT + re.escape(session), commit):
-        return "its commit is not a Co-Authored-By line" + (" and the Claude-Session line of its url" if url else "")
+        return ("its commit is not a Co-Authored-By line for Claude at noreply@anthropic.com"
+                + (" and the Claude-Session line of its url" if url else ""))
     if pr != REMOTE_SESSION_PR + ("" if url is None else f"\n\n{url}"):
         return "its pr is not Claude Code's line" + (" and its url" if url else "")
     expected = REMOTE_SESSION_TEXT.format(commit=commit, pr=pr,
@@ -911,6 +961,7 @@ def read_transcript(path, tolerated=()):
     errors = set()
     synthetic = set()
     first_prompt, seen_user, prompts = None, False, 0
+    handback_prompts = 0  # prompts that are auto mode's SubagentHandback reminder
     reminders = 0  # <system-reminder> blocks in or beside tool results
     other_lines = Counter()  # line types other than user, assistant and attachment
     final = None  # the last assistant line's message: {"id", "synthetic", "text", "error"}
@@ -938,6 +989,7 @@ def read_transcript(path, tolerated=()):
                 first_prompt = _prompt_text(content)
             if _is_prompt(content):
                 prompts += 1
+                handback_prompts += _is_handback_prompt(content)
             elif _is_tool_result(content):
                 # Blocks beside the results, in the same user message: a
                 # reminder there is context like one inside a result, and
@@ -1028,6 +1080,9 @@ def read_transcript(path, tolerated=()):
     # nothing else.
     context["unknown_line_types"] = dict(sorted(other_lines.items()))
     context["prompts"] = prompts
+    # Of those, the ones that are auto mode's SubagentHandback reminder (the
+    # orchestrating session was in auto mode; see HANDBACK_TOOL).
+    context["handback_prompts"] = handback_prompts
     # Context Claude Code appended to a tool's output, which no attachment
     # rule sees: <system-reminder> blocks inside tool results, or beside them
     # in the same user message.
@@ -1045,6 +1100,8 @@ def read_transcript(path, tolerated=()):
         "wall_ms": int((max(stamps) - min(stamps)).total_seconds() * 1000) if len(stamps) >= 2 else None,
         "final_text": final_text or None,
         "ended_on_tool_use": ended_on_tool_use(ordered),
+        # The run's last block is a SubagentHandback call (auto mode).
+        "ended_on_handback": _last_call(ordered) == HANDBACK_TOOL,
         "tool_errors": len(errors),
         "context": context,
         # How the run ended (see `ending`): the final assistant message's
@@ -1104,6 +1161,13 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None, to
     prompt; and a run with no assistant turn. The
     identity line (`cli_prefixes`) is recorded, not checked.
 
+    A run that was offered SubagentHandback, called it, or was told to
+    report through it (`handback_prompts`) ran under an orchestrating
+    session in auto mode: AUTO_MODE comes first, saying so and what to do,
+    and the problems it caused (a tool beyond the arm, a second prompt)
+    follow as usual. A read_tree in the other bridge arm's format names its
+    likely cause (TREE_FORMAT_CAUSE).
+
     Other servers and deferred tools are held against every name ever
     added, so one that reached the agent and later left (a server that
     disconnected) still counts. Removals matter only for `tui` itself: its
@@ -1132,8 +1196,10 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None, to
     read_tree_offered = READ_TREE in (context.get("offered_tools") or []) or READ_TREE in deferred_ever
     if tree_format is not None and read_tree_offered and formats != [tree_format]:
         if formats:
+            # Only the other bridge arm's format: "unknown" has another cause.
+            cause = f", {TREE_FORMAT_CAUSE}" if "unknown" not in formats else ""
             problems.append(f"was offered a read_tree that shows the tree as {', '.join(formats)}, not as the "
-                            f"{arm} arm's {tree_format}")
+                            f"{arm} arm's {tree_format}{cause}")
         else:
             problems.append(f"was offered read_tree only as a deferred tool, and no record carries its "
                             f"description, so its tree format cannot be checked against the {arm} arm's "
@@ -1172,7 +1238,25 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None, to
                         "(a message sent to the agent, a hook)")
     if not stats.get("turns"):
         problems.append("never ran: the transcript has no assistant turn")
+    handback = _handback_signs(stats, context, deferred_ever)
+    if handback:
+        problems.insert(0, f"{AUTO_MODE} (this run {handback})")
     return problems
+
+
+def _handback_signs(stats, context, deferred_ever):
+    """What shows the run got auto mode's SubagentHandback, as prose ("was
+    offered it, called it 1x and ..."), or None."""
+    signs = []
+    if HANDBACK_TOOL in (context.get("offered_tools") or []) or HANDBACK_TOOL in deferred_ever:
+        signs.append("was offered it")
+    calls = (stats.get("tool_calls") or {}).get(HANDBACK_TOOL)
+    if isinstance(calls, int) and calls > 0:
+        signs.append(f"called it {calls}x")
+    prompts = context.get("handback_prompts")
+    if isinstance(prompts, int) and prompts > 0:
+        signs.append(f"got {prompts} prompt{'s' if prompts > 1 else ''} telling it to report through it")
+    return _listed(signs) if signs else None
 
 
 def attachment_problem(entry):
@@ -1247,7 +1331,9 @@ def ending(stats, max_turns):
     with INFERRED_END as its detail: Claude Code left the closing line out,
     the reply arrived. A null stop_reason on anything else (a final tool_use
     under the cap, a thinking block) is still a harness error, and so is any
-    explicit stop_reason but end_turn (max_tokens, refusal, ...).
+    explicit stop_reason but end_turn (max_tokens, refusal, ...). A run that
+    ends on a SubagentHandback call (`ended_on_handback`) is one too, and
+    its detail says why: the orchestrating session was in auto mode.
     """
     reached = stats.get("max_turns_reached")
     if isinstance(reached, dict):
@@ -1270,7 +1356,10 @@ def ending(stats, max_turns):
         return "end_turn", None
     if reason is None and stats.get("end_inferred") and not stats.get("ended_on_tool_use"):
         return "end_turn", INFERRED_END
-    if reason is None:
+    if stats.get("ended_on_handback"):
+        why = (f"its last block is a {HANDBACK_TOOL} call, which ends a run without closing its message: the "
+               "orchestrating session is in auto mode")
+    elif reason is None:
         why = "it never finished streaming: an API error, a usage limit or an interruption cut it off"
     elif reason == "tool_use":
         why = (f"it asked for a tool at turn {stats.get('turns')}, under maxTurns {max_turns}: "

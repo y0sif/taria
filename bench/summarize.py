@@ -20,8 +20,9 @@ Sections:
 
 - Not a clean batch, first, when any batch's plan tolerated an attachment
   (run.py plan --tolerate-attachment; its rows' context.tolerated_attachments):
-  per such batch what it carries in every call and how many runs got it,
-  and, merged with clean batches, that the conditions differ. Every agent
+  per such batch what its plan tolerated and how many runs got it (that it
+  carries it in every call only when every run got it), and, merged with
+  clean batches, that the conditions differ. Every agent
   section repeats the marker under its heading, and every table row built
   from such runs has `[not clean]` beside the arm, task or pair it is about
   (`[not clean: X only]` for a comparison where only X's side carries it).
@@ -355,11 +356,25 @@ def _carried(rows, kind):
     return len(chars), chars
 
 
+def _tolerance_head(batch, types, rows):
+    """What a batch that tolerated `types` carries, true to how many of its
+    `rows` got each: "B carries X in every call" when every run got every
+    type, else "B tolerated X; N of M runs got it"."""
+    counts = [(kind, _carried(rows, kind)[0]) for kind in types]
+    if all(n == len(rows) for _, n in counts):
+        return f"{batch} carries {_what(types)} in every call"
+    if len(counts) == 1:
+        return f"{batch} tolerated {_what(types)}; {counts[0][1]} of {len(rows)} runs got it"
+    return f"{batch} tolerated " + "; ".join(f"{_what([kind])}, which {n} of {len(rows)} runs got"
+                                             for kind, n in counts)
+
+
 def tolerance_banner(records):
     """The marker for results with runs of a batch that tolerated an
     attachment: per such batch what it carries and how many of its runs got
     it, then, when clean batches are merged in, that the conditions differ,
-    and what NOT_CLEAN marks. Empty when every batch is clean."""
+    and what NOT_CLEAN marks. Empty when every batch is clean. A batch is
+    said to carry the note in every call only when every run got it."""
     agent = [r for r in records if label(r) == "agent"]
     batches = group(agent, lambda r: r.get("batch") or NO_BATCH)
     tolerating = {b: sorted({t for r in rs for t in tolerated_types(r)}) for b, rs in batches.items()}
@@ -369,14 +384,23 @@ def tolerance_banner(records):
     lines = []
     for batch in sorted(tolerating):
         types, rows = tolerating[batch], batches[batch]
-        got = []
+        got, counts = [], []
         for kind in types:
             n, chars = _carried(rows, kind)
+            counts.append(n)
             size = "" if not chars else f", {min(chars)}" + (f"-{max(chars)}" if max(chars) != min(chars) else "")
             got.append(f"{kind}: {n} of {len(rows)} runs got it{size}{' characters each' if size else ''}")
-        lines.append(f"> **{batch} carries {_what(types)} in every call: not a clean batch.** Its plan tolerated "
-                     f"{'; '.join(got)}. Where every arm got the same note, its arms compare with each other, but "
-                     "its absolute token counts include the note.")
+        if all(n == len(rows) for n in counts):
+            what = ("Where every arm got the same note, its arms compare with each other, but its absolute token "
+                    "counts include the note.")
+        elif not any(counts):
+            what = ("No run got it, so no token count includes it, but its plan would have let it through, so it "
+                    "is not a clean batch.")
+        else:
+            what = ("Only some runs got it, so its arms may not have carried it alike (the agent context table "
+                    "counts them per arm and model), and the token counts of the runs that got it include it.")
+        lines.append(f"> **{_tolerance_head(batch, types, rows)}: not a clean batch.** Its plan tolerated "
+                     f"{'; '.join(got)}. {what}")
     clean = sorted(b for b in batches if b not in tolerating)
     if clean:
         lines.append(f"> Mixed conditions: {', '.join(clean)} tolerated nothing. An arm from "
@@ -395,11 +419,13 @@ def tolerance_marker(records):
     a batch that is not clean (the banner at the top says which)."""
     if not not_clean(records):
         return []
-    batches = sorted({r.get("batch") or NO_BATCH for r in records if tolerated_types(r)})
-    types = sorted({t for r in records for t in tolerated_types(r)})
-    return [f"> {', '.join(batches)} {'carries' if len(batches) == 1 else 'carry'} {_what(types)} in every call: "
-            f"not a clean batch. Rows marked `{NOT_CLEAN}` include its runs, whose absolute token counts include "
-            "the note.", ""]
+    batches = group([r for r in records if tolerated_types(r)], lambda r: r.get("batch") or NO_BATCH)
+    heads = [_tolerance_head(b, sorted({t for r in rs for t in tolerated_types(r)}), rs)
+             for b, rs in sorted(batches.items())]
+    one = len(heads) == 1
+    where = "" if all(h.endswith(" in every call") for h in heads) else " where a run got it"
+    return [f"> {'; '.join(heads)}: not {'a clean batch' if one else 'clean batches'}. Rows marked `{NOT_CLEAN}` "
+            f"include {'its' if one else 'their'} runs, whose absolute token counts include the note{where}.", ""]
 
 
 # --- Grouping -----------------------------------------------------------------------------
