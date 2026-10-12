@@ -49,6 +49,16 @@ session, Claude Code added a ~710-character attribution note beside a tool
 result in every subagent run, and a guard that only read the types it knew
 let it through.
 
+A flagged type known to be the same for every run of a batch
+(ATTACHMENTS_TOLERABLE: `remote_session_change` only) can be tolerated by
+the batch's plan (`run.py plan --tolerate-attachment TYPE`). Read with that
+tolerance, such an attachment is held to the shape it is known in (its
+fields, and the text they fill: REMOTE_SESSION_TEXT) and, when it has it,
+recorded in the context's `tolerated_attachments` instead of refused; one in
+any other shape is still refused. A batch that tolerates one is not a clean
+batch: where every arm got the same note its arms compare with each other,
+but its absolute token counts include the note.
+
 The tools the agent was offered are in its `prompt_snapshot` attachments.
 Claude Code writes the first before any tool is known, without a `tools`
 key, and a new one whenever the tool list changes; each repeats the tools
@@ -160,6 +170,12 @@ ATTACHMENTS_FLAGGED = {
                               "turn /remote-control off in the orchestrating session"),
     "skill_listing": ("a skill listing", "no arm's agent should get one, as its tools are mcp__tui only"),
 }
+# Flagged, and a plan may tolerate it (`run.py plan --tolerate-attachment`):
+# a type known to be the same for every run of a batch, so every arm gets it
+# alike. Tolerated, it is held to the shape it is known in (_tolerated_shape)
+# and recorded in the context's tolerated_attachments rather than refused.
+# skill_listing is not one: nothing shows it would be the same for every run.
+ATTACHMENTS_TOLERABLE = frozenset({"remote_session_change"})
 KNOWN_ATTACHMENTS = ATTACHMENTS_VERIFIED | ATTACHMENTS_HARMLESS | frozenset(ATTACHMENTS_FLAGGED)
 LINE_TYPES = frozenset({"user", "assistant", "attachment"})
 # The top-level fields each harmless type is known with, `type` included: any
@@ -264,6 +280,38 @@ REMINDER = re.compile(r"<system-reminder>\s*(.*?)\s*</system-reminder>", re.S)
 REMINDER_OPEN = "<system-reminder>"
 TOTAL_TOKENS = re.compile(
     r"(?:<system-reminder>\s*)?<total_tokens>\d+ tokens left</total_tokens>(?:\s*</system-reminder>)?"
+)
+# remote_session_change, when a plan tolerates it: the fields every real one
+# has (the 62 archived runs of outline1 and probe3, and live subagent runs of
+# Claude Code 2.1.294), and the text it renders, the attribution lines its
+# commit and pr fill. The commit is a Co-Authored-By line, plus a
+# Claude-Session line naming its url when it has one (a url of null comes
+# with neither session line, as some live subagent runs of 2.1.294 had),
+# and the pr is Claude Code's own line, plus the url. The SendUserFile line
+# is there only when sendUserFileHint is true, which an orchestrating
+# session's own transcript has had and no subagent's yet. Anything else
+# (another field, another sentence, a managed attribution) is refused.
+REMOTE_SESSION_FIELDS = ("type", "url", "commit", "pr", "sendUserFileHint", "managedCommit", "managedPr")
+REMOTE_SESSION_FLAGS = ("sendUserFileHint", "managedCommit", "managedPr")
+REMOTE_SESSION_URL = re.compile(r"https://\S+")
+REMOTE_SESSION_COMMIT = r"Co-Authored-By: [^\n]+"
+REMOTE_SESSION_PR = "\U0001f916 Generated with [Claude Code](https://claude.com/claude-code)"
+REMOTE_SESSION_TEXT = (
+    "<system-reminder>\n"
+    "Attribution for git commits and pull requests you create from here on (this replaces Claude Code's own "
+    "earlier attribution guidance, such as a previous copy of this reminder; the user's own instructions about "
+    "these lines, such as a CLAUDE.md or memory rule, take precedence over this reminder, but do not add "
+    "attribution lines this reminder leaves out):\n"
+    "- End git commit messages with:\n"
+    "{commit}\n"
+    "- End pull request descriptions with:\n"
+    "{pr}\n"
+    "{hint}"
+    "</system-reminder>"
+)
+REMOTE_SESSION_HINT = (
+    "\nThe user can follow this conversation from another device; to put a file in front of them there (a "
+    "report, a screenshot, a built artifact), send it with SendUserFile.\n"
 )
 
 
@@ -646,44 +694,120 @@ def _harmless_shape(kind, att, texts):
     return None
 
 
+def _tolerated_shape(kind, att, texts):
+    """None when an attachment a plan tolerates has the shape it is known
+    in, else what differs. remote_session_change: exactly its seven fields
+    (REMOTE_SESSION_FIELDS), a url of null or one https URL, a commit and a
+    pr in the words real ones have (the session lines naming that url when
+    there is one), three booleans, and rendered text that is the note its
+    commit and pr fill (REMOTE_SESSION_TEXT, with the SendUserFile line
+    exactly when sendUserFileHint is true). One with no rendered text put
+    nothing in front of the model, and only its fields are checked."""
+    if kind != "remote_session_change":
+        return f"{kind} has no tolerated shape"
+    fields = REMOTE_SESSION_FIELDS
+    extra = _beyond(att, fields)
+    if extra:
+        return f"fields beyond {_listed(fields[1:])}: {extra}"
+    missing = [field for field in fields if field not in att]
+    if missing:
+        return f"it has no {', '.join(missing)}"
+    url, commit, pr = att["url"], att["commit"], att["pr"]
+    if url is not None and not (isinstance(url, str) and REMOTE_SESSION_URL.fullmatch(url)):
+        return "its url is neither null nor one https URL"
+    if not (isinstance(commit, str) and isinstance(pr, str)):
+        return "its commit and pr are not strings"
+    if not all(isinstance(att[flag], bool) for flag in REMOTE_SESSION_FLAGS):
+        return f"its {_listed(REMOTE_SESSION_FLAGS)} are not all booleans"
+    session = "" if url is None else f"\nClaude-Session: {url}"
+    if not re.fullmatch(REMOTE_SESSION_COMMIT + re.escape(session), commit):
+        return "its commit is not a Co-Authored-By line" + (" and the Claude-Session line of its url" if url else "")
+    if pr != REMOTE_SESSION_PR + ("" if url is None else f"\n\n{url}"):
+        return "its pr is not Claude Code's line" + (" and its url" if url else "")
+    expected = REMOTE_SESSION_TEXT.format(commit=commit, pr=pr,
+                                          hint=REMOTE_SESSION_HINT if att["sendUserFileHint"] else "")
+    return _rendered_problem(texts, expected, "the attribution note its commit and pr fill")
+
+
 UNREADABLE = ("its rendered field is in no shape the guard reads (a list of objects whose one key is content, "
               "a string or text blocks), so the text it put in front of the model cannot be checked")
 
 
-def _refusal(kind, att, texts, unreadable=0):
+def tolerable_problem(kind):
+    """None when a plan may tolerate attachment type `kind`
+    (ATTACHMENTS_TOLERABLE), else why not, in one sentence."""
+    only = f"only {_listed(sorted(ATTACHMENTS_TOLERABLE))} can be tolerated"
+    if not isinstance(kind, str):
+        return f"an attachment type is a name, not {kind!r}; {only}"
+    if kind in ATTACHMENTS_TOLERABLE:
+        return None
+    if kind in ATTACHMENTS_FLAGGED:
+        return (f"{kind} ({ATTACHMENTS_FLAGGED[kind][0]}) is flagged, but not known to be the same for every run "
+                f"of a batch, so a plan cannot tolerate it; {only}")
+    if kind in ATTACHMENTS_VERIFIED or kind in ATTACHMENTS_HARMLESS:
+        rule = "verified" if kind in ATTACHMENTS_VERIFIED else "harmless"
+        return (f"{kind} is not flagged: the guard holds it to its own rule ({rule}), so there is nothing to "
+                f"tolerate; {only}")
+    return f"unknown attachment type {kind!r}: the guard has no rule for it and refuses it in every batch; {only}"
+
+
+def check_tolerated(types):
+    """`types`, the attachment types a plan tolerates, sorted and without
+    repeats. Raises ValueError when it is not a list of names, or names a
+    type a plan may not tolerate (tolerable_problem)."""
+    if not isinstance(types, (list, tuple, set, frozenset)):
+        raise ValueError(f"the tolerated attachments are a list of type names, not {types!r}")
+    for kind in types:
+        problem = tolerable_problem(kind)
+        if problem:
+            raise ValueError(problem)
+    return sorted(set(types))
+
+
+def _refusal(kind, att, texts, unreadable=0, tolerated=frozenset()):
     """(rule, detail) when the guard refuses this attachment, else None:
     "unknown" for a type with no rule (or no type, or no attachment object),
     "flagged" for one refused by name, "shape" for a known type whose
     rendered text does not read (`unreadable` characters of it, as JSON, the
-    count the guard's sentence includes), or a harmless type in a shape it
-    is not known in."""
+    count the guard's sentence includes), a harmless type in a shape it is
+    not known in, or a `tolerated` one in a shape it is not known in. A
+    flagged type in `tolerated` in its known shape is not refused."""
     if not isinstance(att, dict) or not isinstance(kind, str) or kind not in KNOWN_ATTACHMENTS:
         return "unknown", None
-    if kind in ATTACHMENTS_FLAGGED:
+    if kind in ATTACHMENTS_FLAGGED and kind not in tolerated:
         return "flagged", None
     if unreadable:
         return "shape", UNREADABLE
-    detail = _harmless_shape(kind, att, texts) if kind in ATTACHMENTS_HARMLESS else None
+    if kind in ATTACHMENTS_FLAGGED:
+        detail = _tolerated_shape(kind, att, texts)
+    else:
+        detail = _harmless_shape(kind, att, texts) if kind in ATTACHMENTS_HARMLESS else None
     return ("shape", detail) if detail else None
 
 
-def _context(attachments):
+def _context(attachments, tolerated=frozenset()):
     """The context row field from `attachments`: (attachment, rendered texts,
     unreadable rendered characters) in transcript order, the attachment as
-    the line carries it (not always an object)."""
+    the line carries it (not always an object). An attachment of a type in
+    `tolerated`, in the shape it is known in, is tallied in
+    `tolerated_attachments` instead of refused."""
     claude_md, deferred, loaded, servers, types = [], set(), set(), set(), set()
     deferred_added, servers_added = set(), set()  # every name ever added, removals ignored
     snapshots, offered, tree_formats, prefixes = [], set(), set(), set()
     refused = {}  # (label, rule, detail) -> [count, rendered chars]
+    kept = {kind: [0, 0] for kind in sorted(tolerated)}  # tolerated type -> [count, rendered chars]
     cwd, skills = None, False
     for att, texts, unreadable in attachments:
         kind = att.get("type") if isinstance(att, dict) else None
-        refusal = _refusal(kind, att, texts, unreadable)
+        refusal = _refusal(kind, att, texts, unreadable, tolerated)
         if refusal is not None:
             label = _label(kind) if isinstance(att, dict) else "<not an object>"
             tally = refused.setdefault((label, *refusal), [0, 0])
             tally[0] += 1
             tally[1] += sum(len(t) for t in texts) + unreadable
+        elif kind in tolerated:
+            kept[kind][0] += 1
+            kept[kind][1] += sum(len(t) for t in texts)
         if not isinstance(kind, str):
             continue
         types.add(kind)
@@ -764,11 +888,21 @@ def _context(attachments):
             for (label, rule, detail), (count, chars) in sorted(refused.items(), key=lambda kv: (
                 kv[0][0], kv[0][1], kv[0][2] or ""))
         ],
+        # The attachments the plan tolerates (ATTACHMENTS_TOLERABLE), each
+        # type with how many arrived in the shape it is known in and their
+        # rendered characters: count 0 for one that never came. Empty for a
+        # plan that tolerates nothing, a clean batch's.
+        "tolerated_attachments": {kind: {"count": count, "rendered_chars": chars}
+                                  for kind, (count, chars) in kept.items()},
     }
 
 
-def read_transcript(path):
-    """The bench's numbers for the transcript at `path` (see the module doc)."""
+def read_transcript(path, tolerated=()):
+    """The bench's numbers for the transcript at `path` (see the module doc),
+    read with the attachment types the batch's plan tolerates (`tolerated`,
+    see check_tolerated, which raises ValueError for a type a plan may not
+    tolerate)."""
+    tolerated = frozenset(check_tolerated(tolerated))
     lines, malformed = _lines(path)
     agent_id = session_id = None
     stamps, attachments, versions, efforts = [], [], set(), set()
@@ -888,7 +1022,7 @@ def read_transcript(path):
     # line, at the end of the run or in the middle of it: its output count is
     # the largest partial one, so the run's output total is a lower bound.
     unclosed = sum(1 for e in messages.values() if not any(l["stop_reason"] is not None for l in e["lines"]))
-    context = _context(attachments)
+    context = _context(attachments, tolerated)
     # The lines no rule covers, and how many prompts the agent was given
     # (user lines that are not tool results): the task, and in a real run
     # nothing else.
@@ -941,9 +1075,15 @@ def read_transcript(path):
 # --- Was the run set up as its arm requires? ----------------------------------------------
 
 
-def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
+def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None, tolerated=()):
     """Problems with how the run was set up, one sentence each; empty when
     the agent ran as its arm requires.
+
+    `tolerated` is the attachment types the batch's plan tolerates (see
+    check_tolerated, which raises ValueError for one a plan may not). A
+    tolerated attachment the context recorded (read_transcript with the same
+    list) is not a problem; one recorded as tolerated that `tolerated` does
+    not name is refused by name, as if read without it.
 
     Allowed: the arm's `mcp__tui__<tool>` tools and ToolSearch (which loads
     deferred tools). A problem is: a tool called outside that; a model not
@@ -969,6 +1109,7 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
     disconnected) still counts. Removals matter only for `tui` itself: its
     instructions must still be there at the end.
     """
+    tolerated = frozenset(check_tolerated(tolerated))
     allowed = {SERVER_PREFIX + t for t in arm_tools}
     problems = []
     for name, count in sorted((stats.get("tool_calls") or {}).items()):
@@ -1013,6 +1154,12 @@ def guard(stats, arm, model_family, arm_tools, effort=None, tree_format=None):
         problems.append(f"lost the {SERVER} server's instructions mid-run: the server was removed (it disconnected)")
     problems += [attachment_problem(entry) for entry in context.get("refused_attachments") or []
                  if isinstance(entry, dict)]
+    # Read as tolerated, but not tolerated here: refused as if read without.
+    kept = context.get("tolerated_attachments")
+    for kind, tally in sorted(kept.items() if isinstance(kept, dict) else []):
+        if kind not in tolerated and isinstance(tally, dict) and tally.get("count"):
+            problems.append(attachment_problem({"type": kind, "rule": "flagged", "count": tally.get("count"),
+                                                "rendered_chars": tally.get("rendered_chars")}))
     reminders = context.get("tool_result_reminders")
     if isinstance(reminders, int) and reminders > 0:
         problems.append(f"has {reminders} <system-reminder> block(s) in or beside tool results: context Claude "

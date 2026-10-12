@@ -104,7 +104,32 @@ the guard refuses. Call `run.py` by absolute path.
 `plan` writes the shuffled jobs (task x arm x model x run) and the seed to
 `results/B/plan.json`, and never replaces one. It also refuses a batch whose
 `runs.jsonl` already has rows (a dry run's, say): their job ids would match
-the plan's, and `next` takes a job with a row as done. `next` claims the
+the plan's, and `next` takes a job with a row as done.
+
+`plan --tolerate-attachment remote_session_change` (repeatable) plans a batch
+that runs with `/remote-control` on in the orchestrating session, for when
+turning it off is not an option (it would cut off the person following the
+session from another device). The plan records `tolerated_attachments`
+(sorted; `[]` by default), and `next` and `regrade` grade every run of the
+batch with it: remote control's attribution note, in the shape real ones
+have, is recorded in the row's `context.tolerated_attachments` instead of
+making the run a harness error (see Isolation). It is acceptable only when
+every arm of the batch carries the same note, which holds when one session
+with remote control on orchestrates the whole batch: then the arms of the
+batch compare with each other as fairly as in a clean one. What it costs:
+about 710 characters beside the first tool result, carried in every call
+after it, so the batch's absolute token counts include the note, and it is
+not a clean batch. Do not hold its absolute numbers against a clean batch's;
+`summarize.py` marks every table built from it. Only
+`remote_session_change` can be tolerated: `plan` refuses `skill_listing`
+(nothing shows it would be the same for every run), a type the guard holds
+to its own rule, and a type it does not know, saying which and why.
+
+```bash
+python3 bench/run.py plan --batch B --models sonnet,haiku --runs 5 --tolerate-attachment remote_session_change
+```
+
+`next` claims the
 slot's next job, starts its demo and prints one line:
 
 ```json
@@ -249,7 +274,7 @@ added to the agent's prompt:
 |---|---|---|
 | verified | `prompt_snapshot`, `mcp_instructions_delta`, `deferred_tools_delta`, `deferred_tools_record`, `max_turns_reached`, `instructions` | reads what they carry and holds the run to it (below) |
 | harmless | `environment`, `session_context`, `date`, `model`, `credential_org`, `thinking_drop`, `total_tokens_reminder` | holds each to the top-level fields it is known with (any other field is refused) and to the shape it is known in: a snapshot of the 8 keys a real run's has, their types, one line each; session context of `userEmail` and `gitStatus` only, each in Claude Code's words around the data (the e-mail sentence around the address, the git status's opening sentence and section labels around the repo's branches, status and commits); a `YYYY-MM-DD` date; a model identity of `modelId`, `marketingName` and `knowledgeCutoff`; a `<total_tokens>` count. Its rendered text is then held to the text its own values fill. Only the environment's and the session context's are compared character for character, against the template every archived run rendered them in (`ENVIRONMENT_TEXT` and `SESSION_CONTEXT_TEXT` in `bench/transcript.py`), so a sentence Claude Code adds is refused; the one exception is the environment's untrusted-data line (`ENVIRONMENT_UNTRUSTED`), which Claude Code 2.1.294 renders only while a remote feature flag is false, so it may be missing, and is exact when there. The date's and the model's are compared after stripping surrounding whitespace and the `<system-reminder>` wrapper: "Today's date is ..." with the attachment's date, and the model line its identity spells (the attachment's `text` must be that line too). The token reminder's `text` and rendered text must each be a bare `<total_tokens>N tokens left</total_tokens>`, wrapper optional, with any N: the rendered count is not tied to the one in its `text`. `credential_org` and `thinking_drop` must render nothing but whitespace (diagnostics Claude Code records and never shows the model) |
-| flagged | `remote_session_change`, `skill_listing` | refuses it by name |
+| flagged | `remote_session_change`, `skill_listing` | refuses it by name, unless the batch's plan tolerates it (`remote_session_change` only, below): then holds it to its seven fields (`type`, `url`, `commit`, `pr`, `sendUserFileHint`, `managedCommit`, `managedPr`, no other), a `url` of null or one https URL, a `commit` that is a `Co-Authored-By` line (and the `Claude-Session` line of its url when it has one), a `pr` that is Claude Code's "Generated with" line (and its url), three booleans, and rendered text that is the note those fill (`REMOTE_SESSION_TEXT` in `bench/transcript.py`, with the SendUserFile line exactly when `sendUserFileHint` is true), and records it in `context.tolerated_attachments` |
 
 Any other type, an attachment line with no type, or one whose attachment is
 not an object makes the run a harness error, and the guard's sentence names
@@ -270,6 +295,24 @@ worktree, and do not `cd` or `/add-dir` during a batch: both change the
 environment text, which the guard refuses. Call `run.py` by absolute path.
 A new Claude Code version that adds a type stops a batch at its
 first run, which is the point: give the type its rule, then resume.
+
+When `/remote-control` cannot be off, plan the batch with
+`--tolerate-attachment remote_session_change` (see How runs execute). The
+guard then reads every run of the batch with that tolerance: a note in the
+shape the table above gives is no guard problem, and the row's
+`context.tolerated_attachments` says how many came and how many characters
+they rendered, as
+`{"remote_session_change": {"count": 1, "rendered_chars": 710}}`; a run that
+got none records count 0. A note in any other shape (a field added or
+missing, a sentence more, rendered text that does not read) is still
+refused, and so is a note in a batch whose plan does not tolerate it, which
+is every batch planned before the option, outline1 and probe3 among them:
+their regrade still refuses all their runs. Every other check is unchanged.
+It is acceptable only when every arm of the batch carries the same note,
+which one orchestrating session gives them all. It costs the batch its
+clean status: its absolute token counts include the note in every call
+after it arrives, so they are not comparable with a clean batch's, and the
+summary marks them.
 
 The agent's identity line, the first line of its system prompt
 (`prompt_snapshot.cliPrefix`), is Claude Code's choice and changed between
@@ -300,9 +343,10 @@ assistant line), and the guard. The guard makes a run a harness error if it:
   problem too;
 - ever got the instructions of an MCP server other than `tui`, got none
   from `tui`, or lost `tui`'s mid-run;
-- was given an attachment without a rule, one flagged by name, one whose
-  rendered text does not read, or a harmless one in a shape or with
-  rendered text it is not known in (the table above);
+- was given an attachment without a rule, one flagged by name that its
+  plan does not tolerate, one whose rendered text does not read, or a
+  harmless or tolerated one in a shape or with rendered text it is not
+  known in (the table above);
 - has a `<system-reminder>` block inside a tool result, or beside one in
   the same user message, which is where Claude Code appends its reminders
   to a tool's output, out of reach of the attachment rules
@@ -366,8 +410,11 @@ only what persists: each row's recorded `state` (the task's check runs on it
 again), its `demo_alive`, and its transcript. The transcript is read from
 the batch's archive (`results/B/transcripts/`, see Known limits), or, when
 it is not there, found again by agent id under `~/.claude/projects`. It is
-read with the plan's effort and max turns. Nothing runs again and no model
-is called.
+read with the plan's effort, max turns and tolerated attachments (none for
+a plan from before the option), so a batch planned clean stays held to a
+clean batch's guard. A plan that names a type no plan may tolerate (edited
+by hand) is refused by `regrade` and `next` alike, before anything is
+graded. Nothing runs again and no model is called.
 
 It refuses while any slot of the batch is held. It copies `runs.jsonl` to
 `runs.orig-<UTC time>.jsonl` first, never over an existing backup, then
@@ -407,7 +454,7 @@ One JSON object per run, the same keys in both modes, null where none applies.
 | `tokens` | `input`, `cache_creation`, `cache_read`, `output`, summed over messages |
 | `output_tokens_lower_bound`, `unclosed_messages` | `tokens.output` is a lower bound because a message never got its closing line; how many messages did not |
 | `final_text` | the agent's last text, up to 500 characters |
-| `context` | `offered_tools` and `offered_tools_snapshots`, the tools the prompt snapshots listed (their union, and each snapshot's list); `claude_md_files`; `deferred_tools`, `loaded_tools` and `deferred_tools_added` (at the end, loaded by ToolSearch, every one ever added); `mcp_instruction_servers` and `mcp_instruction_servers_added` (at the end, every one ever added); `environment_cwd`; `skill_listing`; `attachment_types`; `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description); `cli_prefixes`, the agent's identity line; `refused_attachments`, one entry per type, rule (`unknown`, `flagged` or `shape`) and detail the guard refused, with its count and rendered characters; `unknown_line_types`; `prompts`, the user lines that are not tool results, plus each tool-result line with anything beside its results but reminders; and `tool_result_reminders`, the `<system-reminder>` blocks in or beside tool results |
+| `context` | `offered_tools` and `offered_tools_snapshots`, the tools the prompt snapshots listed (their union, and each snapshot's list); `claude_md_files`; `deferred_tools`, `loaded_tools` and `deferred_tools_added` (at the end, loaded by ToolSearch, every one ever added); `mcp_instruction_servers` and `mcp_instruction_servers_added` (at the end, every one ever added); `environment_cwd`; `skill_listing`; `attachment_types`; `tree_formats`: the tree format each offered `read_tree` described, inline or in a deferred-tool record (`["json"]`, `["outline"]`, or `[]` without one or without a recorded description); `cli_prefixes`, the agent's identity line; `refused_attachments`, one entry per type, rule (`unknown`, `flagged` or `shape`) and detail the guard refused, with its count and rendered characters; `tolerated_attachments`, per type the plan tolerates, how many arrived in their known shape and their rendered characters (`{"remote_session_change": {"count": 1, "rendered_chars": 710}}`, count 0 when none came, `{}` in a clean batch); `unknown_line_types`; `prompts`, the user lines that are not tool results, plus each tool-result line with anything beside its results but reminders; and `tool_result_reminders`, the `<system-reminder>` blocks in or beside tool results |
 | `status_at_run`, `regraded_at`, `regrade_git_sha`, `regrade_git_dirty`, `regrade_note` | added by `regrade` only: see Regrading |
 
 ## Summaries
@@ -423,13 +470,25 @@ python3 bench/summarize.py --all                    # every batch, merged
 python3 bench/summarize.py FILE ...                 # exactly these files
 ```
 
-- **Run conditions**, first, when the rows come from more than one batch:
+- **Not a clean batch**, first of all, when a batch's plan tolerated an
+  attachment (`plan --tolerate-attachment`, read from its rows'
+  `context.tolerated_attachments`): per such batch "B carries remote
+  control's note in every call: not a clean batch", how many of its runs got
+  the note and its size, and, merged with clean batches, that an arm from
+  one held against an arm from the other counts the note's tokens on one
+  side only. The line repeats under every agent section's heading, and every
+  table row built from such runs has `[not clean]` beside the arm, task or
+  pair it is about, or `[not clean: X only]` for a comparison where only X's
+  side carries the note. The agent context table counts the runs of each arm
+  and model that got it, which should be all of them.
+- **Run conditions**, when the rows come from more than one batch:
   per batch the git SHA (and dirty flag), claude versions, the agents'
   identity line (`context.cli_prefixes`, `not recorded` for a row graded
   before it existed), models requested and resolved, effort, max turns,
-  seed, arms, graded n and harness errors, then which of SHA, claude,
-  identity line, models resolved, effort, max turns and seed differ between
-  the batches with agent runs (read from their agent rows).
+  seed, arms, graded n, harness errors and tolerated attachments (`none` for
+  a clean batch), then which of SHA, claude, identity line, models resolved,
+  effort, max turns, seed and tolerated attachments differ between the
+  batches with agent runs (read from their agent rows).
   A batch of dry runs only has no claude, model, effort or max turns, so it
   is listed but left out of that comparison, and the header names it.
   Merged batches are compared as if they ran together, so read this

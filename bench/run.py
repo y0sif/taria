@@ -55,6 +55,16 @@ Two ways to drive a run:
             regrade needs them; `next` archives as it grades, so this is for
             a batch graded before it did.
 
+`plan --tolerate-attachment TYPE` (repeatable; only remote_session_change,
+Claude Code's remote-control attribution note) records the type in the
+plan's tolerated_attachments, and grading (next and regrade) reads every
+transcript of the batch with it: such an attachment in the shape it is known
+in is recorded in the row's context.tolerated_attachments instead of making
+the run a harness error. With one orchestrating session every arm of the
+batch gets the same note, so its arms still compare with each other, but
+its absolute token counts include the note, and it is not a clean batch
+(summarize.py marks it).
+
 Every run ends in exactly one status:
 
   passed         the check passed and the demo is still running
@@ -88,6 +98,7 @@ Usage:  python3 bench/run.py dry-run [--tasks T1,T3] [--arms taria,tmux,outline]
         python3 bench/run.py agents  --slots K [--dir D] [--effort E] [--max-turns N] [--remove]
         python3 bench/run.py plan    --batch B [--tasks ..] [--arms ..] [--models sonnet,haiku]
                                      [--runs N] [--seed S] [--effort E] [--max-turns N]
+                                     [--tolerate-attachment remote_session_change]
         python3 bench/run.py next    --batch B --slot K [--agent-id ID] [--agents-dir D]
         python3 bench/run.py status  --batch B
         python3 bench/run.py abort   --batch B --slot K [--reason TEXT]
@@ -627,6 +638,9 @@ def cmd_plan(args):
         "seed": args.seed,
         "effort": args.effort,
         "max_turns": args.max_turns,
+        # Attachment types the guard flags that this batch lets through,
+        # recorded per run instead (see plan_tolerated): not a clean batch.
+        "tolerated_attachments": sorted(set(args.tolerate_attachments)),
         "agent_body_sha256": agents.body_sha256(),
         **git_provenance(),
         "jobs": jobs,
@@ -641,9 +655,27 @@ def cmd_plan(args):
     print(
         f"run.py: batch {args.batch}: {len(jobs)} jobs ({len(args.tasks)} tasks x "
         f"{len(args.arms)} arms x {len(args.models)} models x {args.runs} runs), seed "
-        f"{args.seed}, effort {args.effort}, max {args.max_turns} turns; {paths.plan}"
+        f"{args.seed}, effort {args.effort}, max {args.max_turns} turns{tolerance_note(plan)}; {paths.plan}"
     )
     return EXIT_OK
+
+
+def plan_tolerated(plan):
+    """The attachment types `plan` tolerates (`plan --tolerate-attachment`),
+    sorted; [] for a plan from before the option. Raises CommandError when
+    the plan names one a plan may not tolerate (a plan edited by hand), so
+    nothing is graded under a tolerance the guard does not know."""
+    try:
+        return load_transcript_module().check_tolerated(plan.get("tolerated_attachments", []))
+    except ValueError as err:
+        raise CommandError(f"the plan of batch {plan.get('batch')} tolerates what no plan may: {err}")
+
+
+def tolerance_note(plan):
+    """`, tolerating T (not a clean batch)` for a plan that tolerates
+    attachments, else nothing."""
+    tolerated = plan.get("tolerated_attachments") or []
+    return f", tolerating {', '.join(map(str, tolerated))} (not a clean batch)" if tolerated else ""
 
 
 # --- Subagent runs: next, status, abort ---------------------------------------------------
@@ -781,14 +813,16 @@ TRANSCRIPT_FIELDS = (
 )
 
 
-def transcript_verdict(transcript_mod, path, arm, model, effort, max_turns, extra_problems=()):
+def transcript_verdict(transcript_mod, path, arm, model, effort, max_turns, extra_problems=(), tolerated=()):
     """(row fields, errors, cut_off) from the transcript at `path`: the stats
     a row records, the guard (plus `extra_problems`), and how the run ended.
+    The transcript is read and guarded with the attachment types the plan
+    tolerates (`tolerated`, plan_tolerated), which its context then records.
     The one grading logic for `next` and `regrade`. Raises when the
     transcript cannot be read."""
-    stats = transcript_mod.read_transcript(path)
+    stats = transcript_mod.read_transcript(path, tolerated=tolerated)
     problems = list(transcript_mod.guard(stats, arm, model, ARM_TOOLS[arm], effort=effort,
-                                         tree_format=ARM_TREE_FORMAT.get(arm)))
+                                         tree_format=ARM_TREE_FORMAT.get(arm), tolerated=tolerated))
     problems += list(extra_problems)
     kind, detail = transcript_mod.ending(stats, max_turns)
     inferred = kind == "end_turn" and detail is not None
@@ -837,7 +871,8 @@ def grade_agent_run(plan, slot, agent_id, run=None, transcript_mod=None, transcr
             errors.append(f"no transcript for agent {agent_id} under ~/.claude/projects")
         else:
             fields, found, cut_off = transcript_verdict(
-                transcript_mod, path, arm, slot["model"], plan["effort"], plan["max_turns"]
+                transcript_mod, path, arm, slot["model"], plan["effort"], plan["max_turns"],
+                tolerated=plan.get("tolerated_attachments") or [],
             )
             row.update(fields)
             errors += found
@@ -983,6 +1018,7 @@ def check_agent_files(plan, k, agents_dir, slots_dir):
 def cmd_next(args):
     paths = Paths(args.results_dir, args.batch)
     plan = load_plan(paths)
+    plan_tolerated(plan)  # a tolerance the guard does not know grades and claims nothing
     if args.agent_id is not None and not AGENT_ID_RE.match(args.agent_id):
         raise CommandError(f"agent id {args.agent_id!r} is not [0-9A-Za-z_-]+")
     os.makedirs(paths.slots, exist_ok=True)
@@ -1073,7 +1109,7 @@ def cmd_status(args):
     print(
         f"batch {plan['batch']}: {len(plan['jobs'])} jobs; {len(recorded)} recorded ("
         + ", ".join(f"{s} {n}" for s, n in counts.items())
-        + f"); {len(held)} held; {len(pending)} pending"
+        + f"); {len(held)} held; {len(pending)} pending{tolerance_note(plan)}"
     )
     for k in sorted(slots):
         s = slots[k]
@@ -1182,7 +1218,8 @@ def regrade_row(row, plan, transcript_mod, projects_dir=None, paths=None):
         new["regrade_note"] = "its meta file is gone, so the agent type was not checked again"
     try:
         fields, found, cut_off = transcript_verdict(
-            transcript_mod, path, arm, row.get("model"), plan["effort"], plan["max_turns"], extra
+            transcript_mod, path, arm, row.get("model"), plan["effort"], plan["max_turns"], extra,
+            tolerated=plan.get("tolerated_attachments") or [],
         )
         errors += found
     except Exception as err:  # noqa: BLE001 - an unreadable transcript is the harness's
@@ -1225,6 +1262,7 @@ def regrade(paths, transcript_mod=None, projects_dir=None):
     Returns (rows, changes, backup, sources): changes are (job, old, new,
     reason); sources counts where the regraded rows' transcripts came from."""
     plan = load_plan(paths)
+    plan_tolerated(plan)  # a tolerance the guard does not know regrades nothing
     held = sorted(k for k, s in read_all_slots(paths).items() if s.get("batch") == plan["batch"])
     if held:
         raise CommandError(
@@ -1274,7 +1312,8 @@ def cmd_regrade(args):
     rows, changes, backup, sources = regrade(paths, projects_dir=args.projects_dir)
     kept = sum(1 for r in rows if str(r.get("regrade_note") or "").startswith("kept as recorded"))
     dry = sum(1 for r in rows if r.get("mode") != "subagent")
-    print(f"run.py: regraded batch {args.batch}: {len(rows)} rows ({dry} dry-run kept, {kept} kept as "
+    tolerating = tolerance_note(load_plan(paths))
+    print(f"run.py: regraded batch {args.batch}{tolerating}: {len(rows)} rows ({dry} dry-run kept, {kept} kept as "
           f"recorded); {len(changes)} changed status; transcripts: {sources['archive']} archived, "
           f"{sources['live']} live; the original is {backup}")
     for job, old, new, why in changes:
@@ -1360,6 +1399,17 @@ def _batch(value):
     return value
 
 
+def _tolerable(value):
+    """An attachment type a plan may tolerate (transcript.tolerable_problem)."""
+    try:
+        problem = load_transcript_module().tolerable_problem(value)
+    except HarnessError as err:
+        raise argparse.ArgumentTypeError(str(err))
+    if problem:
+        raise argparse.ArgumentTypeError(problem)
+    return value
+
+
 def _positive(value):
     number = int(value)
     if number < 1:
@@ -1408,6 +1458,11 @@ def parse_args(argv=None):
     p.add_argument("--batch", type=_batch, required=True)
     p.add_argument("--models", action="extend", type=lambda v: _list(v, list(MODELS), "model"),
                    help=f"comma-separated model families (default {DEFAULT_MODELS})")
+    p.add_argument("--tolerate-attachment", dest="tolerate_attachments", action="append", default=[],
+                   type=_tolerable, metavar="TYPE",
+                   help="let the guard pass this flagged attachment type, recorded per run instead "
+                        "(repeatable; only remote_session_change, the same note for every arm): "
+                        "the batch is then not a clean batch")
 
     p = sub.add_parser("next", parents=[common], help="grade a slot's run and claim its next job")
     p.add_argument("--batch", type=_batch, required=True)

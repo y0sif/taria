@@ -100,6 +100,7 @@ CONTEXT = {
     "environment_cwd": (str, type(None)), "skill_listing": (bool,), "attachment_types": (list,),
     "tree_formats": (list,), "cli_prefixes": (list,), "refused_attachments": (list,),
     "unknown_line_types": (dict,), "prompts": (int,), "tool_result_reminders": (int,),
+    "tolerated_attachments": (dict,),
 }
 TUI = {arm: sorted("mcp__tui__" + t for t in tools) for arm, tools in ARM_TOOLS.items()}
 # Harmless types known from Claude Code transcripts outside the bench, which no
@@ -725,6 +726,9 @@ class AttachmentRules(Variant, unittest.TestCase):
                          harmless, "every harmless type has its shape check")
         for kind, (what, remedy) in transcript.ATTACHMENTS_FLAGGED.items():
             self.assertTrue(what and remedy, kind)
+        # A plan may tolerate only a flagged type, and not every one.
+        self.assertEqual(transcript.ATTACHMENTS_TOLERABLE, {"remote_session_change"})
+        self.assertLess(transcript.ATTACHMENTS_TOLERABLE, flagged)
 
     def test_real_fixtures_carry_only_known_types(self):
         seen = set()
@@ -1258,6 +1262,274 @@ class AttachmentRules(Variant, unittest.TestCase):
             "has 1 transcript line(s) of type <no type>, which the guard does not know",
             "has 2 transcript line(s) of type progress, which the guard does not know",
         ])
+
+
+REMOTE = "remote_session_change"
+
+
+class ToleratedAttachments(Variant, unittest.TestCase):
+    """A plan may tolerate remote_session_change (run.py plan
+    --tolerate-attachment): read with that tolerance, a note in the shape
+    real ones have is recorded in the context's tolerated_attachments, not
+    refused; one in any other shape still is, and nothing else changes."""
+
+    def guard(self, stats, arm="taria", tolerated=()):
+        return transcript.guard(stats, arm, "sonnet", ARM_TOOLS[arm], effort="medium",
+                                tree_format=ARM_TREE_FORMAT.get(arm), tolerated=tolerated)
+
+    def remote_line(self):
+        return copy.deepcopy(next(l for l in lines_of(OUTLINE_REMOTE) if is_att(l, REMOTE)))
+
+    @staticmethod
+    def rendered(line):
+        return sum(len(r["content"]) for r in line.get("rendered", []))
+
+    def with_line(self, line, tolerated=(REMOTE,)):
+        """real_taria_clean with `line` beside its first tool result, where
+        Claude Code put the note, read tolerating `tolerated`."""
+        lines = lines_of(TARIA_CLEAN)
+        at = next(i for i, l in enumerate(lines) if l["type"] == "user" and isinstance(l["message"]["content"], list))
+        return transcript.read_transcript(self.write(lines[: at + 1] + [line] + lines[at + 1:]), tolerated=tolerated)
+
+    def refused_sentence(self, line, count=1):
+        return (f"was given Claude Code's remote-control attribution note ({REMOTE}, {count}x, "
+                f"{count * self.rendered(line)} chars rendered): turn /remote-control off in the orchestrating session")
+
+    def test_a_real_note_passes_when_tolerated_and_is_refused_when_not(self):
+        line = self.remote_line()
+        size = self.rendered(line)
+        self.assertGreater(size, 600)
+        tolerated = transcript.read_transcript(fixture(OUTLINE_REMOTE), tolerated=[REMOTE])
+        self.assertEqual(self.guard(tolerated, "outline", [REMOTE]), [], "the real outline1 run, on its merits")
+        self.assertEqual(tolerated["context"]["refused_attachments"], [])
+        self.assertEqual(tolerated["context"]["tolerated_attachments"], {REMOTE: {"count": 1, "rendered_chars": size}})
+        self.assertIn(REMOTE, tolerated["context"]["attachment_types"], "still listed among what the run got")
+        # Everything else about the read is the same as without the tolerance.
+        plain = read(OUTLINE_REMOTE)
+        for key in set(plain) - {"context"}:
+            self.assertEqual(tolerated[key], plain[key], key)
+        for key in set(plain["context"]) - {"refused_attachments", "tolerated_attachments"}:
+            self.assertEqual(tolerated["context"][key], plain["context"][key], key)
+        # Without the tolerance: refused by name, as before.
+        self.assertEqual(plain["context"]["tolerated_attachments"], {})
+        self.assertEqual(self.guard(plain, "outline"), [self.refused_sentence(line)])
+        # Added to a clean run of another arm, twice: both tolerated, counted.
+        stats = self.with_line(line)
+        self.assertEqual((self.guard(stats, tolerated=[REMOTE]), stats["context"]["tolerated_attachments"]),
+                         ([], {REMOTE: {"count": 1, "rendered_chars": size}}))
+        lines = lines_of(TARIA_CLEAN)
+        twice = transcript.read_transcript(self.write(lines[:4] + [line, self.remote_line()] + lines[4:]),
+                                           tolerated=[REMOTE])
+        self.assertEqual(twice["context"]["tolerated_attachments"], {REMOTE: {"count": 2, "rendered_chars": 2 * size}})
+        self.assertEqual(self.guard(twice, tolerated=[REMOTE]), [])
+
+    def test_a_run_without_the_note_is_fine_in_a_tolerating_batch(self):
+        stats = transcript.read_transcript(fixture(TARIA_CLEAN), tolerated=[REMOTE])
+        self.assertEqual(stats["context"]["tolerated_attachments"], {REMOTE: {"count": 0, "rendered_chars": 0}})
+        self.assertEqual(self.guard(stats, tolerated=[REMOTE]), [])
+
+    def test_the_guard_refuses_a_note_its_plan_does_not_tolerate(self):
+        """Read with the tolerance, guarded without it: refused by name, the
+        same sentence as a note read without it."""
+        line = self.remote_line()
+        stats = self.with_line(line)
+        self.assertEqual(self.guard(stats), [self.refused_sentence(line)])
+        # A tolerance that came to nothing is no problem either way.
+        clean = transcript.read_transcript(fixture(TARIA_CLEAN), tolerated=[REMOTE])
+        self.assertEqual(self.guard(clean), [])
+
+    def test_only_remote_session_change_can_be_tolerated(self):
+        self.assertIsNone(transcript.tolerable_problem(REMOTE))
+        self.assertEqual(transcript.check_tolerated([REMOTE, REMOTE]), [REMOTE])
+        self.assertEqual(transcript.check_tolerated(()), [])
+        cases = {
+            "skill_listing": "skill_listing (a skill listing) is flagged, but not known to be the same for every run "
+                             "of a batch, so a plan cannot tolerate it",
+            "environment": "environment is not flagged: the guard holds it to its own rule (harmless)",
+            "prompt_snapshot": "prompt_snapshot is not flagged: the guard holds it to its own rule (verified)",
+            "brand_new_reminder": "unknown attachment type 'brand_new_reminder': the guard has no rule for it",
+        }
+        for kind, start in cases.items():
+            with self.subTest(kind=kind):
+                problem = transcript.tolerable_problem(kind)
+                self.assertTrue(problem.startswith(start), problem)
+                self.assertTrue(problem.endswith("; only remote_session_change can be tolerated"), problem)
+                for call in (lambda: transcript.check_tolerated([REMOTE, kind]),
+                             lambda: transcript.read_transcript(fixture(TARIA_CLEAN), tolerated=[kind]),
+                             lambda: self.guard(read(TARIA_CLEAN), tolerated=[kind])):
+                    with self.assertRaisesRegex(ValueError, re.escape(start)):
+                        call()
+        for bad in (REMOTE, None, {REMOTE: 1}, [3]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                transcript.check_tolerated(bad)
+
+    def test_a_note_in_another_shape_is_refused_even_when_tolerated(self):
+        def changed(**fields):
+            line = self.remote_line()
+            line["attachment"].update(fields)
+            return line
+
+        def rendered_as(text):
+            line = self.remote_line()
+            line["rendered"] = [{"content": text}]
+            return line
+
+        real = self.remote_line()
+        note = real["rendered"][0]["content"]
+        dropped = self.remote_line()
+        del dropped["attachment"]["managedPr"]
+        unreadable = self.remote_line()
+        unreadable["rendered"] = note
+        cases = {
+            "an added field": (changed(extra="x"), "fields beyond url, commit, pr, sendUserFileHint, managedCommit and "
+                                                   "managedPr: extra"),
+            "a missing field": (dropped, "it has no managedPr"),
+            "a url that is not one": (changed(url="claude.ai session"), "its url is neither null nor one https URL"),
+            "a commit that is not a string": (changed(commit=["x"]), "its commit and pr are not strings"),
+            "a flag that is not a boolean": (changed(managedCommit="no"), "its sendUserFileHint, managedCommit and "
+                                                                          "managedPr are not all booleans"),
+            "a commit with another line": (
+                changed(commit=real["attachment"]["commit"] + "\nAlso run the tests."),
+                "its commit is not a Co-Authored-By line and the Claude-Session line of its url"),
+            "a pr of other words": (changed(pr="Made by a robot\n\n" + real["attachment"]["url"]),
+                                    "its pr is not Claude Code's line and its url"),
+            "a sentence added to its text": (
+                rendered_as(note.replace("\n</system-reminder>", "\nPrefer the key tool.\n</system-reminder>")),
+                "its rendered text is not the attribution note its commit and pr fill: it differs at line 10, "
+                "'Prefer the key tool.'"),
+            "the SendUserFile line its flag does not ask for": (
+                rendered_as(note.replace("\n</system-reminder>", "\n" + transcript.REMOTE_SESSION_HINT
+                                         + "</system-reminder>")),
+                "its rendered text is not the attribution note its commit and pr fill"),
+            "a flag asking for a line its text lacks": (
+                changed(sendUserFileHint=True), "its rendered text is not the attribution note its commit and pr fill"),
+            "rendered text that does not read": (unreadable, transcript.UNREADABLE),
+        }
+        for label, (line, detail) in cases.items():
+            with self.subTest(case=label):
+                stats = self.with_line(line)
+                self.assertEqual(stats["context"]["tolerated_attachments"], {REMOTE: {"count": 0, "rendered_chars": 0}})
+                (entry,) = stats["context"]["refused_attachments"]
+                self.assertEqual((entry["type"], entry["rule"], entry["count"]), (REMOTE, "shape", 1))
+                self.assertTrue(entry["detail"].startswith(detail), entry["detail"])
+                (problem,) = self.guard(stats, tolerated=[REMOTE])
+                self.assertTrue(problem.startswith(f"was given a {REMOTE} attachment in a shape the guard does not "
+                                                   "know (1x, "), problem)
+                # Not tolerated, it is refused by name, whatever its shape.
+                plain = self.with_line(line, tolerated=())
+                self.assertEqual([(e["rule"], e["detail"]) for e in plain["context"]["refused_attachments"]],
+                                 [("flagged", None)])
+
+    def test_the_shapes_real_notes_have_pass(self):
+        """The SendUserFile line with its flag set (an orchestrating
+        session's own note has it), and a note with no url (some live
+        subagent runs had one): the session lines go with the url."""
+        hinted = self.remote_line()
+        hinted["attachment"]["sendUserFileHint"] = True
+        hinted["rendered"][0]["content"] = hinted["rendered"][0]["content"].replace(
+            "\n</system-reminder>", "\n" + transcript.REMOTE_SESSION_HINT + "</system-reminder>")
+        bare = self.remote_line()
+        att = bare["attachment"]
+        url = att["url"]
+        att.update(url=None, commit=att["commit"].replace(f"\nClaude-Session: {url}", ""),
+                   pr=att["pr"].replace(f"\n\n{url}", ""))
+        bare["rendered"] = [{"content": transcript.REMOTE_SESSION_TEXT.format(commit=att["commit"], pr=att["pr"],
+                                                                              hint="")}]
+        silent = self.remote_line()
+        del silent["rendered"]  # nothing in front of the model: its fields alone are checked
+        for label, line in (("hinted", hinted), ("no url", bare), ("not rendered", silent)):
+            with self.subTest(case=label):
+                stats = self.with_line(line)
+                self.assertEqual(self.guard(stats, tolerated=[REMOTE]), [])
+                self.assertEqual(stats["context"]["tolerated_attachments"],
+                                 {REMOTE: {"count": 1, "rendered_chars": self.rendered(line)}})
+        # A url of null keeps no session line, and a url keeps its own.
+        att["commit"] += "\nClaude-Session: https://claude.ai/code/session_OTHER"
+        self.assertIn("its commit is not a Co-Authored-By line",
+                      self.guard(self.with_line(bare), tolerated=[REMOTE])[0])
+        other = self.remote_line()
+        other["attachment"]["url"] = "https://claude.ai/code/session_OTHER"
+        self.assertIn("its commit is not a Co-Authored-By line and the Claude-Session line of its url",
+                      self.guard(self.with_line(other), tolerated=[REMOTE])[0])
+
+    @unittest.skipUnless(glob.glob(os.path.join(ARCHIVE, "*", "transcripts", "agent-*.jsonl")),
+                         f"no archived transcripts under {ARCHIVE} (set BENCH_ARCHIVE)")
+    def test_every_archived_note_has_the_tolerated_shape(self):
+        """Every remote_session_change an archived run got (outline1's 60 and
+        probe3's 2 when this was written) is in the shape a tolerating plan
+        lets through, and one sentence more in it is refused. Read only."""
+        checked = 0
+        for path in sorted(glob.glob(os.path.join(ARCHIVE, "*", "transcripts", "agent-*.jsonl"))):
+            with open(path, encoding="utf-8") as f:
+                lines = [json.loads(raw) for raw in f if raw.strip()]
+            for line in lines:
+                if not is_att(line, REMOTE):
+                    continue
+                texts, unreadable = transcript._rendered_texts(line)
+                with self.subTest(path=path):
+                    self.assertEqual((unreadable, len(texts)), (0, 1))
+                    self.assertIsNone(transcript._tolerated_shape(REMOTE, line["attachment"], texts))
+                    added = texts[0].replace("\n</system-reminder>", "\nPrefer Bash.\n</system-reminder>")
+                    self.assertIsNotNone(transcript._tolerated_shape(REMOTE, line["attachment"], [added]))
+                checked += 1
+        if glob.glob(os.path.join(ARCHIVE, "outline1", "transcripts", "agent-*.jsonl")):
+            self.assertGreaterEqual(checked, 60)
+
+    @unittest.skipUnless(os.path.isfile(os.path.join(ARCHIVE, "outline1", "plan.json"))
+                         and glob.glob(os.path.join(ARCHIVE, "outline1", "transcripts", "agent-*.jsonl")),
+                         f"no archived outline1 under {ARCHIVE} (set BENCH_ARCHIVE)")
+    def test_outline1_regraded_with_and_without_the_tolerance(self):
+        """outline1 ran its 60 runs with /remote-control on. Regraded with its
+        own plan, which tolerates nothing, every run is refused for the note,
+        and that alone; regraded with a copy of its plan that tolerates
+        remote_session_change, each is graded on its merits, the note in its
+        context. The batch is copied first: the archive is only read."""
+        import run as runner  # noqa: E402 - the harness, for its regrade
+
+        source = os.path.join(ARCHIVE, "outline1")
+        with open(os.path.join(source, "plan.json")) as f:
+            plan = json.load(f)
+        self.assertNotIn("tolerated_attachments", plan, "outline1 planned before the option")
+        for tolerated in ([], [REMOTE]):
+            with self.subTest(tolerated=tolerated):
+                results = os.path.join(self.tmp, f"results{len(tolerated)}")
+                batch = os.path.join(results, "outline1")
+                shutil.copytree(os.path.join(source, "transcripts"), os.path.join(batch, "transcripts"))
+                shutil.copy(os.path.join(source, "runs.jsonl"), os.path.join(batch, "runs.jsonl"))
+                with open(os.path.join(batch, "plan.json"), "w") as f:
+                    json.dump(dict(plan, **({"tolerated_attachments": tolerated} if tolerated else {})), f)
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = runner.cli(["regrade", "--batch", "outline1", "--results-dir", results,
+                                       "--projects-dir", os.path.join(self.tmp, "no-projects")])
+                self.assertEqual(code, 0, err.getvalue())
+                self.assertIn("transcripts: 60 archived, 0 live", out.getvalue())
+                with open(os.path.join(batch, "runs.jsonl")) as f:
+                    rows = [json.loads(line) for line in f if line.strip()]
+                self.assertEqual(len(rows), 60)
+                for row in rows:
+                    tally = row["context"]["tolerated_attachments"]
+                    if not tolerated:
+                        self.assertEqual(row["status"], "harness_error", row["job"])
+                        (problem,) = row["guard_problems"]
+                        self.assertRegex(problem, r"^was given Claude Code's remote-control attribution note "
+                                                  r"\(remote_session_change, 1x, 7\d\d chars rendered\)")
+                        self.assertEqual(tally, {})
+                    else:
+                        self.assertIn(row["status"], ("passed", "failed", "max_turns"), row["job"])
+                        self.assertEqual(row["guard_problems"], [], row["job"])
+                        self.assertEqual(tally[REMOTE]["count"], 1)
+                        self.assertIn(tally[REMOTE]["rendered_chars"], (709, 710))
+                        self.assertEqual(row["status"], row["status_at_run"], "graded on its merits, as at run time")
+                if tolerated:
+                    self.assertIn("regraded batch outline1, tolerating remote_session_change (not a clean batch)",
+                                  out.getvalue())
+                    text = summarize.render(rows)
+                    self.assertTrue(text.startswith("> **outline1 carries remote control's note in every call: not "
+                                                    "a clean batch.** Its plan tolerated remote_session_change: 60 "
+                                                    "of 60 runs got it, 709-710 characters each."), text[:300])
+        with open(os.path.join(source, "plan.json")) as f:
+            self.assertEqual(json.load(f), plan, "the archive is only read")
 
 
 class ScrubTranscript(Variant, unittest.TestCase):
@@ -1903,18 +2175,18 @@ class MultiBatchSummary(unittest.TestCase):
         self.assertTrue(out.startswith("## Run conditions\n"), out[:200])
         header = out.partition("## Agent runs (headline)")[0]
         self.assertIn("| batch | kinds | git SHA | claude | identity line | models | models resolved | effort | "
-                      "max turns | seed | arms | n | harness err |", header)
+                      "max turns | seed | arms | n | harness err | tolerated attachments |", header)
         identity = json.dumps(CLAUDE_CODE_PREFIX)
         self.assertIn(f"| full | agent | full-sha0123 | 2.1.294 | {identity} | haiku, sonnet | claude-haiku-5-5, "
-                      "claude-sonnet-5-5 | medium | 30 | 42 | taria, tmux | 20 | 0 |", header)
+                      "claude-sonnet-5-5 | medium | 30 | 42 | taria, tmux | 20 | 0 | none |", header)
         self.assertIn(f"| outl | agent | outl-sha0123 | 2.1.300 | {identity} | haiku, sonnet | claude-haiku-5-5, "
-                      "claude-sonnet-5-5 | medium | 30 | 42 | outline | 10 | 0 |", header)
+                      "claude-sonnet-5-5 | medium | 30 | 42 | outline | 10 | 0 | none |", header)
         self.assertIn("The batches differ in git SHA, claude:", header)
         self.assertNotIn("not recorded", header)
         # Same conditions: said so. One batch: no header at all.
         same = [dict(r, git_sha="same", claude_versions=["2.1.294"], claude_version="2.1.294") for r in self.full()]
-        self.assertIn("The batches agree on git SHA, claude, identity line, models resolved, effort, max turns, seed.",
-                      summarize.render(same))
+        self.assertIn("The batches agree on git SHA, claude, identity line, models resolved, effort, max turns, seed, "
+                      "tolerated attachments.", summarize.render(same))
         one = [r for r in self.full() if r["batch"] == "full"]
         self.assertTrue(summarize.render(one).startswith("## Agent runs (headline)"))
         # An arm run in two batches is pooled, and the header says so.
@@ -1941,7 +2213,7 @@ class MultiBatchSummary(unittest.TestCase):
         header = text.partition("## Agent runs (headline)")[0]
         self.assertIn("| dryb | dry-run | dry-sha01234 | - | - | - | - | - | - | 7 |", header)
         self.assertIn("The batches with agent runs (full, outl) agree on git SHA, claude, identity line, models "
-                      "resolved, effort, max turns, seed.", header)
+                      "resolved, effort, max turns, seed, tolerated attachments.", header)
         self.assertIn("Left out of that comparison, as dry runs only (a scripted solver, no model, so no claude "
                       "version, model, effort or max turns): dryb.", header)
         self.assertNotIn("differ in", header)
@@ -1984,6 +2256,77 @@ class MultiBatchSummary(unittest.TestCase):
         self.assertIn("The identity line is not recorded for some agent rows of outl (graded before the field "
                       "existed, or without a transcript), so it cannot be compared there; `run.py regrade` records "
                       "it.", header)
+
+    @staticmethod
+    def tolerating(rows, batch="rc", got=True):
+        """`rows` as runs of `batch`, whose plan tolerated remote_session_change
+        (each run got the note when `got`)."""
+        tally = {"count": 1, "rendered_chars": 710} if got else {"count": 0, "rendered_chars": 0}
+        return [dict(r, batch=batch, git_sha=f"{batch}-sha0123456789",
+                     context=dict(r["context"], tolerated_attachments={"remote_session_change": dict(tally)}))
+                for r in rows]
+
+    def test_a_batch_that_tolerated_an_attachment_is_marked(self):
+        """A batch whose plan tolerated remote control's note carries it in
+        every call: the summary says so first, under every agent section, and
+        in every table row built from its runs, so its numbers cannot pass for
+        a clean batch's."""
+        clean = summarize.render(self.full())
+        self.assertNotIn("not clean", clean)
+        self.assertNotIn("remote", clean)
+        one = self.tolerating([r for r in self.full() if r["batch"] == "full"])
+        one[0]["context"]["tolerated_attachments"]["remote_session_change"] = {"count": 0, "rendered_chars": 0}
+        out = summarize.render(one)
+        self.assertTrue(out.startswith(
+            "> **rc carries remote control's note in every call: not a clean batch.** Its plan tolerated "
+            "remote_session_change: 19 of 20 runs got it, 710 characters each. Where every arm got the same note, "
+            "its arms compare with each other, but its absolute token counts include the note.\n"), out[:400])
+        self.assertNotIn("Mixed conditions", out)
+        marker = ("> rc carries remote control's note in every call: not a clean batch. Rows marked `[not clean]` "
+                  "include its runs, whose absolute token counts include the note.")
+        for heading in ("## Agent runs (headline)", "## Arms per model, across all tasks",
+                        "## taria vs tmux, per model", "## Model comparison"):
+            self.assertIn(f"{heading}\n\n{marker}\n", out, heading)
+        self.assertIn("| T1 | taria [not clean] | haiku | medium | 30 | 5 |", out)
+        self.assertIn("| haiku | tmux [not clean] | medium | 30 | 1 | 5 |", out)
+        self.assertIn("| haiku | medium | 30 | taria vs tmux [not clean] |", out)
+        self.assertIn("| T1 [not clean] | medium | 30 | 5/5 | 3/5 |", out)
+        self.assertIn("| taria [not clean] | medium | 30 | 1 | 5 |", out)
+        self.assertIn("| tmux [not clean] | medium | 30 | 3/5 60%", out)
+        table = [l for l in out.partition("## Agent runs (headline)")[2].partition("## Provenance")[0].splitlines()
+                 if l.startswith("| ") and not l.startswith("| task |") and not l.startswith("| model |")
+                 and not l.startswith("| arm |")]
+        self.assertTrue(table)
+        self.assertTrue(all("[not clean]" in l for l in table), [l for l in table if "[not clean]" not in l])
+        context = next(l for l in out.partition("### Agent context")[2].splitlines()
+                       if l.startswith("| taria | haiku |"))
+        self.assertTrue(context.endswith("| remote_session_change 5/5 |"), context)
+        # Merged with a clean batch: the conditions differ, and each comparison
+        # across the two says which side carries the note.
+        rows = [r for r in self.full() if r["batch"] == "full"] + self.tolerating(
+            [r for r in self.full() if r["batch"] == "outl"])
+        out = summarize.render(rows)
+        self.assertTrue(out.startswith("> **rc carries remote control's note in every call: not a clean batch.**"))
+        self.assertIn("> Mixed conditions: full tolerated nothing. An arm from rc held against one from full differs "
+                      "in this too: the note's tokens count on one side only.", out)
+        header = out.partition("## Agent runs (headline)")[0]
+        self.assertIn("| harness err | tolerated attachments |", header)
+        self.assertIn("| taria, tmux | 20 | 0 | none |", header)
+        self.assertIn("| outline | 10 | 0 | remote_session_change |", header)
+        self.assertIn("The batches differ in git SHA, claude, tolerated attachments:", header)
+        self.assertIn("| T1 | outline [not clean] | haiku |", out)
+        self.assertIn("| T1 | taria | haiku |", out)
+        self.assertIn("| haiku | medium | 30 | outline vs taria [not clean: outline only] |", out)
+        self.assertIn("| haiku | medium | 30 | taria vs tmux |", out)
+        self.assertIn("| T1 [not clean: outline only] | medium | 30 | 5/5 | 3/5 |", out)  # outline vs tmux, haiku
+        # Two tolerating batches agree on it; a run without the note is counted.
+        both = self.tolerating([r for r in self.full() if r["batch"] == "full"], batch="rc2", got=False) + rows[20:]
+        out = summarize.render(both)
+        self.assertIn("rc2 carries remote control's note in every call: not a clean batch.** Its plan tolerated "
+                      "remote_session_change: 0 of 20 runs got it.", out)
+        self.assertNotIn("Mixed conditions", out)
+        self.assertNotIn("differ in git SHA, claude, tolerated", out)
+        self.assertIn("| haiku | medium | 30 | outline vs taria [not clean] |", out)
 
     def test_the_pairs_compared(self):
         self.assertEqual(summarize.arm_pairs({"taria", "tmux", "outline"}),

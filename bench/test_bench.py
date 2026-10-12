@@ -408,6 +408,39 @@ class Plan(unittest.TestCase):
         self.assertEqual((a["seed"], a["effort"], a["max_turns"]), (11, "medium", 30))
         self.assertEqual(a["agent_body_sha256"], agents.body_sha256())
         self.assertEqual(a["models"], ["sonnet", "haiku"])
+        self.assertEqual(a["tolerated_attachments"], [], "a clean batch by default")
+
+    def test_a_plan_records_the_attachments_it_tolerates(self):
+        code, text = self.plan("rc", "--tasks", "T3", "--seed", "1", "--tolerate-attachment", "remote_session_change",
+                               "--tolerate-attachment", "remote_session_change")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.load("rc")["tolerated_attachments"], ["remote_session_change"])
+        self.assertIn("max 30 turns, tolerating remote_session_change (not a clean batch);", text)
+        code, out, _ = quiet_cli("status", "--batch", "rc", "--results-dir", self.results)
+        self.assertEqual(code, 0)
+        self.assertIn("3 pending, tolerating remote_session_change (not a clean batch)", out)
+
+    def test_a_plan_tolerates_only_remote_session_change(self):
+        """Only a type the guard flags by name and that is the same for every
+        run of a batch: not skill_listing, not a type with its own rule, not
+        a type the guard does not know."""
+        cases = {
+            "skill_listing": "skill_listing (a skill listing) is flagged, but not known to be the same for every run "
+                             "of a batch, so a plan cannot tolerate it; only remote_session_change can be tolerated",
+            "environment": "environment is not flagged: the guard holds it to its own rule (harmless), so there is "
+                           "nothing to tolerate; only remote_session_change can be tolerated",
+            "mcp_instructions_delta": "mcp_instructions_delta is not flagged: the guard holds it to its own rule "
+                                      "(verified)",
+            "brand_new_reminder": "unknown attachment type 'brand_new_reminder': the guard has no rule for it and "
+                                  "refuses it in every batch; only remote_session_change can be tolerated",
+        }
+        for kind, why in cases.items():
+            with self.subTest(kind=kind):
+                code, text = self.plan(f"x-{kind}", "--tolerate-attachment", "remote_session_change",
+                                       "--tolerate-attachment", kind)
+                self.assertEqual(code, runner.EXIT_HARNESS)
+                self.assertIn(f"argument --tolerate-attachment: {why}", text)
+                self.assertFalse(os.path.exists(os.path.join(self.results, f"x-{kind}")), "no plan written")
 
     def test_an_existing_plan_is_refused(self):
         self.assertEqual(self.plan("x", "--tasks", "T1", "--seed", "1")[0], 0)
@@ -638,13 +671,18 @@ class GradeAgentRun(unittest.TestCase):
     def module(self, stats=None, problems=(), path="/x/agent-a1.jsonl"):
         seen = {}
 
-        def guard(stats, arm, family, arm_tools, effort=None, tree_format=None):
-            seen.update(arm=arm, family=family, arm_tools=arm_tools, effort=effort, tree_format=tree_format)
+        def guard(stats, arm, family, arm_tools, effort=None, tree_format=None, tolerated=()):
+            seen.update(arm=arm, family=family, arm_tools=arm_tools, effort=effort, tree_format=tree_format,
+                        tolerated=list(tolerated))
             return list(problems)
+
+        def read_transcript(p, tolerated=()):
+            seen.update(read_tolerated=list(tolerated))
+            return dict(stats or self.STATS)
 
         return types.SimpleNamespace(
             find_transcript=lambda agent_id: path,
-            read_transcript=lambda p: dict(stats or self.STATS),
+            read_transcript=read_transcript,
             guard=guard,
             ending=transcript.ending,
         ), seen
@@ -659,7 +697,7 @@ class GradeAgentRun(unittest.TestCase):
         row, seen, run = self.grade()
         self.assertEqual((row["status"], row["passed"], row["check_passed"]), ("passed", True, True))
         self.assertEqual(seen, {"arm": "taria", "family": "sonnet", "arm_tools": harness.ARM_TOOLS["taria"],
-                                "effort": "medium", "tree_format": "json"})
+                                "effort": "medium", "tree_format": "json", "tolerated": [], "read_tolerated": []})
         self.assertEqual(list(row), list(runner.ROW_KEYS))
         self.assertEqual((row["mode"], row["solver"], row["model"], row["model_resolved"]),
                          ("subagent", "agent", "sonnet", "claude-sonnet-5-5"))
@@ -728,7 +766,7 @@ class GradeAgentRun(unittest.TestCase):
 
     def test_an_unreadable_transcript_is_a_harness_error(self):
         mod, _ = self.module()
-        mod.read_transcript = lambda p: (_ for _ in ()).throw(OSError("gone"))
+        mod.read_transcript = lambda p, tolerated=(): (_ for _ in ()).throw(OSError("gone"))
         row = runner.grade_agent_run(self.PLAN, self.SLOT, "a1", run=FakeRun(self.GOOD_STATE),
                                      transcript_mod=mod, prov=self.PROV)
         self.assertEqual(row["status"], "harness_error")
@@ -809,6 +847,35 @@ class GradeAgentRun(unittest.TestCase):
         self.assertEqual(row["status"], "harness_error")
         self.assertIn("was not offered mcp__tui__act, mcp__tui__key, mcp__tui__read_tree, mcp__tui__type_text",
                       row["error"])
+
+    def test_the_plans_tolerance_reaches_the_reader_and_the_guard(self):
+        mod, seen = self.module()
+        runner.grade_agent_run({**self.PLAN, "tolerated_attachments": ["remote_session_change"]}, self.SLOT, "a1",
+                               run=FakeRun(self.GOOD_STATE), transcript_mod=mod, prov=self.PROV)
+        self.assertEqual((seen["read_tolerated"], seen["tolerated"]), (["remote_session_change"],) * 2)
+
+    def test_a_real_remote_control_run_passes_only_when_its_plan_tolerates_the_note(self):
+        """outline1's j022, which got remote control's note: refused in a
+        clean batch, graded on its merits in one whose plan tolerates it, the
+        note recorded in its context. A run without the note is fine there."""
+        slot = {**self.SLOT, "slot": 1, "task": "T2", "arm": "outline", "model": "sonnet"}
+        row = self.real("real_outline_remote.jsonl", slot=slot)
+        self.assertEqual(row["status"], "harness_error")
+        (problem,) = row["guard_problems"]
+        self.assertRegex(problem, r"^was given Claude Code's remote-control attribution note \(remote_session_change, "
+                                  r"1x, \d+ chars rendered\): turn /remote-control off in the orchestrating session$")
+        self.assertEqual(row["context"]["tolerated_attachments"], {})
+        row = self.real("real_outline_remote.jsonl", slot=slot, tolerated_attachments=["remote_session_change"])
+        self.assertEqual((row["status"], row["passed"], row["guard_problems"], row["error"]),
+                         ("passed", True, [], None))
+        self.assertEqual(row["context"]["refused_attachments"], [])
+        size = int(re.search(r"(\d+) chars rendered", problem).group(1))
+        self.assertEqual(row["context"]["tolerated_attachments"],
+                         {"remote_session_change": {"count": 1, "rendered_chars": size}})
+        row = self.real("real_taria_clean.jsonl", tolerated_attachments=["remote_session_change"])
+        self.assertEqual((row["status"], row["guard_problems"]), ("passed", []))
+        self.assertEqual(row["context"]["tolerated_attachments"],
+                         {"remote_session_change": {"count": 0, "rendered_chars": 0}})
 
     def test_the_stub_route_through_load_transcript_module(self):
         mod, _ = self.module()
@@ -1202,6 +1269,50 @@ class Regrade(unittest.TestCase):
         self.assertIn("0 changed status", out)
         self.assertEqual((again["j001"]["status"], again["j001"]["status_at_run"], again["j001"]["guard_problems"]),
                          ("harness_error", "passed", [problem]))
+
+    def test_regrade_reads_with_the_plans_tolerance(self):
+        """The same rows regraded in a batch whose plan tolerates remote
+        control's note: the run that got it is graded on its merits, the note
+        in its context; the clean run is unchanged. Then a plan edited to
+        tolerate what no plan may refuses both regrade and next."""
+        code, _, err = quiet_cli("plan", "--batch", "rc", "--tasks", "T2,T3", "--arms", "outline,taria",
+                                 "--models", "sonnet", "--seed", "1", "--results-dir", self.results,
+                                 "--tolerate-attachment", "remote_session_change")
+        self.assertEqual(code, 0, err)
+        self.paths = runner.Paths(self.results, "rc")
+        self.archive_copy("real_outline_remote.jsonl", "aremote")
+        self.archive_copy("real_taria_clean.jsonl", "aclean")
+        self.write_rows([
+            self.row("j001", "T2", "sonnet", "aremote", "harness_error", arm="outline", batch="rc"),
+            self.row("j002", "T3", "sonnet", "aclean", "passed", batch="rc"),
+        ])
+        code, out, err = quiet_cli("regrade", "--batch", "rc", "--results-dir", self.results,
+                                   "--projects-dir", self.projects)
+        self.assertEqual(code, 0, err)
+        self.assertIn("regraded batch rc, tolerating remote_session_change (not a clean batch): 2 rows", out)
+        self.assertIn("j001: harness_error -> passed", out)
+        rows = {r["job"]: r for r in read_rows(self.results, "rc")}
+        self.assertEqual((rows["j001"]["status"], rows["j001"]["guard_problems"]), ("passed", []))
+        self.assertEqual(rows["j001"]["context"]["tolerated_attachments"]["remote_session_change"]["count"], 1)
+        self.assertEqual((rows["j002"]["status"], rows["j002"]["context"]["tolerated_attachments"]),
+                         ("passed", {"remote_session_change": {"count": 0, "rendered_chars": 0}}))
+        # A plan edited by hand to tolerate what no plan may: nothing graded.
+        with open(self.paths.plan) as f:
+            plan = json.load(f)
+        with open(self.paths.plan, "w") as f:
+            json.dump(dict(plan, tolerated_attachments=["remote_session_change", "skill_listing"]), f)
+        with open(self.paths.runs, "rb") as f:
+            before = f.read()
+        for argv in (("regrade", "--batch", "rc", "--projects-dir", self.projects),
+                     ("next", "--batch", "rc", "--slot", "1")):
+            with self.subTest(command=argv[0]):
+                code, out, err = quiet_cli(*argv, "--results-dir", self.results)
+                self.assertEqual(code, runner.EXIT_HARNESS)
+                self.assertIn("the plan of batch rc tolerates what no plan may: skill_listing (a skill listing) is "
+                              "flagged", err)
+                with open(self.paths.runs, "rb") as f:
+                    self.assertEqual(f.read(), before)
+        self.assertFalse(os.path.exists(self.paths.slot(1)), "next claimed nothing")
 
     def archive(self):
         return quiet_cli("archive", "--batch", "b", "--results-dir", self.results, "--projects-dir", self.projects)
