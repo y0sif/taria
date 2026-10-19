@@ -69,6 +69,18 @@ const INPUT_QUEUE: usize = 32;
 /// and the oldest are exactly the `Dropped` answers a burst is watching for.
 const ACK_QUEUE: usize = 8 * MAX_KEY_REPEAT as usize;
 
+/// The reason [`BridgeHandle::rejected_rx`] holds for a line that ran past
+/// [`MAX_LINE_BYTES`].
+///
+/// A fixed string rather than a measurement: the reader stops at the cap
+/// instead of reading on to learn how long the line was, which is what the cap
+/// is for. The tool layer matches on it, because this is the one rejection that
+/// ends the connection, and the one an app repeats on every reconnect: it
+/// resends its latest snapshot to every bridge that connects, so the same line
+/// overflows again. The tests below hold its number to [`MAX_LINE_BYTES`].
+pub(crate) const OVERSIZED_LINE: &str =
+    "the line is over 1 MiB (1048576 bytes), this bridge's line limit";
+
 /// One snapshot as the app published it, in both the forms the bridge needs.
 ///
 /// They are kept together because neither can stand in for the other. The
@@ -234,12 +246,19 @@ pub struct BridgeHandle {
     /// Why the most recent line from an app was thrown away, if one was.
     ///
     /// Set for every line the reader could not turn into an [`AppToBridge`],
-    /// and never cleared, because the question it answers outlives the
-    /// connection: an app that connects, publishes nothing this bridge can
-    /// read and dies leaves the state at [`BridgeState::Never`], which on its
-    /// own is indistinguishable from an app that never started. Reporting the
-    /// reason is what stops `read_tree` sending an adopter to check a socket
-    /// path the app plainly reached.
+    /// and kept past the connection, because the question it answers outlives
+    /// it: an app that connects, publishes nothing this bridge can read and
+    /// dies leaves the state at [`BridgeState::Never`], which on its own is
+    /// indistinguishable from an app that never started. Reporting the reason
+    /// is what stops `read_tree` sending an adopter to check a socket path the
+    /// app plainly reached.
+    ///
+    /// Also set for a line over [`MAX_LINE_BYTES`], which ends the connection
+    /// instead of being skipped. That reason is a fixed string, and the one
+    /// value this channel ever clears: the next snapshot that parses retires
+    /// it, because the tree that overflowed has then been replaced by one that
+    /// fits. Until then it is kept across reconnects, since the app resends the
+    /// same tree to every connection and it overflows every time.
     ///
     /// Read only where no snapshot is available. Once a snapshot has arrived,
     /// a later rejected line says nothing about the tree being served, and
@@ -505,6 +524,12 @@ async fn run_connection(
                         cap_bytes = MAX_LINE_BYTES,
                         "app sent an oversized line; treating the connection as broken"
                     );
+                    // Kept like a malformed line's reason, and sent before
+                    // returning, so it is in place by the time the state is
+                    // demoted. Without it the tools could only say the app
+                    // went away, and the agent would wait for an app that is
+                    // still running and about to send the same line again.
+                    rejected_tx.send_replace(Some(OVERSIZED_LINE.to_string()));
                     return ConnectionEnd::AppClosed;
                 }
                 Err(err) => {
@@ -577,6 +602,19 @@ fn handle_app_line(
         }
         Ok(AppToBridge::Snapshot(parsed)) => {
             tracing::debug!(seq = parsed.seq, "snapshot received");
+            // A snapshot that fits retires the oversized-line reason, and only
+            // that one: a tree the bridge can read has replaced the one it
+            // could not. Any other reason stays, as it always has. Cleared
+            // before the state is promoted, so a tool call that sees this tree
+            // can never pair the next disconnect with the old size.
+            rejected_tx.send_if_modified(|rejected| {
+                if rejected.as_deref() == Some(OVERSIZED_LINE) {
+                    *rejected = None;
+                    true
+                } else {
+                    false
+                }
+            });
             // The line is kept beside the parsed form, not instead of it: the
             // agent reads the line and the bridge reasons about the parse.
             // See [`AppSnapshot`].
@@ -638,7 +676,97 @@ fn is_unknown_message_type(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_unknown_message_type;
+    use taria::{Node, Role};
+
+    use super::*;
+
+    /// The reason is a fixed string, so nothing else keeps its number in step
+    /// with the cap the reader enforces.
+    #[test]
+    fn the_oversized_reason_names_the_limit_the_reader_enforces() {
+        assert_eq!(MAX_LINE_BYTES, 1024 * 1024, "the reason says 1 MiB");
+        assert!(
+            OVERSIZED_LINE.contains(&format!("over 1 MiB ({MAX_LINE_BYTES} bytes)")),
+            "{OVERSIZED_LINE}"
+        );
+    }
+
+    /// The overflow arm records why it ended the connection, and does so
+    /// before `run_connection` returns: the manager demotes the state as soon
+    /// as it does, and a tool call that sees the demotion has to find the
+    /// reason already there.
+    #[tokio::test]
+    async fn an_oversized_line_is_recorded_before_the_connection_ends() {
+        let (bridge_end, mut app_end) = UnixStream::pair().expect("a socket pair");
+        let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
+        // Held open, so the end of the session cannot be what ends the call.
+        let (_input_tx, mut input_rx) = mpsc::channel(1);
+        let (ack_tx, _) = broadcast::channel(1);
+        let (protocol_tx, _protocol_rx) = watch::channel(None);
+        let (rejected_tx, rejected_rx) = watch::channel(None);
+        let writer = tokio::spawn(async move {
+            // One byte past the cap and no newline. The write fails once the
+            // bridge closes its end, which is the outcome under test.
+            let _ = app_end.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]).await;
+            app_end
+        });
+        let mut label = None;
+        let end = run_connection(
+            bridge_end,
+            &state_tx,
+            &mut input_rx,
+            &ack_tx,
+            &protocol_tx,
+            &rejected_tx,
+            &mut label,
+        )
+        .await;
+        assert!(matches!(end, ConnectionEnd::AppClosed));
+        assert_eq!(rejected_rx.borrow().as_deref(), Some(OVERSIZED_LINE));
+        drop(writer.await.expect("the writer task"));
+    }
+
+    /// A snapshot that parses retires the oversized reason, and only that
+    /// one. A handshake does not: every reconnect greets the bridge before it
+    /// sends the same tree again.
+    #[test]
+    fn a_snapshot_that_fits_clears_the_oversized_reason_and_nothing_else() {
+        let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
+        let (ack_tx, _) = broadcast::channel(1);
+        let (protocol_tx, _protocol_rx) = watch::channel(None);
+        let (rejected_tx, rejected_rx) = watch::channel(Some(OVERSIZED_LINE.to_string()));
+        let mut label = None;
+        let hello = serde_json::to_string(&AppToBridge::hello("demo", PROTOCOL_VERSION))
+            .expect("a hello serializes");
+        let snapshot = serde_json::to_string(&AppToBridge::Snapshot(Snapshot::new(
+            1,
+            Node::new("app", Role::App),
+        )))
+        .expect("a snapshot serializes");
+        let mut line = |line: &str| {
+            handle_app_line(
+                line.as_bytes(),
+                &state_tx,
+                &ack_tx,
+                &protocol_tx,
+                &rejected_tx,
+                &mut label,
+            );
+        };
+
+        line(&hello);
+        assert_eq!(rejected_rx.borrow().as_deref(), Some(OVERSIZED_LINE));
+        line(&snapshot);
+        assert_eq!(rejected_rx.borrow().as_deref(), None);
+
+        // Any other reason is kept, as it always was.
+        rejected_tx.send_replace(Some("expected value at line 1".to_string()));
+        line(&snapshot);
+        assert_eq!(
+            rejected_rx.borrow().as_deref(),
+            Some("expected value at line 1")
+        );
+    }
 
     #[test]
     fn classifies_unknown_type_as_ignorable() {

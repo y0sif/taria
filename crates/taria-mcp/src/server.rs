@@ -7,11 +7,11 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use taria::key::KeyPress;
-use taria::wire::{InputId, InputStatus};
+use taria::wire::{InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{Action, AgentInput, MAX_NODE_DEPTH, Node, NodeId, PROTOCOL_VERSION};
 use tokio::sync::{broadcast, watch};
 
-use crate::bridge::{AppSnapshot, BridgeHandle, BridgeState, LinkState};
+use crate::bridge::{AppSnapshot, BridgeHandle, BridgeState, LinkState, OVERSIZED_LINE};
 use crate::tree_format::TreeFormat;
 
 /// How long an input-sending tool waits for the app to answer, counting both
@@ -677,7 +677,8 @@ pub fn action_name(action: &Action) -> String {
 /// alone: a rejected line, an open connection, and a completed handshake are
 /// three facts about the same silence, and which of them is the story depends
 /// on the others. Read nowhere else. Once a tree is being served, none of this
-/// is what an agent needs to hear about.
+/// is what an agent needs to hear about. A disconnect reads only `rejected`,
+/// and only for [`OVERSIZED_LINE`]: see [`available_snapshot`].
 struct LinkReport {
     /// Why the most recent line from an app was thrown away, if one was.
     rejected: Option<String>,
@@ -691,9 +692,10 @@ struct LinkReport {
 /// Extract the live snapshot from a [`BridgeState`], or the error explaining
 /// why none is available. The failure modes call for different next steps, so
 /// they get distinct messages: an app that connected and then went away (it
-/// exited or crashed; waiting for it to come back is enough), and the four
-/// ways [`BridgeState::Never`] is reached, which [`no_snapshot_reason`] tells
-/// apart.
+/// exited or crashed; waiting for it to come back is enough), the same state
+/// reached because the bridge cut the app off over a line too long to read
+/// (waiting fixes nothing), and the ways [`BridgeState::Never`] is reached,
+/// which [`no_snapshot_reason`] tells apart.
 fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnapshot, McpError> {
     match state {
         BridgeState::Connected(snapshot) => Ok(snapshot),
@@ -701,26 +703,60 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
         BridgeState::Disconnected {
             app_label,
             last_seq,
-        } => Err(McpError::internal_error(
-            format!(
-                "app '{}' disconnected (last snapshot seq {last_seq}); it may have exited. The \
-                 bridge reconnects automatically; retry once the app is back.",
+        } => {
+            // The opening is the same either way: callers and scripts match
+            // on it to tell a departed app from one that never came.
+            let gone = format!(
+                "app '{}' disconnected (last snapshot seq {last_seq})",
                 app_label.as_deref().unwrap_or("unknown")
-            ),
-            None,
-        )),
+            );
+            let message = if is_oversized(report.rejected.as_deref()) {
+                format!(
+                    "{gone}; its latest snapshot was over 1 MiB ({MAX_LINE_BYTES} bytes), this \
+                     bridge's line limit, so the bridge closed the connection. {OVERSIZED_REPEATS}"
+                )
+            } else {
+                format!(
+                    "{gone}; it may have exited. The bridge reconnects automatically; retry once \
+                     the app is back."
+                )
+            };
+            Err(McpError::internal_error(message, None))
+        }
     }
+}
+
+/// What follows from a snapshot over [`MAX_LINE_BYTES`], said the same way by
+/// every answer that reports one.
+///
+/// The loop is the point. The app resends its latest snapshot to every bridge
+/// that connects, so each reconnect meets the same line and is closed over it
+/// again. "It may have exited; retry once the app is back" had an agent
+/// waiting on an app that was running all along, for a tree no retry could
+/// fetch.
+const OVERSIZED_REPEATS: &str = "The app resends its latest snapshot on every reconnect, so this \
+repeats until it publishes a smaller tree, most likely by bounding a value it does not bound \
+today (a draft, a log, a transcript). No input tool can reach the app until then, and nothing you \
+send can fix it.";
+
+/// True when `rejected` is the bridge's reason for a line over
+/// [`MAX_LINE_BYTES`], as opposed to a line that arrived whole and failed to
+/// parse, or no rejection at all.
+fn is_oversized(rejected: Option<&str>) -> bool {
+    rejected == Some(OVERSIZED_LINE)
 }
 
 /// Why no app has published a tree yet, in the terms of whichever fact is the
 /// story.
 ///
-/// [`BridgeState::Never`] is four states wearing one name, and they call for
-/// four different next steps. Only the last of them is worth checking a socket
-/// path over, and it used to be the answer given to all four. Sending an
+/// [`BridgeState::Never`] is five states wearing one name, and they call for
+/// five different next steps. Only the last of them is worth checking a socket
+/// path over, and it used to be the answer given to all of them. Sending an
 /// adopter to re-check a path the bridge is connected to is the first wrong
 /// turn a retrofit takes, and the bridge knew better every time:
 ///
+/// - A line ran past [`MAX_LINE_BYTES`] and the bridge closed the connection
+///   over it. The app found the socket, and its tree is too big to carry.
 /// - A line arrived and could not be read. The app found the socket, so the
 ///   line is what is wrong.
 /// - The peer completed the handshake and has published nothing. The app is
@@ -732,6 +768,20 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
 /// - Nothing is connected. Here, and only here, the path and whether the app
 ///   is running are the questions.
 fn no_snapshot_reason(report: LinkReport) -> String {
+    // An oversized line outranks everything, the rejected-line answer below
+    // included: that one's depth and version hints are about a line that
+    // arrived whole and failed to parse, and this one never arrived whole. It
+    // outranks the link too, because every reconnect greets the bridge and
+    // then sends the same line, so an open connection or a fresh handshake is
+    // the lead-up to the next overflow rather than news.
+    if is_oversized(report.rejected.as_deref()) {
+        return format!(
+            "no snapshot from the app yet, but not because nothing is there: an app reached \
+             this socket, and its snapshot was over 1 MiB ({MAX_LINE_BYTES} bytes), this \
+             bridge's line limit, so the bridge closed the connection. The socket path is right, \
+             so the tree is what is wrong. {OVERSIZED_REPEATS}"
+        );
+    }
     // A rejected line outranks the rest: it is the most specific thing that
     // happened, and it happened on whatever connection the others describe.
     if let Some(err) = report.rejected {
@@ -859,6 +909,10 @@ struct Observed {
     /// this build cannot name fails its whole line, id and all, so the app
     /// answering an input is indistinguishable here from the app saying
     /// nothing. This is the one trace that is left of the difference.
+    ///
+    /// It also tells two departures apart: an app that exited, and one the
+    /// bridge closed the connection on because its next tree was over
+    /// [`MAX_LINE_BYTES`] (see [`OVERSIZED_LINE`]).
     rejected: Option<String>,
 }
 
@@ -1080,17 +1134,44 @@ fn report(
     {
         // Both answers name the departure the way `read_tree` does, so an
         // agent meets one vocabulary for a missing app, not two.
+        //
+        // Unless the bridge did the leaving. A tree over the line limit ends
+        // the connection from this side, and "may have exited, possibly
+        // because of this input" then sends the agent to wait for an app
+        // that never went anywhere and will send the same tree on every
+        // reconnect. The openings stay, so a caller matching on them still
+        // reads the same verdict.
+        let oversized = is_oversized(seen.rejected.as_deref());
         if seen.status.is_some() {
-            return Ok(text_result(format!(
-                "The app acknowledged this input and then disconnected: {} and may have exited, \
-                 possibly because of this input. An input that ends the app reads exactly like \
-                 this, and there is no tree to return because the app is gone. If you did not \
-                 mean to end it, it exited for its own reasons. The bridge reconnects \
-                 automatically; call read_tree once the app is back.",
-                gone_app(&state)
-            )));
+            let text = if oversized {
+                format!(
+                    "The app acknowledged this input and then disconnected: {}, because the \
+                     snapshot it sent next was over 1 MiB ({MAX_LINE_BYTES} bytes), this bridge's \
+                     line limit. The bridge closed the connection, not the app, so there is no \
+                     tree to return. {OVERSIZED_REPEATS}",
+                    gone_app(&state)
+                )
+            } else {
+                format!(
+                    "The app acknowledged this input and then disconnected: {} and may have \
+                     exited, possibly because of this input. An input that ends the app reads \
+                     exactly like this, and there is no tree to return because the app is gone. \
+                     If you did not mean to end it, it exited for its own reasons. The bridge \
+                     reconnects automatically; call read_tree once the app is back.",
+                    gone_app(&state)
+                )
+            };
+            return Ok(text_result(text));
         }
-        return Err(McpError::internal_error(
+        let message = if oversized {
+            format!(
+                "the app disconnected before acknowledging this input: {}, because a snapshot it \
+                 sent was over 1 MiB ({MAX_LINE_BYTES} bytes), this bridge's line limit. The \
+                 bridge closed the connection, not the app, and whether the input was applied \
+                 before it did is not known. {OVERSIZED_REPEATS}",
+                gone_app(&state)
+            )
+        } else {
             format!(
                 "the app disconnected before acknowledging this input: {} and may have exited, \
                  possibly because of this input. Whether the input was applied before it went is \
@@ -1098,9 +1179,9 @@ fn report(
                  its way out. The bridge reconnects automatically; call read_tree once the app \
                  is back, then retry if the effect is missing.",
                 gone_app(&state)
-            ),
-            None,
-        ));
+            )
+        };
+        return Err(McpError::internal_error(message, None));
     }
     match (seen.status, seen.changed) {
         (Some(InputStatus::Dropped), _) => Err(McpError::internal_error(
@@ -1477,6 +1558,104 @@ mod tests {
         );
     }
 
+    /// The words every answer about a line over the limit carries.
+    const OVER_THE_LIMIT: &str = "over 1 MiB (1048576 bytes)";
+
+    /// A line over the limit outranks every other answer, the rejected-line
+    /// one included, whose depth and version hints are about a line that
+    /// arrived whole. An app whose tree outgrew the limit greets every
+    /// reconnect and then overflows again, so each moment the link describes
+    /// (down between attempts, just opened, greeted) is one an agent polls
+    /// into, and each used to answer it with something else: the socket path,
+    /// "worth one retry", an app that never publishes nodes.
+    #[test]
+    fn an_oversized_line_outranks_every_link_state() {
+        let links = [
+            ("down", LinkState::Down, None),
+            ("just opened", open_for(10), None),
+            ("open and silent", open_for(4_000), None),
+            ("greeted", open_for(10), Some(PROTOCOL_VERSION)),
+        ];
+        for (name, link, peer_protocol) in links {
+            let reason = no_snapshot_reason(LinkReport {
+                rejected: Some(OVERSIZED_LINE.to_string()),
+                link,
+                peer_protocol,
+            });
+            assert!(
+                reason.starts_with("no snapshot from the app yet")
+                    && reason.contains(OVER_THE_LIMIT)
+                    && reason.contains("The socket path is right"),
+                "{name}: the size is the story, and the path is not in question: {reason}"
+            );
+            for wrong in [
+                "is the socket path correct",
+                "worth one retry",
+                "never publishes nodes",
+                "another taria-mcp process",
+                "levels deep",
+            ] {
+                assert!(
+                    !reason.contains(wrong),
+                    "{name}: `{wrong}` is another state's answer: {reason}"
+                );
+            }
+        }
+    }
+
+    /// The departure an oversized line causes keeps the opening every
+    /// disconnect has, which callers match on, and replaces "it may have
+    /// exited" with the cause: the app is running, and waiting fixes nothing.
+    #[test]
+    fn a_disconnect_over_an_oversized_line_names_the_size_not_an_exit() {
+        let gone = || BridgeState::Disconnected {
+            app_label: Some("demo".to_string()),
+            last_seq: 7,
+        };
+        let err = available_snapshot(
+            gone(),
+            LinkReport {
+                rejected: Some(OVERSIZED_LINE.to_string()),
+                ..silent_link()
+            },
+        )
+        .expect_err("a disconnected app has no tree");
+        assert!(
+            err.message
+                .starts_with("app 'demo' disconnected (last snapshot seq 7); ")
+                && err.message.contains(OVER_THE_LIMIT),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("on every reconnect")
+                && err.message.contains("nothing you send can fix it"),
+            "the agent has to hear that this repeats and that it cannot help: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("may have exited"),
+            "the app did not exit; the bridge closed the connection: {}",
+            err.message
+        );
+
+        // Any other rejected line is not this story, and leaves the
+        // disconnect answer as it was.
+        let err = available_snapshot(
+            gone(),
+            LinkReport {
+                rejected: Some("expected value at line 1".to_string()),
+                ..silent_link()
+            },
+        )
+        .expect_err("a disconnected app has no tree");
+        assert_eq!(
+            err.message,
+            "app 'demo' disconnected (last snapshot seq 7); it may have exited. The bridge \
+             reconnects automatically; retry once the app is back."
+        );
+    }
+
     /// A published snapshot in both forms, built from a line the way an app
     /// would send it: the tests below compare parses, and the results they
     /// read back are what the relay makes of that line.
@@ -1715,6 +1894,77 @@ mod tests {
                     .contains("app 'demo' (last snapshot seq 7) is gone"),
             "the report must name the app and its departure: {}",
             err.message
+        );
+    }
+
+    /// The input that pushed the tree over the limit: acknowledged, and then
+    /// the bridge closed the connection over the snapshot that followed.
+    /// "May have exited, possibly because of this input" is wrong twice over,
+    /// since the app is running and resends that tree on every reconnect. The
+    /// fate is still known, so the answer is still a result, and the opening
+    /// is the one every acknowledged departure has.
+    #[test]
+    fn an_acknowledged_input_followed_by_an_oversized_tree_names_the_size() {
+        let gone = || {
+            Some(BridgeState::Disconnected {
+                app_label: Some("demo".to_string()),
+                last_seq: 7,
+            })
+        };
+        let seen = Observed {
+            status: Some(InputStatus::Delivered),
+            gone: gone(),
+            rejected: Some(OVERSIZED_LINE.to_string()),
+            ..Observed::default()
+        };
+        let result = report(seen, snapshot("after"), 1, TreeFormat::Json)
+            .expect("an acknowledged input is not a failed call, even here");
+        let text = result_text(&result);
+        assert!(
+            text.starts_with("The app acknowledged this input and then disconnected: ")
+                && text.contains("app 'demo' (last snapshot seq 7) is gone")
+                && text.contains(OVER_THE_LIMIT)
+                && text.contains("The bridge closed the connection, not the app"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("may have exited"),
+            "the app did not exit: {text}"
+        );
+
+        // Without an acknowledgement the fate is unknown and it stays an
+        // error, naming the same cause.
+        let seen = Observed {
+            status: None,
+            gone: gone(),
+            rejected: Some(OVERSIZED_LINE.to_string()),
+            ..Observed::default()
+        };
+        let err = report(seen, snapshot("after"), 1, TreeFormat::Json)
+            .expect_err("an input with no acknowledgement has no known fate");
+        assert!(
+            err.message
+                .starts_with("the app disconnected before acknowledging this input: ")
+                && err.message.contains(OVER_THE_LIMIT)
+                && !err.message.contains("may have exited"),
+            "{}",
+            err.message
+        );
+
+        // A line rejected for any other reason says nothing about why the app
+        // went, and the plain departure answer stands.
+        let seen = Observed {
+            status: Some(InputStatus::Delivered),
+            gone: gone(),
+            rejected: Some("expected value at line 1".to_string()),
+            ..Observed::default()
+        };
+        let result = report(seen, snapshot("after"), 1, TreeFormat::Json).expect("a result");
+        let text = result_text(&result);
+        assert!(
+            text.contains("and may have exited, possibly because of this input")
+                && !text.contains(OVER_THE_LIMIT),
+            "{text}"
         );
     }
 
