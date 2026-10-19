@@ -11,15 +11,34 @@
 //! [`cut_to_fit`] makes the tree fit before it is published. It cuts what
 //! costs the most first and stops as soon as the tree fits:
 //!
-//! 1. the longest values, down to one shared length, so the biggest strings
-//!    shrink first and shorter ones are untouched;
-//! 2. values and labels together, the same way, once values alone are not
-//!    enough;
-//! 3. nodes: first any node that could not fit with nothing beside it, then
-//!    the trailing children of the widest nodes, then, shallowest first, as
-//!    many of those as still fit, each node's next children in their order
-//!    until one does not;
-//! 4. last, every child of the root.
+//! 1. nodes that could never fit are dropped, with everything under them,
+//!    before any string is cut. Such a node is one whose id, role and
+//!    actions, with its strings at the floor, do not fit with only its
+//!    ancestors beside it: one huge id or a long run of custom actions,
+//!    which no cut shortens. Left in, it would have every later stage cut
+//!    the rest of the tree to make room it can never be given;
+//! 2. strings are cut: the longest values first, down to one shared length,
+//!    so the biggest strings shrink first and shorter ones are untouched,
+//!    then values and labels together, the same way, once values alone are
+//!    not enough;
+//! 3. every node keeps at most one shared number of children, the largest
+//!    that fits, so a list of fifty thousand rows loses its last rows while
+//!    a status bar beside it keeps its place;
+//! 4. shallowest first, the children that cap removed go back while they
+//!    fit, each parent keeping a run of its first children with no gap,
+//!    apart from a node that could never fit. The run ends at the first
+//!    child too large for the room left, which closes its parent's list
+//!    although a later, smaller sibling might still fit. So two children
+//!    that each fit alone but not together keep only the first, and every
+//!    sibling after them goes too: a status bar and a `quit` that follow
+//!    two children with half-megabyte ids are dropped, and the line is left
+//!    half full. Only absurd sizes reach this, and a gap would be worse: it
+//!    would tell an agent reading a list that the row after it is the next
+//!    one;
+//! 5. last, the bare root: every child of the root goes.
+//!
+//! The fourth stage only gives back what the third took beyond what fitting
+//! needed, so it never runs on a tree an earlier stage made fit.
 //!
 //! Ids and custom action names are never changed, because they are what an
 //! agent sends back: a node it can read but not address is worse than one it
@@ -101,8 +120,11 @@ impl SnapshotTooLarge {
         }
     }
 
-    /// Length of the snapshot line as built, before anything was cut, in
-    /// bytes, not counting the terminating `\n`.
+    /// Length of the snapshot line as built, before the size bound cut
+    /// anything, in bytes, not counting the terminating `\n`. For a tree
+    /// deeper than [`taria::MAX_NODE_DEPTH`] that is the tree after the
+    /// depth cut, which runs first: the tree as built is never serialized,
+    /// because serializing recurses and the depth cut is what bounds that.
     ///
     /// Counted with `seq` at its largest, the way the bound counts it. A tree
     /// is cut when its line would not fit at every seq, not merely at the one
@@ -120,8 +142,8 @@ impl SnapshotTooLarge {
     }
 
     /// How many labels and values were shortened among the nodes that were
-    /// published. A string in a node that was then dropped is counted in
-    /// [`nodes_dropped`](Self::nodes_dropped) instead.
+    /// published. A node that was dropped is counted in
+    /// [`nodes_dropped`](Self::nodes_dropped) instead, whatever it held.
     pub fn strings_trimmed(&self) -> usize {
         self.strings_trimmed
     }
@@ -245,26 +267,50 @@ pub(crate) fn cut_to_fit(root: &mut Node, budget: usize, before: Option<usize>) 
     let Some(before) = before else {
         return bare_root(root, &survey, usize::MAX);
     };
-    let excess = before.saturating_sub(budget);
-
-    let trimmed = match water_level(&mut survey.values, excess) {
-        Some(level) => Some(trim_strings(root, level, Strings::Values)),
-        None => {
-            // A fresh fill over both sets, not labels on top of values
-            // already at the floor: with labels in play the shared level can
-            // sit above the floor, and values are then cut less.
-            let mut both = survey.values.clone();
-            both.extend_from_slice(&survey.labels);
-            water_level(&mut both, excess)
-                .map(|level| trim_strings(root, level, Strings::ValuesAndLabels))
-        }
+    let Some(framing) = Framing::measured() else {
+        return bare_root(root, &survey, before);
     };
-    let (strings_trimmed, nodes_dropped) = match trimmed {
-        Some(strings) => (strings, 0),
-        None => match drop_to_fit(root, budget) {
-            Some(counts) => counts,
-            None => return bare_root(root, &survey, before),
-        },
+
+    // Nodes that could never fit go first, before any string is cut, so
+    // that no string anywhere is cut to make room one of them will never
+    // be given.
+    let Some(mut slots) = flatten(root) else {
+        return bare_root(root, &survey, before);
+    };
+    let Some(unfit) = mark_reach(&mut slots, framing, budget) else {
+        return bare_root(root, &survey, before);
+    };
+    let mut now = before;
+    // Handed on to the drop stage, which then need not flatten the tree
+    // again, for as long as it still describes the tree.
+    let mut flattened = Some(slots);
+    if unfit > 0 {
+        if let Some(slots) = flattened.take() {
+            let fits: Vec<bool> = slots.iter().map(|slot| slot.fits).collect();
+            keep_only(root, &slots, &fits);
+        }
+        // Measured again rather than worked out from what went: this runs
+        // only for a tree holding an absurd node, and measuring is the one
+        // count of what is left that cannot be wrong.
+        let Some(after) = measure(root) else {
+            return bare_root(root, &survey, before);
+        };
+        now = after;
+        let rest = Survey::of(root);
+        survey.values = rest.values;
+        survey.labels = rest.labels;
+    }
+
+    let (strings_trimmed, nodes_dropped) = if now <= budget {
+        (0, unfit)
+    } else {
+        match cut_strings(root, &mut survey, now - budget) {
+            Some(strings) => (strings, unfit),
+            None => match drop_to_fit(root, flattened, framing, budget) {
+                Some((strings, dropped)) => (strings, unfit.saturating_add(dropped)),
+                None => return bare_root(root, &survey, before),
+            },
+        }
     };
     match measure(root) {
         Some(after) if after <= budget => Bounded {
@@ -279,6 +325,24 @@ pub(crate) fn cut_to_fit(root: &mut Node, budget: usize, before: Option<usize>) 
         // than in one that might not.
         _ => bare_root(root, &survey, before),
     }
+}
+
+/// Cut strings until `excess` bytes come off, and return how many were cut,
+/// or `None`, with nothing cut, when cutting every one to [`STRING_FLOOR`]
+/// would not be enough.
+///
+/// Values first, and labels with them only once values alone fall short.
+fn cut_strings(root: &mut Node, survey: &mut Survey, excess: usize) -> Option<usize> {
+    if let Some(level) = water_level(&mut survey.values, excess) {
+        return Some(trim_strings(root, level, Strings::Values));
+    }
+    // A fresh fill over both sets, not labels on top of values already at
+    // the floor: with labels in play the shared level can sit above the
+    // floor, and values are then cut less.
+    let mut both = survey.values.clone();
+    both.extend_from_slice(&survey.labels);
+    let level = water_level(&mut both, excess)?;
+    Some(trim_strings(root, level, Strings::ValuesAndLabels))
 }
 
 /// Which strings a water-fill cuts.
@@ -364,20 +428,31 @@ fn measure(node: &Node) -> Option<usize> {
     Some(count.0)
 }
 
-/// Exact length of `node`'s JSON without its children: the part of it a cap
-/// on children cannot shrink.
+/// Exact length of `node`'s JSON without its children, with its label and
+/// value as they would be cut to [`STRING_FLOOR`]: the part of it no stage
+/// but dropping it can shrink.
 ///
 /// Measured by setting the children aside rather than modelling the fields,
-/// so the one model the drop stage still plans with is how a child list is
-/// framed, and [`Framing`] measures that too.
-fn measure_own(node: &mut Node) -> Option<usize> {
+/// less what [`floor_saving`] says the cut would take off, so nothing is cut
+/// to learn it and the one model the node stages still plan with is how a
+/// child list is framed, which [`Framing`] measures too.
+fn measure_own_at_floor(node: &mut Node) -> Option<usize> {
     let children = std::mem::take(&mut node.children);
     let own = measure(node);
     node.children = children;
-    own
+    let keep = keep_for(node.role);
+    let saving = [(&node.value, keep), (&node.label, Keep::Head)]
+        .into_iter()
+        .filter_map(|(text, keep)| Some(floor_saving(text.as_deref()?, keep)))
+        .fold(0usize, usize::saturating_add);
+    own?.checked_sub(saving)
 }
 
 /// What a root that did not fit holds, read once before anything is cut.
+///
+/// The lengths of the strings are read again once nodes that could never fit
+/// are dropped, so the string stages plan on what is left. Everything else
+/// describes the tree as it came, because that is what the report is about.
 struct Survey {
     /// Escaped lengths of the values over [`STRING_FLOOR`], the only ones a
     /// cut can touch.
@@ -528,44 +603,71 @@ fn trim_to_floor(node: &mut Node) -> usize {
 /// which may be a little under `target` when the next character costs more
 /// than the room left.
 fn trim_to(s: &mut String, target: usize, keep: Keep) {
-    let room = target.saturating_sub(MARKER_BYTES);
-    let mut used = 0usize;
+    let (at, _) = cut_point(s, target, keep);
     match keep {
+        // `at` is just past a character, so this cannot split one.
         Keep::Head => {
-            let mut end = 0;
-            for (at, c) in s.char_indices() {
-                used = used.saturating_add(char_cost(c));
-                if used > room {
-                    break;
-                }
-                end = at + c.len_utf8();
-            }
-            // `end` is just past a character, so this cannot split one.
-            s.truncate(end);
+            s.truncate(at);
             s.push_str(MARKER);
         }
-        Keep::Tail => {
-            let mut start = s.len();
-            for (at, c) in s.char_indices().rev() {
-                used = used.saturating_add(char_cost(c));
-                if used > room {
-                    break;
-                }
-                start = at;
-            }
-            // `start` is where a character begins, so neither can this.
-            s.replace_range(..start, MARKER);
-        }
+        // `at` is where a character begins, so neither can this.
+        Keep::Tail => s.replace_range(..at, MARKER),
     }
+}
+
+/// Where [`trim_to`] cuts `s`: the byte offset the kept part ends at, for
+/// [`Keep::Head`], or starts at, for [`Keep::Tail`], and the escaped bytes
+/// the kept part costs, [`MARKER`] not included.
+///
+/// Apart from [`trim_to`] so that what a cut would leave can be known
+/// without making it: the first stage has to know what each node would cost
+/// with its strings at the floor before it decides whether any string is cut.
+fn cut_point(s: &str, target: usize, keep: Keep) -> (usize, usize) {
+    let room = target.saturating_sub(MARKER_BYTES);
+    let mut used = 0usize;
+    // Takes `c` into the kept part if it still fits. The first character
+    // that does not is where the cut lands.
+    let mut take = |c: char| {
+        let next = used.saturating_add(char_cost(c));
+        if next > room {
+            return false;
+        }
+        used = next;
+        true
+    };
+    let at = match keep {
+        Keep::Head => s
+            .char_indices()
+            .find(|&(_, c)| !take(c))
+            .map_or(s.len(), |(at, _)| at),
+        Keep::Tail => s
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !take(c))
+            .map_or(0, |(at, c)| at + c.len_utf8()),
+    };
+    (at, used)
+}
+
+/// Escaped bytes cutting `s` to [`STRING_FLOOR`] would take off it: none
+/// for a string already within the floor.
+fn floor_saving(s: &str, keep: Keep) -> usize {
+    let len = escaped_len(s);
+    if len <= STRING_FLOOR {
+        return 0;
+    }
+    let (_, kept) = cut_point(s, STRING_FLOOR, keep);
+    len.saturating_sub(kept.saturating_add(MARKER_BYTES))
 }
 
 /// How `serde_json` frames a node's children, measured from its own output
 /// rather than written down here.
 ///
-/// The drop stage adds a tree up from what each node costs without its
-/// children, [`measure_own`], and these two numbers, so they are the whole of
-/// its model of the format. Taking them from two tiny trees on every cut
-/// keeps that model in step with whatever `serde_json` and [`Node`] write.
+/// The node stages add a tree up from what each node costs without its
+/// children, [`measure_own_at_floor`], and these two numbers, so they are the
+/// whole of their model of the format. Taking them from two tiny trees on
+/// every cut keeps that model in step with whatever `serde_json` and [`Node`]
+/// write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Framing {
     /// What a non-empty child list adds besides its entries: the key, the
@@ -600,61 +702,59 @@ impl Framing {
     }
 }
 
-/// One node of a tree flattened in breadth-first order, as the drop stage
-/// needs it.
+/// One node of a tree flattened in breadth-first order, as the node stages
+/// need it.
 ///
 /// Breadth-first puts every node after its parent and before everything
 /// deeper, and a node's children side by side in their own order. The first
-/// is what lets [`size_at_cap`] add a tree up in one backwards pass and the
-/// refill reach shallow nodes first; the second is what lets a node's
-/// children be found, and kept or dropped, as one range.
+/// is what lets [`mark_reach`] work down a tree in one forward pass,
+/// [`size_at_cap`] add it up in one backwards pass, and the refill reach
+/// shallow nodes first; the second is what lets a node's children be found,
+/// and kept or dropped, as one range.
 #[derive(Debug, Clone, Copy, Default)]
 struct Slot {
     /// Index of the parent slot. Unused on the root, slot 0.
     parent: usize,
-    /// Exact JSON length without its children; see [`measure_own`].
+    /// Exact JSON length without its children, its strings at the floor;
+    /// see [`measure_own_at_floor`].
     own: usize,
-    /// How many of its own strings were cut to the floor.
-    trimmed: usize,
     /// Index of its first child's slot; the rest follow it.
     first_child: usize,
     /// How many children it has.
     children: usize,
-    /// The smallest tree that holds this node: it, every ancestor, and the
-    /// child lists between them, with nothing else.
-    reach: usize,
-    /// Whether `reach` is within the budget. One that is not can never be
-    /// published, so it is dropped with everything under it before the cap
-    /// is searched for.
-    admissible: bool,
-    /// Position among its admissible siblings, which is what a cap on
-    /// children counts.
+    /// Position among its siblings, which is what a cap on children counts.
     rank: usize,
-    /// How many of its children are admissible.
-    admissible_children: usize,
+    /// The smallest tree that holds this node, every string at the floor:
+    /// it, every ancestor, and the child lists between them, with nothing
+    /// else. Set by [`mark_reach`].
+    reach: usize,
+    /// Whether `reach` is within the budget. A node for which it is not
+    /// could never be published, and goes with everything under it before
+    /// any string is cut. Set by [`mark_reach`].
+    fits: bool,
 }
 
-/// Drop nodes until the tree fits, after cutting every string to the floor.
-/// Returns how many published strings were cut and how many nodes were
-/// dropped, or `None` when not even the root alone fits or a node could not
-/// be measured.
+/// Drop nodes until the tree fits, and then cut the strings of the nodes kept
+/// to the floor. Returns how many published strings were cut and how many
+/// nodes were dropped, or `None` when not even the root alone fits or a node
+/// could not be measured.
 ///
-/// Three passes over the tree flattened breadth-first:
+/// `slots` is the tree as the first stage flattened it, while that still
+/// describes it, and the tree is flattened afresh when it is `None`. Every
+/// node in it could fit with nothing but its ancestors beside it: the first
+/// stage took out those that could not.
 ///
-/// 1. Any node that could not fit with nothing but its ancestors beside it
-///    goes, with everything under it. Such a node is one huge id or a long
-///    run of custom actions, which no cut shortens, and left in it would
-///    hold the cap below at zero for its whole parent: its siblings would go
-///    with it, a status bar, a help line, the `quit` that is an agent's way
-///    out.
-/// 2. One cap on how many children any node keeps, the widest that fits,
+/// Two passes over the tree flattened breadth-first, each planning with every
+/// string at the floor:
+///
+/// 1. One cap on how many children any node keeps, the widest that fits,
 ///    found by halving. Every node wider than the cap loses its tail and
 ///    every narrower one keeps everything, so a status bar beside a runaway
 ///    list, one of a handful of the root's children, stays well inside any
 ///    cap the list's rows leave room for. Searching adds the tree up once
 ///    per halving, a few dozen times at most, rather than once per node
 ///    dropped.
-/// 3. One cap for the whole tree is coarse: where the deepest branch is the
+/// 2. One cap for the whole tree is coarse: where the deepest branch is the
 ///    last child of a wide node, any cap that keeps that branch keeps
 ///    everything, and the widest cap that fits can leave most of the budget
 ///    unused. So what the cap dropped is offered back, breadth-first so
@@ -662,31 +762,39 @@ struct Slot {
 ///    is taken when its parent is kept and it fits in what is left. The
 ///    first that does not fit ends the offer for its parent: none of its
 ///    later siblings is taken, though a smaller one might fit, so what a
-///    node keeps is always its first children, with no gap. A gap would
-///    tell an agent reading a list that the row after it is the next one.
-///    Other parents' children are still offered after it.
+///    node keeps is always its first children, with no gap apart from a
+///    node that could never fit, which the first stage took out. A gap
+///    would tell an agent reading a list that the row after it is the next
+///    one. Other parents' children are still offered after it.
+///
+/// The strings are cut last, and only in the nodes kept, which is all a
+/// string cut in a dropped node would have been spent on.
 ///
 /// Every pass is linear in the tree and the search runs a logarithmic number
 /// of them, so a list of two hundred thousand rows costs a few dozen walks
 /// over a flat array rather than anything quadratic.
-fn drop_to_fit(root: &mut Node, budget: usize) -> Option<(usize, usize)> {
-    let framing = Framing::measured()?;
-    let mut slots = flatten_to_floor(root)?;
-    if !mark_admissible(&mut slots, framing, budget) {
-        return None;
-    }
+fn drop_to_fit(
+    root: &mut Node,
+    slots: Option<Vec<Slot>>,
+    framing: Framing,
+    budget: usize,
+) -> Option<(usize, usize)> {
+    let slots = match slots {
+        Some(slots) => slots,
+        None => flatten(root)?,
+    };
 
-    let widest = slots
-        .iter()
-        .map(|slot| slot.admissible_children)
-        .max()
-        .unwrap_or(0);
+    let widest = slots.iter().map(|slot| slot.children).max().unwrap_or(0);
     let mut scratch = vec![0usize; slots.len()];
     let mut size = |cap| size_at_cap(&slots, framing, cap, &mut scratch);
     // Invariant: a cap of `fits` fits and one of `over` does not. A cap of
-    // zero is the root alone, which `mark_admissible` found fits.
+    // zero is the root alone, which the first stage found fits; checked
+    // again here rather than taken on trust.
     let mut fits = 0;
     let mut used = size(0);
+    if used > budget {
+        return None;
+    }
     let all = size(widest);
     if all <= budget {
         fits = widest;
@@ -707,83 +815,81 @@ fn drop_to_fit(root: &mut Node, budget: usize) -> Option<(usize, usize)> {
 
     let kept = refill(&slots, framing, fits, budget, used);
     keep_only(root, &slots, &kept);
-    let (mut strings, mut published) = (0usize, 0usize);
-    for (slot, _) in slots.iter().zip(&kept).filter(|(_, kept)| **kept) {
-        strings = strings.saturating_add(slot.trimmed);
-        published += 1;
-    }
+    let published = kept.iter().filter(|kept| **kept).count();
+    let strings = trim_strings(root, STRING_FLOOR, Strings::ValuesAndLabels);
     Some((strings, slots.len().saturating_sub(published)))
 }
 
-/// Cut every string in the tree to the floor and flatten it breadth-first
-/// into [`Slot`]s, or `None` if a node could not be measured.
-fn flatten_to_floor(root: &mut Node) -> Option<Vec<Slot>> {
+/// Flatten the tree breadth-first into [`Slot`]s, each measured as it would
+/// be with its strings at the floor, or `None` if a node could not be
+/// measured. Nothing in the tree is cut.
+fn flatten(root: &mut Node) -> Option<Vec<Slot>> {
     let mut slots = Vec::new();
-    let mut queue: VecDeque<(&mut Node, usize)> = VecDeque::from([(root, 0)]);
-    while let Some((node, parent)) = queue.pop_front() {
+    let mut queue: VecDeque<(&mut Node, usize, usize)> = VecDeque::from([(root, 0, 0)]);
+    while let Some((node, parent, rank)) = queue.pop_front() {
         let index = slots.len();
-        let trimmed = trim_to_floor(node);
-        let own = measure_own(node)?;
+        let own = measure_own_at_floor(node)?;
         slots.push(Slot {
             parent,
             own,
-            trimmed,
             // Everything still queued takes the indices after this one, and
             // the children are queued behind it, so they come next, side by
             // side.
             first_child: index.saturating_add(queue.len()).saturating_add(1),
             children: node.children.len(),
+            rank,
             ..Slot::default()
         });
-        queue.extend(node.children.iter_mut().map(|child| (child, index)));
+        queue.extend(
+            node.children
+                .iter_mut()
+                .enumerate()
+                .map(|(rank, child)| (child, index, rank)),
+        );
     }
     Some(slots)
 }
 
-/// Work out which nodes could fit at all, and rank each admissible node
-/// among its admissible siblings. Returns false when the root itself does
-/// not fit, which nothing short of the bare root can help.
+/// Work out which nodes could ever fit: those whose reach is within the
+/// budget. Returns how many could not, or `None` when the root itself could
+/// not, which nothing short of the bare root can help.
 ///
 /// Parent before child, which breadth-first order guarantees, so a node's
-/// reach is its parent's plus a child list and itself.
-fn mark_admissible(slots: &mut [Slot], framing: Framing, budget: usize) -> bool {
-    let Some(root) = slots.first_mut() else {
-        return false;
-    };
+/// reach is its parent's plus a child list and itself, and a node under one
+/// that could never fit could never fit either.
+fn mark_reach(slots: &mut [Slot], framing: Framing, budget: usize) -> Option<usize> {
+    let root = slots.first_mut()?;
     root.reach = root.own;
-    root.admissible = root.reach <= budget;
-    if !root.admissible {
-        return false;
+    root.fits = root.reach <= budget;
+    if !root.fits {
+        return None;
     }
+    let mut unfit = 0usize;
     for index in 0..slots.len() {
         let Some(&parent) = slots.get(index) else {
             break;
         };
         let range = parent.first_child..parent.first_child.saturating_add(parent.children);
-        let mut admissible = 0;
-        if let Some(children) = slots.get_mut(range) {
-            for child in children {
-                child.reach = parent
-                    .reach
-                    .saturating_add(framing.list)
-                    .saturating_add(child.own);
-                child.admissible = parent.admissible && child.reach <= budget;
-                if child.admissible {
-                    child.rank = admissible;
-                    admissible += 1;
-                }
+        let Some(children) = slots.get_mut(range) else {
+            continue;
+        };
+        for child in children {
+            child.reach = parent
+                .reach
+                .saturating_add(framing.list)
+                .saturating_add(child.own);
+            child.fits = parent.fits && child.reach <= budget;
+            if !child.fits {
+                unfit = unfit.saturating_add(1);
             }
         }
-        if let Some(slot) = slots.get_mut(index) {
-            slot.admissible_children = admissible;
-        }
     }
-    true
+    Some(unfit)
 }
 
-/// Exact JSON length of the flattened tree if no node kept more than `cap`
-/// of its admissible children. `kept_bytes` is scratch space, one entry per
-/// slot.
+/// Exact JSON length of the flattened tree, every string at the floor, if no
+/// node kept more than `cap` of its children. `kept_bytes` is scratch space,
+/// one entry per slot.
 ///
 /// Backwards over breadth-first order, so every node is reached after all of
 /// its descendants: by then the children it keeps have added themselves to
@@ -795,13 +901,12 @@ fn size_at_cap(slots: &[Slot], framing: Framing, cap: usize, kept_bytes: &mut [u
     for (index, slot) in slots.iter().enumerate().rev() {
         let bytes = slot
             .own
-            .saturating_add(framing.around(slot.admissible_children.min(cap)))
+            .saturating_add(framing.around(slot.children.min(cap)))
             .saturating_add(kept_bytes.get(index).copied().unwrap_or(0));
         if index == 0 {
             return bytes;
         }
-        if slot.admissible
-            && slot.rank < cap
+        if slot.rank < cap
             && let Some(parent) = kept_bytes.get_mut(slot.parent)
         {
             *parent = parent.saturating_add(bytes);
@@ -818,9 +923,7 @@ fn size_at_cap(slots: &[Slot], framing: Framing, cap: usize, kept_bytes: &mut [u
 /// without are offered in their turn, deeper down the order, and only once
 /// it is kept. Once one child of a parent does not fit, that parent is
 /// closed and its later children are not offered, so every kept node keeps
-/// an unbroken run of its admissible children from the first. A child that
-/// is not admissible is passed over without closing its parent: it was never
-/// going to fit, and the rows after it are as much the next ones as it was.
+/// an unbroken run of its children from the first.
 fn refill(
     slots: &[Slot],
     framing: Framing,
@@ -840,10 +943,10 @@ fn refill(
     }
     let is_kept = |kept: &[bool], index: usize| kept.get(index).copied().unwrap_or(false);
 
-    // What the cap keeps, which is what `used` measured: a chain of
-    // admissible nodes within the cap all the way up from the root.
+    // What the cap keeps, which is what `used` measured: a chain of nodes
+    // within the cap all the way up from the root.
     for (index, slot) in slots.iter().enumerate().skip(1) {
-        if slot.admissible && slot.rank < cap && is_kept(&kept, slot.parent) {
+        if slot.rank < cap && is_kept(&kept, slot.parent) {
             if let Some(entry) = kept.get_mut(index) {
                 *entry = true;
             }
@@ -856,8 +959,7 @@ fn refill(
     // What the cap dropped, offered back. Breadth-first, so every parent has
     // been decided by the time its children are reached.
     for (index, slot) in slots.iter().enumerate().skip(1) {
-        if !slot.admissible
-            || is_kept(&kept, index)
+        if is_kept(&kept, index)
             || !is_kept(&kept, slot.parent)
             || closed.get(slot.parent).copied().unwrap_or(true)
         {
@@ -1108,13 +1210,13 @@ mod tests {
         );
 
         let mut tree = varied_tree();
-        // Nothing in the varied tree is over the floor, so flattening trims
-        // nothing and the tree it measures is the one serialized.
+        // Nothing in the varied tree is over the floor, so the tree the
+        // slots plan for is the one serialized.
         let before = tree.clone();
-        let mut slots = flatten_to_floor(&mut tree).unwrap();
-        assert_eq!(tree, before);
+        let mut slots = flatten(&mut tree).unwrap();
+        assert_eq!(tree, before, "flattening cuts nothing");
         assert_eq!(slots.len(), count_nodes(&tree));
-        assert!(mark_admissible(&mut slots, framing, usize::MAX));
+        assert_eq!(mark_reach(&mut slots, framing, usize::MAX), Some(0));
 
         let mut scratch = vec![0; slots.len()];
         assert_eq!(
@@ -1130,6 +1232,31 @@ mod tests {
                 "cap {cap}"
             );
         }
+
+        // With strings over the floor, every escape class among them, the
+        // slots plan for the tree as the floor would leave it, worked out
+        // without cutting anything: the same bytes as cutting it and
+        // measuring.
+        let mut long = varied_tree();
+        let mut pending = vec![&mut long];
+        while let Some(node) = pending.pop() {
+            node.label = Some(ESCAPE_HEAVY.repeat(30));
+            if node.value.is_some() {
+                node.value = Some(format!("{}tail", ESCAPE_HEAVY.repeat(40)));
+            }
+            pending.extend(node.children.iter_mut());
+        }
+        let untouched = long.clone();
+        let slots = flatten(&mut long).unwrap();
+        assert_eq!(long, untouched, "flattening cuts nothing");
+        let mut at_floor = long.clone();
+        let cut = trim_strings(&mut at_floor, STRING_FLOOR, Strings::ValuesAndLabels);
+        assert!(cut > count_nodes(&long), "labels and values were over");
+        let mut scratch = vec![0; slots.len()];
+        assert_eq!(
+            size_at_cap(&slots, framing, usize::MAX, &mut scratch),
+            json_len(&at_floor)
+        );
         // And escaped lengths, which the string stages plan with, are what
         // serde_json writes between the quotes.
         for text in [ESCAPE_HEAVY, "", "plain", MARKER, "\x1f\x20"] {
@@ -1433,6 +1560,109 @@ mod tests {
         }
     }
 
+    /// The edge the no-gap rule costs, pinned so the module documentation
+    /// stays true of it: two children that each fit alone but not together,
+    /// ahead of the chrome. The second does not fit in the room the first
+    /// leaves, which closes the root's list, so the chrome after it goes too
+    /// although it would fit.
+    #[test]
+    fn a_child_too_large_for_the_room_left_closes_its_parents_list() {
+        let mut root = Node::new("app", Role::App)
+            .label("closed")
+            .child(Node::new("a".repeat(800), Role::Text))
+            .child(Node::new("b".repeat(900), Role::Text))
+            .children(status_and_quit());
+        let bounded = bound_root(&mut root, 1500).expect("over budget");
+
+        let ids: Vec<&str> = root.children.iter().map(|c| c.id.0.as_str()).collect();
+        assert_eq!(ids, ["a".repeat(800)], "the run ends at the second");
+        assert_eq!(bounded.nodes_dropped, 3);
+        assert!(json_len(&root) <= 1500);
+    }
+
+    /// The chrome a real app publishes beside whatever runs away.
+    fn status_and_quit() -> [Node; 2] {
+        [
+            Node::new("status", Role::Status).value("3 tasks"),
+            Node::new("quit", Role::Button)
+                .label("Quit")
+                .action(Action::Activate),
+        ]
+    }
+
+    /// A node that could never fit is dropped before any string is cut, so
+    /// it costs its siblings nothing. Cut later, it had every label and
+    /// value in the tree cut to the floor first: a 300 KB draft that fits
+    /// whole went out at 256 bytes, in a line of 590.
+    #[test]
+    fn a_node_that_could_never_fit_costs_its_siblings_nothing() {
+        let draft = "d".repeat(300_000);
+        let mut root = Node::new("app", Role::App)
+            .label("unfit")
+            .child(Node::new("I".repeat(2_000_000), Role::Text))
+            .child(Node::new("draft", Role::TextInput).value(draft.clone()))
+            .children(status_and_quit());
+        let bounded = bound_root(&mut root, ROOT_BUDGET).expect("over budget");
+
+        let ids: Vec<&str> = root.children.iter().map(|c| c.id.0.as_str()).collect();
+        assert_eq!(ids, ["draft", "status", "quit"]);
+        assert_eq!(value_of(&root, 0), draft, "the draft goes out whole");
+        assert_eq!(bounded.strings_trimmed, 0, "no string was cut");
+        assert_eq!(bounded.nodes_dropped, 1);
+        assert_eq!(bounded.largest.0, "I".repeat(2_000_000));
+        assert!(json_len(&root) > 300_000);
+    }
+
+    /// Past the node that could never fit, the string stages run on what is
+    /// left, so a draft too long for the line is cut to what the line has
+    /// room for rather than to the floor.
+    #[test]
+    fn a_long_draft_beside_a_node_that_could_never_fit_fills_the_line() {
+        let mut root = Node::new("app", Role::App)
+            .label("unfit")
+            .child(Node::new("I".repeat(1_100_000), Role::Text))
+            .child(Node::new("draft", Role::TextInput).value("d".repeat(1_500_000)))
+            .children(status_and_quit());
+        let bounded = bound_root(&mut root, ROOT_BUDGET).expect("over budget");
+
+        let ids: Vec<&str> = root.children.iter().map(|c| c.id.0.as_str()).collect();
+        assert_eq!(ids, ["draft", "status", "quit"]);
+        assert_eq!(root.children[1..], status_and_quit());
+        let kept = escaped_len(value_of(&root, 0));
+        assert!(
+            kept > ROOT_BUDGET - 1024,
+            "{kept} bytes of draft in a line of {ROOT_BUDGET}"
+        );
+        assert!(json_len(&root) <= ROOT_BUDGET);
+        assert_eq!(bounded.strings_trimmed, 1);
+        assert_eq!(bounded.nodes_dropped, 1);
+    }
+
+    /// The same for a run of custom actions too long for the line: the log
+    /// beside it fits, so it is kept whole, tail and all, not cut to the
+    /// floor's last 256 bytes.
+    #[test]
+    fn a_log_beside_custom_actions_that_could_never_fit_keeps_its_tail_whole() {
+        let log: String = (0..526_000)
+            .map(|n| if n % 80 == 79 { '\n' } else { 'l' })
+            .collect();
+        let actions = Node::new("actions", Role::Menu)
+            .actions((0..80_000).map(|n| Action::Custom(format!("action-{n:06}"))));
+        assert!(json_len(&actions) > 2_000_000, "{}", json_len(&actions));
+        let mut root = Node::new("app", Role::App)
+            .label("unfit")
+            .child(actions)
+            .child(Node::new("log", Role::Log).value(log.clone()))
+            .children(status_and_quit());
+        let bounded = bound_root(&mut root, ROOT_BUDGET).expect("over budget");
+
+        let ids: Vec<&str> = root.children.iter().map(|c| c.id.0.as_str()).collect();
+        assert_eq!(ids, ["log", "status", "quit"]);
+        assert_eq!(value_of(&root, 0), log, "the log goes out whole");
+        assert_eq!(bounded.strings_trimmed, 0);
+        assert_eq!(bounded.nodes_dropped, 1);
+    }
+
     /// Where the deepest branch is the last child of a wide node, any one
     /// cap that keeps the branch keeps everything, and the widest cap that
     /// fits keeps one level of it. What the cap dropped is offered back,
@@ -1693,19 +1923,19 @@ mod tests {
         node
     }
 
-    /// Ids of the nodes the drop stage finds admissible in `original` at
-    /// `budget`: those that could fit with nothing beside them but their
+    /// Ids of the nodes the first stage finds could ever fit in `original`
+    /// at `budget`: those that fit with nothing beside them but their
     /// ancestors.
-    fn admissible_ids(original: &Node, budget: usize) -> HashSet<String> {
+    fn fitting_ids(original: &Node, budget: usize) -> HashSet<String> {
         let mut tree = original.clone();
-        let mut slots = flatten_to_floor(&mut tree).unwrap();
-        mark_admissible(&mut slots, Framing::measured().unwrap(), budget);
+        let mut slots = flatten(&mut tree).unwrap();
+        mark_reach(&mut slots, Framing::measured().unwrap(), budget);
         // The same breadth-first order the slots were flattened in.
         let mut ids = HashSet::new();
         let mut slots = slots.iter();
         let mut queue = VecDeque::from([&tree]);
         while let Some(node) = queue.pop_front() {
-            if slots.next().is_some_and(|slot| slot.admissible) {
+            if slots.next().is_some_and(|slot| slot.fits) {
                 ids.insert(node.id.0.clone());
             }
             queue.extend(&node.children);
@@ -1722,14 +1952,17 @@ mod tests {
 
     /// Random trees against random budgets. Whatever comes out fits, nothing
     /// panics, a tree that fits comes back untouched, the bare root is never
-    /// needed (so the stages' model of the format held), and everything kept
-    /// is what was there: the same ids, roles, actions and focus, children
-    /// in their order, and strings either whole or cut where marked.
+    /// needed (so the stages' model of the format held), a tree that fits
+    /// once the nodes that could never fit are gone loses nothing else, and
+    /// everything kept is what was there: the same ids, roles, actions and
+    /// focus, children in their order with no gap, and strings either whole
+    /// or cut where marked.
     #[test]
     fn random_trees_always_fit_and_keep_what_they_keep_intact() {
         // How many trees fit, were cut in their strings only, and lost nodes,
-        // so the test can show it reached every stage.
-        let (mut fitted, mut strings_only, mut dropped) = (0, 0, 0);
+        // so the test can show it reached every stage, and how many of those
+        // that lost nodes lost only the ones that could never fit.
+        let (mut fitted, mut strings_only, mut dropped, mut unfit_only) = (0, 0, 0, 0);
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut ids = 0;
@@ -1776,7 +2009,22 @@ mod tests {
                 by_id.insert(node.id.0.as_str(), node);
                 pending.extend(&node.children);
             }
-            let admissible = (bounded.nodes_dropped > 0).then(|| admissible_ids(&original, budget));
+            let fitting = fitting_ids(&original, budget);
+            // Stopped as soon as the tree fit: when dropping the nodes that
+            // could never fit is enough, that is all that happened, and no
+            // string anywhere was cut.
+            let mut pruned = original.clone();
+            let mut pending = vec![&mut pruned];
+            while let Some(node) = pending.pop() {
+                node.children
+                    .retain(|child| fitting.contains(child.id.0.as_str()));
+                pending.extend(node.children.iter_mut());
+            }
+            if json_len(&pruned) <= budget {
+                assert_eq!(root, pruned, "seed {seed}: cut more than the unfit nodes");
+                assert_eq!(bounded.strings_trimmed, 0, "seed {seed}");
+                unfit_only += 1;
+            }
             let mut trimmed = 0;
             let mut pending = vec![&root];
             while let Some(node) = pending.pop() {
@@ -1807,23 +2055,24 @@ mod tests {
                 );
                 // And with no gap: what a node keeps is its first children,
                 // passing over only those that could never fit.
-                if let Some(admissible) = &admissible {
-                    let fit: Vec<&str> = all
-                        .iter()
-                        .copied()
-                        .filter(|id| admissible.contains(*id))
-                        .collect();
-                    assert!(
-                        fit.starts_with(&kept),
-                        "seed {seed}: a gap in the children of {:?}",
-                        node.id.0
-                    );
-                }
+                let fit: Vec<&str> = all
+                    .iter()
+                    .copied()
+                    .filter(|id| fitting.contains(*id))
+                    .collect();
+                assert!(
+                    fit.starts_with(&kept),
+                    "seed {seed}: a gap in the children of {:?}",
+                    node.id.0
+                );
                 pending.extend(&node.children);
             }
             assert_eq!(bounded.strings_trimmed, trimmed, "seed {seed}");
         }
-        eprintln!("{fitted} fitted, {strings_only} cut in their strings, {dropped} lost nodes");
+        eprintln!(
+            "{fitted} fitted, {strings_only} cut in their strings, {dropped} lost nodes, \
+             {unfit_only} only those that could never fit"
+        );
         for (stage, count) in [
             ("fit", fitted),
             ("strings", strings_only),

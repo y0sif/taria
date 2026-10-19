@@ -1,10 +1,12 @@
 //! Per-frame recording of the semantic tree.
 
 use std::cell::RefCell;
+use std::mem;
 
 use taria::Node;
 
 use crate::TariaLayer;
+use crate::layer::drop_iteratively;
 
 /// Records the semantic nodes of one rendered frame.
 ///
@@ -60,9 +62,20 @@ impl<'a> FrameRecorder<'a> {
     /// [`TariaLayer::last_truncation`](crate::TariaLayer::last_truncation)
     /// and [`TariaLayer::last_oversize`](crate::TariaLayer::last_oversize)
     /// for how an app finds out.
-    pub fn publish(self) {
-        let Self { layer, nodes } = self;
-        layer.publish_nodes(nodes.into_inner());
+    pub fn publish(mut self) {
+        let nodes = mem::take(self.nodes.get_mut());
+        self.layer.publish_nodes(nodes);
+    }
+}
+
+impl Drop for FrameRecorder<'_> {
+    /// Free a frame that was recorded and never published without recursing,
+    /// as the layer frees every tree it is handed: what was recorded can be
+    /// deeper than the call stack.
+    fn drop(&mut self) {
+        mem::take(self.nodes.get_mut())
+            .into_iter()
+            .for_each(drop_iteratively);
     }
 }
 

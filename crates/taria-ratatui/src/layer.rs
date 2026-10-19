@@ -220,6 +220,19 @@ impl Inner {
     }
 }
 
+impl Drop for Inner {
+    /// Free the trees without recursing: `last_raw` is the tree as built,
+    /// which can be deeper than the call stack.
+    fn drop(&mut self) {
+        for tree in [self.last_raw.take(), self.last_root.take()]
+            .into_iter()
+            .flatten()
+        {
+            drop_iteratively(tree);
+        }
+    }
+}
+
 /// One agent input on its way from a connection's reader thread to the app.
 ///
 /// The generation tags the connection it arrived on, so an input queued by a
@@ -848,23 +861,23 @@ impl TariaLayer {
     /// at any `seq`. The bound cuts what costs the most first and stops as
     /// soon as the tree fits:
     ///
-    /// 1. the longest values, all down to one shared length, so the biggest
-    ///    shrink first and shorter ones are untouched. A cut value ends in
-    ///    `…`, except that a [`Role::Log`] or [`Role::Terminal`] value keeps
-    ///    its end and starts with `…` instead, because the end is where
-    ///    those grow. A string of 256 bytes of JSON or less is never cut;
-    /// 2. values and labels together, the same way, when values alone are
-    ///    not enough;
-    /// 3. nodes. First any node too large to fit with nothing beside it, one
-    ///    whose id or custom actions alone run over, with everything under
-    ///    it, so that it cannot take its siblings with it. Then the trailing
-    ///    children of the widest nodes, so a list of fifty thousand rows
-    ///    loses its last rows while a status bar beside it keeps its place.
-    ///    Then, shallowest
-    ///    first, as many of those as still fit go back, each node's next
-    ///    children in their order until one does not, so a list keeps its
-    ///    first rows with no gap;
-    /// 4. last, every child of the root, which leaves a root that always
+    /// 1. nodes that could never fit, one whose id or custom actions alone
+    ///    run over, are dropped with everything under them before any string
+    ///    is cut, so that they cost their siblings nothing;
+    /// 2. strings are cut: the longest values first, all down to one shared
+    ///    length, so the biggest shrink first and shorter ones are untouched,
+    ///    then values and labels together, the same way, when values alone
+    ///    are not enough. A cut value ends in `…`, except that a
+    ///    [`Role::Log`] or [`Role::Terminal`] value keeps its end and starts
+    ///    with `…` instead, because the end is where those grow. A string of
+    ///    256 bytes of JSON or less is never cut;
+    /// 3. every node keeps at most one shared number of children, the
+    ///    largest that fits, so a list of fifty thousand rows loses its last
+    ///    rows while a status bar beside it keeps its place;
+    /// 4. shallowest first, the children that cap removed go back while they
+    ///    fit, each parent keeping a run of its first children with no gap,
+    ///    apart from a node that could never fit;
+    /// 5. last, every child of the root, which leaves a root that always
     ///    fits.
     ///
     /// Ids and custom action names are never changed, so whatever an agent
@@ -900,6 +913,10 @@ impl TariaLayer {
     /// tree too large for one line; see [`publish`](Self::publish).
     pub(crate) fn publish_nodes(&mut self, nodes: Vec<Node>) {
         let Some(inner) = self.inner.as_mut() else {
+            // Freed without recursing even here: the tree as built can be
+            // deeper than the call stack, and a disabled layer must not be
+            // the one thing that cannot take it.
+            nodes.into_iter().for_each(drop_iteratively);
             return;
         };
         let mut root = Node::new("app", Role::App)
@@ -916,8 +933,12 @@ impl TariaLayer {
         // but the tree. So the same tree would be cut to the same snapshot,
         // the one already sent, and skipping the work changes nothing but
         // what it costs, which for a tree too large for the line is the
-        // whole bound on every frame the app draws.
+        // whole bound on every frame the app draws. The tree as built is
+        // freed without recursing, here and wherever else the layer lets go
+        // of one, because the depth cut below exists for trees deeper than
+        // the call stack, and the drop glue `Node` derives recurses.
         if inner.is_newest_frame(&mut root) {
+            drop_iteratively(root);
             return;
         }
 
@@ -954,7 +975,9 @@ impl TariaLayer {
             tree.focused = !focused_below(&tree);
             Some(bounded)
         };
-        inner.last_raw = raw;
+        if let Some(replaced) = mem::replace(&mut inner.last_raw, raw) {
+            drop_iteratively(replaced);
+        }
 
         // Compared again once cut: a tree that changed only past a cut, a
         // draft typed into beyond what fits, is cut to the snapshot already
@@ -1012,9 +1035,12 @@ impl Drop for TariaLayer {
     /// starting, however large it is and however the bridge reads, no other
     /// line but the queued acks is started after it, and those get
     /// `SHUTDOWN_FLUSH`. So dropping never takes longer than `ACCEPT_POLL` +
-    /// `WRITE_TIMEOUT` + `SHUTDOWN_FLUSH`, about 5.3 s, and takes more than a
-    /// few milliseconds only against a bridge too slow to take the line it is
-    /// being sent.
+    /// `WRITE_TIMEOUT` + `SHUTDOWN_FLUSH`, about 5.3 s, and takes longer than
+    /// one `ACCEPT_POLL` only against a bridge too slow to take the line it
+    /// is being sent.
+    ///
+    /// The trees the layer still holds are freed without recursing, because
+    /// the one the newest frame built can be deeper than the call stack.
     fn drop(&mut self) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -1298,6 +1324,21 @@ fn same_node(a: &mut Node, b: &mut Node) -> bool {
     same
 }
 
+/// Free a tree one node at a time.
+///
+/// The drop glue [`Node`] derives frees a node's children before the node,
+/// by recursing, so a tree deeper than the call stack aborts the process
+/// when it is dropped: not a panic that unwinds, a stack overflow. Every
+/// tree this crate lets go of before the depth cut goes through here
+/// instead. Each node is freed with its children moved out to a list of
+/// their own, so a chain holds one node there at a time.
+pub(crate) fn drop_iteratively(root: Node) {
+    let mut pending = vec![root];
+    while let Some(mut node) = pending.pop() {
+        pending.append(&mut node.children);
+    }
+}
+
 /// `node` without its children, copied without copying them.
 fn shallow_copy(node: &mut Node) -> Node {
     let children = mem::take(&mut node.children);
@@ -1423,8 +1464,9 @@ fn serve_client(
 ) -> io::Result<()> {
     // SO_SNDTIMEO is shared across the duplicated fds; only writes block long
     // enough to need it. Every line sets it again before each of its writes,
-    // from its own deadline (see `write_all_before`); this is the bound on
-    // any write that does not.
+    // from its own deadline (see `write_all_before`), so after the first line
+    // it stays at `WRITE_WAIT` or less, and this value governs no write: it
+    // only means the socket never starts out with no timeout at all.
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
     // Capture the snapshot and epoch atomically so the writer loop neither
@@ -2534,14 +2576,6 @@ mod tests {
         focused_below(root)
     }
 
-    /// Drop a tree too deep for the recursive drop glue, one node at a time.
-    fn drop_iteratively(root: Node) {
-        let mut pending = vec![root];
-        while let Some(mut node) = pending.pop() {
-            pending.append(&mut node.children);
-        }
-    }
-
     /// The tree as built is compared, searched for focus and copied before
     /// the depth cut, so none of the three may recurse: the tree the cut
     /// exists for can be deeper than the call stack.
@@ -2568,6 +2602,58 @@ mod tests {
         for tree in [deep, same, other] {
             drop_iteratively(tree);
         }
+    }
+
+    /// Run `test` on a thread with a stack far smaller than a recursive drop
+    /// of a 100k-deep tree needs, so a recursion anywhere in it overflows
+    /// however large the test thread's own stack happens to be. A stack
+    /// overflow aborts the process rather than failing the test, so this is
+    /// what makes such a regression fail every time instead of now and then.
+    fn on_a_small_stack(test: impl FnOnce() + Send + 'static) {
+        let outcome = thread::Builder::new()
+            .name("small-stack".into())
+            .stack_size(512 * 1024)
+            .spawn(test)
+            .expect("spawn a test thread")
+            .join();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The derived drop glue of [`Node`] recurses, so every tree the layer
+    /// lets go of before the depth cut is freed one node at a time: the
+    /// frame drawn unchanged, the tree as built that a changed frame
+    /// replaces, the one the layer holds when it is dropped, and whatever a
+    /// disabled layer or an unpublished frame is handed. Publishing a tree
+    /// deeper than the call stack succeeded before this, and the next
+    /// publish aborted the process.
+    #[test]
+    fn a_tree_deeper_than_the_call_stack_is_freed_without_recursing() {
+        const DEEP: usize = 100_000;
+        on_a_small_stack(|| {
+            let mut layer = bind_test_layer("taria-layer-", "deepfree");
+            layer.publish([chain(DEEP)]);
+            // Drawn again unchanged: the frame's own tree is freed.
+            layer.publish([chain(DEEP)]);
+            assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+            // A different one, which the depth cut makes the snapshot already
+            // sent: the tree as built that it replaces is freed all the same.
+            layer.publish([chain(DEEP + 1)]);
+            assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+            // And one that is a new snapshot.
+            layer.publish([chain(DEEP), Node::new("new", Role::Text)]);
+            assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
+            assert_eq!(layer.truncated_snapshots(), 2);
+            // A frame recorded and never published is freed with it.
+            layer.frame().push(chain(DEEP));
+            // And the layer frees the one it still holds.
+            drop(layer);
+
+            let mut disabled =
+                TariaLayer::disabled("deepfree", PathBuf::new(), io::Error::other("test"));
+            disabled.publish([chain(DEEP)]);
+        });
     }
 
     /// Only the branches that run over are cut. A wide tree with one runaway
@@ -2704,15 +2790,12 @@ mod tests {
     #[test]
     fn a_size_bound_that_drops_the_only_focused_node_leaves_focus_on_the_root() {
         let mut layer = bind_test_layer("taria-layer-", "bigfocus");
-        // The focused row is the last, and a little longer than the rest:
-        // the bound takes back any dropped row that still fits in what the
-        // others leave, which is always less than one row.
+        // The focused row is the last, and a list keeps a run of its first
+        // rows, so it is the first row to go.
         let rows = (0..60_000).map(|n| {
-            let focused = n == 59_999;
-            let note = if focused { " (selected)" } else { "" };
             Node::new(format!("row-{n:05}"), Role::ListItem)
-                .label(format!("Task {n:05}{note}"))
-                .focused(focused)
+                .label(format!("Task {n:05}"))
+                .focused(n == 59_999)
         });
         layer.publish([Node::new("list", Role::List).children(rows)]);
 
@@ -2725,6 +2808,46 @@ mod tests {
             "the focused row was dropped, so the root has to carry focus"
         );
         assert!(!subtree_has_focus_below_root(&root));
+    }
+
+    /// Through the layer, the line a node that could never fit leaves: the
+    /// draft beside it goes out whole, in the line it would have had alone
+    /// plus the chrome. Dropped only after every string was cut to the
+    /// floor, it left a line of 590 bytes with 256 of them the draft.
+    #[test]
+    fn a_node_that_could_never_fit_leaves_the_draft_beside_it_whole() {
+        let mut layer = bind_test_layer("taria-layer-", "unfit");
+        let value = "d".repeat(300_000);
+        let chrome = [
+            Node::new("status", Role::Status).value("1 draft"),
+            Node::new("quit", Role::Button)
+                .label("Quit")
+                .action(taria::Action::Activate),
+        ];
+        let mut nodes = vec![
+            Node::new("I".repeat(2_000_000), Role::Text),
+            draft(value.clone()),
+        ];
+        nodes.extend(chrome.clone());
+        layer.publish(nodes);
+
+        let snapshot = layer.latest_snapshot().expect("published");
+        let ids: Vec<&str> = snapshot
+            .root
+            .children
+            .iter()
+            .map(|child| child.id.0.as_str())
+            .collect();
+        assert_eq!(ids, ["draft", "status", "quit"]);
+        assert_eq!(snapshot.root.children[0], draft(value.clone()));
+        assert_eq!(snapshot.root.children[1..], chrome);
+
+        let alone = line_len(Snapshot::new(1, root_around_draft("unfit", value)));
+        let line = line_len(snapshot);
+        assert!(line > alone && line <= MAX_LINE_BYTES, "{line} of {alone}");
+        let too_large = layer.last_oversize().expect("recorded");
+        assert_eq!(too_large.strings_trimmed(), 0);
+        assert_eq!(too_large.nodes_dropped(), 1);
     }
 
     /// The cost the comparison before the bound exists for. Deduplicating
