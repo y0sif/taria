@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ContentBlock;
-use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{Action, AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
 use taria_mcp::bridge::{self, AppSnapshot, BridgeHandle, BridgeState, LinkState};
 use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer, TypeTextParams};
@@ -130,6 +130,27 @@ impl FakeApp {
             .expect("write to bridge");
     }
 
+    /// Publish a tree whose line is over [`MAX_LINE_BYTES`], the way an app
+    /// with an unbounded draft does once the draft grows past it.
+    ///
+    /// The write is allowed to fail partway: the bridge stops reading at its
+    /// cap and closes the connection, so a broken pipe here is the outcome
+    /// these tests are about rather than a fault in the fake.
+    async fn send_oversized(&mut self, seq: u64) {
+        let mut line = oversized_snapshot_line(seq);
+        line.push('\n');
+        let _ = self.write.write_all(line.as_bytes()).await;
+    }
+
+    /// Wait until the bridge closes this connection.
+    async fn wait_closed(&mut self) {
+        timeout(WAIT, async {
+            while let Ok(Some(_)) = self.lines.next_line().await {}
+        })
+        .await
+        .expect("the bridge should close the connection");
+    }
+
     /// Answer an input, naming the id it was sent under.
     async fn ack(&mut self, id: InputId, status: InputStatus) {
         self.send(&AppToBridge::ack(id, status)).await;
@@ -170,6 +191,24 @@ fn published(parsed: Snapshot) -> AppSnapshot {
         .expect("a snapshot serializes");
     AppSnapshot::from_line(&line, parsed)
 }
+
+/// A snapshot line over [`MAX_LINE_BYTES`]: a well-formed tree whose one text
+/// input holds a value the app never bounded, which is how a real app gets
+/// here. Well-formed on purpose, so the only thing wrong with it is its size.
+fn oversized_snapshot_line(seq: u64) -> String {
+    let root = Node::new("app", Role::App).label("too-big").child(
+        Node::new("draft", Role::TextInput)
+            .value("x".repeat(MAX_LINE_BYTES))
+            .action(Action::SetValue),
+    );
+    let line = serde_json::to_string(&AppToBridge::Snapshot(Snapshot::new(seq, root)))
+        .expect("an oversized snapshot serializes");
+    assert!(line.len() > MAX_LINE_BYTES, "the line must be over the cap");
+    line
+}
+
+/// The words every answer about a line over the cap carries.
+const OVER_THE_LIMIT: &str = "over 1 MiB (1048576 bytes)";
 
 /// Wait until the watch holds a connected snapshot with at least `min_seq`.
 async fn wait_for_snapshot(rx: &mut watch::Receiver<BridgeState>, min_seq: u64) -> AppSnapshot {
@@ -340,6 +379,167 @@ async fn read_tree_names_the_parse_failure_rather_than_the_socket_path() {
     );
 }
 
+/// An app whose very first tree is over the line cap. It greets every bridge
+/// that connects and sends the same tree, so the bridge closes the connection,
+/// backs off, reconnects and is closed again, and an agent polling `read_tree`
+/// lands in every phase of that loop: between attempts with nothing connected,
+/// on a connection just opened, and after a fresh handshake. Each phase had an
+/// answer of its own, and none was the size: "is the socket path correct?",
+/// "worth one retry", an app that "never publishes nodes".
+#[tokio::test]
+async fn read_tree_names_an_oversized_first_snapshot_on_every_reconnect() {
+    let (_dir, path) = test_socket_path("oversized-first");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle);
+
+    let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = accepts.clone();
+    let app = tokio::spawn(async move {
+        while let Ok((stream, _addr)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut app = FakeApp::from_stream(stream);
+            app.send(&AppToBridge::hello("big-app", PROTOCOL_VERSION))
+                .await;
+            app.send_oversized(1).await;
+        }
+    });
+
+    // Until the first overflow the answers are about the connection, which
+    // is right: nothing has been rejected yet.
+    timeout(WAIT, async {
+        loop {
+            let err = server.read_tree().await.expect_err("no tree fits");
+            if err.message.contains(OVER_THE_LIMIT) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the oversized line should reach the tool surface");
+
+    // From then on, every answer names the size, across a span longer than
+    // the bridge's 2 s backoff cap, so it covers several reconnects.
+    let span = Duration::from_millis(2_500);
+    let started = Instant::now();
+    let mut polls = 0;
+    while started.elapsed() < span {
+        let err = server
+            .read_tree()
+            .await
+            .expect_err("a tree over the cap is never served");
+        assert!(
+            err.message.starts_with("no snapshot from the app yet")
+                && err.message.contains(OVER_THE_LIMIT)
+                && err.message.contains("The socket path is right"),
+            "poll {polls}: the size is the answer: {}",
+            err.message
+        );
+        // The last is the rejected-line answer's depth hint, which is about
+        // a line that arrived whole and failed to parse.
+        for wrong in [
+            "is the socket path correct",
+            "worth one retry",
+            "never publishes nodes",
+            "levels deep",
+        ] {
+            assert!(
+                !err.message.contains(wrong),
+                "poll {polls}: `{wrong}` is another state's answer: {}",
+                err.message
+            );
+        }
+        polls += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let accepted = accepts.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        accepted >= 3,
+        "the span must cover reconnects, but the app accepted {accepted} connections"
+    );
+    app.abort();
+}
+
+/// An app that overflowed and then went away, taking its listener with it.
+/// The size answer says the app is running and resends the tree on every
+/// reconnect, and that nothing the agent sends can fix it. Kept after the app
+/// exits, it held an agent to that story about an app that was gone, until
+/// some app sent a tree that fit. A connect that finds nothing listening is
+/// the bridge's evidence the app has gone, and the plain departure answer
+/// takes over from it.
+///
+/// `unlink` picks how the app leaves: removing its socket file (`connect`
+/// finds no file) or leaving it behind, the way a crash does (`connect` is
+/// refused).
+async fn forgets_the_size_once_the_app_is_gone(name: &str, unlink: bool) {
+    let (_dir, path) = test_socket_path(name);
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before-paste"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+    app.send_oversized(2).await;
+    app.wait_closed().await;
+
+    // The size is recorded while the app is still there: the bridge's
+    // reconnect lands in the listener's backlog.
+    let opening = "app 'fake-app' disconnected (last snapshot seq 1); ";
+    timeout(WAIT, async {
+        loop {
+            let err = server.read_tree().await.expect_err("no tree fits");
+            if err.message.starts_with(opening) && err.message.contains(OVER_THE_LIMIT) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the oversized line should reach the tool surface");
+
+    drop(app);
+    drop(listener);
+    if unlink {
+        std::fs::remove_file(&path).expect("remove the app's socket file");
+    }
+
+    // The backlogged connection is reset with the listener, and the next
+    // connect finds nothing listening, so this is one backoff away.
+    let plain = "app 'fake-app' disconnected (last snapshot seq 1); it may have exited. The \
+                 bridge reconnects automatically; retry once the app is back.";
+    let err = timeout(WAIT, async {
+        loop {
+            let err = server.read_tree().await.expect_err("the app is gone");
+            if !err.message.contains(OVER_THE_LIMIT) {
+                return err;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the size should be forgotten once nothing listens");
+    assert_eq!(err.message, plain);
+
+    // And it stays forgotten across the failed reconnects that follow: nothing
+    // is there to send the tree again.
+    for poll in 0..10 {
+        let err = server.read_tree().await.expect_err("the app is gone");
+        assert_eq!(err.message, plain, "poll {poll}");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+}
+
+#[tokio::test]
+async fn read_tree_forgets_the_size_once_the_app_removed_its_socket() {
+    forgets_the_size_once_the_app_is_gone("oversized-then-unlinked", true).await;
+}
+
+#[tokio::test]
+async fn read_tree_forgets_the_size_once_the_app_left_a_stale_socket() {
+    forgets_the_size_once_the_app_is_gone("oversized-then-stale", false).await;
+}
+
 /// A message whose `type` this bridge has no variant for is additive under the
 /// freeze, so it must be ignored like an unknown enum variant, not reported as
 /// a malformed line. Regression for the v0.1 review: an internally tagged enum
@@ -405,15 +605,15 @@ async fn read_tree_ignores_an_unknown_future_message_type() {
 }
 
 /// The state that stopped the first agent to meet this project before it
-/// could try anything: a bridge whose `connect` succeeded onto a socket
-/// nobody was ever going to accept it from.
+/// could try anything: a bridge whose `connect` succeeded onto a socket that
+/// was not going to accept it while another bridge held the app.
 ///
 /// The adapter serves one bridge at a time, so a second bridge's connection is
-/// completed by the kernel into the listen backlog and then left unread: no
-/// handshake, no snapshot, and the same "is the socket path correct?" an app
-/// that was never started gets. Both answers were yes, and the real cause was
-/// another session's `taria-mcp` still holding the app. The bridge knows its
-/// own connect succeeded, which is the whole difference.
+/// completed by the kernel into the listen backlog and left unread until the
+/// first bridge leaves: no handshake, no snapshot, and the same "is the socket
+/// path correct?" an app that was never started gets. Both answers were yes,
+/// and the real cause was another session's `taria-mcp` still holding the app.
+/// The bridge knows its own connect succeeded, which is the whole difference.
 #[tokio::test]
 async fn read_tree_names_a_connection_the_app_never_accepted() {
     let (_dir, path) = test_socket_path("never-accepted");
@@ -606,6 +806,58 @@ async fn act_reports_an_app_that_went_away_after_taking_the_input() {
     );
 
     exit.await.expect("fake app task");
+}
+
+/// The input that pushed the tree over the cap: the app acks it and publishes
+/// the tree it led to, which the bridge closes the connection over. The app
+/// never went anywhere, so "may have exited, possibly because of this input"
+/// sends the agent to wait for an app that is running and will resend the
+/// same tree to every reconnect. The answer names the size instead, and stays
+/// a result: the input's fate is known.
+#[tokio::test]
+async fn act_names_the_oversized_tree_that_followed_the_input() {
+    let (_dir, path) = test_socket_path("act-then-oversized");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle.clone());
+
+    let app = FakeApp::accept(&listener, Snapshot::new(4, demo_root("before-paste"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 4).await;
+
+    // The listener is handed back rather than dropped, like a running app's:
+    // the bridge's reconnect lands in its backlog and is not answered inside
+    // the call's window.
+    let paste = tokio::spawn(async move {
+        let mut app = app;
+        app.recv_input().await;
+        app.send_oversized(5).await;
+        (app, listener)
+    });
+
+    let result = server
+        .act(Parameters(ActParams {
+            node: "input".to_string(),
+            action: "set_value".to_string(),
+            value: Some("a long paste".to_string()),
+        }))
+        .await
+        .expect("an input the app acknowledged is not a failed call");
+    let text = result_text(&result);
+    assert!(
+        text.starts_with("The app acknowledged this input and then disconnected: ")
+            && text.contains("app 'fake-app' (last snapshot seq 4) is gone"),
+        "the opening every acknowledged departure has: {text}"
+    );
+    assert!(
+        text.contains(OVER_THE_LIMIT) && text.contains("The bridge closed the connection"),
+        "the report must name the size as the cause: {text}"
+    );
+    assert!(
+        !text.contains("may have exited"),
+        "the app did not exit: {text}"
+    );
+
+    paste.await.expect("fake app task");
 }
 
 /// An app that never reads its socket: no ack, no snapshot. The result must
@@ -1513,7 +1765,7 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
 
 #[tokio::test]
 async fn newline_free_flood_disconnects_the_app_connection() {
-    let (_dir, listener, mut handle, _server) = setup("line-flood").await;
+    let (_dir, listener, mut handle, server) = setup("line-flood").await;
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("pre-flood"))).await;
     wait_for_snapshot(&mut handle.state_rx, 1).await;
 
@@ -1527,6 +1779,127 @@ async fn newline_free_flood_disconnects_the_app_connection() {
         }
     }
     wait_for_disconnect(&mut handle.state_rx).await;
+
+    // And says why: the bridge closed the connection over the line's size,
+    // which "it may have exited" would have put down to the app.
+    let err = server
+        .read_tree()
+        .await
+        .expect_err("no tree after the connection broke");
+    assert!(
+        err.message
+            .starts_with("app 'fake-app' disconnected (last snapshot seq 1); ")
+            && err.message.contains(OVER_THE_LIMIT),
+        "read_tree must name the line limit: {}",
+        err.message
+    );
+}
+
+/// An app that served a tree and then outgrew the cap. Every tool keeps the
+/// opening a disconnect has, and names the size where "it may have exited"
+/// used to be, including after the reconnect that greets the bridge and sends
+/// the same tree again: the handshake is not a tree, and must not clear it.
+#[tokio::test]
+async fn a_tree_that_outgrows_the_cap_is_named_by_every_tool() {
+    let (_dir, path) = test_socket_path("outgrown");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle.clone());
+
+    let mut app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("small"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 3).await;
+    app.send_oversized(4).await;
+    wait_for_disconnect(&mut handle.state_rx).await;
+
+    // The bridge reconnects at once after a connection that delivered a tree,
+    // and a running app resends its latest one.
+    let (stream, _addr) = timeout(WAIT, listener.accept())
+        .await
+        .expect("the bridge should reconnect")
+        .expect("accept");
+    let mut again = FakeApp::from_stream(stream);
+    again
+        .send(&AppToBridge::hello("fake-app", PROTOCOL_VERSION))
+        .await;
+    again.send_oversized(4).await;
+    again.wait_closed().await;
+
+    let read_err = server
+        .read_tree()
+        .await
+        .expect_err("read_tree has no tree to serve");
+    let act_err = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect_err("act must refuse while the tree does not fit");
+    for err in [&read_err, &act_err] {
+        assert!(
+            err.message
+                .starts_with("app 'fake-app' disconnected (last snapshot seq 3); "),
+            "the disconnect opening stays: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(OVER_THE_LIMIT) && err.message.contains("on every reconnect"),
+            "the size is the cause, and it repeats: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("may have exited"),
+            "the app did not exit: {}",
+            err.message
+        );
+    }
+    drop(app);
+}
+
+/// The size is a reason for as long as the tree is too big, and no longer. A
+/// tree that fits again is served and clears it, so a later plain disconnect
+/// reads as the departure it is, not as the old size.
+#[tokio::test]
+async fn a_tree_that_fits_again_clears_the_size_from_the_next_disconnect() {
+    let (_dir, path) = test_socket_path("refits");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path);
+    let server = TariaMcpServer::new(handle.clone());
+
+    let mut app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("small"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 3).await;
+    app.send_oversized(4).await;
+    wait_for_disconnect(&mut handle.state_rx).await;
+    let err = server
+        .read_tree()
+        .await
+        .expect_err("no tree while it does not fit");
+    assert!(err.message.contains(OVER_THE_LIMIT), "{}", err.message);
+
+    // The app bounds its draft and publishes a tree that fits.
+    let refit = FakeApp::accept(&listener, Snapshot::new(5, demo_root("bounded"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 5).await;
+    let tree = server
+        .read_tree()
+        .await
+        .expect("a tree that fits is served");
+    assert!(result_text(&tree).contains("bounded"), "{tree:?}");
+
+    // Then exits.
+    drop(refit);
+    wait_for_disconnect(&mut handle.state_rx).await;
+    let err = server
+        .read_tree()
+        .await
+        .expect_err("no tree after the app went");
+    assert_eq!(
+        err.message,
+        "app 'fake-app' disconnected (last snapshot seq 5); it may have exited. The bridge \
+         reconnects automatically; retry once the app is back.",
+        "a plain departure must not inherit the old size"
+    );
+    drop(app);
 }
 
 /// Simulate an app restart mid-`act`: the fake app receives the input, then

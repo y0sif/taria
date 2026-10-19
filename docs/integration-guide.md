@@ -33,7 +33,7 @@ has the details and a lint that catches it.
 
 ## Add the dependency
 
-Both crates are on crates.io, at version `0.3.0`.
+Both crates are on crates.io, at version `0.3.1`.
 
 ```bash
 cargo add taria-ratatui
@@ -434,9 +434,10 @@ snapshot, the agent has been told a truth it cannot check.
 
 ## Watch your publish rate
 
-Identical trees are deduped: a frame whose nodes match the previous publish
-is skipped entirely and `seq` does not move. Publishing every frame is
-therefore free, but only for as long as the tree actually holds still.
+Identical trees are deduped: a frame whose nodes match the previous frame's
+is skipped before anything is cut or measured, and `seq` does not move.
+Publishing every frame therefore costs one comparison, but only for as long
+as the tree actually holds still.
 
 A live metric defeats it. A words-per-minute counter carried to four
 decimals puts a new string in the tree on every frame, so every frame
@@ -500,6 +501,61 @@ invites the obvious one, a browser over a deep directory. Publish the expanded
 path rather than the whole structure. That is what a tree widget draws anyway,
 the rows a person can currently see, and it makes the snapshot the size of the
 screen instead of the size of the data behind it.
+
+## Keep the snapshot small enough to arrive
+
+A snapshot travels as one line, and a bridge reads a line up to a fixed size
+and no further. Past that it cannot find where the next message starts, so it
+closes the connection. Closing fixes nothing: the bridge reconnects, the
+adapter sends it the latest snapshot, which is the same one, and the bridge
+closes that connection too, for as long as the tree stays that large. The
+bridge names the limit, but only the app can bring its tree within it.
+
+`taria::wire::MAX_LINE_BYTES` is 1 MiB, 1048576 bytes, not counting the
+newline. Both peers enforce it.
+
+The adapter trims every snapshot to fit at publish, after the depth cut, and
+stops as soon as the tree fits. A node that could never fit goes first, with
+everything under it; its siblings are not dropped with it. Then the longest
+values are cut to one shared length, then labels with them; a string of 256
+bytes of JSON or less is never cut. A cut is marked with `…`: a `Role::Log` or
+`Role::Terminal` value keeps its end, because that is where those grow, and
+every other string keeps its start. When more nodes have to go, a list keeps
+its first rows with no gap, and the strings left are cut only as far as the
+smaller tree needs. Rows are chosen as if every string were at the floor, so a
+draft beside a list that had to lose rows ends up near the floor too; it stays
+whole only when the nodes that went were what ran over.
+Ids and custom action names are never touched, so an agent can still act on
+whatever it reads. The stages are in `architecture.md` (Snapshot size). The
+tree is trimmed rather than withheld for the reason it is cut for depth: a
+publish that does not happen leaves the agent on a stale tree.
+
+A frame identical to the one before it is skipped before the trim. A changed
+tree is compared again after it, so an edit past the cut of a trimmed value
+sends nothing new: the agent already has that tree.
+
+You are told, because you are the only one who can fix it:
+
+```rust
+let trimmed = layer.oversized_snapshots();
+if let Some(last) = layer.last_oversize() {
+    // Names the line's size and the node holding the longest string,
+    // which is where to look.
+    eprintln!("my-app: {trimmed} snapshot(s) trimmed to fit one line: {last}");
+}
+```
+
+Both `oversized_snapshots()` and `truncated_snapshots()` count snapshots, not
+frames, so a tree that stays too large while the app redraws it counts once.
+
+Nothing laid out by hand comes near this; the demo's whole tree is under
+8 KB. The trees that reach it hold data that grows: a draft someone keeps
+typing into, a log nobody capped, a chat transcript, a list holding every row.
+Bound those yourself. Publish the tail of a log, or the lines its pane shows;
+cap a draft or a transcript at what an agent needs to read; publish the rows
+on screen. The adapter's bound is a guard, not a way to publish: a tree over
+the limit is cut again on every frame that changes it, which for a draft
+someone is typing into is every keystroke.
 
 ## The raw inputs, and what they are for
 
@@ -770,12 +826,13 @@ let dropped = layer.dropped_inputs();
 if dropped > 0 {
     eprintln!("my-app: dropped {dropped} agent input(s): could not keep up");
 }
-// Inputs discarded because the bridge connection they arrived on ended
-// first. Nothing on the agent side is left to hear about these, so the
-// person running the app is the only one who can.
+// Inputs discarded because they were not aimed at a live session: the
+// bridge connection they arrived on ended first, or a waiting client wrote
+// them before its session began. Nothing on the agent side is left to hear
+// about these, so the person running the app is the only one who can.
 let stale = layer.stale_inputs();
 if stale > 0 {
-    eprintln!("my-app: discarded {stale} agent input(s): bridge went away");
+    eprintln!("my-app: discarded {stale} agent input(s): no live session");
 }
 // Inputs whose kind this build of taria cannot read. The layer acked each
 // one `Ignored` for you, so the agent was told; the version gap is yours.
@@ -795,8 +852,12 @@ if acks > 0 {
 All four are monotonic across reconnects and all four are 0 on a disabled
 layer. The input queue holds 256, so a nonzero `dropped_inputs` means an agent
 outpaced the loop by a lot; a loop that only wakes on keyboard events gets
-there first. A nonzero `stale_inputs` means a bridge session ended with input
-still queued, which a harness restart mid-call will do. A nonzero
+there first. A nonzero `stale_inputs` means one of two things. A bridge
+session ended with input still queued, which a harness restart mid-call will
+do. Or a second client wrote input while it waited for the first to leave,
+before the app's `hello` reached it; that input was thrown away unacked,
+because its writer had seen no tree. taria-mcp never does this: its input
+tools refuse to send before the app's first snapshot. A nonzero
 `unknown_inputs` means the bridge is built against a newer taria than the app,
 and the agent is asking for something this build has no way to do.
 

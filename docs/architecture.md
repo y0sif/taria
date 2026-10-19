@@ -50,14 +50,18 @@ and an input the app deliberately dropped looks like a slow one.
   for the lifetime of its process. An ack can outlive the connection it was
   sent on, so ids that never repeat are what stop a dead app's ack from
   answering a live input. A process-wide counter satisfies this.
-- Line cap: both sides refuse incoming lines over 1 MiB and treat the
-  connection as broken rather than buffering without bound.
+- Line cap: both sides refuse incoming lines over 1 MiB
+  (`taria::wire::MAX_LINE_BYTES`) and treat the connection as broken rather
+  than buffering without bound. The adapter trims every snapshot to fit; see
+  Snapshot size below.
 - `seq`: increments per published snapshot within one app run. It resets
   when the app restarts, so the bridge detects change by comparing whole
   snapshots, not by `seq` ordering. `seq` signals staleness only within one
   connection.
-- Dedup: a frame whose tree is identical to the previous publish is skipped
-  entirely; `seq` does not move.
+- Dedup: a frame whose tree is the one the previous frame built is skipped
+  before anything is cut or measured, and a frame whose cut tree is the
+  snapshot already sent is skipped after the cut. Either way `seq` does not
+  move.
 - `focused`: serialized on every node and accepted when absent, where absence
   reads as `false`. Nothing on the wire moves today; what the pairing buys is
   that omitting the field for the nodes that are not focused stays an additive
@@ -80,7 +84,9 @@ bridge saying it has no tree while the app is connected and healthy, and a
 deep later snapshot leaves it serving the last shallow tree with nothing
 marking it stale. Writing is worse than reading: serialization recurses per
 level too, and a tree thousands of levels deep exhausts the stack and aborts
-the process from inside a library thread.
+the process from inside a library thread. Freeing one recurses the same way,
+so every tree the adapter lets go of, a branch the cut removed, a frame never
+published or a tree handed to a disabled layer, is freed one node at a time.
 
 `MAX_NODE_DEPTH` is 32, a little under half the measured ceiling, and the
 slack pays for the transport envelope, for a root an adapter adds above the
@@ -91,15 +97,72 @@ nothing, because what to do about a deep tree belongs to the adapter.
 
 The ratatui adapter cuts. Over the limit, every node at the limit publishes
 without its children, per branch, and the app is told through
-`truncated_snapshots()` and `last_truncation()`. Cutting, because the other
-two answers are the same failure: publishing the tree as built puts a line on
-the wire the bridge cannot parse, so it skips it and goes on serving the last
-tree it read, and skipping the publish is that same stale tree chosen
-deliberately. Only the cut still delivers the part of the tree that is fine.
-The app is the peer told about it because the app is the only one that can fix
-it, and the fix is nearly always to publish what the widget draws rather than
-the data behind it: for a deep tree view, the expanded path and the rows on
-screen.
+`truncated_snapshots()` and `last_truncation()`. The count is of snapshots
+sent, not frames drawn, so a deep tree that sits still while the app redraws
+it sixty times a second counts once. Cutting, because the other two answers
+are the same failure: publishing the tree as built puts a line on the wire the
+bridge cannot parse, so it skips it and goes on serving the last tree it read,
+and skipping the publish is that same stale tree chosen deliberately. Only the
+cut still delivers the part of the tree that is fine. The app is the peer told
+about it because the app is the only one that can fix it, and the fix is
+nearly always to publish what the widget draws rather than the data behind it:
+for a deep tree view, the expanded path and the rows on screen.
+
+### Snapshot size
+
+A snapshot is one line, and both peers read a line up to
+`taria::wire::MAX_LINE_BYTES`, 1 MiB, and no further. Unlike a deep tree, a
+tree too large does not fail quietly: the reader cannot find where the next
+message starts, so it closes the connection. That loops. The bridge
+reconnects, the adapter greets it and sends the latest snapshot, which is the
+same one, and the bridge closes that connection too, for as long as the app
+holds the tree. One unbounded value is enough: a draft, a log, a transcript.
+
+The bridge keeps the overrun as a reason, across reconnects, until a snapshot
+parses or a connect finds nothing listening at the socket, which means the
+app has gone. So `read_tree` and the input tools say the line was over the
+limit and that only a smaller tree fixes it, instead of that the app may have
+exited, and an app that overran and then exited reads as exited.
+
+The ratatui adapter trims. A frame whose tree is the one the previous frame
+built stops before the bound, so a tree that sits still costs one comparison
+whether or not it fits. A changed tree is bounded at publish, after the depth
+cut, because measuring it serializes it, which recurses, and the cut is what
+keeps that safe. It is measured exactly, by serializing it into a counter
+that keeps nothing, and one over the limit is cut in stages, stopping as soon
+as the tree fits:
+
+1. every node that could never be published goes, with everything under it,
+   and its siblings stay. That is a node whose id, role, actions and strings
+   cut to 256 bytes of JSON cannot fit with only its ancestors beside it;
+2. the longest values, all down to one shared length, then values and labels
+   together, the same way. No string of 256 bytes of JSON or less is cut;
+3. every node keeps at most one shared number of children, the largest that
+   fits. This stage and the next plan as stage 1 does, with every string at
+   that 256-byte floor. Once they have dropped nodes, the kept tree's strings
+   are cut only as far as it needs: not at all if it fits whole, otherwise as
+   in stage 2;
+4. shallowest first, the children that cap removed go back while they fit.
+   Each parent keeps a run of its first children with no gap, apart from a
+   node that could never fit, and a child too large for the room left closes
+   its parent's list;
+5. if all else fails, a bare root, which always fits.
+
+A cut string is marked with `…` (U+2026). A `log` or `terminal` value keeps
+its tail, since that is where those grow; every other string keeps its head.
+Ids and custom action names are never changed, because they are what an agent
+sends back: a node it can read but not address is worse than one it cannot
+read at all. Focus is decided after the bound, since a dropped row can be the
+focused one. The line is sized for the largest possible `seq`, so the same
+tree is always cut the same way and dedup still works on it: an edit past the
+cut of a trimmed value produces the tree already sent, and nothing goes out.
+
+The app is told through `oversized_snapshots()` and `last_oversize()`, whose
+`SnapshotTooLarge` carries the size the line would have had and the node
+holding the longest string, ids and custom action names included. Like
+`truncated_snapshots()`, the count is of snapshots sent, not frames drawn.
+Trimming rather than withholding, for the reason the depth cut gives: a
+withheld tree leaves the agent on a stale one.
 
 ### Key strings
 
@@ -342,6 +405,11 @@ known fate, so an app that takes it and exits is reported and not raised.
 Raised, it made every caller that branches on the flag read a working `quit`
 as a failed call, and the prose saying otherwise did not help them.
 
+When the bridge itself closed the connection, over a line past the cap, both
+departure answers keep their opening and change their reason: the app did not
+exit, its next tree was too large, and it resends that tree on every
+reconnect, so nothing the agent sends can fix it.
+
 An adapter that sends no acks at all still works, which is what the last two
 rows are for.
 
@@ -426,7 +494,9 @@ App side (`TariaLayer::bind`, or `bind_or_disabled`):
    during startup, which is the one thing taria promises never to do.
 5. Bind, and serve one client at a time from a listener thread. Each
    connection gets the `hello` plus the latest snapshot, then streams every
-   new publish. The listener socket is non-blocking and the thread polls a
+   new publish. Whatever a client that waited behind the previous session
+   wrote before its `hello` is discarded first (see One connection owns its
+   inputs). The listener socket is non-blocking and the thread polls a
    shutdown flag every 50 ms rather than parking in `accept()`: waking a
    parked `accept()` by connecting to the socket path fails exactly when it
    matters, because by then the path may hold a socket another process bound,
@@ -435,6 +505,12 @@ App side (`TariaLayer::bind`, or `bind_or_disabled`):
    only while that file is still the one this layer bound, compared by device
    and inode: a second instance that took the path over is serving a socket of
    its own there, and unlinking it would leave that instance unreachable.
+   Before a connected bridge's connection closes, the acks still queued are
+   written, so an app that answers an input and exits in the same frame does
+   not leave the agent told that input's fate is unknown; a snapshot still
+   waiting is not sent, because it describes a UI about to be gone. The flush
+   gets 250 ms in all, so a drop takes at most one 50 ms poll, the 5 s the
+   line being written may take, and that 250 ms.
 
 `bind_or_disabled` turns any of those failures into an inert layer instead
 of an error, so taria can never stop an app from starting. Every method
@@ -452,29 +528,36 @@ Bridge side (`taria-mcp`):
    backoff growing instead of resetting it.
 2. On disconnect, the watch flips to `Disconnected`, keeping the app label
    and the last `seq`, so tool calls fail fast with an error that says which
-   app went away instead of acting on a stale tree.
+   app went away instead of acting on a stale tree. When the bridge closed the
+   connection itself, over a line past the cap, the error says that instead
+   of "it may have exited": the app is still running, and sends the same line
+   on every reconnect. Once a connect finds nothing listening, the app is
+   gone, and the error says "it may have exited" again.
 3. On reconnect, inputs queued while disconnected are discarded, and the
    peer's `protocol_version` is forgotten so the next connection is not
    judged by the previous app's handshake.
-4. Lines it could not read are kept, one at a time, with the reason.
+4. Lines it could not read are kept, one at a time, with the reason. A line
+   over the cap is kept as a fixed reason that survives reconnects, until a
+   snapshot parses or a connect finds nothing listening.
 5. Its own `connect` is published too: whether a connection is open, and
    since when.
 
-Those last two exist for the same reason. "No snapshot yet" is four states
+Those last two exist for the same reason. "No snapshot yet" is five states
 wearing one name, and the bridge holds the facts that separate them:
 
 | What is true | What `read_tree` says |
 |---|---|
+| A line ran past the 1 MiB cap and the bridge closed the connection over it | The socket path is right, so the tree is what is wrong: it is over the line limit, the app resends it on every reconnect, and only a smaller tree fixes it. Outranks every row below, since each reconnect greets the bridge and then overflows again. |
 | A line arrived and could not be read | The app found the socket, so the line is what is wrong; the reason is quoted, and the two things that produce it named (a tree past `MAX_NODE_DEPTH`, an app built against a taria whose snapshot shape differs from this bridge's). |
 | The peer greeted this bridge and published nothing | The app is connected; what is missing is the tree. An app that binds the layer and never publishes nodes looks exactly like this. |
 | A connection is open and nobody has said a word on it (past a 500 ms grace) | The path is not what is wrong. An adapter greets a bridge the moment it accepts one and serves one at a time, so this is the second bridge's view of a socket another one is holding, usually a `taria-mcp` left running by an earlier session. |
 | Nothing is connected | Is the app running, and is the socket path correct? |
 
-All four used to be answered by asking whether the socket path was right,
+All of them used to be answered by asking whether the socket path was right,
 which is the first wrong turn a retrofit takes and the first wall a new agent
-hits: in both of the middle cases the bridge is connected to that path. The
-input tools ask for a tree before they send anything, so they carry whichever
-of these applies rather than a second vocabulary for it.
+hits: in every row but the last, the bridge reached something listening at
+that path. The input tools ask for a tree before they send anything, so they
+carry whichever of these applies rather than a second vocabulary for it.
 
 An ack whose `status` this build cannot name fails its whole line, id
 included, so the app answering an input is indistinguishable at the bridge
@@ -506,6 +589,25 @@ discard is deliberately not acked: the peer that would read the ack is the
 one that left. The bridge drops its own queue on reconnect for the
 mirror-image reason, so both sides agree.
 
+A waiting client's inputs start after its `hello`. A client that connects
+while another is served waits in the listen backlog (the kernel's queue of
+connections not yet accepted), and whatever it writes there sits in the
+kernel's buffer until its turn. That client has seen no tree, so nothing it
+wrote can be a reply to one. So for a client that was already waiting when the
+previous session ended, the adapter reads off what is waiting just before the
+`hello` goes out and throws it away, unacked, counting each complete `input`
+line in `stale_inputs()`. If that read stops partway through a line, the rest
+of the line is skipped when it arrives. More than 1 MiB waiting breaks the
+connection, like a line that long.
+
+A client that waited behind nobody keeps what it wrote: the first connection
+of a process, and one that connects to an idle app, such as a script that
+connects and writes at once. The listener tells the two apart by whether an
+accept has found the backlog empty since the last session ended, so a client
+that connects the instant a session ends counts as one that waited. taria-mcp
+is never affected: its input tools refuse to send before the app's first
+snapshot.
+
 The same ownership decides who may still be answered. `ack` refuses an id
 whose connection has ended, because ids are unique only within a bridge
 process: a fresh bridge counts from the start again, so an id an app held
@@ -515,26 +617,30 @@ An id also stops being answerable once its own connection has delivered a
 queue's worth of newer inputs past it, which bounds what the layer remembers
 and costs at most a late ack the peer already has to survive.
 
-Guard rails on the app side: a 5 s write timeout drops a peer that stops
-reading, and a bounded input queue (256 entries) drops the newest input,
-acks it `dropped`, and counts it in `dropped_inputs()` instead of blocking
-the socket thread. The ack queue is bounded too, at 1024, and drops from the
-opposite end: the oldest, because an ack answers one specific input and the
-answers an agent is still waiting on are the newest, while the oldest name
-inputs whose waiter has long since timed out. It has to be bounded because a
-bridge that reads steadily but far slower than an agent sends never stalls
-long enough for the write timeout to fire, and would otherwise grow the app's
-memory until the process is killed. Drops are counted in `dropped_acks()`,
-which is a report about the bridge rather than the app: the input was applied
-and the caller was answered nowhere. On the bridge side, an input waits at
-most 500 ms for room in the queue to the app, so a stopped app fails a tool
-call instead of hanging it.
+Guard rails on the app side: every line has 5 s in all to be written, so a
+peer that stops reading, or reads too slowly to take a whole line in that
+time, is dropped; the acks flushed at shutdown get 250 ms in all; and a
+bounded input queue (256 entries) drops the newest input, acks it `dropped`,
+and counts it in `dropped_inputs()` instead of blocking the socket thread.
+The ack queue is bounded too, at 1024, and drops from the opposite end: the
+oldest, because an ack answers one specific input and the answers an agent is
+still waiting on are the newest, while the oldest name inputs whose waiter has
+long since timed out. It has to be bounded because a bridge that reads
+steadily but far slower than an agent sends never stalls long enough for the
+write timeout to fire, and would otherwise grow the app's memory until the
+process is killed. Drops are counted in `dropped_acks()`, which is a report
+about the bridge rather than the app: the input was applied and the caller
+was answered nowhere. On the bridge side, an input waits at most 500 ms for
+room in the queue to the app, so a stopped app fails a tool call instead of
+hanging it.
 
 Four counters in all record agent traffic that went nowhere:
 `dropped_inputs()`, `stale_inputs()`, `unknown_inputs()` and
 `dropped_acks()`. All are monotonic across reconnects, all are 0 on a
 disabled layer, and all are read after the terminal is restored, because the
-layer never prints.
+layer never prints. Two more, `truncated_snapshots()` and
+`oversized_snapshots()`, lose no input: they count trees the agent was handed
+cut (see Tree depth and Snapshot size).
 
 ## Focus contract
 

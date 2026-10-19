@@ -2,11 +2,14 @@
 //! snapshot streaming, agent input, per-input acks, and reconnects, all over a
 //! real Unix domain socket.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -136,6 +139,38 @@ fn publish_single_node(layer: &mut TariaLayer, id: &str) {
     rec.publish();
 }
 
+/// The longest dropping a layer may take while a bridge is connected, as its
+/// doc states it: one `ACCEPT_POLL` nap (50 ms), one `WRITE_TIMEOUT` (5 s)
+/// for the line being written when the shutdown came, and the
+/// `SHUTDOWN_FLUSH` (250 ms). The constants are private to the crate, so they
+/// are spelled out here.
+const DROP_BOUND: Duration = Duration::from_millis(50 + 5_000 + 250);
+
+/// Slack for a loaded machine. Far short of a second `WRITE_TIMEOUT`, which a
+/// timeout on each wait for room, rather than on the line, used to add.
+const DROP_MARGIN: Duration = Duration::from_millis(1_000);
+
+/// Drop `layer` on another thread and return how long it took, failing at
+/// [`DROP_BOUND`] plus [`DROP_MARGIN`] rather than waiting out a regression.
+fn time_drop(layer: TariaLayer) -> Duration {
+    let (tx, rx) = mpsc::channel();
+    let started = Instant::now();
+    thread::spawn(move || {
+        drop(layer);
+        let _ = tx.send(started.elapsed());
+    });
+    let limit = DROP_BOUND + DROP_MARGIN;
+    rx.recv_timeout(limit)
+        .unwrap_or_else(|_| panic!("dropping the layer took longer than {limit:?}"))
+}
+
+/// A tree whose snapshot line is about 900 KB: far more than the socket
+/// buffers between the two ends hold, and short enough of `MAX_LINE_BYTES`
+/// that nothing in it is cut.
+fn publish_900_kb(layer: &mut TariaLayer) {
+    layer.publish([Node::new("draft", Role::TextInput).value("d".repeat(900 * 1024))]);
+}
+
 #[test]
 fn hello_then_snapshots_stream_to_client() {
     let mut layer = bind_layer("stream");
@@ -174,6 +209,66 @@ fn latest_snapshot_is_replayed_on_connect() {
         panic!("expected the latest snapshot right after hello");
     };
     assert_eq!(snapshot.root.children[0].id.0, "pre");
+}
+
+/// The replay above is what made an oversized tree fatal: a bridge drops a
+/// connection whose line runs past `MAX_LINE_BYTES`, reconnects, and is
+/// replayed the same latest snapshot, for as long as the app holds the tree.
+/// So the line a fresh client is sent has to be one it can read, and the
+/// connection has to go on working after it.
+#[test]
+fn an_oversized_tree_is_replayed_as_a_line_the_bridge_can_read() {
+    use taria::wire::MAX_LINE_BYTES;
+
+    let mut layer = bind_layer("oversized");
+    let draft = "d".repeat(MAX_LINE_BYTES + 1);
+    let frame = || {
+        [Node::new("draft", Role::TextInput)
+            .value(draft.clone())
+            .focused(true)]
+    };
+    layer.publish(frame());
+
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+    let mut line = String::new();
+    client.reader.read_line(&mut line).unwrap();
+    let content = line
+        .strip_suffix('\n')
+        .expect("the snapshot is one whole line");
+    assert!(
+        content.len() <= MAX_LINE_BYTES,
+        "{} bytes, over the {MAX_LINE_BYTES} a bridge reads",
+        content.len()
+    );
+    let AppToBridge::Snapshot(snapshot) = serde_json::from_str(content).unwrap() else {
+        panic!("expected the latest snapshot right after hello");
+    };
+    let value = snapshot.root.children[0].value.as_deref().unwrap();
+    assert!(value.ends_with('\u{2026}'), "the cut is marked");
+    assert!(draft.starts_with(value.trim_end_matches('\u{2026}')));
+    assert_eq!(layer.oversized_snapshots(), 1);
+
+    // Still a working connection: an input goes in and its ack comes back.
+    client.send_input(1, key("q"));
+    assert_eq!(poll_try_recv(&layer), Some(key("q")));
+    assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
+
+    // Redrawn unchanged, the tree is not a new snapshot: the next one the
+    // bridge reads is the next change, under the very next seq.
+    for _ in 0..3 {
+        layer.publish(frame());
+    }
+    layer.publish([Node::new("draft", Role::TextInput)
+        .value(format!("x{draft}"))
+        .focused(true)]);
+    let AppToBridge::Snapshot(snapshot) = client.read_message() else {
+        panic!("expected the changed tree");
+    };
+    assert_eq!(snapshot.seq, 2, "the redraws published nothing");
+    let value = snapshot.root.children[0].value.as_deref().unwrap();
+    assert!(value.starts_with('x') && value.ends_with('\u{2026}'));
+    assert_eq!(layer.oversized_snapshots(), 2);
 }
 
 #[test]
@@ -505,15 +600,38 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
     let stream = UnixStream::connect(layer.socket_path()).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     let mut writer = stream.try_clone().unwrap();
+    // The flood starts once the session has: input written before the hello
+    // is discarded unread, which would leave this test counting a race
+    // instead of the queue.
+    let mut reader = BufReader::new(stream);
+    let mut hello = String::new();
+    reader.read_line(&mut hello).unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<AppToBridge>(&hello).unwrap(),
+            AppToBridge::Hello { .. }
+        ),
+        "the handshake is always first"
+    );
+    let (alive_tx, alive_rx) = mpsc::channel();
     let collector = thread::spawn(move || {
-        let mut reader = BufReader::new(stream);
         let mut messages = Vec::new();
         let mut line = String::new();
         loop {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => break, // the layer closed the connection
-                Ok(_) => messages.push(serde_json::from_str::<AppToBridge>(&line).unwrap()),
+                Ok(_) => {
+                    let msg = serde_json::from_str::<AppToBridge>(&line).unwrap();
+                    if matches!(
+                        &msg,
+                        AppToBridge::Snapshot(snapshot) if snapshot.root.children[0].id.0 == "alive"
+                    ) {
+                        // Nobody is listening once the wait below gave up.
+                        let _ = alive_tx.send(());
+                    }
+                    messages.push(msg);
+                }
                 Err(err) => panic!("client read failed: {err}"),
             }
         }
@@ -526,7 +644,15 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
     }
 
     // The socket thread must stay live mid-flood: a publish still streams.
+    // Waited for before the half-close below, not after it: the reader's EOF
+    // ends the connection at once, and the writer sends nothing it has not
+    // sent by then, so a snapshot still behind a backlog of drop acks would
+    // be lost by design rather than by a blocked thread.
     publish_single_node(&mut layer, "alive");
+    assert!(
+        alive_rx.recv_timeout(TIMEOUT).is_ok(),
+        "a publish mid-flood must still reach the client"
+    );
 
     // Half-close the write side: the reader consumes the whole flood, sees
     // EOF, and tears the connection down, which the collector observes as
@@ -555,18 +681,6 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
         layer.dropped_inputs(),
         FLOOD - QUEUE,
         "each dropped input must be counted exactly once"
-    );
-
-    assert!(
-        matches!(messages.first(), Some(AppToBridge::Hello { .. })),
-        "the handshake is always first"
-    );
-    assert!(
-        messages.iter().any(|msg| matches!(
-            msg,
-            AppToBridge::Snapshot(snapshot) if snapshot.root.children[0].id.0 == "alive"
-        )),
-        "a publish mid-flood must still reach the client"
     );
 
     // The drops reach the agent, which used to see nothing at all. Not
@@ -743,6 +857,255 @@ fn a_second_client_waits_until_the_first_is_gone() {
     second.send_input(1, key("j"));
     assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("j")));
     assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
+}
+
+/// What a client writes while it waits its turn is not its session's input.
+///
+/// It sits in the kernel's socket buffer until the first client leaves, and
+/// used to be read then as the new session's first lines, so the app applied
+/// keys a client sent before it had seen any tree at all. Nothing written
+/// before the hello can have been written in reply to it, so all of it is
+/// discarded, counted and never acked, and the session starts with what the
+/// client writes after the hello.
+///
+/// The blind bytes here end partway through a line, cut inside its leading
+/// whitespace, so the remainder the client writes once it is served is a
+/// whole input on its own. Only skipping the rest of the cut line keeps that
+/// one from the app.
+///
+/// A third client waits behind both, and is served the moment the second
+/// leaves, with no gap in which the listener finds nobody waiting. It waited
+/// longer than the second did, so its blind input goes the same way.
+#[test]
+fn input_a_waiting_client_wrote_before_its_hello_never_reaches_the_app() {
+    let mut layer = bind_layer("prehello");
+    publish_single_node(&mut layer, "tree");
+    let mut first = Client::connect(&layer);
+    assert!(matches!(first.read_message(), AppToBridge::Hello { .. }));
+    assert!(matches!(first.read_message(), AppToBridge::Snapshot(_)));
+
+    // Written blind while the first client is served: one whole input, and
+    // the start of another.
+    let mut second = Client::connect(&layer);
+    second.send_input(1, key("q"));
+    second.writer.write_all(b"    ").unwrap();
+    // Queued behind the second, and just as blind.
+    let mut third = Client::connect(&layer);
+    third.send_input(1, key("d"));
+
+    drop(first);
+    assert_eq!(
+        second.read_message(),
+        AppToBridge::hello("prehello", PROTOCOL_VERSION)
+    );
+    assert!(matches!(second.read_message(), AppToBridge::Snapshot(_)));
+
+    // The rest of the cut line, then an input written in reply to the hello.
+    second.send_input(2, key("y"));
+    second.send_input(3, key("j"));
+
+    assert_eq!(
+        layer.recv_timeout(TIMEOUT),
+        Some(key("j")),
+        "neither the blind input nor the rest of the cut line may reach the app"
+    );
+    assert_eq!(
+        second.read_message(),
+        ack(3, InputStatus::Delivered),
+        "nothing is acked for the blind input or the cut line: the first ack \
+         of the session answers the first input written after its hello"
+    );
+    assert_eq!(layer.try_recv(), None, "nothing else was queued");
+    assert_eq!(
+        layer.stale_inputs(),
+        1,
+        "the whole blind input is counted once; the cut line is not counted"
+    );
+    assert_eq!(layer.unknown_inputs(), 0);
+    assert_eq!(layer.dropped_inputs(), 0);
+
+    // The second leaves, and the third, waiting since before the second was
+    // served, is served at once.
+    drop(second);
+    assert_eq!(
+        third.read_message(),
+        AppToBridge::hello("prehello", PROTOCOL_VERSION)
+    );
+    assert!(matches!(third.read_message(), AppToBridge::Snapshot(_)));
+    third.send_input(2, key("k"));
+    assert_eq!(
+        layer.recv_timeout(TIMEOUT),
+        Some(key("k")),
+        "a client served straight after another is drained like it"
+    );
+    assert_eq!(third.read_message(), ack(2, InputStatus::Delivered));
+    assert_eq!(layer.try_recv(), None);
+    assert_eq!(
+        layer.stale_inputs(),
+        2,
+        "the third's blind input is counted"
+    );
+}
+
+/// The discard above is for a client that waited behind another, and only
+/// for one. A client that finds the app idle is accepted within a poll of
+/// connecting, and a script that writes the moment it connects, without
+/// reading the hello first (`printf '...' | socat - UNIX:...`), waited behind
+/// nobody: what it wrote is its session's input, and 0.3.0 applied it.
+#[test]
+fn a_lone_client_that_writes_before_reading_its_hello_keeps_its_input() {
+    let layer = bind_layer("blindlone");
+    let mut client = Client::connect(&layer);
+    // Written at once, almost always before the listener's next poll accepts
+    // the connection, so it is already waiting when the session starts.
+    client.send_input(1, key("j"));
+
+    assert_eq!(
+        client.read_message(),
+        AppToBridge::hello("blindlone", PROTOCOL_VERSION)
+    );
+    assert_eq!(
+        poll_try_recv(&layer),
+        Some(key("j")),
+        "the first connection of a process waited behind nobody"
+    );
+    assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
+    assert_eq!(layer.stale_inputs(), 0, "nothing was discarded");
+}
+
+/// The same for a client that connects once an earlier session is over and
+/// the listener has since found nobody waiting: it connected after that
+/// session ended, so it never waited behind it.
+#[test]
+fn a_client_that_finds_the_app_idle_after_a_session_keeps_its_blind_input() {
+    let layer = bind_layer("blindagain");
+    let mut first = Client::connect(&layer);
+    assert!(matches!(first.read_message(), AppToBridge::Hello { .. }));
+    // Half-close, then read to EOF: the barrier proving the layer is done
+    // with the first connection.
+    first.writer.shutdown(Shutdown::Write).unwrap();
+    let mut line = String::new();
+    while first.reader.read_line(&mut line).unwrap() > 0 {
+        line.clear();
+    }
+    // Five of the listener's polls, so it has looked for a waiting client
+    // since and found none.
+    thread::sleep(Duration::from_millis(250));
+
+    let mut second = Client::connect(&layer);
+    second.send_input(1, key("j"));
+    assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
+    assert_eq!(
+        poll_try_recv(&layer),
+        Some(key("j")),
+        "a client that connected to an idle app waited behind nobody"
+    );
+    assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
+    assert_eq!(layer.stale_inputs(), 0, "nothing was discarded");
+}
+
+/// A common way out of an app answers an input and drops the layer in the
+/// same frame: `q` handled as quit, an input refused on the way out. Nothing
+/// gives the writer a turn in between, so both of that input's acks can still
+/// be queued when the shutdown starts, and they used to be thrown away with
+/// the connection, leaving the agent to time out on an input the app took.
+///
+/// A smoke test, and no proof: the writer may well send both acks before the
+/// drop, and then this passes without any flush at all. The proof is the
+/// `writer_loop` unit tests in `layer.rs`, which put the acks and the
+/// shutdown in place before the writer runs.
+#[test]
+fn acks_queued_as_the_layer_drops_still_reach_the_bridge() {
+    let layer = bind_layer("exitflush");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    client.send_input(1, key("q"));
+    let mut handled = 0;
+    let deadline = Instant::now() + TIMEOUT;
+    while handled == 0 && Instant::now() < deadline {
+        layer.drain_acking(|_| {
+            handled += 1;
+            InputStatus::Ignored
+        });
+        if handled == 0 {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(handled, 1, "the input reaches the app");
+    // At once, with nothing in between to give the writer a turn.
+    drop(layer);
+
+    assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
+    assert_eq!(client.read_message(), ack(1, InputStatus::Ignored));
+    let mut line = String::new();
+    assert_eq!(
+        client.reader.read_line(&mut line).unwrap(),
+        0,
+        "the connection closes after the acks, with nothing else: {line:?}"
+    );
+}
+
+/// `Drop` waits for the writer, and the writer may be partway through a
+/// snapshot line when the shutdown comes. Against a bridge that stopped
+/// reading, a line far larger than the socket buffers fills them and the
+/// write stalls. The stall is bounded per line: a timeout per `write` call
+/// let the first call return its partial count after one timeout and the
+/// next wait out a second, so dropping took over ten seconds.
+#[test]
+fn drop_is_bounded_against_a_bridge_that_stopped_reading_mid_snapshot() {
+    let TestLayer { mut layer, _dir } = bind_layer("stuckdrop");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    // From here on the client reads nothing.
+    publish_900_kb(&mut layer);
+    // Long enough for the writer to be stalled in that line.
+    thread::sleep(Duration::from_millis(100));
+    let took = time_drop(layer);
+    assert!(took <= DROP_BOUND + DROP_MARGIN, "took {took:?}");
+    // Held to here, so the bridge was stuck rather than gone throughout.
+    drop(client);
+}
+
+/// The same bound against a bridge that does read, too slowly for the line:
+/// 64 KB every 3 s. Each wait for room in the socket then ends in a little
+/// progress before its timeout can fire, so a timeout on each wait never
+/// fired at all, and dropping the layer waited for the whole line, over
+/// thirty seconds.
+#[test]
+fn drop_is_bounded_against_a_bridge_that_reads_too_slowly() {
+    let TestLayer { mut layer, _dir } = bind_layer("slowdrop");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let trickle = thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let mut chunk = Vec::with_capacity(64 * 1024);
+            while !stop.load(Ordering::SeqCst) {
+                chunk.clear();
+                match (&mut client.reader).take(64 * 1024).read_to_end(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                for _ in 0..30 {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    });
+
+    publish_900_kb(&mut layer);
+    thread::sleep(Duration::from_millis(100));
+    let took = time_drop(layer);
+    assert!(took <= DROP_BOUND + DROP_MARGIN, "took {took:?}");
+    stop.store(true, Ordering::SeqCst);
+    trickle.join().expect("the slow reader");
 }
 
 #[test]

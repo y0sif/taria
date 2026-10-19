@@ -13,6 +13,99 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [0.3.1] - 2026-10-19
+
+**An app whose tree outgrew one line keeps its bridge.** A snapshot travels as
+one line, and the bridge closes the connection on a line over 1 MiB. The
+adapter wrote snapshots of any size, so an app holding one unbounded value, a
+draft, a log or a transcript, lost its bridge, and again on every reconnect,
+which resends the latest snapshot. The agent was told the app may have exited.
+The adapter now trims every snapshot to fit, and the bridge names the limit.
+
+**A bridge waiting its turn can no longer act on a UI it never saw.** The
+adapter serves one bridge at a time, and a second one waits in the listen
+backlog (the kernel's queue of connections not yet accepted). Input it wrote
+while waiting was applied once the first bridge left. It is now thrown away,
+unacked, before the `hello` goes out. A client that connects to an idle app
+keeps what it writes, as before.
+
+**Answers the app gave on its way out arrive.** An app that answered an input
+and exited in the same frame closed the connection with the answer still
+queued, so the agent was told the input's fate was unknown. The adapter now
+writes the queued acks before it closes, within 250 ms.
+
+Nothing on the wire moved. `PROTOCOL_VERSION` stays 1, and no message or field
+changed. `docs/protocol.md` gains a SHOULD (keep every snapshot within the
+line cap) and a MAY (discard input written before the `hello`), both
+describing what the reference peers do. The MAY answers a question version 1
+had left open (Appendix B item 7), so it is additive. The Rust API only grows.
+All three crates move to 0.3.1 together: they share one workspace version.
+
+### For whoever drives an app
+
+- **A tree over the line limit is named, not mistaken for an exit.** The
+  bridge keeps an overrun as its reason, across reconnects, until a snapshot
+  parses or a connect finds nothing listening at the socket. Until then
+  `read_tree` and every input tool say the snapshot was over 1 MiB (1048576
+  bytes), that the app resends it on every reconnect, and that nothing the
+  agent sends can fix it. An app that overran and then exited reads as exited.
+- **A second bridge is told the app has not accepted it yet**, not that it
+  "never accepted" it: the app does once the first bridge leaves.
+- **An input acked just before an oversized snapshot is not blamed for it.**
+  The answer says the bridge closed the connection, not the app, and why. It
+  opens as before, so a caller matching on the opening reads the same verdict.
+- **A trimmed string says so where it was cut.** A cut value or label ends in
+  `…`, and a `log` or `terminal` value, which keeps its tail, starts with it.
+  Ids and custom action names are never cut, so an agent can still use them.
+- **An edit past the cut of a trimmed value shows no change.** The tree is the
+  one already sent, so nothing new goes out, and the input tool reports the
+  input received with no change.
+- **An advertised `quit` comes back acknowledged.** The ack the app queued as
+  it took the input now reaches the bridge before the connection closes, and
+  so does an `Ignored` it gave on its way out.
+
+### For an app author adopting taria
+
+- **Every snapshot is bounded to fit one line.** An unchanged frame is
+  skipped; a changed one is measured exactly and, if over, cut as
+  `docs/architecture.md` describes. A string of 256 bytes of JSON or less is
+  never cut.
+- **You are told.** `oversized_snapshots()` counts snapshots published
+  trimmed, and `last_oversize()` returns a `SnapshotTooLarge`: the line's size
+  as built, the limit, the strings trimmed and nodes dropped, and the node
+  holding the longest string, ids and custom action names included. The fix is
+  yours: publish a log's tail, cap a draft, publish the rows on screen. The
+  demo prints each snapshot counter at exit when it is nonzero.
+- **`truncated_snapshots()` counts snapshots, as its doc always said.** It
+  counted frames: a deep tree redrawn unchanged at 60 fps added 60 a second.
+  It now counts once per snapshot sent, as `oversized_snapshots()` does.
+- **A tree deeper than the call stack no longer aborts the app.** The depth
+  cut exists for such a tree, but 0.3.0 freed what it cut away, and any tree
+  handed to a disabled layer, by recursing, which overflows the stack. Every
+  tree the adapter lets go of, an unpublished frame included, is now freed
+  one node at a time.
+- **Input a waiting client wrote before its `hello` is discarded**, unacked,
+  and counted in `stale_inputs()`. Only a client that waited in the backlog
+  for the previous session to end is affected; one that waits for the `hello`
+  before writing, as taria-mcp does, loses nothing.
+- **Every line has 5 s in all, and `Drop` is bounded.** In 0.3.0 the 5 s write
+  timeout bounded each wait for room in the socket, not the line, so a bridge
+  reading slowly or not at all could hold a line, and `Drop`, for 10 s or
+  more. A line now goes out in 2 KiB pieces against one 5 s deadline, and a
+  bridge that misses it is dropped. Acks queued at shutdown get 250 ms and a
+  pending snapshot is not sent, so `Drop` takes at most 50 ms + 5 s + 250 ms.
+- **`taria::wire::MAX_LINE_BYTES`** is the 1 MiB limit as a public constant,
+  shared by both reference peers, for a peer or a test that sizes against it.
+
+### The gates
+
+- `scripts/adversarial.py` grows from 20 probes to 22. A stand-in app sends a
+  tree over the line cap, once after a tree was served and once as its first,
+  and every answer has to name the limit.
+- `scripts/e2e.py` grows from 22 steps to 23. Step w types the demo's draft
+  past 1 MiB through `type_text`: the bridge stays up, the draft comes back
+  trimmed, `set_value ""` clears it, and the demo reports the trim at exit.
+
 ## [0.3.0] - 2026-10-19
 
 **`taria-mcp --tree-format outline` serves the tree as an outline.** The
@@ -658,6 +751,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[0.3.1]: https://github.com/y0sif/taria/releases/tag/v0.3.1
 [0.3.0]: https://github.com/y0sif/taria/releases/tag/v0.3.0
 [0.2.1]: https://github.com/y0sif/taria/releases/tag/v0.2.1
 [0.2.0]: https://github.com/y0sif/taria/releases/tag/v0.2.0

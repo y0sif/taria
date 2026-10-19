@@ -71,10 +71,13 @@ exercises macOS end to end. Windows is not supported.
 **Can two agents connect to the same app at once?**
 
 No. The adapter serves one bridge client at a time. A second bridge's
-connection is completed by the kernel and then never served, so it sits there
-receiving no handshake and no snapshot; `read_tree` on that bridge says the
-socket is held by another client rather than sending you back to check the
-path. Multiple simultaneous clients are on the deferred list in
+connection is completed by the kernel and not served until the first client
+leaves, so until then it sits there receiving no handshake and no snapshot;
+`read_tree` on that bridge says the socket is held by another client rather
+than sending you back to check the path. Anything it wrote while it waited is
+thrown away when its turn comes, because it was written before it had seen a
+tree. taria-mcp sends nothing until it has a tree, so a second agent loses
+nothing. Multiple simultaneous clients are on the deferred list in
 `docs/architecture.md`.
 
 **Is the protocol stable?**

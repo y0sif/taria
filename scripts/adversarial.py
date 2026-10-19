@@ -9,7 +9,8 @@ an INFO line for observed-but-debatable behavior.
 
 Some states the demo cannot be driven into honestly -- a peer on another
 protocol version, a snapshot using a role this build has never heard of, an
-app that drops half a burst, an app that stops reading its socket. Those are
+app that drops half a burst, an app that stops reading its socket, a tree
+past the bridge's 1 MiB line cap. Those are
 probed against [`FakeApp`], which speaks the ndjson wire directly, so the
 bridge under test is the real one and only the app is a stand-in.
 
@@ -110,7 +111,7 @@ SILENT_PEER_RE = re.compile(
     r"handshake and no snapshot on it\. A taria adapter greets a bridge the moment it accepts "
     r"one, and serves one bridge at a time, so an open connection that says nothing is what a "
     r"second bridge gets: the kernel completed it into the listen backlog and the app, still "
-    r"serving the first bridge, never accepted it\. The likely cause is another taria-mcp "
+    r"serving the first bridge, has not accepted it\. The likely cause is another taria-mcp "
     r"process holding this app, often one left running by an earlier session; stopping that one "
     r"hands the app to this bridge, which needs no restart of its own\. Failing that, the peer "
     r"at this path wedged before its handshake, or is not a taria adapter at all\.$"
@@ -164,10 +165,11 @@ class FakeApp:
     then does exactly what the probe tells it to: publish a snapshot, ack an
     input, or -- with `read_inputs=False` -- never read its socket at all.
 
-    It exists for the five states `taria-demo` cannot be put into on demand:
+    It exists for the six states `taria-demo` cannot be put into on demand:
     another protocol version, a snapshot using a role and an action this
     build has never heard of, an app that drops part of one burst, an app
-    that stops reading, and -- with `accept=False` -- a socket that is bound
+    that stops reading, a tree past the bridge's line cap (written through
+    [`send_raw`]), and -- with `accept=False` -- a socket that is bound
     and listening and never accepts, which is what a second bridge meets
     while another one holds the app. In every one of them the bridge under
     test is the real binary; only the peer is a stand-in.
@@ -201,8 +203,8 @@ class FakeApp:
             # Bound and listening, and that is all. The bridge's connect
             # succeeds into the listen backlog and nothing is ever read from
             # it or written to it: the adapter serving one bridge at a time
-            # does this to the second one, and there is no way to ask a real
-            # app for it without a second live bridge.
+            # does this to the second one until the first leaves, and there
+            # is no way to ask a real app for it without a second live bridge.
             return
         try:
             conn, _ = self.srv.accept()
@@ -1521,12 +1523,12 @@ def probe_lost_acks(client, ctx):
 
 
 def probe_socket_held_by_another_bridge(client, ctx):
-    """A bridge connected to a socket nobody will accept it from.
+    """A bridge connected to a socket that will not accept it yet.
 
     The adapter serves one bridge at a time, so a second bridge's connection
-    is completed by the kernel into the listen backlog and then left unread:
-    the connect succeeded, and no handshake and no snapshot will ever arrive
-    on it. That is what a `taria-mcp` left running by an earlier session does
+    is completed by the kernel into the listen backlog and left unread until
+    the first bridge leaves: the connect succeeded, and no handshake and no
+    snapshot arrives on it until then. That is what a `taria-mcp` left running by an earlier session does
     to the next one, and it is the first thing a fresh agent meets, before any
     feature of the release can be tried at all. The answer used to be "is the
     taria-enabled app running, and is the socket path correct?"; both were
@@ -1578,6 +1580,180 @@ def probe_socket_held_by_another_bridge(client, ctx):
     return (
         f"connect succeeded and the peer never spoke; read_tree named the held socket "
         f"after {matched.group('open')}s open, and key said the same"
+    )
+
+
+# The bridge's line cap, taria::wire::MAX_LINE_BYTES, and the words every
+# answer about a line past it carries. Hard coded like the protocol numbers
+# above, so a change to the cap is a deliberate edit here too.
+LINE_CAP = 1024 * 1024
+OVER_THE_LIMIT = "over 1 MiB (1048576 bytes)"
+
+
+def oversized_snapshot(seq):
+    """One snapshot line past the bridge's cap, newline included.
+
+    A well-formed tree whose one text input holds a value the app never
+    bounded, which is how a real app gets there: a draft, a log or a
+    transcript that grew. Only its size is wrong.
+    """
+    root = {
+        "id": "root",
+        "role": "app",
+        "focused": False,
+        "children": [
+            {
+                "id": "draft",
+                "role": "text_input",
+                "value": "x" * LINE_CAP,
+                "focused": True,
+                "actions": ["set_value"],
+            }
+        ],
+    }
+    line = json.dumps(
+        {
+            "type": "snapshot",
+            "protocol_version": BRIDGE_PROTOCOL,
+            "seq": seq,
+            "root": root,
+        }
+    ).encode()
+    assert len(line) > LINE_CAP
+    return line + b"\n"
+
+
+def send_oversized(app, seq):
+    """Write an oversized snapshot, expecting the bridge to cut it off.
+
+    The bridge stops reading at its cap and closes the connection, so the
+    write usually fails partway with a broken pipe. That is the state under
+    test, not a fault in the stand-in.
+    """
+    try:
+        app.send_raw(oversized_snapshot(seq))
+    except OSError:
+        pass
+
+
+def probe_oversized_after_tree(client, ctx):
+    """A served app whose next tree is past the bridge's 1 MiB line cap.
+
+    The bridge closes the connection at the cap, and the app, which never
+    went anywhere, resends that tree to every reconnect. Before the bridge
+    kept a reason for it, every tool answered with "it may have exited" and
+    "retry once the app is back", which sent the agent to wait on a loop no
+    retry could break.
+
+    `client` goes unused: the state needs a peer that publishes a tree no
+    real adapter writes any more.
+    """
+    with fake_session() as (mcp, app):
+        app.snapshot(1, FAKE_ROOT)
+        mcp.read_tree()
+        send_oversized(app, 2)
+
+        # Polled: the bridge closes the connection on its own schedule, and
+        # until it does read_tree still serves the tree it has.
+        prefix = "app 'fake-app' disconnected (last snapshot seq 1); "
+        deadline = time.monotonic() + READ_TIMEOUT
+        message = ""
+        while time.monotonic() < deadline:
+            try:
+                mcp.call_raw("read_tree")
+            except ToolError as err:
+                message = err.message
+                if message.startswith(prefix):
+                    break
+            time.sleep(0.05)
+        answers = {"read_tree": message}
+        # The input tools ask for a tree before they send anything, so act
+        # meets the same answer rather than a second vocabulary for it.
+        try:
+            text = mcp.call_raw("act", {"node": "btn", "action": "activate"})
+            raise StepFailure(f"act was answered with no tree to act on: {text[:200]}")
+        except ToolError as err:
+            answers["act"] = err.message
+        for tool, answer in answers.items():
+            require(
+                answer.startswith(prefix),
+                f"{tool} lost the disconnect opening: {answer[:300]}",
+            )
+            require(
+                OVER_THE_LIMIT in answer and "on every reconnect" in answer,
+                f"{tool} did not name the line cap: {answer[:300]}",
+            )
+            require(
+                "may have exited" not in answer,
+                f"{tool} blamed the app for a connection the bridge closed: "
+                f"{answer[:300]}",
+            )
+    return "read_tree and act kept the disconnect opening and named the 1 MiB cap"
+
+
+def probe_oversized_first_tree(client, ctx):
+    """An app whose first tree is already past the bridge's line cap.
+
+    Nothing is ever served, so every answer comes from the no-snapshot
+    path, which has one answer per state of the link. Before the bridge kept
+    a reason, an app the bridge had plainly reached was asked whether it was
+    running and whether the socket path was right. Here the reconnect then
+    sits unaccepted in the stand-in's backlog, because it accepts only once,
+    and that silence has an answer of its own too; the size has to outrank
+    it, for as long as the agent keeps asking.
+    """
+    with fake_session() as (mcp, app):
+        send_oversized(app, 1)
+
+        # Until the overflow is read the answers are about the connection,
+        # which is right: nothing has been rejected yet.
+        deadline = time.monotonic() + READ_TIMEOUT
+        first = ""
+        while time.monotonic() < deadline:
+            try:
+                tree = mcp.call_raw("read_tree")
+                raise StepFailure(f"read_tree served a tree past the cap: {tree[:200]}")
+            except ToolError as err:
+                first = err.message
+                if OVER_THE_LIMIT in first:
+                    break
+            time.sleep(0.05)
+        require(OVER_THE_LIMIT in first, f"read_tree never named the cap: {first[:300]}")
+
+        # Then across a span past the bridge's 2 s backoff cap and its 0.5 s
+        # grace for a silent connection, so the reconnect is in it.
+        started = time.monotonic()
+        answers = []
+        for _ in range(10):
+            try:
+                tree = mcp.call_raw("read_tree")
+                raise StepFailure(f"read_tree served a tree past the cap: {tree[:200]}")
+            except ToolError as err:
+                answers.append(err.message)
+            time.sleep(0.35)
+        span = time.monotonic() - started
+        require(span >= 3.0, f"the polls spanned only {span:.1f}s")
+        for n, answer in enumerate(answers, 1):
+            require(
+                answer.startswith("no snapshot from the app yet")
+                and OVER_THE_LIMIT in answer
+                and "The socket path is right" in answer,
+                f"read_tree call {n} did not name the cap: {answer[:300]}",
+            )
+            for wrong in (
+                "is the socket path correct",
+                "another taria-mcp process",
+                "worth one retry",
+                "never publishes nodes",
+            ):
+                require(
+                    wrong not in answer,
+                    f"read_tree call {n} gave another state's answer ({wrong!r}): "
+                    f"{answer[:300]}",
+                )
+    return (
+        f"{len(answers)} read_tree calls across {span:.1f}s all named the 1 MiB cap, "
+        "none asked about the socket path"
     )
 
 
@@ -1711,6 +1887,8 @@ def main():
         ("app stops reading its socket", probe_input_queue_full),
         ("acks lost to the bridge's channel", probe_lost_acks),
         ("socket held by another bridge", probe_socket_held_by_another_bridge),
+        ("tree over the line cap after one was served", probe_oversized_after_tree),
+        ("first tree over the line cap", probe_oversized_first_tree),
     ]
 
     def teardown():

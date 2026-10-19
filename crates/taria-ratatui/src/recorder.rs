@@ -1,10 +1,12 @@
 //! Per-frame recording of the semantic tree.
 
 use std::cell::RefCell;
+use std::mem;
 
 use taria::Node;
 
 use crate::TariaLayer;
+use crate::layer::drop_iteratively;
 
 /// Records the semantic nodes of one rendered frame.
 ///
@@ -14,17 +16,38 @@ use crate::TariaLayer;
 /// [`publish`](Self::publish).
 pub struct FrameRecorder<'a> {
     layer: &'a mut TariaLayer,
-    /// Interior mutability so [`sem`](crate::sem) can record through a shared
-    /// reference from inside `Widget::render`. Single-threaded by
-    /// construction (the render path), so a `RefCell` suffices.
-    nodes: RefCell<Vec<Node>>,
+    nodes: Recorded,
+}
+
+/// The nodes a frame has recorded so far.
+///
+/// Interior mutability so [`sem`](crate::sem) can record through a shared
+/// reference from inside `Widget::render`. Single-threaded by construction
+/// (the render path), so a `RefCell` suffices.
+///
+/// A type of its own, with no lifetime, so that freeing what it holds needs
+/// no `Drop` on [`FrameRecorder`]. One there would keep the recorder's
+/// borrow of the layer alive until the recorder goes out of scope rather
+/// than until its last use, and an app that reads the layer after recording
+/// a frame it then leaves unpublished would stop compiling.
+struct Recorded(RefCell<Vec<Node>>);
+
+impl Drop for Recorded {
+    /// Free, without recursing, a frame that was recorded and never
+    /// published, as the layer frees every tree it is handed: what was
+    /// recorded can be deeper than the call stack.
+    fn drop(&mut self) {
+        mem::take(self.0.get_mut())
+            .into_iter()
+            .for_each(drop_iteratively);
+    }
 }
 
 impl<'a> FrameRecorder<'a> {
     pub(crate) fn new(layer: &'a mut TariaLayer) -> Self {
         Self {
             layer,
-            nodes: RefCell::new(Vec::new()),
+            nodes: Recorded(RefCell::new(Vec::new())),
         }
     }
 
@@ -32,12 +55,12 @@ impl<'a> FrameRecorder<'a> {
     /// taria's fluent builders, including manual children for composite
     /// widgets like dialogs.
     pub fn push(&mut self, node: Node) {
-        self.nodes.get_mut().push(node);
+        self.nodes.0.get_mut().push(node);
     }
 
     /// Where [`sem`](crate::sem)-wrapped widgets record their nodes.
     pub(crate) fn sink(&self) -> &RefCell<Vec<Node>> {
-        &self.nodes
+        &self.nodes.0
     }
 
     /// Publish the recorded frame as a new snapshot.
@@ -46,18 +69,23 @@ impl<'a> FrameRecorder<'a> {
     /// (`id: "app"`, role `App`, labeled with the app label). The root is
     /// marked focused only when no recorded node (or descendant) is, so a
     /// snapshot always carries focus somewhere. `seq` increments per
-    /// published snapshot; a frame identical to the previous one is skipped
-    /// entirely. This never blocks the render path.
+    /// published snapshot. A frame whose tree is the one the previous frame
+    /// built is skipped before anything is cut or measured, and one that is
+    /// cut to the snapshot already sent is not sent again. This never blocks
+    /// the render path.
     ///
     /// A tree deeper than [`taria::MAX_NODE_DEPTH`] is cut rather than sent
     /// or skipped, because a snapshot past that depth does not arrive at the
-    /// bridge at all and nothing says so. See
+    /// bridge at all and nothing says so. A tree too large for one line of
+    /// [`taria::wire::MAX_LINE_BYTES`] is then trimmed to fit, because a
+    /// longer line costs the app its bridge on every reconnect. See
     /// [`TariaLayer::publish`](crate::TariaLayer::publish) for why, and
     /// [`TariaLayer::last_truncation`](crate::TariaLayer::last_truncation)
+    /// and [`TariaLayer::last_oversize`](crate::TariaLayer::last_oversize)
     /// for how an app finds out.
-    pub fn publish(self) {
-        let Self { layer, nodes } = self;
-        layer.publish_nodes(nodes.into_inner());
+    pub fn publish(mut self) {
+        let nodes = mem::take(self.nodes.0.get_mut());
+        self.layer.publish_nodes(nodes);
     }
 }
 
@@ -156,6 +184,27 @@ mod tests {
         rec.push(Node::new("a", Role::Text).label("changed"));
         rec.publish();
         assert_eq!(layer.latest_snapshot().unwrap().seq, 2);
+    }
+
+    /// Compiled rather than run for what it checks: a recorder holds the
+    /// layer only until its last use, as it did in 0.3.0. A `Drop` on
+    /// [`FrameRecorder`](crate::FrameRecorder) itself would hold it to the
+    /// end of the scope, and reading the layer before giving up on a frame
+    /// would be rejected as a second borrow (E0502).
+    #[test]
+    fn a_recorder_left_unpublished_holds_the_layer_only_until_its_last_use() {
+        let mut layer = test_layer("borrow");
+        for paused in [true, false] {
+            let node = Node::new("a", Role::Text);
+            let mut rec = layer.frame();
+            rec.push(node);
+            if paused {
+                layer.dropped_inputs();
+                continue;
+            }
+            rec.publish();
+        }
+        assert_eq!(layer.latest_snapshot().unwrap().seq, 1);
     }
 
     #[test]

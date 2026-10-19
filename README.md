@@ -11,7 +11,7 @@ terminals and guessing at structure. taria works on the other side of the
 terminal: the app publishes what is on screen semantically, the way
 accessibility trees transformed GUI automation.
 
-> Status: pre-alpha, at version 0.3.0. The vertical slice works end to end: a
+> Status: pre-alpha, at version 0.3.1. The vertical slice works end to end: a
 > ratatui adapter, an MCP bridge, and a demo app an agent can drive today. The
 > wire format is frozen at `PROTOCOL_VERSION` 1. See `CHANGELOG.md` for what
 > this release changed and what the freeze promises, `docs/comparison.md` for
@@ -164,8 +164,8 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-python3 scripts/e2e.py           # end-to-end: 22 steps, demo app + bridge + MCP
-python3 scripts/adversarial.py   # 20 edge-case probes
+python3 scripts/e2e.py           # end-to-end: 23 steps, demo app + bridge + MCP
+python3 scripts/adversarial.py   # 22 edge-case probes
 ```
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers the rest: the setup, the CI gate,

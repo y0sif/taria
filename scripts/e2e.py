@@ -71,6 +71,16 @@ BRIDGE_DROP_RE = re.compile(
 )
 DEMO_DROPPED_RE = re.compile(r"^taria-demo: dropped (\d+) agent input\(s\)", re.M)
 
+# The longest line a bridge reads from an app, `taria::wire::MAX_LINE_BYTES`:
+# past it the bridge can no longer tell where the next message starts and
+# drops the connection. A snapshot is one line, so the adapter cuts every tree
+# to fit it, and the demo reports what it cut once the terminal is restored.
+# Step w is the only one that makes that line print.
+MAX_LINE_BYTES = 1024 * 1024
+DEMO_TRIMMED_RE = re.compile(
+    r"^taria-demo: trimmed (\d+) snapshot\(s\) to fit one line; the last: (.*)$", re.M
+)
+
 
 class ToolError(Exception):
     """A tool call failed (JSON-RPC error or isError result)."""
@@ -1886,6 +1896,274 @@ def step_v_outline_format(ctx):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def line_bytes(text):
+    """Bytes `text` spends inside a JSON line, quotes left out.
+
+    Python escapes exactly what serde_json does in the characters used here:
+    a control character becomes `\\u00XX`, and non-ASCII stays as it is."""
+    return len(json.dumps(text, ensure_ascii=False).encode()) - 2
+
+
+def step_w_oversized_draft(ctx):
+    """A draft typed past the line limit is trimmed, and the bridge stays up.
+
+    Issue #5's repro, kept as a gate. The demo publishes its new-task draft
+    whole, on purpose, so typing grows one `value` without bound. Before the
+    adapter bounded its snapshots, the line carrying a draft past
+    MAX_LINE_BYTES was one the bridge could not read: it dropped the
+    connection, reconnected, was sent the same snapshot again and dropped
+    that too, and from then on every call answered that the app had
+    disconnected and may have exited, while the demo was running fine.
+
+    Its own demo and its own bridge, like u and v: the scenario's app has to
+    finish with nothing trimmed, and this one ends with the trimmed line in
+    its report, which is the last thing asserted.
+
+    Grown with the cheapest character to send. type_text bounds a call at
+    4096 characters, not bytes, and what crosses the limit is the line's
+    bytes, so the cost that counts is what one character spends on the line.
+    serde_json leaves non-ASCII unescaped, so a 4-byte character costs 4 (64
+    calls to cross), and writes a control character as `\\u0001`, which costs
+    6 (43 calls). That also makes UTF-8 the wrong ruler for this draft: it
+    reads a sixth of what the line carries, so the size assertion that binds
+    is on the escaped value. A head of plain text goes first, so "the bound
+    kept the head" is a claim about something other than filler.
+
+    Once the cut is reached, more typing changes nothing the tree shows: the
+    bound keeps the same head, the layer dedupes the frame, and the call
+    answers no-change. Those calls are held to an acknowledgement, not to a
+    new tree. read_tree is called raw, never through the retrying helper,
+    because that helper waits out "disconnected", the very answer this step
+    exists to catch.
+    """
+    head = "Typed past one line: "
+    filler = "\x01"
+    per_call = 4096  # type_text's bound, in characters
+    # Twice what crossing takes, so a bound that cut too late still fails
+    # here, on the cap, rather than running on.
+    max_calls = 2 * MAX_LINE_BYTES // (per_call * line_bytes(filler)) + 1
+    tmpdir = tempfile.mkdtemp(prefix="taria-e2e-oversize-")
+    sock = os.path.join(tmpdir, "oversize.sock")
+    app = None
+    client = None
+    typed = ""
+    calls = 0
+
+    def answer(text):
+        """One type_text call: (kind, tree), and nothing else gets through.
+
+        An error, or an answer saying the app is gone, is the regression
+        itself, so it fails here with the size the draft reaches with this
+        call's text in it.
+        """
+        try:
+            reply = client.call_raw("type_text", {"text": text})
+        except ToolError as err:
+            lost = (
+                "the bridge lost the app over a line it could not read: "
+                if "disconnected" in err.message or "may have exited" in err.message
+                else ""
+            )
+            raise StepFailure(
+                f"{lost}type_text call {calls} errored with the draft at "
+                f"{line_bytes(typed)} line bytes: {err.message[:300]}"
+            )
+        kind, tree = parse_result(reply)
+        require(
+            kind in ("tree", "no_change"),
+            f"type_text call {calls} answered {kind!r} with the draft at "
+            f"{line_bytes(typed)} line bytes; text the focused input takes is "
+            f"answered with a tree or a no-change note: {reply[:200]}",
+        )
+        return kind, tree
+
+    try:
+        app = PtyApp(sock)
+        require(app.wait_for_socket(), f"the oversize demo never bound {sock}")
+        client = McpClient(sock)
+        client.initialize()
+        tree = client.read_tree()
+
+        # Aim at the input the way an agent does: through what it advertises.
+        node = find(tree, "input")
+        require(
+            has_action(node, "focus"),
+            f"the input advertises {node.get('actions')}: nothing aims at it",
+        )
+        tree = act(client, "input", "focus")
+        require(
+            one_focused(tree, "after the focus act") == "input",
+            "focus did not hand the keyboard to the input",
+        )
+        require(
+            find(tree, "input").get("value") in (None, ""),
+            f"the draft starts as {find(tree, 'input').get('value')!r}, expected empty",
+        )
+
+        # Every call until the cut grows the draft, so every one publishes a
+        # tree holding exactly what was typed. The first that does not is the
+        # cut.
+        trimmed = None
+        while trimmed is None:
+            require(
+                calls < max_calls,
+                f"{calls} type_text calls put {line_bytes(typed)} line bytes in "
+                f"the draft and it was never trimmed",
+            )
+            text = filler * per_call
+            if not typed:
+                text = head + text[len(head) :]
+            calls += 1
+            typed += text
+            kind, tree = answer(text)
+            require(
+                kind == "tree",
+                f"type_text call {calls} answered {kind!r} before the draft was "
+                "cut; each call grows it, so each has to publish a tree",
+            )
+            value = find(tree, "input").get("value") or ""
+            if value != typed:
+                trimmed = value
+        crossed_at = calls
+
+        require(
+            trimmed.endswith("…") and typed.startswith(trimmed[:-1]),
+            f"the draft came back {len(trimmed)} chars long ending "
+            f"{trimmed[-8:]!r}, not the typed text's head cut with …",
+        )
+        require(
+            trimmed.startswith(head),
+            f"the cut draft starts {trimmed[:len(head)]!r}, not with {head!r}: "
+            "a text input keeps its head",
+        )
+        # Whether the line was over when it was cut is the demo's report to
+        # say, below: the draft alone can still be under the limit when the
+        # rest of the tree tips the line over it.
+        require(
+            line_bytes(trimmed) < MAX_LINE_BYTES and len(trimmed.encode()) < MAX_LINE_BYTES,
+            f"the draft was cut to {line_bytes(trimmed)} line bytes "
+            f"({len(trimmed.encode())} in UTF-8), not under {MAX_LINE_BYTES}",
+        )
+
+        # More typing past the cut: acknowledged, and no reconnect loop.
+        later = []
+        for _ in range(2):
+            calls += 1
+            typed += filler * per_call
+            kind, tree = answer(filler * per_call)
+            later.append(kind)
+            if tree is not None:
+                value = find(tree, "input").get("value") or ""
+                require(
+                    value.endswith("…") and line_bytes(value) < MAX_LINE_BYTES,
+                    f"typing past the cut published a draft of "
+                    f"{line_bytes(value)} line bytes ending {value[-8:]!r}",
+                )
+
+        try:
+            text = client.call_raw("read_tree")
+        except ToolError as err:
+            raise StepFailure(
+                f"read_tree errored with the draft at {line_bytes(typed)} line "
+                f"bytes: {err.message[:300]}"
+            )
+        read_bytes = len(text.encode())
+        # Under the limit, and not far under: the bound stops cutting as soon
+        # as the tree fits, so a draft cut to a stub would fit too and still
+        # be a regression. The slack covers the envelope and the seq.
+        require(
+            MAX_LINE_BYTES - 16 * 1024 < read_bytes < MAX_LINE_BYTES,
+            f"read_tree returned {read_bytes} bytes; expected the draft cut to "
+            f"just under the {MAX_LINE_BYTES} byte line the bridge reads",
+        )
+        live = json.loads(text)
+        value = find(live, "input").get("value") or ""
+        require(
+            value.endswith("…")
+            and value.startswith(head)
+            and typed.startswith(value[:-1])
+            and line_bytes(value) < MAX_LINE_BYTES,
+            f"read_tree's draft is {line_bytes(value)} line bytes ending "
+            f"{value[-8:]!r}, not the typed head cut with …",
+        )
+
+        # Still serving inputs, not only reads: the advertised set_value
+        # clears the draft, and the cleared tree is the next one published.
+        node = find(live, "input")
+        require(
+            has_action(node, "set_value"),
+            f"the input advertises {node.get('actions')}: nothing clears it",
+        )
+        tree = act(client, "input", "set_value", value="")
+        require(
+            find(tree, "input").get("value") in (None, ""),
+            f"set_value \"\" left a draft of "
+            f"{line_bytes(find(tree, 'input').get('value') or '')} line bytes",
+        )
+
+        # Out through the advertised quit, so the demo restores the terminal
+        # and prints its report. The one answer here allowed to say the app
+        # is gone, because that is what was asked for.
+        require(
+            has_action(find(tree, "quit"), "activate"),
+            "the quit node advertises no activate",
+        )
+        try:
+            kind, _ = client.call_outcome("act", {"node": "quit", "action": "activate"})
+            require(kind == "gone", f"the quit act answered {kind!r}")
+        except ToolError as err:
+            require(
+                "disconnected before acknowledging this input" in err.message,
+                f"unexpected report from the quit act: {err.message[:200]}",
+            )
+        try:
+            app.proc.wait(timeout=READ_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise StepFailure("the oversize demo did not exit after the quit act")
+        require(
+            app.proc.returncode == 0,
+            f"the oversize demo exited with {app.proc.returncode}",
+        )
+        require(
+            app.wait_stderr(),
+            "the oversize demo's stderr never reached EOF, so its trimmed count "
+            "may not have been written yet",
+        )
+        stderr = app.stderr_tail()
+        match = DEMO_TRIMMED_RE.search(stderr)
+        require(
+            match,
+            f"the draft was cut and the demo printed no trimmed-snapshot line; "
+            f"demo stderr:\n{stderr}",
+        )
+        trimmed_count, last = int(match.group(1)), match.group(2)
+        size = re.search(r"snapshot is (\d+) bytes", last)
+        require(
+            trimmed_count >= 1
+            and "at node `input`" in last
+            and size is not None
+            and int(size.group(1)) > MAX_LINE_BYTES,
+            f"the demo's report does not name an over-limit snapshot cut at "
+            f"`input`: {match.group(0)}",
+        )
+        return (
+            f"{calls} type_text calls of {per_call} chars ({line_bytes(filler)} "
+            f"line bytes each); call {crossed_at} cut the draft to "
+            f"{line_bytes(trimmed)} line bytes, head kept, ends with …; "
+            f"later calls answered {', '.join(later)}; read_tree {read_bytes} "
+            f"bytes; set_value \"\" cleared it; demo: trimmed {trimmed_count} "
+            f"snapshot(s), last {size.group(1)} bytes at `input`"
+        )
+    finally:
+        if client is not None:
+            client.close()
+            if client.proc.poll() is None:
+                client.proc.kill()
+        if app is not None:
+            app.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # --- Runner -----------------------------------------------------------------
 
 
@@ -2071,6 +2349,18 @@ def main():
         name = "v outline tree format"
         try:
             evidence = step_v_outline_format(ctx)
+            results.append((name, True, evidence))
+            print(f"PASS {name}: {evidence}", flush=True)
+        except (StepFailure, ToolError, TimeoutError) as err:
+            results.append((name, False, str(err)))
+            print(f"FAIL {name}: {err}", flush=True)
+
+        # The line-size bound (issue #5), on its own demo and bridge for the
+        # same reason as u: its demo ends with a report the scenario's clean
+        # run must not carry.
+        name = "w draft past 1 MiB trimmed, bridge stays up"
+        try:
+            evidence = step_w_oversized_draft(ctx)
             results.append((name, True, evidence))
             print(f"PASS {name}: {evidence}", flush=True)
         except (StepFailure, ToolError, TimeoutError) as err:

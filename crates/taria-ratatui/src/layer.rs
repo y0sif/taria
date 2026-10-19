@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::mem;
 use std::net::Shutdown;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::FileTypeExt;
@@ -18,19 +19,72 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{AgentInput, MAX_NODE_DEPTH, Node, PROTOCOL_VERSION, Role, Snapshot, TreeTooDeep};
 
 use crate::FrameRecorder;
+use crate::bound::{self, ROOT_BUDGET, SnapshotTooLarge};
 
-/// How long a snapshot write may stall on a slow or stuck bridge before the
-/// connection is dropped. Protects the app from a peer that stops reading.
+/// How long the writer may spend on any one line before the connection is
+/// dropped. Protects the app from a peer that stops reading, or reads too
+/// slowly to take a whole line in that time.
+///
+/// The bound is on the line, not on each wait for room in the socket, which
+/// is all a socket's own write timeout bounds (see [`write_all_before`]).
+/// Bounded that way, a line far larger than the socket buffers could stall
+/// for one timeout per wait: a bridge that had stopped reading held a 900 KB
+/// snapshot for two timeouts, and one taking 64 KB every 3 s, which freed
+/// room before any wait timed out, held it for forty seconds. [`Drop`] waits
+/// for the writer, so either held the app's exit too. Now a bridge that
+/// cannot take a whole line, a snapshot of up to [`MAX_LINE_BYTES`] included,
+/// within this time is dropped, and reconnects to be sent the latest snapshot
+/// afresh.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Longest accepted ndjson line from a connected client. A peer that streams
-/// more than this without a newline is treated as broken and disconnected,
-/// so a hostile or buggy bridge cannot make the app buffer unboundedly.
-const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// The most one `write` call is handed, so that the kernel waits for room in
+/// the socket at most once inside it, and the write timeout, which bounds
+/// each such wait rather than the call, bounds the call too. See
+/// [`write_all_before`].
+///
+/// One buffer on Linux, and within the send low-water mark that macOS and the
+/// BSDs wait for before they copy anything. A typical line is one or a few
+/// calls, and a snapshot at [`MAX_LINE_BYTES`] about five hundred, measured at
+/// under a millisecond more than one call for the lot.
+const WRITE_CHUNK: usize = 2 * 1024;
+
+/// The longest one wait for room in the socket runs before the writer looks
+/// at the clock again. See [`write_all_before`].
+///
+/// The kernel keeps a socket's write timeout on a timer wheel that files a
+/// long timeout coarsely and fires it late: on Linux at 1000 Hz, a 5 s
+/// timeout fired up to 430 ms past its time when measured, more than the
+/// whole [`SHUTDOWN_FLUSH`]. A timeout this short is filed to the
+/// millisecond, so waiting in slices of it holds a deadline to within a few
+/// milliseconds, and a writer stalled on a stuck bridge wakes 20 times a
+/// second to find it still stuck.
+const WRITE_WAIT: Duration = Duration::from_millis(50);
+
+/// How long the writer may spend, in total, on the acks still queued when the
+/// layer shuts down.
+///
+/// A common exit drains input, answers it and drops the layer in one frame:
+/// a `q` acted on as quit, a `drain_acking` that returns
+/// [`Ignored`](InputStatus::Ignored) on the way out. Nothing gives the writer
+/// a turn between those calls, so every one of those answers can still be
+/// queued, the [`Delivered`](InputStatus::Delivered) of the dequeue included,
+/// and closing the connection without them leaves the agent waiting out a
+/// timeout on an input the app did take. Measured before this flush existed,
+/// such an app got no ack out at all in 16 runs of 20. So they are written
+/// before the connection closes.
+///
+/// Bounded, because [`Drop`] waits for the writer and an exit must not hang on
+/// a bridge that stopped reading; [`WRITE_TIMEOUT`] is far too long for that.
+/// The bound is total, not per write, and a peer that reads too slowly loses
+/// the acks that miss it, which costs the same timeout the flush exists to
+/// spare it. A snapshot still waiting is not written at all: it describes a UI
+/// that is about to be gone, and it can be large enough to spend the whole
+/// budget on its own.
+const SHUTDOWN_FLUSH: Duration = Duration::from_millis(250);
 
 /// Capacity of the agent-input queue between the socket thread and the app.
 /// When the app is not draining inputs, the newest input is dropped, counted
@@ -97,8 +151,9 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 /// with an [`AppToBridge::Ack`], so an agent can tell an input the app acted
 /// on from one it never saw. An input belongs to the connection it arrived
 /// on: one whose bridge disconnected before the app dequeued it is discarded
-/// rather than applied, because it was aimed at a session that is gone (see
-/// [`stale_inputs`](Self::stale_inputs)).
+/// rather than applied, because it was aimed at a session that is gone, and
+/// so is one a client wrote while it waited its turn, before the handshake
+/// that opens its session (see [`stale_inputs`](Self::stale_inputs)).
 ///
 /// A layer may also be *disabled*: [`bind_or_disabled`](Self::bind_or_disabled)
 /// hands back an inert layer rather than an error, so taria failing to bind
@@ -129,12 +184,53 @@ struct Inner {
     /// makes every comparison fail and leaves the path alone.
     socket_ident: Option<(u64, u64)>,
     seq: u64,
+    /// The root of the newest snapshot published.
     last_root: Option<Node>,
+    /// The tree the newest frame built, as assembled and before anything was
+    /// cut from it, when a cut made it differ from `last_root`. `None` when
+    /// that frame's tree is `last_root` itself, so a tree that fits is held
+    /// once rather than twice, and the next frame is compared against
+    /// `last_root` instead.
+    ///
+    /// Kept for a frame that was not published too: a tree that changed only
+    /// past a cut is cut to the snapshot already sent, and remembering it is
+    /// what lets the next frame, drawn unchanged, skip the cut.
+    last_raw: Option<Node>,
     /// Snapshots published with a branch cut for depth, and the failure
     /// behind the newest cut. Owned here rather than in [`Shared`] because
     /// only the app thread publishes and only the app thread reads these.
     truncated: u64,
     last_truncation: Option<TreeTooDeep>,
+    /// Snapshots published with something cut to fit one line, and what was
+    /// cut from the newest of them. Owned here for the same reason.
+    oversized: u64,
+    last_oversize: Option<SnapshotTooLarge>,
+}
+
+impl Inner {
+    /// Is `root` the tree the newest frame built, as assembled?
+    ///
+    /// Compared against what that frame kept: the tree it was cut from, when
+    /// it had to be cut, or else the snapshot, which is then the same tree.
+    fn is_newest_frame(&mut self, root: &mut Node) -> bool {
+        match self.last_raw.as_mut().or(self.last_root.as_mut()) {
+            Some(newest) => same_tree(root, newest),
+            None => false,
+        }
+    }
+}
+
+impl Drop for Inner {
+    /// Free the trees without recursing: `last_raw` is the tree as built,
+    /// which can be deeper than the call stack.
+    fn drop(&mut self) {
+        for tree in [self.last_raw.take(), self.last_root.take()]
+            .into_iter()
+            .flatten()
+        {
+            drop_iteratively(tree);
+        }
+    }
 }
 
 /// One agent input on its way from a connection's reader thread to the app.
@@ -271,8 +367,11 @@ impl TariaLayer {
                 socket_ident,
                 seq: 0,
                 last_root: None,
+                last_raw: None,
                 truncated: 0,
                 last_truncation: None,
+                oversized: 0,
+                last_oversize: None,
             }),
             bind_error: None,
         })
@@ -373,7 +472,8 @@ impl TariaLayer {
     /// [`try_recv_with_id`](Self::try_recv_with_id).
     ///
     /// Inputs left over from a bridge connection that has since ended are
-    /// discarded here rather than handed over; see
+    /// discarded here rather than handed over, and input a client wrote before
+    /// its handshake never reaches the queue at all; see
     /// [`stale_inputs`](Self::stale_inputs).
     ///
     /// [`AgentInput::Unknown`] never arrives here either. An input whose
@@ -568,17 +668,41 @@ impl TariaLayer {
         })
     }
 
-    /// How many agent inputs have been discarded so far because the bridge
-    /// connection they arrived on ended before the app dequeued them. Always
-    /// 0 on a disabled layer.
+    /// How many agent inputs have been discarded so far, rather than handed to
+    /// the app, because they were not aimed at the session that was live when
+    /// they were read. Always 0 on a disabled layer.
     ///
-    /// Such an input was aimed at a bridge session that no longer exists:
-    /// applying it would act on an agent's intent minutes or milliseconds
-    /// after the agent that formed it is gone, with nobody left to receive
-    /// the result. A `key q` that arrives just before the bridge restarts
-    /// would otherwise quit the app on the next frame. The bridge drops its
-    /// own queue on reconnect for the mirror-image reason, so both sides
-    /// agree that an input belongs to one connection.
+    /// Two things put an input here. The first is a bridge connection that
+    /// ended before the app dequeued what arrived on it. Such an input was
+    /// aimed at a bridge session that no longer exists: applying it would act
+    /// on an agent's intent minutes or milliseconds after the agent that
+    /// formed it is gone, with nobody left to receive the result. A `key q`
+    /// that arrives just before the bridge restarts would otherwise quit the
+    /// app on the next frame. The bridge drops its own queue on reconnect for
+    /// the mirror-image reason, so both sides agree that an input belongs to
+    /// one connection.
+    ///
+    /// The second is input a client wrote while it waited behind another.
+    /// Only one bridge is served at a time, so a client that connects while
+    /// another is attached waits in the listen backlog, and whatever it writes
+    /// meanwhile sits unread in the kernel's socket buffer until its turn
+    /// comes. That client has seen no tree, so its inputs name nodes and keys
+    /// it guessed at, and applying them once the first client leaves would
+    /// act on a UI it never looked at. So a connection that was already
+    /// waiting when the previous session ended has what it wrote read off and
+    /// thrown away just before its hello goes out, and every complete line of
+    /// that which is an input is counted here, a kind this build cannot read
+    /// included. None of it is acked: the session it would be answered on had
+    /// not begun. Clients waiting back to back are each treated so.
+    ///
+    /// A client that waited behind nobody keeps what it wrote before reading
+    /// its hello: the first connection of a process, and one that connects
+    /// after the listener last found nobody waiting. A script that connects
+    /// to an idle app and writes at once is such a client, and its input is
+    /// its session's, as it was in 0.3.0. A client that waits for the hello
+    /// before writing is never affected either way, and taria-mcp is one,
+    /// whose input tools refuse to send until the app's first snapshot has
+    /// arrived.
     ///
     /// Monotonic across reconnects, and read like
     /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
@@ -635,6 +759,14 @@ impl TariaLayer {
     /// How many published snapshots have had a branch cut for being deeper
     /// than [`taria::MAX_NODE_DEPTH`]. Always 0 on a disabled layer.
     ///
+    /// It counts snapshots, not frames. A frame whose tree, once cut, is the
+    /// snapshot already published is not sent again and is not counted
+    /// again, so a deep tree that sits still while the app redraws it sixty
+    /// times a second counts once, and a deep tree that changes counts once
+    /// per change. The number says how many trees the agent was handed cut,
+    /// which is the thing worth knowing, rather than how often the app drew
+    /// one.
+    ///
     /// See [`publish`](Self::publish) for what the cut does and why.
     /// [`last_truncation`](Self::last_truncation) names the branch. Monotonic
     /// for the lifetime of the layer, and read like
@@ -653,6 +785,34 @@ impl TariaLayer {
     /// the counter alone is not enough here.
     pub fn last_truncation(&self) -> Option<TreeTooDeep> {
         self.inner.as_ref()?.last_truncation.clone()
+    }
+
+    /// How many published snapshots have had something cut to fit in one
+    /// line of [`taria::wire::MAX_LINE_BYTES`]. Always 0 on a disabled layer.
+    ///
+    /// Counted like [`truncated_snapshots`](Self::truncated_snapshots):
+    /// snapshots, not frames, so a tree that stays too large while the app
+    /// redraws it counts once, and one that changes counts once per change.
+    ///
+    /// See [`publish`](Self::publish) for what is cut and why.
+    /// [`last_oversize`](Self::last_oversize) says how large the line would
+    /// have been and where the bytes were. Monotonic for the lifetime of the
+    /// layer, and read like [`dropped_inputs`](Self::dropped_inputs): after
+    /// the terminal is restored, never while the app owns the alternate
+    /// screen.
+    pub fn oversized_snapshots(&self) -> u64 {
+        self.inner.as_ref().map_or(0, |inner| inner.oversized)
+    }
+
+    /// What was cut from the most recent oversized snapshot, or `None` if no
+    /// published tree has had to be cut to fit.
+    ///
+    /// [`SnapshotTooLarge`] carries the size the line would have had and the
+    /// id of the node holding the longest string. A tree that runs over has
+    /// usually run away in one place, a draft, a log, a list holding every
+    /// row, and the counter alone cannot say which.
+    pub fn last_oversize(&self) -> Option<SnapshotTooLarge> {
+        self.inner.as_ref()?.last_oversize.clone()
     }
 
     /// Publish `nodes` as a snapshot, without going through a
@@ -685,6 +845,62 @@ impl TariaLayer {
     /// almost always to publish what the widget draws rather than the data
     /// behind it, which for a deep tree view is the expanded path and the
     /// rows currently on screen.
+    ///
+    /// # Trees too large to send
+    ///
+    /// A snapshot travels as one line, and a bridge reads a line up to
+    /// [`taria::wire::MAX_LINE_BYTES`] and no further: past that it cannot
+    /// find where the next message starts, so it drops the connection.
+    /// Dropping it fixes nothing. The bridge reconnects, is sent the latest
+    /// snapshot, which is the same one, and drops that connection too, so an
+    /// app holding one long value (a draft, a log tail, a transcript) leaves
+    /// the agent reconnecting for as long as the value stays long, with
+    /// nothing on either side saying why.
+    ///
+    /// So every tree is bounded here, after the depth cut, to fit that line
+    /// at any `seq`. The bound cuts what costs the most first and stops as
+    /// soon as the tree fits:
+    ///
+    /// 1. nodes that could never fit, one whose id, role and actions, with
+    ///    its strings at the floor, cannot fit beside its ancestors, are
+    ///    dropped with everything under them before any string is cut, so
+    ///    that they cost their siblings nothing;
+    /// 2. strings are cut: the longest values first, all down to one shared
+    ///    length, so the biggest shrink first and shorter ones are untouched,
+    ///    then values and labels together, the same way, when values alone
+    ///    are not enough. A cut value ends in `…`, except that a
+    ///    [`Role::Log`] or [`Role::Terminal`] value keeps its end and starts
+    ///    with `…` instead, because the end is where those grow. A string of
+    ///    256 bytes of JSON or less, the floor, is never cut;
+    /// 3. every node keeps at most one shared number of children, the
+    ///    largest that fits, so a list of fifty thousand rows loses its last
+    ///    rows while a status bar beside it keeps its place;
+    /// 4. shallowest first, the children that cap removed go back while they
+    ///    fit, each parent keeping a run of its first children with no gap,
+    ///    apart from a node that could never fit, and the first child too
+    ///    large for the room left ends its parent's run;
+    /// 5. if all else fails, a bare root, which always fits.
+    ///
+    /// The third and fourth stages plan with every string at the floor, but
+    /// the strings of the nodes they keep are then cut only as far as the
+    /// kept tree needs, and not at all when it fits as it is.
+    ///
+    /// Ids and custom action names are never changed, so whatever an agent
+    /// can read it can still act on. Focus is decided after the bound, for
+    /// the reason it is decided after the depth cut: the focused node can be
+    /// one of the rows dropped.
+    ///
+    /// A frame whose tree is the one the frame before it built stops before
+    /// any of this: it is compared and nothing else, neither measured nor
+    /// cut, so a tree that sits still costs the same whether or not it fits.
+    /// A tree that changed is measured exactly, by serializing it into a
+    /// counter that keeps nothing, and one that does not fit is cut again on
+    /// every frame it changes, so the bound is a guard, not a way to publish:
+    /// see [`oversized_snapshots`](Self::oversized_snapshots) and
+    /// [`last_oversize`](Self::last_oversize) for what was cut and where.
+    /// The fix is the one for depth, to publish what the widget draws: the
+    /// lines of a log the pane shows, the rows of a list on screen, the
+    /// visible part of a draft.
     pub fn publish(&mut self, nodes: impl IntoIterator<Item = Node>) {
         self.publish_nodes(nodes.into_iter().collect());
     }
@@ -693,37 +909,102 @@ impl TariaLayer {
     ///
     /// Wraps the nodes in an auto-generated `app` root (focused only if no
     /// recorded node is), bumps `seq`, and hands the snapshot to the writer
-    /// thread. Skipped entirely when the tree is identical to the previous
-    /// publish, and on a disabled layer. Never blocks the render path beyond
-    /// a brief mutex hold.
+    /// thread. Skipped when the tree is the one the previous frame built,
+    /// before anything is cut or measured; when what is left once it is cut
+    /// is the previous snapshot; and on a disabled layer. Never blocks the
+    /// render path beyond a brief mutex hold.
     ///
-    /// A tree over [`MAX_NODE_DEPTH`] is cut before any of that; see
-    /// [`publish`](Self::publish).
+    /// A tree over [`MAX_NODE_DEPTH`] is cut before any of that, and then a
+    /// tree too large for one line; see [`publish`](Self::publish).
     pub(crate) fn publish_nodes(&mut self, nodes: Vec<Node>) {
         let Some(inner) = self.inner.as_mut() else {
+            // Freed without recursing even here: the tree as built can be
+            // deeper than the call stack, and a disabled layer must not be
+            // the one thing that cannot take it.
+            nodes.into_iter().for_each(drop_iteratively);
             return;
         };
-        // The root added here counts towards the depth, so the check has to
-        // run on the assembled tree rather than on the caller's nodes, and
-        // before focus is decided: cutting a branch can remove the only
-        // focused node, and a snapshot has to carry focus somewhere.
         let mut root = Node::new("app", Role::App)
             .label(inner.shared.app_label.clone())
             .children(nodes);
-        if let Err(too_deep) = root.check_depth() {
-            truncate_to_max_depth(&mut root);
-            inner.truncated += 1;
-            inner.last_truncation = Some(too_deep);
+        // Focus is decided on the tree as built, so that a tree no cut
+        // touches is already the snapshot it goes out as, and the next frame
+        // can be compared against that snapshot with no second copy kept.
+        root.focused = !focused_below(&root);
+        // A frame drawn unchanged stops here, before anything is cut or
+        // measured. Everything below is a function of the tree alone: the
+        // root's label is the app's, fixed when the layer was bound, the
+        // depth limit and the budget are constants, and focus reads nothing
+        // but the tree. So the same tree would be cut to the same snapshot,
+        // the one already sent, and skipping the work changes nothing but
+        // what it costs, which for a tree too large for the line is the
+        // whole bound on every frame the app draws. The tree as built is
+        // freed without recursing, here and wherever else the layer lets go
+        // of one, because the depth cut below exists for trees deeper than
+        // the call stack, and the drop glue `Node` derives recurses.
+        if inner.is_newest_frame(&mut root) {
+            drop_iteratively(root);
+            return;
         }
-        let focus_recorded = root.children.iter().any(subtree_has_focus);
-        let root = root.focused(!focus_recorded);
 
-        if inner.last_root.as_ref() == Some(&root) {
+        // The root added here counts towards the depth, so the check has to
+        // run on the assembled tree rather than on the caller's nodes. A
+        // tree over the limit goes out as a copy cut to it, and the tree as
+        // built is kept to compare the next frame against. Focus is decided
+        // again on the copy: cutting a branch can remove the only focused
+        // node, and a snapshot has to carry focus somewhere.
+        let too_deep = root.check_depth().err();
+        let (mut tree, mut raw) = if too_deep.is_some() {
+            let mut cut = copy_within_depth(&mut root);
+            cut.focused = !focused_below(&cut);
+            (cut, Some(root))
+        } else {
+            (root, None)
+        };
+
+        // Then the size, which has to come after the depth cut: measuring
+        // serializes the tree, which recurses, and the cut is what makes
+        // that safe. Focus was decided before the measure so that the size
+        // the bound reports is that of the tree as it would otherwise have
+        // gone out, and is decided again after a cut, because a dropped row
+        // can be the focused one. The tree as built is copied only when it
+        // is about to be cut, so a tree that fits is never copied here.
+        let before = bound::measure_root(&tree);
+        let too_large = if before.is_some_and(|bytes| bytes <= ROOT_BUDGET) {
+            None
+        } else {
+            if raw.is_none() {
+                raw = Some(tree.clone());
+            }
+            let bounded = bound::cut_to_fit(&mut tree, ROOT_BUDGET, before);
+            tree.focused = !focused_below(&tree);
+            Some(bounded)
+        };
+        if let Some(replaced) = mem::replace(&mut inner.last_raw, raw) {
+            drop_iteratively(replaced);
+        }
+
+        // Compared again once cut: a tree that changed only past a cut, a
+        // draft typed into beyond what fits, is cut to the snapshot already
+        // sent.
+        if inner.last_root.as_ref() == Some(&tree) {
             return;
         }
         inner.seq += 1;
-        let snapshot = Snapshot::new(inner.seq, root.clone());
-        inner.last_root = Some(root);
+        // Counted here, past the dedupe, so both count snapshots the agent
+        // was sent rather than frames the app drew: an over-deep or
+        // oversized tree that sits still on screen would otherwise count
+        // sixty times a second.
+        if let Some(too_deep) = too_deep {
+            inner.truncated = inner.truncated.saturating_add(1);
+            inner.last_truncation = Some(too_deep);
+        }
+        if let Some(bounded) = too_large {
+            inner.oversized = inner.oversized.saturating_add(1);
+            inner.last_oversize = Some(SnapshotTooLarge::new(bounded));
+        }
+        let snapshot = Snapshot::new(inner.seq, tree.clone());
+        inner.last_root = Some(tree);
 
         let mut state = inner.shared.lock_state();
         state.latest = Some(snapshot);
@@ -743,13 +1024,28 @@ impl Drop for TariaLayer {
     /// Stop the threads and unlink the socket. A disabled layer has neither,
     /// so it touches no filesystem at all.
     ///
+    /// Acks still queued for a connected bridge are written before its
+    /// connection is closed, so an app that answers an input and exits in the
+    /// same frame does not leave the agent waiting on that answer; a snapshot
+    /// still waiting is not. See `SHUTDOWN_FLUSH` for why the one and not the
+    /// other, and for the bound on it.
+    ///
     /// How long this takes depends only on what the threads are doing, never
     /// on what is at the socket path. The listener polls the shutdown flag
     /// rather than waiting to be woken by a connection, so it returns whether
     /// the socket file was replaced by a second instance, removed, or is
-    /// being served by some other process; the worst case is one
-    /// `ACCEPT_POLL` nap, plus one `WRITE_TIMEOUT` if a connected bridge
-    /// has stopped reading mid-write.
+    /// being served by some other process. With no bridge connected that is
+    /// at most one `ACCEPT_POLL` nap. With one, the line being written when
+    /// the shutdown came is finished or given up within `WRITE_TIMEOUT` of
+    /// starting, however large it is and however the bridge reads, no other
+    /// line but the queued acks is started after it, and those get
+    /// `SHUTDOWN_FLUSH`. So dropping never takes longer than `ACCEPT_POLL` +
+    /// `WRITE_TIMEOUT` + `SHUTDOWN_FLUSH`, about 5.3 s, and takes longer than
+    /// one `ACCEPT_POLL` only against a bridge too slow to take the line it
+    /// is being sent.
+    ///
+    /// The trees the layer still holds are freed without recursing, because
+    /// the one the newest frame built can be deeper than the call stack.
     fn drop(&mut self) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -796,8 +1092,11 @@ struct Shared {
     /// Agent inputs dropped because the input queue was full. Written by
     /// reader threads, read via [`TariaLayer::dropped_inputs`].
     dropped_inputs: AtomicU64,
-    /// Agent inputs discarded at dequeue because the connection they arrived
-    /// on had ended. Written by the app thread, read via
+    /// Agent inputs discarded rather than delivered: at dequeue because the
+    /// connection they arrived on had ended, and before the handshake because
+    /// the client wrote them while it waited its turn. Written by the app
+    /// thread for the first and by the listener thread for the second, both
+    /// with an atomic add, so neither can lose the other's count; read via
     /// [`TariaLayer::stale_inputs`].
     stale_inputs: AtomicU64,
     /// Agent inputs answered [`Ignored`](InputStatus::Ignored) by the reader
@@ -925,6 +1224,9 @@ impl Shared {
         let mut state = self.lock_state();
         if state.generation != generation {
             drop(state);
+            // An atomic add, not a load and store: the listener thread counts
+            // its pre-handshake discards into the same counter (see
+            // `start_connection`), possibly at this very moment.
             self.stale_inputs.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -963,27 +1265,144 @@ impl State {
     }
 }
 
-/// Does `node` or any of its descendants have focus?
-fn subtree_has_focus(node: &Node) -> bool {
-    node.focused || node.children.iter().any(subtree_has_focus)
+/// Is any node below `root` focused?
+///
+/// Walks with a stack of sibling iterators rather than by recursing, for the
+/// reason [`Node::check_depth`] does: it runs on the tree as built, before
+/// the depth cut, and a recursive walk would overflow on a tree deeper than
+/// the call stack. The stack holds one iterator per level, so a wide tree
+/// costs no more memory than a narrow one.
+fn focused_below(root: &Node) -> bool {
+    let mut pending = vec![root.children.iter()];
+    while let Some(siblings) = pending.last_mut() {
+        match siblings.next() {
+            Some(node) if node.focused => return true,
+            Some(node) => pending.push(node.children.iter()),
+            None => {
+                pending.pop();
+            }
+        }
+    }
+    false
 }
 
-/// Drop the children of every node at [`MAX_NODE_DEPTH`], so no node of the
-/// tree rooted at `root` is deeper than the limit.
+/// Are `a` and `b` the same tree?
 ///
-/// Walks with a vector for the reason [`Node::check_depth`] does: the input
-/// this exists for is a tree deeper than the call stack, and a recursive walk
-/// would overflow on exactly that. Only the branches that run over are
-/// touched; the rest of the tree keeps every node it had.
-fn truncate_to_max_depth(root: &mut Node) {
-    let mut pending = vec![(root, 1usize)];
-    while let Some((node, level)) = pending.pop() {
-        if level >= MAX_NODE_DEPTH {
-            node.children.clear();
-            continue;
-        }
-        pending.extend(node.children.iter_mut().map(|child| (child, level + 1)));
+/// What `==` on [`Node`] answers, without its recursion, because one side is
+/// the tree as built and can be deeper than the call stack. Each pair of
+/// nodes is compared with the children set aside, which still compares every
+/// field a node has, the ones a later taria adds included, and the children
+/// are then compared as pairs of their own. The `&mut` is only for setting
+/// the children aside; both trees come back as they were.
+fn same_tree(a: &mut Node, b: &mut Node) -> bool {
+    if !same_node(a, b) {
+        return false;
     }
+    let mut pending = vec![a.children.iter_mut().zip(b.children.iter_mut())];
+    while let Some(pairs) = pending.last_mut() {
+        match pairs.next() {
+            Some((a, b)) => {
+                if !same_node(a, b) {
+                    return false;
+                }
+                pending.push(a.children.iter_mut().zip(b.children.iter_mut()));
+            }
+            None => {
+                pending.pop();
+            }
+        }
+    }
+    true
+}
+
+/// Are `a` and `b` equal apart from their children, and do they have as
+/// many?
+fn same_node(a: &mut Node, b: &mut Node) -> bool {
+    if a.children.len() != b.children.len() {
+        return false;
+    }
+    let a_children = mem::take(&mut a.children);
+    let b_children = mem::take(&mut b.children);
+    let same = *a == *b;
+    a.children = a_children;
+    b.children = b_children;
+    same
+}
+
+/// Free a tree one node at a time.
+///
+/// The drop glue [`Node`] derives frees a node's children before the node,
+/// by recursing, so a tree deeper than the call stack aborts the process
+/// when it is dropped: not a panic that unwinds, a stack overflow. Every
+/// tree this crate lets go of before the depth cut goes through here
+/// instead. Each node is freed with its children moved out to a list of
+/// their own, so a chain holds one node there at a time. A child with no
+/// children of its own is freed where it stands instead, which recurses no
+/// further, so a frame of fifty thousand rows drawn unchanged frees them
+/// at the cost of the derived glue rather than queueing every one.
+pub(crate) fn drop_iteratively(root: Node) {
+    let mut pending = vec![root];
+    while let Some(mut node) = pending.pop() {
+        pending.extend(
+            node.children
+                .drain(..)
+                .filter(|child| !child.children.is_empty()),
+        );
+    }
+}
+
+/// `node` without its children, copied without copying them.
+fn shallow_copy(node: &mut Node) -> Node {
+    let children = mem::take(&mut node.children);
+    let copy = node.clone();
+    node.children = children;
+    copy
+}
+
+/// A copy of `root` cut to [`MAX_NODE_DEPTH`]: every node at the limit is
+/// copied without its children, and nothing below it is copied at all.
+///
+/// A copy, because the tree as built is kept to compare the next frame
+/// against; cut while it is copied, so the part cut away costs nothing. Built
+/// with a stack rather than by recursing, because the tree it reads is the
+/// one too deep for that. Only the branches that run over lose anything; the
+/// rest of the tree keeps every node it had.
+fn copy_within_depth(root: &mut Node) -> Node {
+    // A copy under construction, beside the children of its original still
+    // to copy into it. The stack's height is the level its top is at,
+    // counting the root as 1.
+    let mut stack = vec![(shallow_copy(root), root.children.iter_mut())];
+    while let Some((_, children)) = stack.last_mut() {
+        let next = children.next();
+        let level = stack.len() + 1;
+        match next {
+            Some(child) if level >= MAX_NODE_DEPTH => {
+                let copy = shallow_copy(child);
+                if let Some((parent, _)) = stack.last_mut() {
+                    parent.children.push(copy);
+                }
+            }
+            Some(child) => {
+                let copy = shallow_copy(child);
+                stack.push((copy, child.children.iter_mut()));
+            }
+            // The root stays on the stack once its last child is in, so the
+            // loop ends with it there.
+            None if stack.len() == 1 => break,
+            None => {
+                if let Some((done, _)) = stack.pop()
+                    && let Some((parent, _)) = stack.last_mut()
+                {
+                    parent.children.push(done);
+                }
+            }
+        }
+    }
+    let copied = stack.pop().map(|(copy, _)| copy);
+    drop(stack);
+    // The loop never empties the stack, so the fallback is never taken; it
+    // is the root alone, which is still a tree within the limit.
+    copied.unwrap_or_else(|| shallow_copy(root))
 }
 
 /// Accept loop: serves one bridge client at a time until shutdown.
@@ -991,7 +1410,18 @@ fn truncate_to_max_depth(root: &mut Node) {
 /// The listener is non-blocking, so this thread is never parked in `accept()`
 /// and the shutdown flag is checked on its own schedule; see [`ACCEPT_POLL`]
 /// for why exit cannot be left to depend on a connection arriving.
+///
+/// It also tracks whether the next connection it accepts waited behind the
+/// last one, which is what decides if [`start_connection`] discards what that
+/// client wrote before its hello. A connection accepted after a session
+/// ended, before any accept has found the backlog empty, was waiting in the
+/// backlog while that session ran; a client that connects in the instant
+/// between the session's end and the next accept is taken for one too. One
+/// accepted after an accept found nothing connected after the session had
+/// ended, so it waited behind nobody, and neither did the first connection of
+/// the process.
 fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender<QueuedInput>) {
+    let mut waited = false;
     loop {
         if shared.is_shutdown() {
             return;
@@ -1009,11 +1439,17 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender
                     continue;
                 }
                 // Errors just drop this client; the loop keeps accepting.
-                let _ = serve_client(stream, &shared, &input_tx);
+                let _ = serve_client(stream, &shared, &input_tx, waited);
+                // Whoever is in the backlog now connected while that client
+                // was served, so it waited behind it, however that ended.
+                waited = true;
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                // Nothing waiting to be accepted: nap instead of spinning,
-                // then back to the shutdown check at the top.
+                // Nobody is waiting, so whoever connects next waited behind
+                // nobody.
+                waited = false;
+                // Nap instead of spinning, then back to the shutdown check at
+                // the top.
                 thread::sleep(ACCEPT_POLL);
             }
             Err(_) => {
@@ -1029,15 +1465,21 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender
 
 /// Serve one connected bridge: handshake, then reader thread + writer loop
 /// until the client disconnects or the layer shuts down.
+///
+/// `waited` says the client was in the listen backlog when the previous
+/// session ended; see [`accept_loop`] and [`start_connection`].
 fn serve_client(
     stream: UnixStream,
     shared: &Arc<Shared>,
     input_tx: &SyncSender<QueuedInput>,
+    waited: bool,
 ) -> io::Result<()> {
     // SO_SNDTIMEO is shared across the duplicated fds; only writes block long
-    // enough to need it.
+    // enough to need it. Every line sets it again before each of its writes,
+    // from its own deadline (see `write_all_before`), so after the first line
+    // it stays at `WRITE_WAIT` or less, and this value governs no write: it
+    // only means the socket never starts out with no timeout at all.
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-    let mut write_stream = stream.try_clone()?;
 
     // Capture the snapshot and epoch atomically so the writer loop neither
     // misses nor duplicates a publish that races the handshake. Acks left
@@ -1052,16 +1494,16 @@ fn serve_client(
         (state.latest.clone(), state.epoch, state.generation)
     };
     let alive = Arc::new(AtomicBool::new(true));
-    let reader = match start_connection(
-        &mut write_stream,
+    let (mut write_stream, reader) = match start_connection(
         stream,
         shared,
         input_tx,
         initial_snapshot,
         &alive,
         generation,
+        waited,
     ) {
-        Ok(reader) => reader,
+        Ok(started) => started,
         Err(err) => {
             // The reader thread normally retires this generation as it exits,
             // and here it never started (or never got the handshake). Retire
@@ -1086,31 +1528,174 @@ fn serve_client(
     Ok(())
 }
 
-/// Send the handshake (and the snapshot a new client is owed) and start the
+/// Discard what a client that waited its turn wrote before its handshake,
+/// send the handshake (and the snapshot a new client is owed) and start the
 /// connection's reader thread, so every way of failing to get a connection
 /// off the ground funnels through one `Err` for the caller to clean up after.
+/// On success the writer's handle on the socket comes back beside the reader
+/// thread.
+///
+/// # Input written before the hello
+///
+/// The accept loop serves one client to completion before it accepts the
+/// next, so a client that connects meanwhile sits in the listen backlog with
+/// a socket that works, and whatever it writes there waits in the kernel's
+/// buffer: a probe measured 180 KB accepted before a write would block, all
+/// of it readable once the connection is finally served. Read as the new
+/// session's first lines, that is input the app applies on behalf of a client
+/// that wrote it blind, to a tree it never saw, and the hello is the boundary
+/// that tells the two apart: nothing written before it can have been written
+/// in reply to it. See [`TariaLayer::stale_inputs`], which counts what is
+/// thrown away here.
+///
+/// Only a client that `waited` is drained: one the accept loop took from the
+/// backlog after a session ended, before it last found the backlog empty
+/// (see [`accept_loop`]). A client that connects to an idle app is accepted
+/// within one [`ACCEPT_POLL`], and one that writes at once without reading
+/// the hello, a script piping a line into the socket, waited behind nobody.
+/// What it wrote is input for the session it is about to get, as it was in
+/// 0.3.0, and discarding it would lose it unacked, with nothing to tell the
+/// client. The protocol leaves the choice to the app; this keeps the discard
+/// to the client it exists for.
+///
+/// For a client that waited, the stream is read without blocking, right
+/// before the hello is written and not a step earlier, and everything already
+/// there is discarded. What arrives between this read and the hello's write
+/// slips through, and only a client writing blind can land in that gap. A
+/// client that waits for the hello loses nothing either way.
+///
+/// The bytes may stop partway through a line, whose remainder then arrives
+/// as the session's first bytes. That remainder belongs to a line written
+/// blind, and its own tail can parse as a whole input (a line with leading
+/// whitespace, cut inside it, is one), so the reader is told to skip through
+/// the first newline it reads before it treats anything as input.
+///
+/// More than [`MAX_LINE_BYTES`] waiting is an error, like a line that long:
+/// past that it is a flood, not a client that wrote a little too early, and
+/// reading it all off would let a client that never stops writing hold the
+/// listener here forever.
+///
+/// The latest snapshot is skipped, not written, once the layer is shutting
+/// down, for the reason the writer skips one (see [`writer_loop`]).
 fn start_connection(
-    write_stream: &mut UnixStream,
     stream: UnixStream,
     shared: &Arc<Shared>,
     input_tx: &SyncSender<QueuedInput>,
     initial_snapshot: Option<Snapshot>,
     alive: &Arc<AtomicBool>,
     generation: u64,
-) -> io::Result<JoinHandle<()>> {
+    waited: bool,
+) -> io::Result<(UnixStream, JoinHandle<()>)> {
+    let mut write_stream = stream.try_clone()?;
+    let starts_mid_line = if waited {
+        discard_unsolicited(&stream, shared)?
+    } else {
+        false
+    };
+
     write_line(
-        write_stream,
+        &mut write_stream,
         &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION),
     )?;
-    if let Some(snapshot) = initial_snapshot {
-        write_line(write_stream, &AppToBridge::Snapshot(snapshot))?;
+    if let Some(snapshot) = initial_snapshot
+        && !shared.is_shutdown()
+    {
+        write_line(&mut write_stream, &AppToBridge::Snapshot(snapshot))?;
     }
-    thread::Builder::new().name("taria-reader".into()).spawn({
+    let reader = thread::Builder::new().name("taria-reader".into()).spawn({
         let alive = Arc::clone(alive);
         let shared = Arc::clone(shared);
         let input_tx = input_tx.clone();
-        move || reader_loop(stream, input_tx, alive, shared, generation)
-    })
+        move || reader_loop(stream, input_tx, alive, shared, generation, starts_mid_line)
+    })?;
+    Ok((write_stream, reader))
+}
+
+/// Read off and count what a client that waited its turn wrote before its
+/// hello, for [`start_connection`]. Returns whether it stopped partway through
+/// a line, whose remainder the reader is then told to skip.
+fn discard_unsolicited(stream: &UnixStream, shared: &Shared) -> io::Result<bool> {
+    // The flag belongs to the open socket, not to this handle, so the
+    // `try_clone`d writer goes non-blocking with it. It is put back before
+    // anything is written: the hello and every later write rely on blocking
+    // until their deadline.
+    stream.set_nonblocking(true)?;
+    let mut unsolicited = Vec::new();
+    let read = read_unsolicited(stream, &mut unsolicited);
+    // Counted whatever the read ended in: an input read off here was
+    // discarded either way, including when the next byte overflows the cap.
+    shared
+        .stale_inputs
+        .fetch_add(count_input_lines(&unsolicited), Ordering::Relaxed);
+    stream.set_nonblocking(false)?;
+    read?;
+    Ok(unsolicited.last().is_some_and(|&byte| byte != b'\n'))
+}
+
+/// Append everything `reader` has ready to `pending`, stopping when a read
+/// would block or the peer has closed its end.
+///
+/// For the non-blocking pass [`start_connection`] makes before the hello.
+/// More than [`MAX_LINE_BYTES`] in all is an
+/// [`InvalidData`](io::ErrorKind::InvalidData) error, with `pending` left
+/// holding exactly the first [`MAX_LINE_BYTES`] bytes: the read that ran
+/// over is kept up to the cap, so every complete line before it can still be
+/// counted as an input thrown away. Any other error ends the read the same
+/// way: the connection is broken, and `pending` holds what came before.
+fn read_unsolicited(mut reader: impl Read, pending: &mut Vec<u8>) -> io::Result<()> {
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                let Some(read) = chunk.get(..n) else {
+                    return Err(io::Error::other(
+                        "a read reported more bytes than it was given",
+                    ));
+                };
+                let room = MAX_LINE_BYTES.saturating_sub(pending.len());
+                if n > room {
+                    // Up to the cap, so a complete line that fits before it
+                    // is counted even though the read it came in ran over.
+                    pending.extend_from_slice(read.get(..room).unwrap_or_default());
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "the client wrote more than {MAX_LINE_BYTES} bytes before its \
+                             handshake"
+                        ),
+                    ));
+                }
+                pending.extend_from_slice(read);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// How many complete lines of `bytes` are agent inputs, of any kind.
+///
+/// A line that does not end in `\n` is not complete, and neither is it
+/// counted: whether it would have parsed is unknowable. Lines that do not
+/// parse at all are passed over in silence, as the reader passes them over on
+/// a live connection. An input of a kind this build cannot read
+/// ([`AgentInput::Unknown`]) counts like any other, because it was discarded
+/// like any other; on a live connection it would have been answered, but
+/// before the hello there is nobody to answer.
+fn count_input_lines(bytes: &[u8]) -> u64 {
+    let inputs = bytes
+        .split_inclusive(|&byte| byte == b'\n')
+        .filter(|line| line.ends_with(b"\n"))
+        .filter(|line| {
+            matches!(
+                serde_json::from_slice::<BridgeToApp>(line),
+                Ok(BridgeToApp::Input { .. })
+            )
+        })
+        .count();
+    u64::try_from(inputs).unwrap_or(u64::MAX)
 }
 
 /// Reader half of a connection: parse `BridgeToApp` lines and forward agent
@@ -1125,12 +1710,20 @@ fn start_connection(
 /// Every forwarded input carries `generation`, which this loop retires when
 /// the connection ends so anything still queued from it is discarded instead
 /// of delivered.
+///
+/// `starts_mid_line` says the bytes the client wrote before its hello, which
+/// [`start_connection`] discarded, stopped partway through a line. Everything
+/// up to and including the first newline is that line's remainder, and is
+/// skipped without being parsed, counted or acked; see [`start_connection`].
+/// It is still a line, so a remainder over [`MAX_LINE_BYTES`] breaks the
+/// connection like any other.
 fn reader_loop(
     stream: UnixStream,
     input_tx: SyncSender<QueuedInput>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
     generation: u64,
+    mut starts_mid_line: bool,
 ) {
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
@@ -1152,6 +1745,11 @@ fn reader_loop(
             // Oversized line (or EOF mid-line): treat the connection as
             // broken rather than accumulating an unbounded buffer.
             break;
+        }
+        if std::mem::take(&mut starts_mid_line) {
+            // The rest of a line the client began before its hello. Its tail
+            // can parse on its own, and it was still written blind.
+            continue;
         }
         let Ok(msg) = serde_json::from_slice::<BridgeToApp>(&buf) else {
             continue;
@@ -1213,13 +1811,36 @@ fn reader_loop(
 /// snapshot first could not tell whether it reflects its input yet.
 ///
 /// Returns when the layer shuts down, the reader reports the client gone, or
-/// a write fails.
+/// a write fails. A shutdown first writes every ack still queued, the rest of
+/// the batch in hand included, within [`SHUTDOWN_FLUSH`] in all, and skips the
+/// snapshot that would have followed them; a client already gone gets
+/// nothing, since nobody is left to read it.
+///
+/// The shutdown flag is checked before every line, the snapshot's included,
+/// so a shutdown that comes while a line is being written waits for that line
+/// only, and [`WRITE_TIMEOUT`] bounds the whole of it. That is the bound
+/// [`Drop`] promises, because it waits for this thread.
+///
+/// Every ack that flush can write belongs to this connection. The queue is
+/// emptied under the lock as each connection starts, in the same step that
+/// moves the generation on, so nothing queued for an earlier one survives
+/// into it. While this connection's reader runs, `alive` is true and the
+/// generation is this connection's, and the reader changes both together,
+/// under the lock, as it exits, so an `alive` read under the lock vouches
+/// for every ack taken in the same hold. Every shutdown check takes the acks
+/// in the same hold that read `alive`.
 fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut last_epoch: u64) {
     loop {
         let (acks, snapshot) = {
             let mut state = shared.lock_state();
             loop {
-                if state.shutdown || !alive.load(Ordering::SeqCst) {
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
+                if state.shutdown {
+                    let queued = std::mem::take(&mut state.acks);
+                    drop(state);
+                    flush_acks(stream, queued);
                     return;
                 }
                 if !state.acks.is_empty() || state.epoch != last_epoch {
@@ -1238,31 +1859,152 @@ fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        for (id, status) in acks {
+        let mut acks = acks.into_iter();
+        while let Some((id, status)) = acks.next() {
             // Rechecked per ack rather than once per pass: a full batch
             // against a peer that stopped reading is a whole queue of write
             // timeouts long, and `Drop` waits for this thread, so an exit
-            // during the flush would sit through every one of them.
-            if shared.is_shutdown() || !alive.load(Ordering::SeqCst) {
+            // during the batch would sit through every one of them. The acks
+            // not written yet go out under the flush's bound instead, this
+            // one first and anything queued since the batch was taken last.
+            let unwritten = std::iter::once((id, status)).chain(&mut acks);
+            if stop_writing(stream, shared, alive, unwritten) {
                 return;
             }
             if write_line(stream, &AppToBridge::ack(id, status)).is_err() {
                 return;
             }
         }
-        if let Some(snapshot) = snapshot
-            && write_line(stream, &AppToBridge::Snapshot(snapshot)).is_err()
-        {
+        let Some(snapshot) = snapshot else {
+            continue;
+        };
+        // Checked again here, or a shutdown that came while the batch's last
+        // ack was being written would be noticed only after the snapshot:
+        // the one line a shutdown skips, and the longest.
+        if stop_writing(stream, shared, alive, std::iter::empty()) {
+            return;
+        }
+        if write_line(stream, &AppToBridge::Snapshot(snapshot)).is_err() {
             return;
         }
     }
 }
 
-/// Serialize one message as a newline-terminated JSON frame and write it.
+/// The check [`writer_loop`] makes before each line of a batch: is the
+/// client gone, or is the layer shutting down?
+///
+/// Returns true when the writer must stop: at once when the client is gone,
+/// and when the layer is shutting down, once `unwritten` and then every ack
+/// queued since the batch was taken have been flushed. `unwritten` is
+/// consumed only in that case, so the caller can go on with it otherwise. The
+/// queued acks are taken in the same hold of the lock that read `alive`,
+/// which is what vouches for them; see [`writer_loop`].
+fn stop_writing(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    alive: &AtomicBool,
+    unwritten: impl IntoIterator<Item = (InputId, InputStatus)>,
+) -> bool {
+    let mut state = shared.lock_state();
+    if !alive.load(Ordering::SeqCst) {
+        return true;
+    }
+    if !state.shutdown {
+        return false;
+    }
+    let queued = std::mem::take(&mut state.acks);
+    drop(state);
+    flush_acks(stream, unwritten.into_iter().chain(queued));
+    true
+}
+
+/// Serialize one message as a newline-terminated JSON frame and write it,
+/// the whole line within [`WRITE_TIMEOUT`] of starting or not at all.
+///
+/// The deadline is on the line, not on each `write` it takes; see
+/// [`WRITE_TIMEOUT`] for why. A line that misses it may be written in part,
+/// and every caller then drops the connection, which is the only thing that
+/// can follow a partial line.
 fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
-    let mut line = serde_json::to_string(msg).map_err(io::Error::other)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes())
+    let mut line = serde_json::to_vec(msg).map_err(io::Error::other)?;
+    line.push(b'\n');
+    let deadline = Instant::now()
+        .checked_add(WRITE_TIMEOUT)
+        .ok_or_else(|| io::Error::other("the write deadline is past what the clock can hold"))?;
+    write_all_before(stream, &line, deadline)
+}
+
+/// Write the acks a shutdown found queued, oldest first, giving up once
+/// [`SHUTDOWN_FLUSH`] has passed or a write fails.
+///
+/// Best effort by design: the caller returns either way, and an ack that
+/// misses the deadline costs its waiter the timeout it would have waited out
+/// with no flush at all. The connection is closed straight after, so the
+/// write timeout this leaves on the socket is never used again.
+fn flush_acks(stream: &mut UnixStream, acks: impl IntoIterator<Item = (InputId, InputStatus)>) {
+    let Some(deadline) = Instant::now().checked_add(SHUTDOWN_FLUSH) else {
+        return;
+    };
+    // One buffer and one deadline for the lot, rather than a line at a time,
+    // so the bound is on the flush and not on each of its writes.
+    let mut lines = Vec::new();
+    for (id, status) in acks {
+        let Ok(line) = serde_json::to_vec(&AppToBridge::ack(id, status)) else {
+            break;
+        };
+        lines.extend_from_slice(&line);
+        lines.push(b'\n');
+    }
+    let _ = write_all_before(stream, &lines, deadline);
+}
+
+/// `write_all`, finished by `deadline` or failed with
+/// [`TimedOut`](io::ErrorKind::TimedOut).
+///
+/// A socket's write timeout does not bound a `write` call, only each wait for
+/// room inside one, and a call waits again for every piece the kernel splits
+/// it into (Linux allocates a buffer of at most a few tens of KB at a time,
+/// and waits for room before each). So a large line, against a bridge that
+/// frees a little room before every wait can time out, never times out at
+/// all: a 900 KB snapshot to a bridge taking 64 KB every 3 s held the writer
+/// for forty seconds with a 5 s timeout. Setting the timeout to what is left
+/// of a deadline before each call does not help on its own, because a single
+/// call runs past the deadline.
+///
+/// So no call is handed more than [`WRITE_CHUNK`] bytes, few enough that the
+/// kernel waits for room at most once inside it, and that wait is given what
+/// is left of the deadline, or [`WRITE_WAIT`] if that is less, set before
+/// every call. A wait that times out short of the deadline is simply waited
+/// again. A timeout of zero means none at all to the socket and is refused,
+/// which is why nothing left ends the loop rather than reaching it.
+fn write_all_before(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        stream.set_write_timeout(Some(left.min(WRITE_WAIT)))?;
+        let chunk = bytes.get(..WRITE_CHUNK).unwrap_or(bytes);
+        match stream.write(chunk) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            // The socket is blocking, so this is the wait's timeout firing,
+            // and the clock at the top of the loop says whether that was the
+            // deadline.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Make `path` absolute, resolving a relative path (including a bare
@@ -1726,6 +2468,8 @@ mod tests {
         assert_eq!(layer.unknown_inputs(), 0);
         assert_eq!(layer.truncated_snapshots(), 0);
         assert_eq!(layer.last_truncation(), None);
+        assert_eq!(layer.oversized_snapshots(), 0);
+        assert_eq!(layer.last_oversize(), None);
 
         assert_eq!(layer.try_recv(), None);
         assert_eq!(layer.try_recv_with_id(), None);
@@ -1841,7 +2585,87 @@ mod tests {
     /// Focus anywhere under the root, which is what the root's own focus flag
     /// is the negation of.
     fn subtree_has_focus_below_root(root: &Node) -> bool {
-        root.children.iter().any(subtree_has_focus)
+        focused_below(root)
+    }
+
+    /// The tree as built is compared, searched for focus and copied before
+    /// the depth cut, so none of the three may recurse: the tree the cut
+    /// exists for can be deeper than the call stack.
+    #[test]
+    fn a_tree_deeper_than_the_call_stack_is_compared_and_cut_without_recursing() {
+        const DEEP: usize = 100_000;
+        let mut deep = chain(DEEP);
+        let mut same = chain(DEEP);
+        // Different only at the very bottom, so the comparison has to walk
+        // the whole way down to see it.
+        let mut other = Node::new(format!("n{DEEP}"), Role::TreeItem).label("changed");
+        for level in (1..DEEP).rev() {
+            other = Node::new(format!("n{level}"), Role::TreeItem).child(other);
+        }
+
+        assert!(!focused_below(&deep));
+        assert!(same_tree(&mut deep, &mut same));
+        assert!(!same_tree(&mut deep, &mut other));
+
+        let cut = copy_within_depth(&mut deep);
+        assert_eq!(cut.depth(), MAX_NODE_DEPTH);
+        assert!(cut.check_depth().is_ok());
+        assert_eq!(deep.depth(), DEEP, "the tree as built is left whole");
+        for tree in [deep, same, other] {
+            drop_iteratively(tree);
+        }
+    }
+
+    /// Run `test` on a thread with a stack far smaller than a recursive drop
+    /// of a 100k-deep tree needs, so a recursion anywhere in it overflows
+    /// however large the test thread's own stack happens to be. A stack
+    /// overflow aborts the process rather than failing the test, so this is
+    /// what makes such a regression fail every time instead of now and then.
+    fn on_a_small_stack(test: impl FnOnce() + Send + 'static) {
+        let outcome = thread::Builder::new()
+            .name("small-stack".into())
+            .stack_size(512 * 1024)
+            .spawn(test)
+            .expect("spawn a test thread")
+            .join();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The derived drop glue of [`Node`] recurses, so every tree the layer
+    /// lets go of before the depth cut is freed one node at a time: the
+    /// frame drawn unchanged, the tree as built that a changed frame
+    /// replaces, the one the layer holds when it is dropped, and whatever a
+    /// disabled layer or an unpublished frame is handed. Publishing a tree
+    /// deeper than the call stack succeeded before this, and the next
+    /// publish aborted the process.
+    #[test]
+    fn a_tree_deeper_than_the_call_stack_is_freed_without_recursing() {
+        const DEEP: usize = 100_000;
+        on_a_small_stack(|| {
+            let mut layer = bind_test_layer("taria-layer-", "deepfree");
+            layer.publish([chain(DEEP)]);
+            // Drawn again unchanged: the frame's own tree is freed.
+            layer.publish([chain(DEEP)]);
+            assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+            // A different one, which the depth cut makes the snapshot already
+            // sent: the tree as built that it replaces is freed all the same.
+            layer.publish([chain(DEEP + 1)]);
+            assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+            // And one that is a new snapshot.
+            layer.publish([chain(DEEP), Node::new("new", Role::Text)]);
+            assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
+            assert_eq!(layer.truncated_snapshots(), 2);
+            // A frame recorded and never published is freed with it.
+            layer.frame().push(chain(DEEP));
+            // And the layer frees the one it still holds.
+            drop(layer);
+
+            let mut disabled =
+                TariaLayer::disabled("deepfree", PathBuf::new(), io::Error::other("test"));
+            disabled.publish([chain(DEEP)]);
+        });
     }
 
     /// Only the branches that run over are cut. A wide tree with one runaway
@@ -1861,6 +2685,314 @@ mod tests {
         assert_eq!(root.children[0].id.0, "shallow");
         assert_eq!(root.children[0].label.as_deref(), Some("kept"));
         assert_eq!(layer.truncated_snapshots(), 1);
+    }
+
+    /// The counter counts snapshots the agent was sent, not frames the app
+    /// drew. A deep tree redrawn unchanged is the snapshot already published
+    /// once it is cut, so it is not sent again and must not count again: at
+    /// sixty frames a second it would otherwise add sixty a second.
+    #[test]
+    fn the_same_over_deep_tree_published_twice_counts_once() {
+        let mut layer = bind_test_layer("taria-layer-", "deeptwice");
+        layer.publish([chain(MAX_NODE_DEPTH * 2)]);
+        layer.publish([chain(MAX_NODE_DEPTH * 2)]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.truncated_snapshots(), 1);
+
+        // A deep tree that changed is a new snapshot, cut again.
+        layer.publish([chain(MAX_NODE_DEPTH * 2), Node::new("new", Role::Text)]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
+        assert_eq!(layer.truncated_snapshots(), 2);
+    }
+
+    /// One focused text input holding `value`, as a draft would be published.
+    fn draft(value: String) -> Node {
+        Node::new("draft", Role::TextInput)
+            .value(value)
+            .focused(true)
+    }
+
+    /// The root the layer builds around [`draft`], for sizing values against
+    /// and for the line it would have been sent as.
+    fn root_around_draft(label: &str, value: String) -> Node {
+        Node::new("app", Role::App).label(label).child(draft(value))
+    }
+
+    fn line_len(snapshot: Snapshot) -> usize {
+        serde_json::to_vec(&AppToBridge::Snapshot(snapshot))
+            .expect("serialize a snapshot")
+            .len()
+    }
+
+    /// The size boundary, through the layer: a root exactly at the budget is
+    /// published as built and counted nowhere; one byte more is cut, counted,
+    /// and still fits the line.
+    #[test]
+    fn a_tree_at_the_size_budget_is_published_untouched_and_one_byte_over_is_cut() {
+        let mut layer = bind_test_layer("taria-layer-", "atsize");
+        let base = serde_json::to_vec(&root_around_draft("atsize", String::new()))
+            .expect("serialize a root")
+            .len();
+        let at = "x".repeat(ROOT_BUDGET - base);
+
+        layer.publish([draft(at.clone())]);
+        let snapshot = layer
+            .latest_snapshot()
+            .expect("a tree at the budget publishes");
+        assert_eq!(snapshot.root, root_around_draft("atsize", at.clone()));
+        assert!(line_len(snapshot) <= MAX_LINE_BYTES);
+        assert_eq!(layer.oversized_snapshots(), 0);
+        assert_eq!(layer.last_oversize(), None);
+
+        let over = format!("{at}x");
+        layer.publish([draft(over.clone())]);
+        let snapshot = layer
+            .latest_snapshot()
+            .expect("a tree over is published cut");
+        assert_eq!(snapshot.seq, 2);
+        let value = snapshot.root.children[0].value.clone().expect("a value");
+        assert!(value.ends_with('\u{2026}'), "the cut is marked");
+        assert!(over.starts_with(value.trim_end_matches('\u{2026}')));
+        assert!(snapshot.root.children[0].focused, "focus is untouched");
+        assert!(line_len(snapshot) <= MAX_LINE_BYTES);
+
+        assert_eq!(layer.oversized_snapshots(), 1);
+        let too_large = layer.last_oversize().expect("the cut is recorded");
+        // The line it would have been, counted at the largest seq the way
+        // the bound counts it: one byte over the root budget is one byte over
+        // the line.
+        let unbounded = Snapshot::new(u64::MAX, root_around_draft("atsize", over));
+        assert_eq!(too_large.bytes(), line_len(unbounded));
+        assert_eq!(too_large.bytes(), MAX_LINE_BYTES + 1);
+        assert_eq!(too_large.limit(), MAX_LINE_BYTES);
+        assert_eq!(too_large.strings_trimmed(), 1);
+        assert_eq!(too_large.nodes_dropped(), 0);
+        assert_eq!(too_large.largest().0, "draft");
+        let message = too_large.to_string();
+        assert!(message.contains("`draft`"), "{message}");
+        assert!(message.contains(&MAX_LINE_BYTES.to_string()), "{message}");
+    }
+
+    /// Counted like the depth cut: an oversized draft that sits still while
+    /// the app redraws it is one snapshot, and an edit to it is another.
+    #[test]
+    fn the_same_oversized_tree_published_twice_counts_once() {
+        let mut layer = bind_test_layer("taria-layer-", "bigtwice");
+        let big = "y".repeat(MAX_LINE_BYTES * 2);
+        layer.publish([draft(big.clone())]);
+        layer.publish([draft(big.clone())]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+
+        // An edit past the cut changes nothing the agent would be sent, so
+        // it is not a new snapshot either.
+        layer.publish([draft(format!("{big}z"))]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+
+        // One the agent would see is.
+        layer.publish([draft(format!("z{big}"))]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
+        assert_eq!(layer.oversized_snapshots(), 2);
+    }
+
+    /// Focus is decided after the bound, as it is after the depth cut: the
+    /// rows dropped to fit can include the focused one, and a snapshot has
+    /// to carry focus somewhere.
+    #[test]
+    fn a_size_bound_that_drops_the_only_focused_node_leaves_focus_on_the_root() {
+        let mut layer = bind_test_layer("taria-layer-", "bigfocus");
+        // The focused row is the last, and a list keeps a run of its first
+        // rows, so it is the first row to go.
+        let rows = (0..60_000).map(|n| {
+            Node::new(format!("row-{n:05}"), Role::ListItem)
+                .label(format!("Task {n:05}"))
+                .focused(n == 59_999)
+        });
+        layer.publish([Node::new("list", Role::List).children(rows)]);
+
+        let root = layer.latest_snapshot().expect("published").root;
+        assert_eq!(layer.oversized_snapshots(), 1);
+        let too_large = layer.last_oversize().expect("recorded");
+        assert!(too_large.nodes_dropped() > 0, "the last row went");
+        assert!(
+            root.focused,
+            "the focused row was dropped, so the root has to carry focus"
+        );
+        assert!(!subtree_has_focus_below_root(&root));
+    }
+
+    /// Through the layer, the line a node that could never fit leaves: the
+    /// draft beside it goes out whole, in the line it would have had alone
+    /// plus the chrome. Dropped only after every string was cut to the
+    /// floor, it left a line of 590 bytes with 256 of them the draft.
+    #[test]
+    fn a_node_that_could_never_fit_leaves_the_draft_beside_it_whole() {
+        let mut layer = bind_test_layer("taria-layer-", "unfit");
+        let value = "d".repeat(300_000);
+        let chrome = [
+            Node::new("status", Role::Status).value("1 draft"),
+            Node::new("quit", Role::Button)
+                .label("Quit")
+                .action(taria::Action::Activate),
+        ];
+        let mut nodes = vec![
+            Node::new("I".repeat(2_000_000), Role::Text),
+            draft(value.clone()),
+        ];
+        nodes.extend(chrome.clone());
+        layer.publish(nodes);
+
+        let snapshot = layer.latest_snapshot().expect("published");
+        let ids: Vec<&str> = snapshot
+            .root
+            .children
+            .iter()
+            .map(|child| child.id.0.as_str())
+            .collect();
+        assert_eq!(ids, ["draft", "status", "quit"]);
+        assert_eq!(snapshot.root.children[0], draft(value.clone()));
+        assert_eq!(snapshot.root.children[1..], chrome);
+
+        let alone = line_len(Snapshot::new(1, root_around_draft("unfit", value)));
+        let line = line_len(snapshot);
+        assert!(line > alone && line <= MAX_LINE_BYTES, "{line} of {alone}");
+        let too_large = layer.last_oversize().expect("recorded");
+        assert_eq!(too_large.strings_trimmed(), 0);
+        assert_eq!(too_large.nodes_dropped(), 1);
+    }
+
+    /// The cost the comparison before the bound exists for. Deduplicating
+    /// after the bound meant a tree too large for the line paid the whole
+    /// bound on every frame it was drawn, changed or not, which for a few
+    /// megabytes is a hundred milliseconds a frame. Unchanged, a frame is now
+    /// compared and nothing else.
+    #[test]
+    fn an_unchanged_oversized_tree_is_bounded_once_however_often_it_is_drawn() {
+        let mut layer = bind_test_layer("taria-layer-", "bigstill");
+        let rows: Vec<Node> = (0..5000)
+            .map(|n| Node::new(format!("row-{n:05}"), Role::ListItem).label(format!("Task {n:05}")))
+            .collect();
+        let frame = |text: &str| {
+            [
+                draft(text.to_string()),
+                Node::new("list", Role::List).children(rows.clone()),
+            ]
+        };
+        let big = "d".repeat(MAX_LINE_BYTES * 3);
+
+        let start = bound::runs();
+        let nodes = frame(&big);
+        let started = Instant::now();
+        layer.publish(nodes);
+        let first = started.elapsed();
+        let once = bound::runs();
+        assert_eq!(once.measured - start.measured, 1);
+        assert_eq!(once.cut - start.cut, 1);
+
+        let mut redrawn = Duration::ZERO;
+        for _ in 1..100 {
+            // Built outside the clock: what is timed is the layer's work.
+            let nodes = frame(&big);
+            let started = Instant::now();
+            layer.publish(nodes);
+            redrawn += started.elapsed();
+        }
+        assert_eq!(
+            bound::runs(),
+            once,
+            "an unchanged frame is neither measured nor cut"
+        );
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+        let per_frame = redrawn / 99;
+        eprintln!("first frame {first:?}, each unchanged frame after it {per_frame:?}");
+        assert!(
+            per_frame * 4 < first,
+            "an unchanged frame took {per_frame:?}, against {first:?} for the one bounded"
+        );
+
+        // An edit past the cut is cut once and sends nothing, and the frames
+        // that redraw it unchanged after that are not cut again.
+        let edited = format!("{big}z");
+        for _ in 0..10 {
+            layer.publish(frame(&edited));
+        }
+        let after = bound::runs();
+        assert_eq!(after.cut - once.cut, 1);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+    }
+
+    /// The comparison costs a tree that fits nothing extra: it is measured
+    /// once, never cut, and held once, as the snapshot it went out as. Only a
+    /// tree that had to be cut keeps the tree it was cut from as well.
+    #[test]
+    fn a_tree_that_fits_is_measured_once_and_held_once() {
+        let mut layer = bind_test_layer("taria-layer-", "fitstill");
+        let frame = || {
+            [Node::new("list", Role::List)
+                .children((0..100).map(|n| Node::new(format!("row-{n}"), Role::ListItem)))]
+        };
+        let start = bound::runs();
+        for _ in 0..10 {
+            layer.publish(frame());
+        }
+        let runs = bound::runs();
+        assert_eq!(runs.measured - start.measured, 1);
+        assert_eq!(runs.cut, start.cut);
+        let inner = layer.inner.as_ref().expect("enabled");
+        assert!(
+            inner.last_raw.is_none(),
+            "no second copy of a tree that fits"
+        );
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+
+        layer.publish([draft("y".repeat(MAX_LINE_BYTES * 2))]);
+        let inner = layer.inner.as_ref().expect("enabled");
+        assert!(
+            inner.last_raw.is_some(),
+            "a cut tree keeps what it was cut from"
+        );
+    }
+
+    /// A deep tree whose runaway branch is the last child at every level: 40
+    /// levels, cut to 32 for depth and then to the line for size. Any one
+    /// cap on children that keeps the branch keeps everything, so a cap
+    /// alone kept the first level's leaves and a few percent of the line.
+    /// What the cap dropped is offered back, shallowest first, so the line
+    /// is used.
+    #[test]
+    fn a_deep_tree_cut_for_depth_and_then_for_size_still_fills_the_line() {
+        let mut layer = bind_test_layer("taria-layer-", "deepfill");
+        let leaves = |level: usize| {
+            (0..200).map(move |n| {
+                Node::new(format!("leaf-{level}-{n}"), Role::Text).label("x".repeat(250))
+            })
+        };
+        // 39 links under the root, so 40 levels counting it.
+        let mut branch = Node::new("n39", Role::TreeItem).children(leaves(39));
+        for level in (1..39).rev() {
+            branch = Node::new(format!("n{level}"), Role::TreeItem)
+                .children(leaves(level))
+                .child(branch);
+        }
+        layer.publish([branch]);
+
+        let snapshot = layer.latest_snapshot().expect("published");
+        assert_eq!(layer.truncated_snapshots(), 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+        assert_eq!(
+            snapshot.root.children[0].children.len(),
+            201,
+            "the first level is kept whole, branch and all"
+        );
+        let len = line_len(snapshot);
+        assert!(len <= MAX_LINE_BYTES);
+        assert!(
+            len * 10 >= MAX_LINE_BYTES * 9,
+            "{len} of {MAX_LINE_BYTES} bytes used"
+        );
     }
 
     #[test]
@@ -1934,6 +3066,332 @@ mod tests {
         shared.lock_state().shutdown = true;
         shared.cv.notify_all();
         writer.join().expect("writer thread");
+    }
+
+    /// Write junk into `stream` until the peer's side is full, so the next
+    /// write blocks: a bridge that has stopped reading. Returns how many
+    /// bytes it took, for a test that wants to read past them later.
+    fn fill_until_blocked(stream: &UnixStream) -> usize {
+        stream.set_nonblocking(true).expect("non-blocking");
+        let chunk = [b'x'; 4096];
+        let mut filled = 0;
+        loop {
+            match (&*stream).write(&chunk) {
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("filling the socket failed: {err}"),
+            }
+        }
+        stream.set_nonblocking(false).expect("blocking again");
+        filled
+    }
+
+    /// Run [`writer_loop`] on its own thread and report when it returns, so
+    /// a writer that never does fails the test instead of hanging the suite.
+    /// The stream is dropped as the loop returns, which is the EOF a test
+    /// reads to know nothing else was written.
+    fn spawn_writer(server: UnixStream, shared: &Arc<Shared>) -> Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn({
+            let shared = Arc::clone(shared);
+            move || {
+                let mut server = server;
+                let alive = AtomicBool::new(true);
+                writer_loop(&mut server, &shared, &alive, 0);
+                drop(server);
+                let _ = tx.send(());
+            }
+        });
+        rx
+    }
+
+    /// The exit the flush exists for: the app dequeued an input, refined its
+    /// ack and dropped the layer, all before the writer ran again. Both acks
+    /// are still queued, and so is the snapshot the app published last.
+    #[test]
+    fn a_shutdown_writes_the_queued_acks_and_not_the_snapshot() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+
+        let shared = test_shared("exitflush");
+        {
+            let mut state = shared.lock_state();
+            state.acks.push_back((4, InputStatus::Delivered));
+            state.acks.push_back((4, InputStatus::Ignored));
+            state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
+            state.epoch = 1;
+            state.shutdown = true;
+        }
+        let done = spawn_writer(server, &shared);
+
+        let mut reader = BufReader::new(client);
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read a message") == 0 {
+                break;
+            }
+            lines.push(serde_json::from_str::<AppToBridge>(&line).expect("parse a message"));
+        }
+        assert_eq!(
+            lines,
+            [
+                AppToBridge::ack(4, InputStatus::Delivered),
+                AppToBridge::ack(4, InputStatus::Ignored),
+            ],
+            "every queued ack goes out, in order, and the snapshot behind them does not"
+        );
+        assert!(
+            done.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the writer returns once the acks are out"
+        );
+        assert!(shared.lock_state().acks.is_empty(), "the queue was taken");
+    }
+
+    /// The other place the writer notices a shutdown: partway through a
+    /// batch, blocked on a slow bridge. What it has not written of that batch
+    /// goes out under the flush's bound, followed by anything queued since,
+    /// and the snapshot that was due after the batch is skipped.
+    #[test]
+    fn a_shutdown_mid_batch_writes_the_rest_of_it_and_what_queued_since() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let junk = fill_until_blocked(&server);
+
+        let shared = test_shared("midbatch");
+        {
+            let mut state = shared.lock_state();
+            state.acks.push_back((1, InputStatus::Delivered));
+            state.acks.push_back((2, InputStatus::Delivered));
+            state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
+            state.epoch = 1;
+        }
+        let done = spawn_writer(server, &shared);
+
+        // The writer has the batch once the queue is empty. From there it is
+        // blocked writing the first ack into the full socket, or about to be,
+        // and either way the next time it looks at the shutdown flag is
+        // inside that batch, before one of its acks.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shared.lock_state().acks.is_empty() {
+            assert!(Instant::now() < deadline, "the writer never took the batch");
+            thread::sleep(Duration::from_millis(1));
+        }
+        {
+            let mut state = shared.lock_state();
+            state.acks.push_back((3, InputStatus::Ignored));
+            state.shutdown = true;
+            shared.cv.notify_all();
+        }
+
+        // Reading frees the socket, which lets the blocked write finish and
+        // the writer reach its next check.
+        let mut reader = BufReader::new(client);
+        let mut skipped = vec![0; junk];
+        reader.read_exact(&mut skipped).expect("read past the junk");
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read a message") == 0 {
+                break;
+            }
+            lines.push(serde_json::from_str::<AppToBridge>(&line).expect("parse a message"));
+        }
+        assert_eq!(
+            lines,
+            [
+                AppToBridge::ack(1, InputStatus::Delivered),
+                AppToBridge::ack(2, InputStatus::Delivered),
+                AppToBridge::ack(3, InputStatus::Ignored),
+            ],
+            "the batch in hand first, then what was queued behind it, and no snapshot"
+        );
+        assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    /// The gap the per-ack check leaves: a shutdown that comes while the
+    /// batch's last ack is being written. That ack's check has passed, and
+    /// there is no ack after it whose check could notice, so the writer used
+    /// to go straight on to the snapshot, the one line a shutdown skips and
+    /// the one that can hold `Drop` for a whole `WRITE_TIMEOUT`.
+    #[test]
+    fn a_shutdown_while_the_last_ack_is_written_never_writes_the_snapshot() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let junk = fill_until_blocked(&server);
+
+        let shared = test_shared("lastack");
+        {
+            let mut state = shared.lock_state();
+            state.acks.push_back((1, InputStatus::Delivered));
+            state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
+            state.epoch = 1;
+        }
+        let done = spawn_writer(server, &shared);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shared.lock_state().acks.is_empty() {
+            assert!(Instant::now() < deadline, "the writer never took the batch");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Time for the writer to pass the check before its only ack and
+        // stall in that ack's write, against the full socket. Should it still
+        // be short of the check, that check sees the shutdown instead, and
+        // what is asserted below holds all the same.
+        thread::sleep(Duration::from_millis(100));
+        {
+            let mut state = shared.lock_state();
+            state.shutdown = true;
+            shared.cv.notify_all();
+        }
+
+        // Reading frees the socket, which lets the stalled ack finish.
+        let mut reader = BufReader::new(client);
+        let mut skipped = vec![0; junk];
+        reader.read_exact(&mut skipped).expect("read past the junk");
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read a message") == 0 {
+                break;
+            }
+            lines.push(serde_json::from_str::<AppToBridge>(&line).expect("parse a message"));
+        }
+        assert_eq!(
+            lines,
+            [AppToBridge::ack(1, InputStatus::Delivered)],
+            "the ack in hand goes out, and the snapshot behind it does not"
+        );
+        assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    /// The flush is bounded in total, not per ack: against a bridge that has
+    /// stopped reading, a queue of acks each given the time left would still
+    /// be one bound long, and a queue each given `WRITE_TIMEOUT` would hold
+    /// the app's exit for minutes.
+    #[test]
+    fn the_shutdown_flush_gives_up_on_a_bridge_that_stopped_reading() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        fill_until_blocked(&server);
+        // As on a live connection, where every write already has this
+        // timeout: the flush has to beat it, not lean on it.
+        server
+            .set_write_timeout(Some(WRITE_TIMEOUT))
+            .expect("write timeout");
+
+        let shared = test_shared("stuckflush");
+        {
+            let mut state = shared.lock_state();
+            for id in 0..20 {
+                state.acks.push_back((id, InputStatus::Delivered));
+            }
+            state.shutdown = true;
+        }
+        let done = spawn_writer(server, &shared);
+
+        // Well short of one `WRITE_TIMEOUT`, so a flush that leaned on it
+        // fails here rather than passing slowly.
+        let margin = Duration::from_secs(2);
+        done.recv_timeout(SHUTDOWN_FLUSH + margin)
+            .expect("the flush must give up on a stuck bridge within its bound");
+        // Held to here, so the bridge was stuck rather than gone throughout.
+        drop(client);
+    }
+
+    /// A reader that hands out a scripted sequence of results, for the read
+    /// a socket can only produce by timing: an interrupted call, then a
+    /// would-block once everything waiting has been read.
+    struct Scripted(VecDeque<io::Result<&'static [u8]>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let bytes = self
+                .0
+                .pop_front()
+                .expect("read again after it would have blocked")?;
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    /// What the pre-handshake pass reads and what it counts: every complete
+    /// line that is an input, of any kind, and nothing else.
+    #[test]
+    fn input_written_before_the_hello_is_read_off_and_counted_by_the_line() {
+        let script = [
+            Ok(&br#"{"type":"input","id":1,"input":{"kind":"key","key":"q"}}"#[..]),
+            Err(io::ErrorKind::Interrupted.into()),
+            Ok(&b"\nnot json\n"[..]),
+            // A kind this build cannot read is still an input, discarded
+            // like the rest.
+            Ok(&br#"{"type":"input","id":2,"input":{"kind":"paste"}}"#[..]),
+            Ok(&b"\n{\"type\":\"bye\"}\n"[..]),
+            // Cut off: the reader skips its remainder rather than this
+            // counting it.
+            Ok(&br#"{"type":"input","id":3,"#[..]),
+            Err(io::ErrorKind::WouldBlock.into()),
+        ];
+        let mut pending = Vec::new();
+        read_unsolicited(Scripted(script.into()), &mut pending)
+            .expect("an interrupted read is retried, and a would-block ends the pass");
+        assert!(
+            pending.ends_with(br#""id":3,"#),
+            "everything ready was read"
+        );
+        assert_eq!(count_input_lines(&pending), 2);
+
+        // A peer that closed its end is done too.
+        let mut pending = Vec::new();
+        read_unsolicited(&b"{}\n"[..], &mut pending).expect("EOF ends the pass");
+        assert_eq!(pending, b"{}\n");
+
+        // Up to a line's worth waiting is fine; past it is an oversized line.
+        let line = vec![b' '; MAX_LINE_BYTES];
+        read_unsolicited(line.as_slice(), &mut Vec::new()).expect("exactly the cap is accepted");
+        let flood = vec![b'\n'; MAX_LINE_BYTES + 1];
+        let mut pending = Vec::new();
+        let err = read_unsolicited(flood.as_slice(), &mut pending)
+            .expect_err("more than a line's worth before the hello is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            pending.len() <= MAX_LINE_BYTES,
+            "and nothing past the cap is kept"
+        );
+    }
+
+    /// The read that runs over the cap is kept up to it, so every complete
+    /// line before the cap is counted. Dropping that whole read undercounted
+    /// by as many lines as it held whenever the reads did not land on the cap
+    /// exactly, which a socket's reads need not.
+    #[test]
+    fn every_complete_line_before_the_cap_is_counted() {
+        let line = b"{\"type\":\"input\",\"id\":1,\"input\":{\"kind\":\"key\",\"key\":\"q\"}}\n";
+        let fit = MAX_LINE_BYTES / line.len();
+        assert_ne!(
+            MAX_LINE_BYTES % line.len(),
+            0,
+            "the cap falls inside a line"
+        );
+        // Past the cap by more than one read's worth.
+        let flood = line.repeat(fit + 400);
+        // A short first read, so that no later one ends on the cap.
+        let (first, rest) = flood.split_at(100);
+        let mut pending = Vec::new();
+        let err = read_unsolicited(first.chain(rest), &mut pending)
+            .expect_err("more than a line's worth before the hello is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(pending.len(), MAX_LINE_BYTES, "kept up to the cap");
+        assert_eq!(
+            count_input_lines(&pending),
+            u64::try_from(fit).expect("fits"),
+            "every input that ends before the cap is counted, and the one it cuts is not"
+        );
     }
 
     /// Exit must not depend on the wake-up connection succeeding: with the
@@ -2208,12 +3666,17 @@ mod tests {
     }
 
     #[test]
-    fn focus_detection_is_recursive() {
-        let unfocused = Node::new("a", Role::Pane).child(Node::new("b", Role::Text));
-        assert!(!subtree_has_focus(&unfocused));
+    fn focus_detection_reaches_every_level_below_the_root() {
+        let unfocused = Node::new("a", Role::Pane)
+            .focused(true)
+            .child(Node::new("b", Role::Text));
+        assert!(
+            !focused_below(&unfocused),
+            "the root's own flag is not below it"
+        );
 
         let deep_focus = Node::new("a", Role::Pane)
             .child(Node::new("b", Role::List).child(Node::new("c", Role::ListItem).focused(true)));
-        assert!(subtree_has_focus(&deep_focus));
+        assert!(focused_below(&deep_focus));
     }
 }
