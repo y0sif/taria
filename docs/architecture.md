@@ -127,18 +127,22 @@ built stops before the bound, so a tree that sits still costs one comparison
 whether or not it fits. A changed tree is bounded at publish, after the depth
 cut, because measuring it serializes it, which recurses, and the cut is what
 keeps that safe. It is measured exactly, by serializing it into a counter
-that keeps nothing, and one over the limit is cut in stages, each only when
-the one before was not enough:
+that keeps nothing, and one over the limit is cut in stages, stopping as soon
+as the tree fits:
 
-1. the longest values, all down to one shared length; a string of 256 bytes
-   of JSON or less is never cut;
-2. values and labels together, the same way;
-3. nodes. First any node that could not fit with only its ancestors beside
-   it goes alone, so it cannot take its siblings with it. Then every node
-   loses its children past one shared cap, the largest that fits. Then,
-   shallowest first, the children the cap dropped come back while they fit,
-   and each node keeps an unbroken run of its first children;
-4. every child of the root, which leaves a root that always fits.
+1. every node that could never be published goes, with everything under it,
+   and its siblings stay. That is a node whose id, role, actions and strings
+   cut to 256 bytes of JSON cannot fit with only its ancestors beside it;
+2. the longest values, all down to one shared length, then values and labels
+   together, the same way. A string of 256 bytes of JSON or less is never
+   cut;
+3. every node keeps at most one shared number of children, the largest that
+   fits;
+4. shallowest first, the children that cap removed go back while they fit.
+   Each parent keeps a run of its first children with no gap, apart from a
+   node that could never fit, and a child too large for the room left closes
+   its parent's list;
+5. a bare root, which always fits.
 
 A cut string is marked with `…` (U+2026). A `log` or `terminal` value keeps
 its tail, since that is where those grow; every other string keeps its head.
@@ -491,9 +495,8 @@ App side (`TariaLayer::bind`, or `bind_or_disabled`):
    inputs). The listener socket is non-blocking and the thread polls a
    shutdown flag every 50 ms rather than parking in `accept()`: waking a
    parked `accept()` by connecting to the socket path fails exactly when it
-   matters, because by then the path may hold a socket another process
-   bound, whose listener takes the wake-up while this one
-   stays parked forever.
+   matters, because by then the path may hold a socket another process bound,
+   whose listener takes the wake-up while this one stays parked forever.
    Dropping the layer shuts the threads down and removes the socket file, but
    only while that file is still the one this layer bound, compared by device
    and inode: a second instance that took the path over is serving a socket of

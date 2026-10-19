@@ -514,18 +514,18 @@ bridge names the limit, but only the app can bring its tree within it.
 `taria::wire::MAX_LINE_BYTES` is 1 MiB, 1048576 bytes, not counting the
 newline. Both peers enforce it.
 
-The adapter bounds every snapshot to fit at publish, after the depth cut. It
-cuts what costs the most first and stops as soon as the tree fits: the longest
-values first, all down to one shared length; then values and labels together;
-then nodes; last, every child of the root. A string of 256 bytes or less is
-never cut. When nodes go, a list keeps its first rows with no gap, and a node
-that could never fit goes alone rather than taking its siblings, a status bar
-or a `quit`, with it. A cut is marked with `…`: a `Role::Log` or
-`Role::Terminal` value keeps its end, because that is where those grow, and
-every other string keeps its start. Ids and custom action names are never
-touched, so an agent can still act on whatever it reads. The tree is trimmed
-rather than withheld for the reason it is cut for depth: a publish that does
-not happen leaves the agent on a stale tree.
+The adapter trims every snapshot to fit at publish, after the depth cut, and
+stops as soon as the tree fits. The longest values are cut to one shared
+length, then labels with them; a string of 256 bytes of JSON or less is never
+cut. A cut is marked with `…`: a `Role::Log` or `Role::Terminal` value keeps
+its end, because that is where those grow, and every other string keeps its
+start. When nodes go, a list keeps its first rows with no gap, apart from a
+node that could never fit. That one goes with everything under it, and its
+siblings stay, so a status bar or a `quit` beside it is kept. Ids and custom
+action names are never touched, so an agent can still act on whatever it
+reads. The stages are in `architecture.md` (Snapshot size). The tree is
+trimmed rather than withheld for the reason it is cut for depth: a publish
+that does not happen leaves the agent on a stale tree.
 
 A frame identical to the one before it is skipped before the trim. A changed
 tree is compared again after it, so an edit past the cut of a trimmed value
@@ -551,7 +551,7 @@ typing into, a log nobody capped, a chat transcript, a list holding every row.
 Bound those yourself. Publish the tail of a log, or the lines its pane shows;
 cap a draft or a transcript at what an agent needs to read; publish the rows
 on screen. The adapter's bound is a guard, not a way to publish: a tree over
-the line is cut again on every frame that changes it, which for a draft
+the limit is cut again on every frame that changes it, which for a draft
 someone is typing into is every keystroke.
 
 ## The raw inputs, and what they are for

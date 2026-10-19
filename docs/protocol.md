@@ -76,8 +76,8 @@ the app is the one that speaks first (section 3).
    is answered `ignored`, not left unanswered. The exceptions are a line
    that did not parse, which carries no readable id (section 2.6), an input
    whose connection has since ended, which is deliberately not acked
-   (section 11), and an input written before the app's `hello`, which an app
-   **MAY** discard unacked (section 14.5).
+   (section 11), and an input written before the app's `hello`
+   (section 14.5).
 5. Skip a line it cannot parse and keep the connection (section 2.6).
 6. Never apply an input that arrived on a connection that has since ended
    (section 11).
@@ -936,11 +936,11 @@ retires that generation as the reader thread exits, before the disconnect is
 observable anywhere. An input from a retired generation is discarded at
 dequeue and counted in `stale_inputs()`. Input a waiting client wrote before
 the `hello` is counted there too, though it never reaches the queue
-(section 14.5). The same bookkeeping decides who may still be
-answered: `ack` refuses an id whose connection has ended, and an id also stops
-being answerable once its own connection has delivered a queue's worth (256)
-of newer inputs past it, which bounds what the layer remembers and costs at
-most a late ack the peer already has to survive.
+(section 14.5). The same bookkeeping decides who may still be answered: `ack`
+refuses an id whose connection has ended, and an id also stops being
+answerable once its own connection has delivered a queue's worth (256) of
+newer inputs past it, which bounds what the layer remembers and costs at most
+a late ack the peer already has to survive.
 
 ## 12. Key string grammar
 
@@ -1074,39 +1074,12 @@ not skipped: it ends the connection, and does again on every reconnect
 (section 2.5).
 
 **What to do about a snapshot that is too large is the sender's choice**, as
-it is for depth. The reference adapter **trims**, after the depth cut. A frame
-whose tree is the one the previous frame built is skipped before either cut;
-a changed tree is measured exactly, and what the cut leaves is checked
-against the last snapshot sent. The adapter sizes the line for the largest
-possible `seq`, so the same tree is always cut the same way, and it stops as
-soon as the tree fits:
-
-1. the longest values, all cut to one shared length, so the biggest shrink
-   first and shorter ones are untouched. A string of 256 bytes of JSON or
-   less is never cut;
-2. values and labels together, the same way, when values alone are not
-   enough;
-3. nodes, once every longer string is cut to at most 256 bytes. Any node
-   that could not fit with only its ancestors beside it goes alone, so it
-   cannot take its siblings with it. Every node then keeps at most one shared
-   number of children, the largest that fits, and the children that cap
-   dropped come back, shallowest first, while they fit. Each node keeps an
-   unbroken run of its first children;
-4. last, every child of the root.
-
-A cut string is marked with `…` (U+2026). A `log` or `terminal` value keeps
-its end and starts with the marker, because the end is where those grow; every
+it is for depth, not a protocol rule. The reference adapter **trims**, and
+marks a cut string with `…` (U+2026). A `log` or `terminal` value keeps its
+end and starts with the marker, because the end is where those grow; every
 other string keeps its start. Ids and custom action names are never changed,
-so whatever an agent can read it can still act on. If the focused node was
-dropped, the root carries focus (section 15). The app is told through
-`oversized_snapshots()` and `last_oversize()`, which names the node holding
-the longest string. Trimming, for the reason the depth limit cuts: sending the
-tree as built loses the bridge, and withholding it leaves the agent on a stale
-tree. The fix is nearly always to publish what the widget draws: the lines a
-log pane shows, the visible part of a draft.
-
-One consequence: an edit past the cut of a trimmed value leaves the trimmed
-tree as it was, so the adapter has nothing new to send.
+so whatever an agent can read it can still act on. `docs/architecture.md`
+(Snapshot size) gives the order the adapter cuts in and how it tells the app.
 
 ### 13.3 Socket path length
 
@@ -1602,9 +1575,8 @@ behaviour a peer may rely on.
 6. **A snapshot carrying zero or more than one focused node** (section 15).
 7. **Whether a bridge may send input before it has seen a `hello` or any
    snapshot.** The reference bridge refuses at the tool layer, but nothing on
-   the wire forbids it. An app **MAY** discard input written before its
-   `hello`, and the reference adapter does for a client that waited behind
-   another bridge, counting it in `stale_inputs()` (section 14.5).
+   the wire forbids it. A bridge cannot rely on it: an app may discard such
+   input (section 14.5).
 8. **What a second bridge should do while its connection waits to be
    accepted** (section 14.5). Multiple simultaneous clients are deferred.
 9. **Any timing requirement.** No keepalive, no heartbeat, no deadline for an

@@ -59,7 +59,8 @@ has a lint that catches it.
   that exceeds what a JSON parser will recurse into and would arrive as
   nothing. The adapter cuts deeper branches at publish and tells the app.
 - Snapshots are capped at one line of `MAX_LINE_BYTES`, 1 MiB, because a
-  longer line costs the app its bridge on every reconnect. The adapter
-  shortens the longest values and labels at publish, marking each cut with
-  `…`, drops nodes only when that is not enough, keeping each node's first
-  children with no gap, and tells the app.
+  longer line costs the app its bridge on every reconnect. The adapter trims
+  at publish and tells the app: it drops any node that could never fit,
+  shortens the longest values and labels, marking each cut with `…`, and
+  drops more nodes only when that is not enough, keeping each node's first
+  children with no gap apart from a node that could never fit.

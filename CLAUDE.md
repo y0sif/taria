@@ -25,9 +25,8 @@ refuses a `target/debug` older than the sources.
 - `crates/taria`: wire types (`Snapshot`, `Node`, `Role`, `Action`,
   `AgentInput`), the `wire` module (`AppToBridge`/`BridgeToApp` ndjson
   messages, `InputId`, `InputStatus`, and `MAX_LINE_BYTES`, the 1 MiB line
-  limit both peers enforce), and three modules both peers share:
-  `key` (the key-string grammar), `IdSpace` (prefixed node ids, re-exported
-  at the root),
+  limit both peers enforce), and three modules both peers share: `key` (the
+  key-string grammar), `IdSpace` (prefixed node ids, re-exported at the root),
   `socket` (path resolution, plus the per-platform AF_UNIX path limit: 107
   bytes on Linux, 103 on macOS and the BSDs, and a label that is not a plain
   file name is refused). No I/O, no framework deps, exactly one dependency
@@ -58,40 +57,27 @@ refuses a `target/debug` older than the sources.
   when the app says so, by returning it from `drain_acking` or calling `ack`.
   The wildcard arm `#[non_exhaustive]` forces on a `match` over `AgentInput`
   is the arm that swallows `Text`; the demo carries
-  `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are flushed before the
-  snapshot published after them, from a bounded queue that drops its oldest,
-  and once more at shutdown, within `SHUTDOWN_FLUSH` (250 ms in all), skipping
-  any pending snapshot.
+  `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are flushed
+  before the snapshot published after them, from a bounded queue that drops
+  its oldest, and once more at shutdown, within `SHUTDOWN_FLUSH` (250 ms).
   Inputs are tagged with their connection's generation and discarded (not
   applied) once that connection ends, and `ack` refuses an id whose connection
-  is gone. Input a client wrote before its `hello` is read off just before
-  the `hello` and discarded unacked, but only for a client that was waiting
-  in the backlog when the previous session ended (one connecting the instant
-  a session ends counts too); the first connection of a process, and one to
-  an idle app, keep theirs. Both discards count in `stale_inputs()`. Every
-  line written has a 5 s deadline in all (`WRITE_TIMEOUT`, 2 KiB chunks,
-  waits of at most 50 ms), so a bridge that cannot take a whole line in 5 s
-  is dropped, and `Drop` takes at most `ACCEPT_POLL + WRITE_TIMEOUT +
-  SHUTDOWN_FLUSH`. Four counters of lost agent traffic: `dropped_inputs()`,
-  `stale_inputs()`, `unknown_inputs()`, `dropped_acks()`. A tree over
-  `MAX_NODE_DEPTH` is cut branch-wise at publish rather than withheld (a
-  withheld tree leaves the agent on a stale one), reported via
-  `truncated_snapshots()`/`last_truncation()`. Then a tree over
-  `MAX_LINE_BYTES` is trimmed to fit: longest values first to a shared length
-  (a string of 256 bytes or less is never cut, `…` at the cut, a
-  `log`/`terminal` value keeps its tail), then labels too, then nodes (one
-  that can never fit is dropped alone, the rest take the largest uniform
-  child cap that fits, then are refilled breadth-first while they fit, each
-  parent keeping a contiguous run of its first children), then a bare root;
-  ids and custom action names never change. Reported via
-  `oversized_snapshots()`/`last_oversize()` (`SnapshotTooLarge`, whose
-  `largest` counts ids and custom action names too). A frame whose tree as
-  built matches the previous frame's returns before either cut; a changed one
-  is measured exactly, and the cut tree is compared again with the last
-  snapshot sent. Both counters count snapshots sent, not frames. Binding
-  unlinks only a socket nothing is listening on, refuses a live one so a
-  second instance cannot steal it, and the listener polls a shutdown flag so
-  exit never waits on a connection.
+  is gone. Input written before the `hello` is discarded unacked, but only
+  from a client that waited in the backlog behind the previous session. Each
+  line written gets 5 s in all (`WRITE_TIMEOUT`), so a stuck bridge is
+  dropped and `Drop` stays bounded. Four counters of lost agent traffic:
+  `dropped_inputs()`, `stale_inputs()` (both discards), `unknown_inputs()`,
+  `dropped_acks()`. A tree over `MAX_NODE_DEPTH` is cut branch-wise at
+  publish rather than withheld (a withheld tree leaves the agent on a stale
+  one), reported via `truncated_snapshots()`/`last_truncation()`; then a tree
+  over `MAX_LINE_BYTES` is trimmed to fit (nodes that can never fit, then the
+  longest strings, then trailing nodes; ids and custom action names never
+  change), reported via
+  `oversized_snapshots()`/`last_oversize()`. Both count snapshots sent, not
+  frames, and an unchanged frame skips both cuts. Binding unlinks only a
+  socket nothing is listening on, refuses a live one so a second instance
+  cannot steal it, and the listener polls a shutdown flag so exit never waits
+  on a connection.
 - `crates/taria-mcp`: rmcp stdio server exposing
   `read_tree`/`act`/`key`/`type_text`. A socket-manager task reconnects with
   capped backoff, holds the latest snapshot in a watch channel, and
@@ -116,14 +102,11 @@ refuses a `target/debug` older than the sources.
   as long as the peer's snapshots parse, and refuses every input tool. When
   lines from the app were rejected, `read_tree` says the socket path is right
   and quotes the reason rather than sending an adopter back to check the path.
-  A line over `MAX_LINE_BYTES` ends the connection and leaves a fixed reason
-  (`OVERSIZED_LINE`), kept across reconnects until a snapshot parses or a
-  connect finds nothing listening (`ConnectionRefused`/`NotFound`), so an
-  app that exited reads as exited; while it holds, `read_tree`, the input
-  tools and the departure answers name the 1 MiB limit and say the app
-  resends its latest snapshot on every reconnect, instead of "may have
-  exited". A second bridge waiting in the backlog is told the app "has not
-  accepted" it.
+  A line over `MAX_LINE_BYTES` ends the connection and leaves the reason
+  `OVERSIZED_LINE`, kept across reconnects until a snapshot parses or a
+  connect finds nothing listening; while it holds, every answer names the
+  1 MiB limit instead of "may have exited". A second bridge waiting in the
+  backlog is told the app "has not accepted" it.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
   identities (`IdSpace`), stable across deletes and restarts; the list
@@ -135,9 +118,9 @@ refuses a `target/debug` older than the sources.
   state an agent can enter has an advertised way out; acts on nodes that are
   gone (the dialog's, a deleted task) report `Ignored`. Submitting switches
   to the tab the new task landed on, so the effect is in the next snapshot.
-  At exit it prints every nonzero layer counter, the two snapshot ones
-  included; the draft is published whole on purpose, so a draft past 1 MiB is
-  what trims. `tree.rs` and `update.rs` are pure and unit-tested, including the
+  At exit it prints every nonzero layer counter. The draft is published
+  whole on purpose: e2e step w grows it past 1 MiB to make the adapter trim.
+  `tree.rs` and `update.rs` are pure and unit-tested, including the
   one-focused-node and modal-dialog invariants.
 
 Details: docs/architecture.md. Normative per-message wire spec:

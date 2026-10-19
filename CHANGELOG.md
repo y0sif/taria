@@ -18,114 +18,77 @@ a format bump would not wait for one.
 **An app whose tree outgrew one line keeps its bridge.** A snapshot travels as
 one line, and the bridge closes the connection on a line over 1 MiB. The
 adapter wrote snapshots of any size, so an app holding one unbounded value, a
-draft, a log or a transcript, lost its bridge, and since every reconnect is
-sent the latest snapshot, it lost it again on each one. The agent was told the
-app may have exited, while it ran the whole time. The adapter now trims every
-snapshot to fit, and the bridge names the limit when an app sends a line past
-it.
+draft, a log or a transcript, lost its bridge, and again on every reconnect,
+which resends the latest snapshot. The agent was told the app may have exited.
+The adapter now trims every snapshot to fit, and the bridge names the limit.
 
 **A bridge waiting its turn can no longer act on a UI it never saw.** The
 adapter serves one bridge at a time, and a second one waits in the listen
-backlog, the kernel's queue of connections not yet accepted. Input it wrote
-while waiting sat in the kernel's buffer and was applied once the first bridge
-left. It is now thrown away, unacked, before the `hello` goes out. A client
-that connects to an idle app keeps what it writes, as before.
+backlog. Input it wrote while waiting was applied once the first bridge left.
+It is now thrown away, unacked, before the `hello` goes out. A client that
+connects to an idle app keeps what it writes, as before.
 
 **Answers the app gave on its way out arrive.** An app that answered an input
 and exited in the same frame closed the connection with the answer still
-queued, so the agent was told the input's fate was unknown, for an input the
-app had taken. The adapter now writes the queued acks before it closes, within
-250 ms.
+queued, so the agent was told the input's fate was unknown. The adapter now
+writes the queued acks before it closes, within 250 ms.
 
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1, and no message or field
 changed. `docs/protocol.md` gains a SHOULD (keep every snapshot within the
 line cap) and a MAY (discard input written before the `hello`), both
-describing what the reference peers do. The MAY answers Appendix B item 7, a
-question version 1 had left open and no peer could rely on, which is what
-makes it additive. The Rust API only grows. All three crates move to 0.3.1
-together: they share one workspace version.
+describing what the reference peers do. The MAY answers a question version 1
+had left open (Appendix B item 7), so it is additive. The Rust API only grows.
+All three crates move to 0.3.1 together: they share one workspace version.
 
 ### For whoever drives an app
 
 - **A tree over the line limit is named, not mistaken for an exit.** The
   bridge keeps an overrun as its reason, across reconnects, until a snapshot
-  parses or a connect finds nothing listening at the socket. `read_tree` and
-  every input tool then say the snapshot was over 1 MiB (1048576 bytes), that
-  the app resends its latest snapshot on every reconnect, and that nothing the
-  agent sends can fix it, rather than that the app may have exited or that the
-  socket path may be wrong. An app that overran and then exited reads as
-  exited.
-- **A second bridge is told the app has not accepted it yet.** The answer
-  said the app "never accepted" the connection, but the app accepts it once
-  the first bridge leaves.
-- **The input sent just before it is not blamed for it.** The answer to an
-  input the app acked just before the oversized snapshot said the app "may
-  have exited, possibly because of this input". It now says the bridge closed
-  the connection, not the app, and why. Without an ack it is still an error,
-  naming the same cause. Each
-  answer opens as before, so a caller matching on the opening reads the same
-  verdict.
+  parses or a connect finds nothing listening at the socket. Until then
+  `read_tree` and every input tool say the snapshot was over 1 MiB (1048576
+  bytes), that the app resends it on every reconnect, and that nothing the
+  agent sends can fix it. An app that overran and then exited reads as exited.
+- **A second bridge is told the app has not accepted it yet**, not that it
+  "never accepted" it: the app does once the first bridge leaves.
+- **An input acked just before an oversized snapshot is not blamed for it.**
+  The answer says the bridge closed the connection, not the app, and why. It
+  opens as before, so a caller matching on the opening reads the same verdict.
 - **A trimmed string says so where it was cut.** A cut value or label ends in
   `…`, and a `log` or `terminal` value, which keeps its tail, starts with it.
-  Ids and custom action names are never cut, so whatever an agent reads it
-  can still act on.
-- **An edit past the cut of a trimmed value shows no change.** The tree the
-  agent would be sent is the same, so nothing new is sent, and the input tool
-  reports the input received with no change.
+  Ids and custom action names are never cut, so an agent can still use them.
+- **An edit past the cut of a trimmed value shows no change.** The tree is the
+  one already sent, so nothing new goes out, and the input tool reports the
+  input received with no change.
 - **An advertised `quit` comes back acknowledged.** The ack the app queued as
-  it took the input now reaches the bridge before the connection closes, so
-  the answer is the acknowledged departure, not an input of unknown fate. An
-  input the app answered `Ignored` on its way out is answered too.
+  it took the input now reaches the bridge before the connection closes, and
+  so does an `Ignored` it gave on its way out.
 
 ### For an app author adopting taria
 
-- **Every snapshot is bounded to fit one line.** After the depth cut, the
-  adapter cuts the longest values first, all to one shared length, then
-  values and labels together, then nodes, and as a last resort every child
-  of the root. A string of 256 bytes or less is never cut. The node stage
-  drops any node that could never fit on its own, so it cannot take its
-  siblings with it, caps how many children every node keeps, then gives back,
-  shallowest first, what the cap dropped while it fits. Each node keeps its
-  first children, with no gap.
-- **An unchanged frame costs a comparison.** A frame whose tree is the one
-  the frame before it built is skipped before anything is measured or cut. A
-  changed tree is measured exactly, by serializing it into a counter, and cut
-  only when it does not fit.
-- **You are told.** `oversized_snapshots()` counts the snapshots published
-  trimmed, and `last_oversize()` returns a `SnapshotTooLarge`: the size the
-  line would have had, the limit, how many strings were trimmed and nodes
-  dropped, and the id of the node holding the longest string, ids and custom
-  action names included. The fix is yours: publish a log's tail, cap a draft
-  or a transcript, publish the rows on screen. The demo prints each snapshot
-  counter at exit when it is nonzero.
+- **Every snapshot is bounded to fit one line.** An unchanged frame is
+  skipped; a changed one is measured exactly and cut as `docs/architecture.md`
+  describes. A string of 256 bytes of JSON or less is never cut.
+- **You are told.** `oversized_snapshots()` counts snapshots published
+  trimmed, and `last_oversize()` returns a `SnapshotTooLarge`: the line's size
+  as built, the limit, the strings trimmed and nodes dropped, and the node
+  holding the longest string, ids and custom action names included. The fix is
+  yours: publish a log's tail, cap a draft, publish the rows on screen. The
+  demo prints each snapshot counter at exit when it is nonzero.
 - **`truncated_snapshots()` counts snapshots, as its doc always said.** It
-  counted frames, so a deep tree that sat still while the app redrew it at
-  60 fps added 60 a second. It now counts once per snapshot sent, and
-  `oversized_snapshots()` counts the same way.
-- **Input a waiting client wrote before its `hello` is discarded and
-  counted.** For a client that was already in the backlog when the previous
-  session ended, the adapter reads off what it wrote just before sending it
-  the `hello`, acks none of it, and counts each complete `input` line in
-  `stale_inputs()`, which now has a second cause. The rest of a line the read
-  cut is skipped, and more than 1 MiB waiting breaks the connection. The first
-  connection of a process, and a client that connects to an idle app, keep
-  what they write. A client that connects the instant a session ends counts
-  as one that waited. A client that waits for the `hello` before writing
-  loses nothing, and taria-mcp is one.
-- **Every line has 5 s in all.** In 0.3.0 the 5 s write timeout bounded each
-  wait for room in the socket, not the line, so a bridge that stopped reading
-  mid-snapshot, or read a little before each wait ran out, could hold one
-  line, and `Drop` with it, for 10 s or more. A line now goes out in 2 KiB
-  pieces with waits of at most 50 ms, against one deadline for the whole
-  line. A bridge that cannot take a whole line within 5 s is
-  dropped, and is sent the latest snapshot when it reconnects.
-- **The shutdown flush is bounded.** The acks queued at shutdown get 250 ms
-  in all, and a snapshot still waiting is not sent. Dropping the layer takes
-  at most one 50 ms poll, the 5 s the line being written may take, and that
-  flush.
+  counted frames: a deep tree redrawn unchanged at 60 fps added 60 a second.
+  It now counts once per snapshot sent, as `oversized_snapshots()` does.
+- **Input a waiting client wrote before its `hello` is discarded**, unacked,
+  and counted in `stale_inputs()`. Only a client that waited in the backlog
+  for the previous session to end is affected; one that waits for the `hello`
+  before writing, as taria-mcp does, loses nothing.
+- **Every line has 5 s in all, and `Drop` is bounded.** In 0.3.0 the 5 s write
+  timeout bounded each wait for room in the socket, not the line, so a bridge
+  reading slowly or not at all could hold a line, and `Drop`, for 10 s or
+  more. A line now goes out in 2 KiB pieces against one 5 s deadline, and a
+  bridge that misses it is dropped. Acks queued at shutdown get 250 ms and a
+  pending snapshot is not sent, so `Drop` takes at most 50 ms + 5 s + 250 ms.
 - **`taria::wire::MAX_LINE_BYTES`** is the 1 MiB limit as a public constant,
-  which both reference peers now share, for a peer or a test that sizes
-  against it.
+  shared by both reference peers, for a peer or a test that sizes against it.
 
 ### The gates
 
@@ -133,9 +96,8 @@ together: they share one workspace version.
   tree over the line cap, once after a tree was served and once as its first,
   and every answer has to name the limit.
 - `scripts/e2e.py` grows from 22 steps to 23. Step w types the demo's draft
-  past 1 MiB through `type_text`, checks that the bridge stays up and the
-  draft comes back trimmed, that `set_value ""` clears it, and that the demo
-  reports the trim at exit.
+  past 1 MiB through `type_text`: the bridge stays up, the draft comes back
+  trimmed, `set_value ""` clears it, and the demo reports the trim at exit.
 
 ## [0.3.0] - 2026-10-19
 
