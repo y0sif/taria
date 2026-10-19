@@ -515,17 +515,18 @@ bridge names the limit, but only the app can bring its tree within it.
 newline. Both peers enforce it.
 
 The adapter trims every snapshot to fit at publish, after the depth cut, and
-stops as soon as the tree fits. The longest values are cut to one shared
-length, then labels with them; a string of 256 bytes of JSON or less is never
-cut. A cut is marked with `…`: a `Role::Log` or `Role::Terminal` value keeps
-its end, because that is where those grow, and every other string keeps its
-start. When nodes go, a list keeps its first rows with no gap, apart from a
-node that could never fit. That one goes with everything under it, and its
-siblings stay, so a status bar or a `quit` beside it is kept. Ids and custom
-action names are never touched, so an agent can still act on whatever it
-reads. The stages are in `architecture.md` (Snapshot size). The tree is
-trimmed rather than withheld for the reason it is cut for depth: a publish
-that does not happen leaves the agent on a stale tree.
+stops as soon as the tree fits. A node that could never fit goes first, with
+everything under it; its siblings are not dropped with it. Then the longest
+values are cut to one shared length, then labels with them; a string of 256
+bytes of JSON or less is never cut. A cut is marked with `…`: a `Role::Log` or
+`Role::Terminal` value keeps its end, because that is where those grow, and
+every other string keeps its start. When more nodes have to go, a list keeps
+its first rows with no gap, and the strings left are cut only as far as the
+smaller tree needs, so a draft beside the dropped rows keeps as much as fits.
+Ids and custom action names are never touched, so an agent can still act on
+whatever it reads. The stages are in `architecture.md` (Snapshot size). The
+tree is trimmed rather than withheld for the reason it is cut for depth: a
+publish that does not happen leaves the agent on a stale tree.
 
 A frame identical to the one before it is skipped before the trim. A changed
 tree is compared again after it, so an edit past the cut of a trimmed value

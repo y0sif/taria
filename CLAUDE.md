@@ -67,17 +67,16 @@ refuses a `target/debug` older than the sources.
   line written gets 5 s in all (`WRITE_TIMEOUT`), so a stuck bridge is
   dropped and `Drop` stays bounded. Four counters of lost agent traffic:
   `dropped_inputs()`, `stale_inputs()` (both discards), `unknown_inputs()`,
-  `dropped_acks()`. A tree over `MAX_NODE_DEPTH` is cut branch-wise at
-  publish rather than withheld (a withheld tree leaves the agent on a stale
-  one), reported via `truncated_snapshots()`/`last_truncation()`; then a tree
-  over `MAX_LINE_BYTES` is trimmed to fit (nodes that can never fit, then the
+  `dropped_acks()`. A tree over `MAX_NODE_DEPTH` is cut branch-wise at publish
+  rather than withheld (a withheld tree leaves the agent on a stale one),
+  reported via `truncated_snapshots()`/`last_truncation()`; then a tree over
+  `MAX_LINE_BYTES` is trimmed to fit (nodes that can never fit, then the
   longest strings, then trailing nodes; ids and custom action names never
-  change), reported via
-  `oversized_snapshots()`/`last_oversize()`. Both count snapshots sent, not
-  frames, and an unchanged frame skips both cuts. Binding unlinks only a
-  socket nothing is listening on, refuses a live one so a second instance
-  cannot steal it, and the listener polls a shutdown flag so exit never waits
-  on a connection.
+  change), reported via `oversized_snapshots()`/`last_oversize()`. Both count
+  snapshots sent, not frames, and an unchanged frame skips both cuts. Binding
+  unlinks only a socket nothing is listening on, refuses a live one so a
+  second instance cannot steal it, and the listener polls a shutdown flag so
+  exit never waits on a connection.
 - `crates/taria-mcp`: rmcp stdio server exposing
   `read_tree`/`act`/`key`/`type_text`. A socket-manager task reconnects with
   capped backoff, holds the latest snapshot in a watch channel, and

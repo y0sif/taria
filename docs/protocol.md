@@ -76,8 +76,8 @@ the app is the one that speaks first (section 3).
    is answered `ignored`, not left unanswered. The exceptions are a line
    that did not parse, which carries no readable id (section 2.6), an input
    whose connection has since ended, which is deliberately not acked
-   (section 11), and an input written before the app's `hello`
-   (section 14.5).
+   (section 11), and an input written before the app's `hello`, which it may
+   discard unacked (section 14.5).
 5. Skip a line it cannot parse and keep the connection (section 2.6).
 6. Never apply an input that arrived on a connection that has since ended
    (section 11).

@@ -84,7 +84,9 @@ bridge saying it has no tree while the app is connected and healthy, and a
 deep later snapshot leaves it serving the last shallow tree with nothing
 marking it stale. Writing is worse than reading: serialization recurses per
 level too, and a tree thousands of levels deep exhausts the stack and aborts
-the process from inside a library thread.
+the process from inside a library thread. Freeing one recurses the same way,
+so every tree the adapter lets go of, a branch the cut removed, a frame never
+published or a tree handed to a disabled layer, is freed one node at a time.
 
 `MAX_NODE_DEPTH` is 32, a little under half the measured ceiling, and the
 slack pays for the transport envelope, for a root an adapter adds above the
@@ -134,15 +136,17 @@ as the tree fits:
    and its siblings stay. That is a node whose id, role, actions and strings
    cut to 256 bytes of JSON cannot fit with only its ancestors beside it;
 2. the longest values, all down to one shared length, then values and labels
-   together, the same way. A string of 256 bytes of JSON or less is never
-   cut;
+   together, the same way. No string of 256 bytes of JSON or less is cut;
 3. every node keeps at most one shared number of children, the largest that
-   fits;
+   fits. This stage and the next plan as stage 1 does, with every string at
+   that 256-byte floor. Once they have dropped nodes, the kept tree's strings
+   are cut only as far as it needs: not at all if it fits whole, otherwise as
+   in stage 2;
 4. shallowest first, the children that cap removed go back while they fit.
    Each parent keeps a run of its first children with no gap, apart from a
    node that could never fit, and a child too large for the room left closes
    its parent's list;
-5. a bare root, which always fits.
+5. if all else fails, a bare root, which always fits.
 
 A cut string is marked with `…` (U+2026). A `log` or `terminal` value keeps
 its tail, since that is where those grow; every other string keeps its head.

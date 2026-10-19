@@ -24,9 +24,10 @@ The adapter now trims every snapshot to fit, and the bridge names the limit.
 
 **A bridge waiting its turn can no longer act on a UI it never saw.** The
 adapter serves one bridge at a time, and a second one waits in the listen
-backlog. Input it wrote while waiting was applied once the first bridge left.
-It is now thrown away, unacked, before the `hello` goes out. A client that
-connects to an idle app keeps what it writes, as before.
+backlog (the kernel's queue of connections not yet accepted). Input it wrote
+while waiting was applied once the first bridge left. It is now thrown away,
+unacked, before the `hello` goes out. A client that connects to an idle app
+keeps what it writes, as before.
 
 **Answers the app gave on its way out arrive.** An app that answered an input
 and exited in the same frame closed the connection with the answer still
@@ -66,8 +67,9 @@ All three crates move to 0.3.1 together: they share one workspace version.
 ### For an app author adopting taria
 
 - **Every snapshot is bounded to fit one line.** An unchanged frame is
-  skipped; a changed one is measured exactly and cut as `docs/architecture.md`
-  describes. A string of 256 bytes of JSON or less is never cut.
+  skipped; a changed one is measured exactly and, if over, cut as
+  `docs/architecture.md` describes. A string of 256 bytes of JSON or less is
+  never cut.
 - **You are told.** `oversized_snapshots()` counts snapshots published
   trimmed, and `last_oversize()` returns a `SnapshotTooLarge`: the line's size
   as built, the limit, the strings trimmed and nodes dropped, and the node
@@ -77,6 +79,11 @@ All three crates move to 0.3.1 together: they share one workspace version.
 - **`truncated_snapshots()` counts snapshots, as its doc always said.** It
   counted frames: a deep tree redrawn unchanged at 60 fps added 60 a second.
   It now counts once per snapshot sent, as `oversized_snapshots()` does.
+- **A tree deeper than the call stack no longer aborts the app.** The depth
+  cut exists for such a tree, but 0.3.0 freed what it cut away, and any tree
+  handed to a disabled layer, by recursing, which overflows the stack. Every
+  tree the adapter lets go of, an unpublished frame included, is now freed
+  one node at a time.
 - **Input a waiting client wrote before its `hello` is discarded**, unacked,
   and counted in `stale_inputs()`. Only a client that waited in the backlog
   for the previous session to end is affected; one that waits for the `hello`
