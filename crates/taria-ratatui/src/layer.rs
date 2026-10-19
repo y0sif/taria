@@ -861,24 +861,29 @@ impl TariaLayer {
     /// at any `seq`. The bound cuts what costs the most first and stops as
     /// soon as the tree fits:
     ///
-    /// 1. nodes that could never fit, one whose id or custom actions alone
-    ///    run over, are dropped with everything under them before any string
-    ///    is cut, so that they cost their siblings nothing;
+    /// 1. nodes that could never fit, one whose id, role and actions, with
+    ///    its strings at the floor, cannot fit beside its ancestors, are
+    ///    dropped with everything under them before any string is cut, so
+    ///    that they cost their siblings nothing;
     /// 2. strings are cut: the longest values first, all down to one shared
     ///    length, so the biggest shrink first and shorter ones are untouched,
     ///    then values and labels together, the same way, when values alone
     ///    are not enough. A cut value ends in `…`, except that a
     ///    [`Role::Log`] or [`Role::Terminal`] value keeps its end and starts
     ///    with `…` instead, because the end is where those grow. A string of
-    ///    256 bytes of JSON or less is never cut;
+    ///    256 bytes of JSON or less, the floor, is never cut;
     /// 3. every node keeps at most one shared number of children, the
     ///    largest that fits, so a list of fifty thousand rows loses its last
     ///    rows while a status bar beside it keeps its place;
     /// 4. shallowest first, the children that cap removed go back while they
     ///    fit, each parent keeping a run of its first children with no gap,
-    ///    apart from a node that could never fit;
-    /// 5. last, every child of the root, which leaves a root that always
-    ///    fits.
+    ///    apart from a node that could never fit, and the first child too
+    ///    large for the room left ends its parent's run;
+    /// 5. if all else fails, a bare root, which always fits.
+    ///
+    /// The third and fourth stages plan with every string at the floor, but
+    /// the strings of the nodes they keep are then cut only as far as the
+    /// kept tree needs, and not at all when it fits as it is.
     ///
     /// Ids and custom action names are never changed, so whatever an agent
     /// can read it can still act on. Focus is decided after the bound, for
@@ -1331,11 +1336,18 @@ fn same_node(a: &mut Node, b: &mut Node) -> bool {
 /// when it is dropped: not a panic that unwinds, a stack overflow. Every
 /// tree this crate lets go of before the depth cut goes through here
 /// instead. Each node is freed with its children moved out to a list of
-/// their own, so a chain holds one node there at a time.
+/// their own, so a chain holds one node there at a time. A child with no
+/// children of its own is freed where it stands instead, which recurses no
+/// further, so a frame of fifty thousand rows drawn unchanged frees them
+/// at the cost of the derived glue rather than queueing every one.
 pub(crate) fn drop_iteratively(root: Node) {
     let mut pending = vec![root];
     while let Some(mut node) = pending.pop() {
-        pending.append(&mut node.children);
+        pending.extend(
+            node.children
+                .drain(..)
+                .filter(|child| !child.children.is_empty()),
+        );
     }
 }
 
