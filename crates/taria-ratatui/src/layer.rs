@@ -24,9 +24,44 @@ use taria::{AgentInput, MAX_NODE_DEPTH, Node, PROTOCOL_VERSION, Role, Snapshot, 
 use crate::FrameRecorder;
 use crate::bound::{self, ROOT_BUDGET, SnapshotTooLarge};
 
-/// How long a snapshot write may stall on a slow or stuck bridge before the
-/// connection is dropped. Protects the app from a peer that stops reading.
+/// How long the writer may spend on any one line before the connection is
+/// dropped. Protects the app from a peer that stops reading, or reads too
+/// slowly to take a whole line in that time.
+///
+/// The bound is on the line, not on each wait for room in the socket, which
+/// is all a socket's own write timeout bounds (see [`write_all_before`]).
+/// Bounded that way, a line far larger than the socket buffers could stall
+/// for one timeout per wait: a bridge that had stopped reading held a 900 KB
+/// snapshot for two timeouts, and one taking 64 KB every 3 s, which freed
+/// room before any wait timed out, held it for forty seconds. [`Drop`] waits
+/// for the writer, so either held the app's exit too. Now a bridge that
+/// cannot take a whole line, a snapshot of up to [`MAX_LINE_BYTES`] included,
+/// within this time is dropped, and reconnects to be sent the latest snapshot
+/// afresh.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most one `write` call is handed, so that the kernel waits for room in
+/// the socket at most once inside it, and the write timeout, which bounds
+/// each such wait rather than the call, bounds the call too. See
+/// [`write_all_before`].
+///
+/// One buffer on Linux, and within the send low-water mark that macOS and the
+/// BSDs wait for before they copy anything. A typical line is one or a few
+/// calls, and a snapshot at [`MAX_LINE_BYTES`] about five hundred, measured at
+/// under a millisecond more than one call for the lot.
+const WRITE_CHUNK: usize = 2 * 1024;
+
+/// The longest one wait for room in the socket runs before the writer looks
+/// at the clock again. See [`write_all_before`].
+///
+/// The kernel keeps a socket's write timeout on a timer wheel that files a
+/// long timeout coarsely and fires it late: on Linux at 1000 Hz, a 5 s
+/// timeout fired up to 430 ms past its time when measured, more than the
+/// whole [`SHUTDOWN_FLUSH`]. A timeout this short is filed to the
+/// millisecond, so waiting in slices of it holds a deadline to within a few
+/// milliseconds, and a writer stalled on a stuck bridge wakes 20 times a
+/// second to find it still stuck.
+const WRITE_WAIT: Duration = Duration::from_millis(50);
 
 /// How long the writer may spend, in total, on the acks still queued when the
 /// layer shuts down.
@@ -608,20 +643,27 @@ impl TariaLayer {
     /// the mirror-image reason, so both sides agree that an input belongs to
     /// one connection.
     ///
-    /// The second is input a client wrote before its handshake. Only one
-    /// bridge is served at a time, so a client that connects while another is
-    /// attached waits in the listen backlog, and whatever it writes meanwhile
-    /// sits unread in the kernel's socket buffer until its turn comes. Nothing
-    /// written before the hello that opens a session can have been written in
-    /// reply to it: that client has seen no tree, so its inputs name nodes and
-    /// keys it guessed at, and applying them once the first client leaves
-    /// would act on a UI it never looked at. So what is waiting is read off
-    /// and thrown away just before the hello goes out, and every complete line
-    /// of it that is an input is counted here, a kind this build cannot read
+    /// The second is input a client wrote while it waited behind another.
+    /// Only one bridge is served at a time, so a client that connects while
+    /// another is attached waits in the listen backlog, and whatever it writes
+    /// meanwhile sits unread in the kernel's socket buffer until its turn
+    /// comes. That client has seen no tree, so its inputs name nodes and keys
+    /// it guessed at, and applying them once the first client leaves would
+    /// act on a UI it never looked at. So a connection that was already
+    /// waiting when the previous session ended has what it wrote read off and
+    /// thrown away just before its hello goes out, and every complete line of
+    /// that which is an input is counted here, a kind this build cannot read
     /// included. None of it is acked: the session it would be answered on had
-    /// not begun. A client that waits for the hello before writing is never
-    /// affected, and taria-mcp is one, whose input tools refuse to send until
-    /// the app's first snapshot has arrived.
+    /// not begun. Clients waiting back to back are each treated so.
+    ///
+    /// A client that waited behind nobody keeps what it wrote before reading
+    /// its hello: the first connection of a process, and one that connects
+    /// after the listener last found nobody waiting. A script that connects
+    /// to an idle app and writes at once is such a client, and its input is
+    /// its session's, as it was in 0.3.0. A client that waits for the hello
+    /// before writing is never affected either way, and taria-mcp is one,
+    /// whose input tools refuse to send until the app's first snapshot has
+    /// arrived.
     ///
     /// Monotonic across reconnects, and read like
     /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
@@ -894,10 +936,15 @@ impl Drop for TariaLayer {
     /// on what is at the socket path. The listener polls the shutdown flag
     /// rather than waiting to be woken by a connection, so it returns whether
     /// the socket file was replaced by a second instance, removed, or is
-    /// being served by some other process. The worst case is one
-    /// `ACCEPT_POLL` nap, plus one `WRITE_TIMEOUT` if a connected bridge has
-    /// stopped reading mid-write, plus `SHUTDOWN_FLUSH` for the acks queued
-    /// behind that write.
+    /// being served by some other process. With no bridge connected that is
+    /// at most one `ACCEPT_POLL` nap. With one, the line being written when
+    /// the shutdown came is finished or given up within `WRITE_TIMEOUT` of
+    /// starting, however large it is and however the bridge reads, no other
+    /// line but the queued acks is started after it, and those get
+    /// `SHUTDOWN_FLUSH`. So dropping never takes longer than `ACCEPT_POLL` +
+    /// `WRITE_TIMEOUT` + `SHUTDOWN_FLUSH`, about 5.3 s, and takes more than a
+    /// few milliseconds only against a bridge too slow to take the line it is
+    /// being sent.
     fn drop(&mut self) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -1145,7 +1192,18 @@ fn truncate_to_max_depth(root: &mut Node) {
 /// The listener is non-blocking, so this thread is never parked in `accept()`
 /// and the shutdown flag is checked on its own schedule; see [`ACCEPT_POLL`]
 /// for why exit cannot be left to depend on a connection arriving.
+///
+/// It also tracks whether the next connection it accepts waited behind the
+/// last one, which is what decides if [`start_connection`] discards what that
+/// client wrote before its hello. A connection accepted after a session
+/// ended, before any accept has found the backlog empty, was waiting in the
+/// backlog while that session ran; a client that connects in the instant
+/// between the session's end and the next accept is taken for one too. One
+/// accepted after an accept found nothing connected after the session had
+/// ended, so it waited behind nobody, and neither did the first connection of
+/// the process.
 fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender<QueuedInput>) {
+    let mut waited = false;
     loop {
         if shared.is_shutdown() {
             return;
@@ -1163,11 +1221,17 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender
                     continue;
                 }
                 // Errors just drop this client; the loop keeps accepting.
-                let _ = serve_client(stream, &shared, &input_tx);
+                let _ = serve_client(stream, &shared, &input_tx, waited);
+                // Whoever is in the backlog now connected while that client
+                // was served, so it waited behind it, however that ended.
+                waited = true;
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                // Nothing waiting to be accepted: nap instead of spinning,
-                // then back to the shutdown check at the top.
+                // Nobody is waiting, so whoever connects next waited behind
+                // nobody.
+                waited = false;
+                // Nap instead of spinning, then back to the shutdown check at
+                // the top.
                 thread::sleep(ACCEPT_POLL);
             }
             Err(_) => {
@@ -1183,15 +1247,20 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender
 
 /// Serve one connected bridge: handshake, then reader thread + writer loop
 /// until the client disconnects or the layer shuts down.
+///
+/// `waited` says the client was in the listen backlog when the previous
+/// session ended; see [`accept_loop`] and [`start_connection`].
 fn serve_client(
     stream: UnixStream,
     shared: &Arc<Shared>,
     input_tx: &SyncSender<QueuedInput>,
+    waited: bool,
 ) -> io::Result<()> {
     // SO_SNDTIMEO is shared across the duplicated fds; only writes block long
-    // enough to need it.
+    // enough to need it. Every line sets it again before each of its writes,
+    // from its own deadline (see `write_all_before`); this is the bound on
+    // any write that does not.
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-    let mut write_stream = stream.try_clone()?;
 
     // Capture the snapshot and epoch atomically so the writer loop neither
     // misses nor duplicates a publish that races the handshake. Acks left
@@ -1206,16 +1275,16 @@ fn serve_client(
         (state.latest.clone(), state.epoch, state.generation)
     };
     let alive = Arc::new(AtomicBool::new(true));
-    let reader = match start_connection(
-        &mut write_stream,
+    let (mut write_stream, reader) = match start_connection(
         stream,
         shared,
         input_tx,
         initial_snapshot,
         &alive,
         generation,
+        waited,
     ) {
-        Ok(reader) => reader,
+        Ok(started) => started,
         Err(err) => {
             // The reader thread normally retires this generation as it exits,
             // and here it never started (or never got the handshake). Retire
@@ -1240,10 +1309,12 @@ fn serve_client(
     Ok(())
 }
 
-/// Discard what the client wrote before its handshake, send the handshake
-/// (and the snapshot a new client is owed) and start the connection's reader
-/// thread, so every way of failing to get a connection off the ground
-/// funnels through one `Err` for the caller to clean up after.
+/// Discard what a client that waited its turn wrote before its handshake,
+/// send the handshake (and the snapshot a new client is owed) and start the
+/// connection's reader thread, so every way of failing to get a connection
+/// off the ground funnels through one `Err` for the caller to clean up after.
+/// On success the writer's handle on the socket comes back beside the reader
+/// thread.
 ///
 /// # Input written before the hello
 ///
@@ -1253,15 +1324,26 @@ fn serve_client(
 /// buffer: a probe measured 180 KB accepted before a write would block, all
 /// of it readable once the connection is finally served. Read as the new
 /// session's first lines, that is input the app applies on behalf of a client
-/// that wrote it blind, and the hello is the boundary that tells the two
-/// apart: nothing written before it can have been written in reply to it.
-/// See [`TariaLayer::stale_inputs`], which counts what is thrown away here.
+/// that wrote it blind, to a tree it never saw, and the hello is the boundary
+/// that tells the two apart: nothing written before it can have been written
+/// in reply to it. See [`TariaLayer::stale_inputs`], which counts what is
+/// thrown away here.
 ///
-/// So the stream is read without blocking, right before the hello is written
-/// and not a step earlier, and everything already there is discarded. What
-/// arrives between this read and the hello's write slips through, and only a
-/// client writing blind can land in that gap. A client that waits for the
-/// hello loses nothing either way.
+/// Only a client that `waited` is drained: one the accept loop took from the
+/// backlog after a session ended, before it last found the backlog empty
+/// (see [`accept_loop`]). A client that connects to an idle app is accepted
+/// within one [`ACCEPT_POLL`], and one that writes at once without reading
+/// the hello, a script piping a line into the socket, waited behind nobody.
+/// What it wrote is input for the session it is about to get, as it was in
+/// 0.3.0, and discarding it would lose it unacked, with nothing to tell the
+/// client. The protocol leaves the choice to the app; this keeps the discard
+/// to the client it exists for.
+///
+/// For a client that waited, the stream is read without blocking, right
+/// before the hello is written and not a step earlier, and everything already
+/// there is discarded. What arrives between this read and the hello's write
+/// slips through, and only a client writing blind can land in that gap. A
+/// client that waits for the hello loses nothing either way.
 ///
 /// The bytes may stop partway through a line, whose remainder then arrives
 /// as the session's first bytes. That remainder belongs to a line written
@@ -1273,22 +1355,54 @@ fn serve_client(
 /// past that it is a flood, not a client that wrote a little too early, and
 /// reading it all off would let a client that never stops writing hold the
 /// listener here forever.
+///
+/// The latest snapshot is skipped, not written, once the layer is shutting
+/// down, for the reason the writer skips one (see [`writer_loop`]).
 fn start_connection(
-    write_stream: &mut UnixStream,
     stream: UnixStream,
     shared: &Arc<Shared>,
     input_tx: &SyncSender<QueuedInput>,
     initial_snapshot: Option<Snapshot>,
     alive: &Arc<AtomicBool>,
     generation: u64,
-) -> io::Result<JoinHandle<()>> {
+    waited: bool,
+) -> io::Result<(UnixStream, JoinHandle<()>)> {
+    let mut write_stream = stream.try_clone()?;
+    let starts_mid_line = if waited {
+        discard_unsolicited(&stream, shared)?
+    } else {
+        false
+    };
+
+    write_line(
+        &mut write_stream,
+        &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION),
+    )?;
+    if let Some(snapshot) = initial_snapshot
+        && !shared.is_shutdown()
+    {
+        write_line(&mut write_stream, &AppToBridge::Snapshot(snapshot))?;
+    }
+    let reader = thread::Builder::new().name("taria-reader".into()).spawn({
+        let alive = Arc::clone(alive);
+        let shared = Arc::clone(shared);
+        let input_tx = input_tx.clone();
+        move || reader_loop(stream, input_tx, alive, shared, generation, starts_mid_line)
+    })?;
+    Ok((write_stream, reader))
+}
+
+/// Read off and count what a client that waited its turn wrote before its
+/// hello, for [`start_connection`]. Returns whether it stopped partway through
+/// a line, whose remainder the reader is then told to skip.
+fn discard_unsolicited(stream: &UnixStream, shared: &Shared) -> io::Result<bool> {
     // The flag belongs to the open socket, not to this handle, so the
     // `try_clone`d writer goes non-blocking with it. It is put back before
     // anything is written: the hello and every later write rely on blocking
-    // with `WRITE_TIMEOUT`.
+    // until their deadline.
     stream.set_nonblocking(true)?;
     let mut unsolicited = Vec::new();
-    let read = read_unsolicited(&stream, &mut unsolicited);
+    let read = read_unsolicited(stream, &mut unsolicited);
     // Counted whatever the read ended in: an input read off here was
     // discarded either way, including when the next byte overflows the cap.
     shared
@@ -1296,21 +1410,7 @@ fn start_connection(
         .fetch_add(count_input_lines(&unsolicited), Ordering::Relaxed);
     stream.set_nonblocking(false)?;
     read?;
-    let starts_mid_line = unsolicited.last().is_some_and(|&byte| byte != b'\n');
-
-    write_line(
-        write_stream,
-        &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION),
-    )?;
-    if let Some(snapshot) = initial_snapshot {
-        write_line(write_stream, &AppToBridge::Snapshot(snapshot))?;
-    }
-    thread::Builder::new().name("taria-reader".into()).spawn({
-        let alive = Arc::clone(alive);
-        let shared = Arc::clone(shared);
-        let input_tx = input_tx.clone();
-        move || reader_loop(stream, input_tx, alive, shared, generation, starts_mid_line)
-    })
+    Ok(unsolicited.last().is_some_and(|&byte| byte != b'\n'))
 }
 
 /// Append everything `reader` has ready to `pending`, stopping when a read
@@ -1319,9 +1419,10 @@ fn start_connection(
 /// For the non-blocking pass [`start_connection`] makes before the hello.
 /// More than [`MAX_LINE_BYTES`] in all is an
 /// [`InvalidData`](io::ErrorKind::InvalidData) error, with `pending` left
-/// holding the bytes that fit, so the caller can still count the inputs it
-/// is throwing away. Any other error ends the read the same way: the
-/// connection is broken, and `pending` holds what came before.
+/// holding exactly the first [`MAX_LINE_BYTES`] bytes: the read that ran
+/// over is kept up to the cap, so every complete line before it can still be
+/// counted as an input thrown away. Any other error ends the read the same
+/// way: the connection is broken, and `pending` holds what came before.
 fn read_unsolicited(mut reader: impl Read, pending: &mut Vec<u8>) -> io::Result<()> {
     let mut chunk = [0u8; 8 * 1024];
     loop {
@@ -1333,7 +1434,11 @@ fn read_unsolicited(mut reader: impl Read, pending: &mut Vec<u8>) -> io::Result<
                         "a read reported more bytes than it was given",
                     ));
                 };
-                if pending.len() + n > MAX_LINE_BYTES {
+                let room = MAX_LINE_BYTES.saturating_sub(pending.len());
+                if n > room {
+                    // Up to the cap, so a complete line that fits before it
+                    // is counted even though the read it came in ran over.
+                    pending.extend_from_slice(read.get(..room).unwrap_or_default());
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -1492,13 +1597,18 @@ fn reader_loop(
 /// snapshot that would have followed them; a client already gone gets
 /// nothing, since nobody is left to read it.
 ///
+/// The shutdown flag is checked before every line, the snapshot's included,
+/// so a shutdown that comes while a line is being written waits for that line
+/// only, and [`WRITE_TIMEOUT`] bounds the whole of it. That is the bound
+/// [`Drop`] promises, because it waits for this thread.
+///
 /// Every ack that flush can write belongs to this connection. The queue is
 /// emptied under the lock as each connection starts, in the same step that
 /// moves the generation on, so nothing queued for an earlier one survives
 /// into it. While this connection's reader runs, `alive` is true and the
 /// generation is this connection's, and the reader changes both together,
 /// under the lock, as it exits, so an `alive` read under the lock vouches
-/// for every ack taken in the same hold. Both shutdown checks take the acks
+/// for every ack taken in the same hold. Every shutdown check takes the acks
 /// in the same hold that read `alive`.
 fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut last_epoch: u64) {
     loop {
@@ -1538,36 +1648,71 @@ fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut
             // during the batch would sit through every one of them. The acks
             // not written yet go out under the flush's bound instead, this
             // one first and anything queued since the batch was taken last.
-            {
-                let mut state = shared.lock_state();
-                if !alive.load(Ordering::SeqCst) {
-                    return;
-                }
-                if state.shutdown {
-                    let queued = std::mem::take(&mut state.acks);
-                    drop(state);
-                    let rest = std::iter::once((id, status)).chain(acks).chain(queued);
-                    flush_acks(stream, rest);
-                    return;
-                }
+            let unwritten = std::iter::once((id, status)).chain(&mut acks);
+            if stop_writing(stream, shared, alive, unwritten) {
+                return;
             }
             if write_line(stream, &AppToBridge::ack(id, status)).is_err() {
                 return;
             }
         }
-        if let Some(snapshot) = snapshot
-            && write_line(stream, &AppToBridge::Snapshot(snapshot)).is_err()
-        {
+        let Some(snapshot) = snapshot else {
+            continue;
+        };
+        // Checked again here, or a shutdown that came while the batch's last
+        // ack was being written would be noticed only after the snapshot:
+        // the one line a shutdown skips, and the longest.
+        if stop_writing(stream, shared, alive, std::iter::empty()) {
+            return;
+        }
+        if write_line(stream, &AppToBridge::Snapshot(snapshot)).is_err() {
             return;
         }
     }
 }
 
-/// Serialize one message as a newline-terminated JSON frame and write it.
+/// The check [`writer_loop`] makes before each line of a batch: is the
+/// client gone, or is the layer shutting down?
+///
+/// Returns true when the writer must stop: at once when the client is gone,
+/// and when the layer is shutting down, once `unwritten` and then every ack
+/// queued since the batch was taken have been flushed. `unwritten` is
+/// consumed only in that case, so the caller can go on with it otherwise. The
+/// queued acks are taken in the same hold of the lock that read `alive`,
+/// which is what vouches for them; see [`writer_loop`].
+fn stop_writing(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    alive: &AtomicBool,
+    unwritten: impl IntoIterator<Item = (InputId, InputStatus)>,
+) -> bool {
+    let mut state = shared.lock_state();
+    if !alive.load(Ordering::SeqCst) {
+        return true;
+    }
+    if !state.shutdown {
+        return false;
+    }
+    let queued = std::mem::take(&mut state.acks);
+    drop(state);
+    flush_acks(stream, unwritten.into_iter().chain(queued));
+    true
+}
+
+/// Serialize one message as a newline-terminated JSON frame and write it,
+/// the whole line within [`WRITE_TIMEOUT`] of starting or not at all.
+///
+/// The deadline is on the line, not on each `write` it takes; see
+/// [`WRITE_TIMEOUT`] for why. A line that misses it may be written in part,
+/// and every caller then drops the connection, which is the only thing that
+/// can follow a partial line.
 fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
-    let mut line = serde_json::to_string(msg).map_err(io::Error::other)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes())
+    let mut line = serde_json::to_vec(msg).map_err(io::Error::other)?;
+    line.push(b'\n');
+    let deadline = Instant::now()
+        .checked_add(WRITE_TIMEOUT)
+        .ok_or_else(|| io::Error::other("the write deadline is past what the clock can hold"))?;
+    write_all_before(stream, &line, deadline)
 }
 
 /// Write the acks a shutdown found queued, oldest first, giving up once
@@ -1597,13 +1742,22 @@ fn flush_acks(stream: &mut UnixStream, acks: impl IntoIterator<Item = (InputId, 
 /// `write_all`, finished by `deadline` or failed with
 /// [`TimedOut`](io::ErrorKind::TimedOut).
 ///
-/// A write timeout bounds a single `write`, and `write_all` makes as many as
-/// the peer's reading lets it, each with the full timeout again: a bridge that
-/// takes a few bytes just before every one fires would stretch the total
-/// without limit. So the timeout is set to what is left of the deadline
-/// before every call. A timeout of zero means none at all to the socket and
-/// is refused, which is why nothing left ends the loop rather than reaching
-/// it.
+/// A socket's write timeout does not bound a `write` call, only each wait for
+/// room inside one, and a call waits again for every piece the kernel splits
+/// it into (Linux allocates a buffer of at most a few tens of KB at a time,
+/// and waits for room before each). So a large line, against a bridge that
+/// frees a little room before every wait can time out, never times out at
+/// all: a 900 KB snapshot to a bridge taking 64 KB every 3 s held the writer
+/// for forty seconds with a 5 s timeout. Setting the timeout to what is left
+/// of a deadline before each call does not help on its own, because a single
+/// call runs past the deadline.
+///
+/// So no call is handed more than [`WRITE_CHUNK`] bytes, few enough that the
+/// kernel waits for room at most once inside it, and that wait is given what
+/// is left of the deadline, or [`WRITE_WAIT`] if that is less, set before
+/// every call. A wait that times out short of the deadline is simply waited
+/// again. A timeout of zero means none at all to the socket and is refused,
+/// which is why nothing left ends the loop rather than reaching it.
 fn write_all_before(
     stream: &mut UnixStream,
     mut bytes: &[u8],
@@ -1614,11 +1768,20 @@ fn write_all_before(
         if left.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        stream.set_write_timeout(Some(left))?;
-        match stream.write(bytes) {
+        stream.set_write_timeout(Some(left.min(WRITE_WAIT)))?;
+        let chunk = bytes.get(..WRITE_CHUNK).unwrap_or(bytes);
+        match stream.write(chunk) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            // The socket is blocking, so this is the wait's timeout firing,
+            // and the clock at the top of the loop says whether that was the
+            // deadline.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
             Err(err) => return Err(err),
         }
     }
@@ -2576,6 +2739,64 @@ mod tests {
         assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 
+    /// The gap the per-ack check leaves: a shutdown that comes while the
+    /// batch's last ack is being written. That ack's check has passed, and
+    /// there is no ack after it whose check could notice, so the writer used
+    /// to go straight on to the snapshot, the one line a shutdown skips and
+    /// the one that can hold `Drop` for a whole `WRITE_TIMEOUT`.
+    #[test]
+    fn a_shutdown_while_the_last_ack_is_written_never_writes_the_snapshot() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let junk = fill_until_blocked(&server);
+
+        let shared = test_shared("lastack");
+        {
+            let mut state = shared.lock_state();
+            state.acks.push_back((1, InputStatus::Delivered));
+            state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
+            state.epoch = 1;
+        }
+        let done = spawn_writer(server, &shared);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shared.lock_state().acks.is_empty() {
+            assert!(Instant::now() < deadline, "the writer never took the batch");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Time for the writer to pass the check before its only ack and
+        // stall in that ack's write, against the full socket. Should it still
+        // be short of the check, that check sees the shutdown instead, and
+        // what is asserted below holds all the same.
+        thread::sleep(Duration::from_millis(100));
+        {
+            let mut state = shared.lock_state();
+            state.shutdown = true;
+            shared.cv.notify_all();
+        }
+
+        // Reading frees the socket, which lets the stalled ack finish.
+        let mut reader = BufReader::new(client);
+        let mut skipped = vec![0; junk];
+        reader.read_exact(&mut skipped).expect("read past the junk");
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read a message") == 0 {
+                break;
+            }
+            lines.push(serde_json::from_str::<AppToBridge>(&line).expect("parse a message"));
+        }
+        assert_eq!(
+            lines,
+            [AppToBridge::ack(1, InputStatus::Delivered)],
+            "the ack in hand goes out, and the snapshot behind it does not"
+        );
+        assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
     /// The flush is bounded in total, not per ack: against a bridge that has
     /// stopped reading, a queue of acks each given the time left would still
     /// be one bound long, and a queue each given `WRITE_TIMEOUT` would hold
@@ -2667,6 +2888,35 @@ mod tests {
         assert!(
             pending.len() <= MAX_LINE_BYTES,
             "and nothing past the cap is kept"
+        );
+    }
+
+    /// The read that runs over the cap is kept up to it, so every complete
+    /// line before the cap is counted. Dropping that whole read undercounted
+    /// by as many lines as it held whenever the reads did not land on the cap
+    /// exactly, which a socket's reads need not.
+    #[test]
+    fn every_complete_line_before_the_cap_is_counted() {
+        let line = b"{\"type\":\"input\",\"id\":1,\"input\":{\"kind\":\"key\",\"key\":\"q\"}}\n";
+        let fit = MAX_LINE_BYTES / line.len();
+        assert_ne!(
+            MAX_LINE_BYTES % line.len(),
+            0,
+            "the cap falls inside a line"
+        );
+        // Past the cap by more than one read's worth.
+        let flood = line.repeat(fit + 400);
+        // A short first read, so that no later one ends on the cap.
+        let (first, rest) = flood.split_at(100);
+        let mut pending = Vec::new();
+        let err = read_unsolicited(first.chain(rest), &mut pending)
+            .expect_err("more than a line's worth before the hello is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(pending.len(), MAX_LINE_BYTES, "kept up to the cap");
+        assert_eq!(
+            count_input_lines(&pending),
+            u64::try_from(fit).expect("fits"),
+            "every input that ends before the cap is counted, and the one it cuts is not"
         );
     }
 
