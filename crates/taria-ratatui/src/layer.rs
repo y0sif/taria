@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{AgentInput, MAX_NODE_DEPTH, Node, PROTOCOL_VERSION, Role, Snapshot, TreeTooDeep};
 
 use crate::FrameRecorder;
@@ -26,11 +26,6 @@ use crate::FrameRecorder;
 /// How long a snapshot write may stall on a slow or stuck bridge before the
 /// connection is dropped. Protects the app from a peer that stops reading.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Longest accepted ndjson line from a connected client. A peer that streams
-/// more than this without a newline is treated as broken and disconnected,
-/// so a hostile or buggy bridge cannot make the app buffer unboundedly.
-const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Capacity of the agent-input queue between the socket thread and the app.
 /// When the app is not draining inputs, the newest input is dropped, counted

@@ -142,6 +142,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentInput, Snapshot};
 
+/// Longest line either peer accepts, in bytes, not counting the terminating
+/// `\n`.
+///
+/// A reader that reaches this many bytes without a newline cannot find the
+/// start of the next message, so it treats the connection as broken rather
+/// than skipping the line. Both reference peers enforce it, and the reference
+/// adapter bounds every snapshot it writes to fit.
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
 /// Identifier the bridge assigns to one input so the app's acknowledgement can
 /// be matched back to it.
 ///

@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
+use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{AgentInput, PROTOCOL_VERSION, Snapshot};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -68,10 +68,6 @@ const INPUT_QUEUE: usize = 32;
 /// a slow read that catches up: the broadcast channel drops the oldest acks,
 /// and the oldest are exactly the `Dropped` answers a burst is watching for.
 const ACK_QUEUE: usize = 8 * MAX_KEY_REPEAT as usize;
-/// Longest accepted ndjson line from the app. A peer that streams more than
-/// this without a newline is treated as a broken connection (disconnect and
-/// reconnect) so the bridge never buffers a line unboundedly.
-const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// One snapshot as the app published it, in both the forms the bridge needs.
 ///
