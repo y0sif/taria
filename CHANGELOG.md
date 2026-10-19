@@ -13,7 +13,7 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-19
 
 **`taria-mcp --tree-format outline` serves the tree as an outline.** The
 bridge relays the app's JSON line, and most of that line is repeated field
@@ -36,7 +36,7 @@ text said before.
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1 and apps send the same
 JSON; only the text the bridge hands the model changes.
 
-**This breaks the Rust API of `taria-mcp`, so the next release is 0.3.0.**
+**This breaks the Rust API of `taria-mcp`, so this release is 0.3.0.**
 `args::Cli::Run` gained a field, and `Cli`, its `Run` variant and the new
 `TreeFormat` are now `#[non_exhaustive]`, so that the next flag or format is
 not another break. Code outside the crate that builds or matches them stops
@@ -46,6 +46,16 @@ non-exhaustive. Destructure with `..`, as `Cli::Run { socket, .. }`, and add a
 wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
 `Cli::Run` is no longer possible outside the crate; get one from
 `args::parse`. Nothing changes for whoever runs the binary.
+
+**Upgrade `taria` and `taria-ratatui` as a pair.** All three crates move to
+0.3.0 together, as they did to 0.2.1, because they share one workspace
+version; neither of the other two has a code change. `taria-ratatui` 0.3.0
+depends on `taria` 0.3.0, so an app that keeps `taria = "0.2"` beside it
+builds two copies of the protocol crate, and the nodes it builds are not the
+`Node` the adapter takes: the build fails with a type mismatch. Move both
+requirements to `0.3`. An app that names only `taria-ratatui` and reaches the
+types through `taria_ratatui::taria`, as the integration guide's one-line
+setup does, has only that one to move.
 
 ### For whoever drives an app
 
@@ -120,6 +130,43 @@ wildcard arm to a `match` over `Cli` or `TreeFormat`. A struct literal of
   It then invokes `delete` on that row, the custom action as its line spells
   it, checks the confirm dialog opened, and closes it through the dialog's
   advertised `dismiss`, so the demo ends with no modal and the row intact.
+
+### The benchmark
+
+`bench/` measures what an AI agent pays to drive the demo through taria,
+against the same agent reading the screen through tmux. Six tasks are graded
+from the demo's own state, which `taria-demo` writes as JSON to the file
+named by `TARIA_DEMO_STATE`; unset or empty, it writes nothing. Claude Haiku
+5.5 and Sonnet 5.5 ran each task five times on each of three arms: the tree
+as JSON, the outline, and tmux. `bench/RESULTS.md` has the method, the
+caveats and every number. Medians per run, with this release's bridge,
+counting the tokens the model read:
+
+- **Haiku:** taria passed all 30 runs as JSON and all 30 as the outline, and
+  tmux 29 of 30, a gap within chance at this size. tmux used 1.90x the
+  tokens of taria JSON and 2.09x those of the outline, and took 2.27x JSON's
+  time to finish. Its one failure was typed text meeting the list's key
+  bindings, the failure `type_text` exists to prevent.
+- **Sonnet:** every arm passed all 30 runs. tmux used 7.7% fewer tokens than
+  taria JSON, and the outline 1.7% fewer than tmux. The time to finish
+  showed no detectable difference between tmux and JSON.
+- **The bridge's shorter text** cut taria JSON's tokens per run by a fifth
+  against a first round run on 0.2.1's bridge: 20.0% on Haiku, 19.7% on
+  Sonnet. tmux's text did not change between the rounds. Its Sonnet median
+  moved 0.1%, and its Haiku median rose 10.3%, which `bench/RESULTS.md` puts
+  down to run-to-run variation.
+- **The raw fallbacks nearly stopped.** In the first round, taria agents made
+  38 of their 449 tool calls through `key` or `type_text`; in this one, 2 of
+  453. The texts, the outline's format and remote control's note all
+  changed in between, so `bench/RESULTS.md` credits none of them alone.
+
+### Each crate carries its licences
+
+`taria`, `taria-ratatui` and `taria-mcp` now ship `LICENSE-MIT` and
+`LICENSE-APACHE` in the package crates.io serves. They declared `MIT OR
+Apache-2.0` before without either text, which both licences ask to travel
+with copies. In the repository they are links to the root files, so there is
+one copy of each.
 
 ## [0.2.1] - 2026-10-11
 
@@ -611,7 +658,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
-[Unreleased]: https://github.com/y0sif/taria/compare/v0.2.1...HEAD
+[0.3.0]: https://github.com/y0sif/taria/releases/tag/v0.3.0
 [0.2.1]: https://github.com/y0sif/taria/releases/tag/v0.2.1
 [0.2.0]: https://github.com/y0sif/taria/releases/tag/v0.2.0
 [0.1.0]: https://github.com/y0sif/taria/releases/tag/v0.1.0

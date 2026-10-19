@@ -13,7 +13,7 @@
 #   ./install.sh
 #
 # Environment:
-#   TARIA_VERSION=v0.2.1   Pin to a specific tag (default: latest)
+#   TARIA_VERSION=v0.3.0   Pin to a specific tag (default: latest)
 
 set -eu
 
@@ -81,7 +81,7 @@ else
 
     if [ -z "${TAG:-}" ] || [ "$TAG" = "latest" ]; then
         echo "Could not resolve the latest release tag." >&2
-        echo "Set TARIA_VERSION=v0.2.1 (or similar) and re-run." >&2
+        echo "Set TARIA_VERSION=v0.3.0 (or similar) and re-run." >&2
         exit 1
     fi
     echo "Latest release: $TAG"
