@@ -27,6 +27,28 @@ use crate::FrameRecorder;
 /// connection is dropped. Protects the app from a peer that stops reading.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the writer may spend, in total, on the acks still queued when the
+/// layer shuts down.
+///
+/// A common exit drains input, answers it and drops the layer in one frame:
+/// a `q` acted on as quit, a `drain_acking` that returns
+/// [`Ignored`](InputStatus::Ignored) on the way out. Nothing gives the writer
+/// a turn between those calls, so every one of those answers can still be
+/// queued, the [`Delivered`](InputStatus::Delivered) of the dequeue included,
+/// and closing the connection without them leaves the agent waiting out a
+/// timeout on an input the app did take. Measured before this flush existed,
+/// such an app got no ack out at all in 16 runs of 20. So they are written
+/// before the connection closes.
+///
+/// Bounded, because [`Drop`] waits for the writer and an exit must not hang on
+/// a bridge that stopped reading; [`WRITE_TIMEOUT`] is far too long for that.
+/// The bound is total, not per write, and a peer that reads too slowly loses
+/// the acks that miss it, which costs the same timeout the flush exists to
+/// spare it. A snapshot still waiting is not written at all: it describes a UI
+/// that is about to be gone, and it can be large enough to spend the whole
+/// budget on its own.
+const SHUTDOWN_FLUSH: Duration = Duration::from_millis(250);
+
 /// Capacity of the agent-input queue between the socket thread and the app.
 /// When the app is not draining inputs, the newest input is dropped, counted
 /// (see [`TariaLayer::dropped_inputs`]) and acked
@@ -92,8 +114,9 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 /// with an [`AppToBridge::Ack`], so an agent can tell an input the app acted
 /// on from one it never saw. An input belongs to the connection it arrived
 /// on: one whose bridge disconnected before the app dequeued it is discarded
-/// rather than applied, because it was aimed at a session that is gone (see
-/// [`stale_inputs`](Self::stale_inputs)).
+/// rather than applied, because it was aimed at a session that is gone, and
+/// so is one a client wrote while it waited its turn, before the handshake
+/// that opens its session (see [`stale_inputs`](Self::stale_inputs)).
 ///
 /// A layer may also be *disabled*: [`bind_or_disabled`](Self::bind_or_disabled)
 /// hands back an inert layer rather than an error, so taria failing to bind
@@ -368,7 +391,8 @@ impl TariaLayer {
     /// [`try_recv_with_id`](Self::try_recv_with_id).
     ///
     /// Inputs left over from a bridge connection that has since ended are
-    /// discarded here rather than handed over; see
+    /// discarded here rather than handed over, and input a client wrote before
+    /// its handshake never reaches the queue at all; see
     /// [`stale_inputs`](Self::stale_inputs).
     ///
     /// [`AgentInput::Unknown`] never arrives here either. An input whose
@@ -563,17 +587,34 @@ impl TariaLayer {
         })
     }
 
-    /// How many agent inputs have been discarded so far because the bridge
-    /// connection they arrived on ended before the app dequeued them. Always
-    /// 0 on a disabled layer.
+    /// How many agent inputs have been discarded so far, rather than handed to
+    /// the app, because they were not aimed at the session that was live when
+    /// they were read. Always 0 on a disabled layer.
     ///
-    /// Such an input was aimed at a bridge session that no longer exists:
-    /// applying it would act on an agent's intent minutes or milliseconds
-    /// after the agent that formed it is gone, with nobody left to receive
-    /// the result. A `key q` that arrives just before the bridge restarts
-    /// would otherwise quit the app on the next frame. The bridge drops its
-    /// own queue on reconnect for the mirror-image reason, so both sides
-    /// agree that an input belongs to one connection.
+    /// Two things put an input here. The first is a bridge connection that
+    /// ended before the app dequeued what arrived on it. Such an input was
+    /// aimed at a bridge session that no longer exists: applying it would act
+    /// on an agent's intent minutes or milliseconds after the agent that
+    /// formed it is gone, with nobody left to receive the result. A `key q`
+    /// that arrives just before the bridge restarts would otherwise quit the
+    /// app on the next frame. The bridge drops its own queue on reconnect for
+    /// the mirror-image reason, so both sides agree that an input belongs to
+    /// one connection.
+    ///
+    /// The second is input a client wrote before its handshake. Only one
+    /// bridge is served at a time, so a client that connects while another is
+    /// attached waits in the listen backlog, and whatever it writes meanwhile
+    /// sits unread in the kernel's socket buffer until its turn comes. Nothing
+    /// written before the hello that opens a session can have been written in
+    /// reply to it: that client has seen no tree, so its inputs name nodes and
+    /// keys it guessed at, and applying them once the first client leaves
+    /// would act on a UI it never looked at. So what is waiting is read off
+    /// and thrown away just before the hello goes out, and every complete line
+    /// of it that is an input is counted here, a kind this build cannot read
+    /// included. None of it is acked: the session it would be answered on had
+    /// not begun. A client that waits for the hello before writing is never
+    /// affected, and taria-mcp is one, whose input tools refuse to send until
+    /// the app's first snapshot has arrived.
     ///
     /// Monotonic across reconnects, and read like
     /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
@@ -738,13 +779,20 @@ impl Drop for TariaLayer {
     /// Stop the threads and unlink the socket. A disabled layer has neither,
     /// so it touches no filesystem at all.
     ///
+    /// Acks still queued for a connected bridge are written before its
+    /// connection is closed, so an app that answers an input and exits in the
+    /// same frame does not leave the agent waiting on that answer; a snapshot
+    /// still waiting is not. See `SHUTDOWN_FLUSH` for why the one and not the
+    /// other, and for the bound on it.
+    ///
     /// How long this takes depends only on what the threads are doing, never
     /// on what is at the socket path. The listener polls the shutdown flag
     /// rather than waiting to be woken by a connection, so it returns whether
     /// the socket file was replaced by a second instance, removed, or is
-    /// being served by some other process; the worst case is one
-    /// `ACCEPT_POLL` nap, plus one `WRITE_TIMEOUT` if a connected bridge
-    /// has stopped reading mid-write.
+    /// being served by some other process. The worst case is one
+    /// `ACCEPT_POLL` nap, plus one `WRITE_TIMEOUT` if a connected bridge has
+    /// stopped reading mid-write, plus `SHUTDOWN_FLUSH` for the acks queued
+    /// behind that write.
     fn drop(&mut self) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -791,8 +839,11 @@ struct Shared {
     /// Agent inputs dropped because the input queue was full. Written by
     /// reader threads, read via [`TariaLayer::dropped_inputs`].
     dropped_inputs: AtomicU64,
-    /// Agent inputs discarded at dequeue because the connection they arrived
-    /// on had ended. Written by the app thread, read via
+    /// Agent inputs discarded rather than delivered: at dequeue because the
+    /// connection they arrived on had ended, and before the handshake because
+    /// the client wrote them while it waited its turn. Written by the app
+    /// thread for the first and by the listener thread for the second, both
+    /// with an atomic add, so neither can lose the other's count; read via
     /// [`TariaLayer::stale_inputs`].
     stale_inputs: AtomicU64,
     /// Agent inputs answered [`Ignored`](InputStatus::Ignored) by the reader
@@ -920,6 +971,9 @@ impl Shared {
         let mut state = self.lock_state();
         if state.generation != generation {
             drop(state);
+            // An atomic add, not a load and store: the listener thread counts
+            // its pre-handshake discards into the same counter (see
+            // `start_connection`), possibly at this very moment.
             self.stale_inputs.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -1081,9 +1135,39 @@ fn serve_client(
     Ok(())
 }
 
-/// Send the handshake (and the snapshot a new client is owed) and start the
-/// connection's reader thread, so every way of failing to get a connection
-/// off the ground funnels through one `Err` for the caller to clean up after.
+/// Discard what the client wrote before its handshake, send the handshake
+/// (and the snapshot a new client is owed) and start the connection's reader
+/// thread, so every way of failing to get a connection off the ground
+/// funnels through one `Err` for the caller to clean up after.
+///
+/// # Input written before the hello
+///
+/// The accept loop serves one client to completion before it accepts the
+/// next, so a client that connects meanwhile sits in the listen backlog with
+/// a socket that works, and whatever it writes there waits in the kernel's
+/// buffer: a probe measured 180 KB accepted before a write would block, all
+/// of it readable once the connection is finally served. Read as the new
+/// session's first lines, that is input the app applies on behalf of a client
+/// that wrote it blind, and the hello is the boundary that tells the two
+/// apart: nothing written before it can have been written in reply to it.
+/// See [`TariaLayer::stale_inputs`], which counts what is thrown away here.
+///
+/// So the stream is read without blocking, right before the hello is written
+/// and not a step earlier, and everything already there is discarded. What
+/// arrives between this read and the hello's write slips through, and only a
+/// client writing blind can land in that gap. A client that waits for the
+/// hello loses nothing either way.
+///
+/// The bytes may stop partway through a line, whose remainder then arrives
+/// as the session's first bytes. That remainder belongs to a line written
+/// blind, and its own tail can parse as a whole input (a line with leading
+/// whitespace, cut inside it, is one), so the reader is told to skip through
+/// the first newline it reads before it treats anything as input.
+///
+/// More than [`MAX_LINE_BYTES`] waiting is an error, like a line that long:
+/// past that it is a flood, not a client that wrote a little too early, and
+/// reading it all off would let a client that never stops writing hold the
+/// listener here forever.
 fn start_connection(
     write_stream: &mut UnixStream,
     stream: UnixStream,
@@ -1093,6 +1177,22 @@ fn start_connection(
     alive: &Arc<AtomicBool>,
     generation: u64,
 ) -> io::Result<JoinHandle<()>> {
+    // The flag belongs to the open socket, not to this handle, so the
+    // `try_clone`d writer goes non-blocking with it. It is put back before
+    // anything is written: the hello and every later write rely on blocking
+    // with `WRITE_TIMEOUT`.
+    stream.set_nonblocking(true)?;
+    let mut unsolicited = Vec::new();
+    let read = read_unsolicited(&stream, &mut unsolicited);
+    // Counted whatever the read ended in: an input read off here was
+    // discarded either way, including when the next byte overflows the cap.
+    shared
+        .stale_inputs
+        .fetch_add(count_input_lines(&unsolicited), Ordering::Relaxed);
+    stream.set_nonblocking(false)?;
+    read?;
+    let starts_mid_line = unsolicited.last().is_some_and(|&byte| byte != b'\n');
+
     write_line(
         write_stream,
         &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION),
@@ -1104,8 +1204,69 @@ fn start_connection(
         let alive = Arc::clone(alive);
         let shared = Arc::clone(shared);
         let input_tx = input_tx.clone();
-        move || reader_loop(stream, input_tx, alive, shared, generation)
+        move || reader_loop(stream, input_tx, alive, shared, generation, starts_mid_line)
     })
+}
+
+/// Append everything `reader` has ready to `pending`, stopping when a read
+/// would block or the peer has closed its end.
+///
+/// For the non-blocking pass [`start_connection`] makes before the hello.
+/// More than [`MAX_LINE_BYTES`] in all is an
+/// [`InvalidData`](io::ErrorKind::InvalidData) error, with `pending` left
+/// holding the bytes that fit, so the caller can still count the inputs it
+/// is throwing away. Any other error ends the read the same way: the
+/// connection is broken, and `pending` holds what came before.
+fn read_unsolicited(mut reader: impl Read, pending: &mut Vec<u8>) -> io::Result<()> {
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                let Some(read) = chunk.get(..n) else {
+                    return Err(io::Error::other(
+                        "a read reported more bytes than it was given",
+                    ));
+                };
+                if pending.len() + n > MAX_LINE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "the client wrote more than {MAX_LINE_BYTES} bytes before its \
+                             handshake"
+                        ),
+                    ));
+                }
+                pending.extend_from_slice(read);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// How many complete lines of `bytes` are agent inputs, of any kind.
+///
+/// A line that does not end in `\n` is not complete, and neither is it
+/// counted: whether it would have parsed is unknowable. Lines that do not
+/// parse at all are passed over in silence, as the reader passes them over on
+/// a live connection. An input of a kind this build cannot read
+/// ([`AgentInput::Unknown`]) counts like any other, because it was discarded
+/// like any other; on a live connection it would have been answered, but
+/// before the hello there is nobody to answer.
+fn count_input_lines(bytes: &[u8]) -> u64 {
+    let inputs = bytes
+        .split_inclusive(|&byte| byte == b'\n')
+        .filter(|line| line.ends_with(b"\n"))
+        .filter(|line| {
+            matches!(
+                serde_json::from_slice::<BridgeToApp>(line),
+                Ok(BridgeToApp::Input { .. })
+            )
+        })
+        .count();
+    u64::try_from(inputs).unwrap_or(u64::MAX)
 }
 
 /// Reader half of a connection: parse `BridgeToApp` lines and forward agent
@@ -1120,12 +1281,20 @@ fn start_connection(
 /// Every forwarded input carries `generation`, which this loop retires when
 /// the connection ends so anything still queued from it is discarded instead
 /// of delivered.
+///
+/// `starts_mid_line` says the bytes the client wrote before its hello, which
+/// [`start_connection`] discarded, stopped partway through a line. Everything
+/// up to and including the first newline is that line's remainder, and is
+/// skipped without being parsed, counted or acked; see [`start_connection`].
+/// It is still a line, so a remainder over [`MAX_LINE_BYTES`] breaks the
+/// connection like any other.
 fn reader_loop(
     stream: UnixStream,
     input_tx: SyncSender<QueuedInput>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
     generation: u64,
+    mut starts_mid_line: bool,
 ) {
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
@@ -1147,6 +1316,11 @@ fn reader_loop(
             // Oversized line (or EOF mid-line): treat the connection as
             // broken rather than accumulating an unbounded buffer.
             break;
+        }
+        if std::mem::take(&mut starts_mid_line) {
+            // The rest of a line the client began before its hello. Its tail
+            // can parse on its own, and it was still written blind.
+            continue;
         }
         let Ok(msg) = serde_json::from_slice::<BridgeToApp>(&buf) else {
             continue;
@@ -1208,13 +1382,31 @@ fn reader_loop(
 /// snapshot first could not tell whether it reflects its input yet.
 ///
 /// Returns when the layer shuts down, the reader reports the client gone, or
-/// a write fails.
+/// a write fails. A shutdown first writes every ack still queued, the rest of
+/// the batch in hand included, within [`SHUTDOWN_FLUSH`] in all, and skips the
+/// snapshot that would have followed them; a client already gone gets
+/// nothing, since nobody is left to read it.
+///
+/// Every ack that flush can write belongs to this connection. The queue is
+/// emptied under the lock as each connection starts, in the same step that
+/// moves the generation on, so nothing queued for an earlier one survives
+/// into it. While this connection's reader runs, `alive` is true and the
+/// generation is this connection's, and the reader changes both together,
+/// under the lock, as it exits, so an `alive` read under the lock vouches
+/// for every ack taken in the same hold. Both shutdown checks take the acks
+/// in the same hold that read `alive`.
 fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut last_epoch: u64) {
     loop {
         let (acks, snapshot) = {
             let mut state = shared.lock_state();
             loop {
-                if state.shutdown || !alive.load(Ordering::SeqCst) {
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
+                if state.shutdown {
+                    let queued = std::mem::take(&mut state.acks);
+                    drop(state);
+                    flush_acks(stream, queued);
                     return;
                 }
                 if !state.acks.is_empty() || state.epoch != last_epoch {
@@ -1233,13 +1425,26 @@ fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        for (id, status) in acks {
+        let mut acks = acks.into_iter();
+        while let Some((id, status)) = acks.next() {
             // Rechecked per ack rather than once per pass: a full batch
             // against a peer that stopped reading is a whole queue of write
             // timeouts long, and `Drop` waits for this thread, so an exit
-            // during the flush would sit through every one of them.
-            if shared.is_shutdown() || !alive.load(Ordering::SeqCst) {
-                return;
+            // during the batch would sit through every one of them. The acks
+            // not written yet go out under the flush's bound instead, this
+            // one first and anything queued since the batch was taken last.
+            {
+                let mut state = shared.lock_state();
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
+                if state.shutdown {
+                    let queued = std::mem::take(&mut state.acks);
+                    drop(state);
+                    let rest = std::iter::once((id, status)).chain(acks).chain(queued);
+                    flush_acks(stream, rest);
+                    return;
+                }
             }
             if write_line(stream, &AppToBridge::ack(id, status)).is_err() {
                 return;
@@ -1258,6 +1463,61 @@ fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
     let mut line = serde_json::to_string(msg).map_err(io::Error::other)?;
     line.push('\n');
     stream.write_all(line.as_bytes())
+}
+
+/// Write the acks a shutdown found queued, oldest first, giving up once
+/// [`SHUTDOWN_FLUSH`] has passed or a write fails.
+///
+/// Best effort by design: the caller returns either way, and an ack that
+/// misses the deadline costs its waiter the timeout it would have waited out
+/// with no flush at all. The connection is closed straight after, so the
+/// write timeout this leaves on the socket is never used again.
+fn flush_acks(stream: &mut UnixStream, acks: impl IntoIterator<Item = (InputId, InputStatus)>) {
+    let Some(deadline) = Instant::now().checked_add(SHUTDOWN_FLUSH) else {
+        return;
+    };
+    // One buffer and one deadline for the lot, rather than a line at a time,
+    // so the bound is on the flush and not on each of its writes.
+    let mut lines = Vec::new();
+    for (id, status) in acks {
+        let Ok(line) = serde_json::to_vec(&AppToBridge::ack(id, status)) else {
+            break;
+        };
+        lines.extend_from_slice(&line);
+        lines.push(b'\n');
+    }
+    let _ = write_all_before(stream, &lines, deadline);
+}
+
+/// `write_all`, finished by `deadline` or failed with
+/// [`TimedOut`](io::ErrorKind::TimedOut).
+///
+/// A write timeout bounds a single `write`, and `write_all` makes as many as
+/// the peer's reading lets it, each with the full timeout again: a bridge that
+/// takes a few bytes just before every one fires would stretch the total
+/// without limit. So the timeout is set to what is left of the deadline
+/// before every call. A timeout of zero means none at all to the socket and
+/// is refused, which is why nothing left ends the loop rather than reaching
+/// it.
+fn write_all_before(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        stream.set_write_timeout(Some(left))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Make `path` absolute, resolving a relative path (including a bare
@@ -1929,6 +2189,245 @@ mod tests {
         shared.lock_state().shutdown = true;
         shared.cv.notify_all();
         writer.join().expect("writer thread");
+    }
+
+    /// Write junk into `stream` until the peer's side is full, so the next
+    /// write blocks: a bridge that has stopped reading. Returns how many
+    /// bytes it took, for a test that wants to read past them later.
+    fn fill_until_blocked(stream: &UnixStream) -> usize {
+        stream.set_nonblocking(true).expect("non-blocking");
+        let chunk = [b'x'; 4096];
+        let mut filled = 0;
+        loop {
+            match (&*stream).write(&chunk) {
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("filling the socket failed: {err}"),
+            }
+        }
+        stream.set_nonblocking(false).expect("blocking again");
+        filled
+    }
+
+    /// Run [`writer_loop`] on its own thread and report when it returns, so
+    /// a writer that never does fails the test instead of hanging the suite.
+    /// The stream is dropped as the loop returns, which is the EOF a test
+    /// reads to know nothing else was written.
+    fn spawn_writer(server: UnixStream, shared: &Arc<Shared>) -> Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn({
+            let shared = Arc::clone(shared);
+            move || {
+                let mut server = server;
+                let alive = AtomicBool::new(true);
+                writer_loop(&mut server, &shared, &alive, 0);
+                drop(server);
+                let _ = tx.send(());
+            }
+        });
+        rx
+    }
+
+    /// The exit the flush exists for: the app dequeued an input, refined its
+    /// ack and dropped the layer, all before the writer ran again. Both acks
+    /// are still queued, and so is the snapshot the app published last.
+    #[test]
+    fn a_shutdown_writes_the_queued_acks_and_not_the_snapshot() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+
+        let shared = test_shared("exitflush");
+        {
+            let mut state = shared.lock_state();
+            state.acks.push_back((4, InputStatus::Delivered));
+            state.acks.push_back((4, InputStatus::Ignored));
+            state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
+            state.epoch = 1;
+            state.shutdown = true;
+        }
+        let done = spawn_writer(server, &shared);
+
+        let mut reader = BufReader::new(client);
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read a message") == 0 {
+                break;
+            }
+            lines.push(serde_json::from_str::<AppToBridge>(&line).expect("parse a message"));
+        }
+        assert_eq!(
+            lines,
+            [
+                AppToBridge::ack(4, InputStatus::Delivered),
+                AppToBridge::ack(4, InputStatus::Ignored),
+            ],
+            "every queued ack goes out, in order, and the snapshot behind them does not"
+        );
+        assert!(
+            done.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the writer returns once the acks are out"
+        );
+        assert!(shared.lock_state().acks.is_empty(), "the queue was taken");
+    }
+
+    /// The other place the writer notices a shutdown: partway through a
+    /// batch, blocked on a slow bridge. What it has not written of that batch
+    /// goes out under the flush's bound, followed by anything queued since,
+    /// and the snapshot that was due after the batch is skipped.
+    #[test]
+    fn a_shutdown_mid_batch_writes_the_rest_of_it_and_what_queued_since() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let junk = fill_until_blocked(&server);
+
+        let shared = test_shared("midbatch");
+        {
+            let mut state = shared.lock_state();
+            state.acks.push_back((1, InputStatus::Delivered));
+            state.acks.push_back((2, InputStatus::Delivered));
+            state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
+            state.epoch = 1;
+        }
+        let done = spawn_writer(server, &shared);
+
+        // The writer has the batch once the queue is empty. From there it is
+        // blocked writing the first ack into the full socket, or about to be,
+        // and either way the next time it looks at the shutdown flag is
+        // inside that batch, before one of its acks.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shared.lock_state().acks.is_empty() {
+            assert!(Instant::now() < deadline, "the writer never took the batch");
+            thread::sleep(Duration::from_millis(1));
+        }
+        {
+            let mut state = shared.lock_state();
+            state.acks.push_back((3, InputStatus::Ignored));
+            state.shutdown = true;
+            shared.cv.notify_all();
+        }
+
+        // Reading frees the socket, which lets the blocked write finish and
+        // the writer reach its next check.
+        let mut reader = BufReader::new(client);
+        let mut skipped = vec![0; junk];
+        reader.read_exact(&mut skipped).expect("read past the junk");
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read a message") == 0 {
+                break;
+            }
+            lines.push(serde_json::from_str::<AppToBridge>(&line).expect("parse a message"));
+        }
+        assert_eq!(
+            lines,
+            [
+                AppToBridge::ack(1, InputStatus::Delivered),
+                AppToBridge::ack(2, InputStatus::Delivered),
+                AppToBridge::ack(3, InputStatus::Ignored),
+            ],
+            "the batch in hand first, then what was queued behind it, and no snapshot"
+        );
+        assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    /// The flush is bounded in total, not per ack: against a bridge that has
+    /// stopped reading, a queue of acks each given the time left would still
+    /// be one bound long, and a queue each given `WRITE_TIMEOUT` would hold
+    /// the app's exit for minutes.
+    #[test]
+    fn the_shutdown_flush_gives_up_on_a_bridge_that_stopped_reading() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        fill_until_blocked(&server);
+        // As on a live connection, where every write already has this
+        // timeout: the flush has to beat it, not lean on it.
+        server
+            .set_write_timeout(Some(WRITE_TIMEOUT))
+            .expect("write timeout");
+
+        let shared = test_shared("stuckflush");
+        {
+            let mut state = shared.lock_state();
+            for id in 0..20 {
+                state.acks.push_back((id, InputStatus::Delivered));
+            }
+            state.shutdown = true;
+        }
+        let done = spawn_writer(server, &shared);
+
+        // Well short of one `WRITE_TIMEOUT`, so a flush that leaned on it
+        // fails here rather than passing slowly.
+        let margin = Duration::from_secs(2);
+        done.recv_timeout(SHUTDOWN_FLUSH + margin)
+            .expect("the flush must give up on a stuck bridge within its bound");
+        // Held to here, so the bridge was stuck rather than gone throughout.
+        drop(client);
+    }
+
+    /// A reader that hands out a scripted sequence of results, for the read
+    /// a socket can only produce by timing: an interrupted call, then a
+    /// would-block once everything waiting has been read.
+    struct Scripted(VecDeque<io::Result<&'static [u8]>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let bytes = self
+                .0
+                .pop_front()
+                .expect("read again after it would have blocked")?;
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    /// What the pre-handshake pass reads and what it counts: every complete
+    /// line that is an input, of any kind, and nothing else.
+    #[test]
+    fn input_written_before_the_hello_is_read_off_and_counted_by_the_line() {
+        let script = [
+            Ok(&br#"{"type":"input","id":1,"input":{"kind":"key","key":"q"}}"#[..]),
+            Err(io::ErrorKind::Interrupted.into()),
+            Ok(&b"\nnot json\n"[..]),
+            // A kind this build cannot read is still an input, discarded
+            // like the rest.
+            Ok(&br#"{"type":"input","id":2,"input":{"kind":"paste"}}"#[..]),
+            Ok(&b"\n{\"type\":\"bye\"}\n"[..]),
+            // Cut off: the reader skips its remainder rather than this
+            // counting it.
+            Ok(&br#"{"type":"input","id":3,"#[..]),
+            Err(io::ErrorKind::WouldBlock.into()),
+        ];
+        let mut pending = Vec::new();
+        read_unsolicited(Scripted(script.into()), &mut pending)
+            .expect("an interrupted read is retried, and a would-block ends the pass");
+        assert!(
+            pending.ends_with(br#""id":3,"#),
+            "everything ready was read"
+        );
+        assert_eq!(count_input_lines(&pending), 2);
+
+        // A peer that closed its end is done too.
+        let mut pending = Vec::new();
+        read_unsolicited(&b"{}\n"[..], &mut pending).expect("EOF ends the pass");
+        assert_eq!(pending, b"{}\n");
+
+        // Up to a line's worth waiting is fine; past it is an oversized line.
+        let line = vec![b' '; MAX_LINE_BYTES];
+        read_unsolicited(line.as_slice(), &mut Vec::new()).expect("exactly the cap is accepted");
+        let flood = vec![b'\n'; MAX_LINE_BYTES + 1];
+        let mut pending = Vec::new();
+        let err = read_unsolicited(flood.as_slice(), &mut pending)
+            .expect_err("more than a line's worth before the hello is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            pending.len() <= MAX_LINE_BYTES,
+            "and nothing past the cap is kept"
+        );
     }
 
     /// Exit must not depend on the wake-up connection succeeding: with the

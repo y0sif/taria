@@ -505,8 +505,20 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
     let stream = UnixStream::connect(layer.socket_path()).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     let mut writer = stream.try_clone().unwrap();
+    // The flood starts once the session has: input written before the hello
+    // is discarded unread, which would leave this test counting a race
+    // instead of the queue.
+    let mut reader = BufReader::new(stream);
+    let mut hello = String::new();
+    reader.read_line(&mut hello).unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<AppToBridge>(&hello).unwrap(),
+            AppToBridge::Hello { .. }
+        ),
+        "the handshake is always first"
+    );
     let collector = thread::spawn(move || {
-        let mut reader = BufReader::new(stream);
         let mut messages = Vec::new();
         let mut line = String::new();
         loop {
@@ -557,10 +569,6 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
         "each dropped input must be counted exactly once"
     );
 
-    assert!(
-        matches!(messages.first(), Some(AppToBridge::Hello { .. })),
-        "the handshake is always first"
-    );
     assert!(
         messages.iter().any(|msg| matches!(
             msg,
@@ -743,6 +751,102 @@ fn a_second_client_waits_until_the_first_is_gone() {
     second.send_input(1, key("j"));
     assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("j")));
     assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
+}
+
+/// What a client writes while it waits its turn is not its session's input.
+///
+/// It sits in the kernel's socket buffer until the first client leaves, and
+/// used to be read then as the new session's first lines, so the app applied
+/// keys a client sent before it had seen any tree at all. Nothing written
+/// before the hello can have been written in reply to it, so all of it is
+/// discarded, counted and never acked, and the session starts with what the
+/// client writes after the hello.
+///
+/// The blind bytes here end partway through a line, cut inside its leading
+/// whitespace, so the remainder the client writes once it is served is a
+/// whole input on its own. Only skipping the rest of the cut line keeps that
+/// one from the app.
+#[test]
+fn input_a_waiting_client_wrote_before_its_hello_never_reaches_the_app() {
+    let mut layer = bind_layer("prehello");
+    publish_single_node(&mut layer, "tree");
+    let mut first = Client::connect(&layer);
+    assert!(matches!(first.read_message(), AppToBridge::Hello { .. }));
+    assert!(matches!(first.read_message(), AppToBridge::Snapshot(_)));
+
+    // Written blind while the first client is served: one whole input, and
+    // the start of another.
+    let mut second = Client::connect(&layer);
+    second.send_input(1, key("q"));
+    second.writer.write_all(b"    ").unwrap();
+
+    drop(first);
+    assert_eq!(
+        second.read_message(),
+        AppToBridge::hello("prehello", PROTOCOL_VERSION)
+    );
+    assert!(matches!(second.read_message(), AppToBridge::Snapshot(_)));
+
+    // The rest of the cut line, then an input written in reply to the hello.
+    second.send_input(2, key("y"));
+    second.send_input(3, key("j"));
+
+    assert_eq!(
+        layer.recv_timeout(TIMEOUT),
+        Some(key("j")),
+        "neither the blind input nor the rest of the cut line may reach the app"
+    );
+    assert_eq!(
+        second.read_message(),
+        ack(3, InputStatus::Delivered),
+        "nothing is acked for the blind input or the cut line: the first ack \
+         of the session answers the first input written after its hello"
+    );
+    assert_eq!(layer.try_recv(), None, "nothing else was queued");
+    assert_eq!(
+        layer.stale_inputs(),
+        1,
+        "the whole blind input is counted once; the cut line is not counted"
+    );
+    assert_eq!(layer.unknown_inputs(), 0);
+    assert_eq!(layer.dropped_inputs(), 0);
+}
+
+/// A common way out of an app answers an input and drops the layer in the
+/// same frame: `q` handled as quit, an input refused on the way out. Nothing
+/// gives the writer a turn in between, so both of that input's acks can still
+/// be queued when the shutdown starts, and they used to be thrown away with
+/// the connection, leaving the agent to time out on an input the app took.
+#[test]
+fn acks_queued_as_the_layer_drops_still_reach_the_bridge() {
+    let layer = bind_layer("exitflush");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+
+    client.send_input(1, key("q"));
+    let mut handled = 0;
+    let deadline = Instant::now() + TIMEOUT;
+    while handled == 0 && Instant::now() < deadline {
+        layer.drain_acking(|_| {
+            handled += 1;
+            InputStatus::Ignored
+        });
+        if handled == 0 {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(handled, 1, "the input reaches the app");
+    // At once, with nothing in between to give the writer a turn.
+    drop(layer);
+
+    assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
+    assert_eq!(client.read_message(), ack(1, InputStatus::Ignored));
+    let mut line = String::new();
+    assert_eq!(
+        client.reader.read_line(&mut line).unwrap(),
+        0,
+        "the connection closes after the acks, with nothing else: {line:?}"
+    );
 }
 
 #[test]
