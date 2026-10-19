@@ -857,10 +857,10 @@ impl TariaLayer {
     ///    not enough;
     /// 3. nodes. First any node too large to fit with nothing beside it, one
     ///    whose id or custom actions alone run over, with everything under
-    ///    it, so that it
-    ///    cannot take its siblings with it. Then the trailing children of the
-    ///    widest nodes, so a list of fifty thousand rows loses its last rows
-    ///    while a status bar beside it keeps its place. Then, shallowest
+    ///    it, so that it cannot take its siblings with it. Then the trailing
+    ///    children of the widest nodes, so a list of fifty thousand rows
+    ///    loses its last rows while a status bar beside it keeps its place.
+    ///    Then, shallowest
     ///    first, as many of those as still fit go back, each node's next
     ///    children in their order until one does not, so a list keeps its
     ///    first rows with no gap;
