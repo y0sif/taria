@@ -51,6 +51,7 @@
 //! }
 //! ```
 
+mod bound;
 mod key;
 mod layer;
 mod recorder;
@@ -58,6 +59,7 @@ mod semantic;
 #[cfg(test)]
 mod test_util;
 
+pub use bound::SnapshotTooLarge;
 pub use key::{text_to_keys, to_crossterm, to_crossterm_key};
 pub use layer::TariaLayer;
 pub use recorder::FrameRecorder;

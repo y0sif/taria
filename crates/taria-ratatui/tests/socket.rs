@@ -176,6 +176,47 @@ fn latest_snapshot_is_replayed_on_connect() {
     assert_eq!(snapshot.root.children[0].id.0, "pre");
 }
 
+/// The replay above is what made an oversized tree fatal: a bridge drops a
+/// connection whose line runs past `MAX_LINE_BYTES`, reconnects, and is
+/// replayed the same latest snapshot, for as long as the app holds the tree.
+/// So the line a fresh client is sent has to be one it can read, and the
+/// connection has to go on working after it.
+#[test]
+fn an_oversized_tree_is_replayed_as_a_line_the_bridge_can_read() {
+    use taria::wire::MAX_LINE_BYTES;
+
+    let mut layer = bind_layer("oversized");
+    let draft = "d".repeat(MAX_LINE_BYTES + 1);
+    layer.publish([Node::new("draft", Role::TextInput)
+        .value(draft.clone())
+        .focused(true)]);
+
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+    let mut line = String::new();
+    client.reader.read_line(&mut line).unwrap();
+    let content = line
+        .strip_suffix('\n')
+        .expect("the snapshot is one whole line");
+    assert!(
+        content.len() <= MAX_LINE_BYTES,
+        "{} bytes, over the {MAX_LINE_BYTES} a bridge reads",
+        content.len()
+    );
+    let AppToBridge::Snapshot(snapshot) = serde_json::from_str(content).unwrap() else {
+        panic!("expected the latest snapshot right after hello");
+    };
+    let value = snapshot.root.children[0].value.as_deref().unwrap();
+    assert!(value.ends_with('\u{2026}'), "the cut is marked");
+    assert!(draft.starts_with(value.trim_end_matches('\u{2026}')));
+    assert_eq!(layer.oversized_snapshots(), 1);
+
+    // Still a working connection: an input goes in and its ack comes back.
+    client.send_input(1, key("q"));
+    assert_eq!(poll_try_recv(&layer), Some(key("q")));
+    assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
+}
+
 #[test]
 fn inputs_reach_the_app_acked_delivered_and_malformed_lines_are_ignored() {
     let layer = bind_layer("input");

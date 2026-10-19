@@ -22,6 +22,7 @@ use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus, MAX_LINE_BYTES
 use taria::{AgentInput, MAX_NODE_DEPTH, Node, PROTOCOL_VERSION, Role, Snapshot, TreeTooDeep};
 
 use crate::FrameRecorder;
+use crate::bound::{self, ROOT_BUDGET, SnapshotTooLarge};
 
 /// How long a snapshot write may stall on a slow or stuck bridge before the
 /// connection is dropped. Protects the app from a peer that stops reading.
@@ -153,6 +154,10 @@ struct Inner {
     /// only the app thread publishes and only the app thread reads these.
     truncated: u64,
     last_truncation: Option<TreeTooDeep>,
+    /// Snapshots published with something cut to fit one line, and what was
+    /// cut from the newest of them. Owned here for the same reason.
+    oversized: u64,
+    last_oversize: Option<SnapshotTooLarge>,
 }
 
 /// One agent input on its way from a connection's reader thread to the app.
@@ -291,6 +296,8 @@ impl TariaLayer {
                 last_root: None,
                 truncated: 0,
                 last_truncation: None,
+                oversized: 0,
+                last_oversize: None,
             }),
             bind_error: None,
         })
@@ -671,6 +678,14 @@ impl TariaLayer {
     /// How many published snapshots have had a branch cut for being deeper
     /// than [`taria::MAX_NODE_DEPTH`]. Always 0 on a disabled layer.
     ///
+    /// It counts snapshots, not frames. A frame whose tree, once cut, is the
+    /// snapshot already published is not sent again and is not counted
+    /// again, so a deep tree that sits still while the app redraws it sixty
+    /// times a second counts once, and a deep tree that changes counts once
+    /// per change. The number says how many trees the agent was handed cut,
+    /// which is the thing worth knowing, rather than how often the app drew
+    /// one.
+    ///
     /// See [`publish`](Self::publish) for what the cut does and why.
     /// [`last_truncation`](Self::last_truncation) names the branch. Monotonic
     /// for the lifetime of the layer, and read like
@@ -689,6 +704,34 @@ impl TariaLayer {
     /// the counter alone is not enough here.
     pub fn last_truncation(&self) -> Option<TreeTooDeep> {
         self.inner.as_ref()?.last_truncation.clone()
+    }
+
+    /// How many published snapshots have had something cut to fit in one
+    /// line of [`taria::wire::MAX_LINE_BYTES`]. Always 0 on a disabled layer.
+    ///
+    /// Counted like [`truncated_snapshots`](Self::truncated_snapshots):
+    /// snapshots, not frames, so a tree that stays too large while the app
+    /// redraws it counts once, and one that changes counts once per change.
+    ///
+    /// See [`publish`](Self::publish) for what is cut and why.
+    /// [`last_oversize`](Self::last_oversize) says how large the line would
+    /// have been and where the bytes were. Monotonic for the lifetime of the
+    /// layer, and read like [`dropped_inputs`](Self::dropped_inputs): after
+    /// the terminal is restored, never while the app owns the alternate
+    /// screen.
+    pub fn oversized_snapshots(&self) -> u64 {
+        self.inner.as_ref().map_or(0, |inner| inner.oversized)
+    }
+
+    /// What was cut from the most recent oversized snapshot, or `None` if no
+    /// published tree has had to be cut to fit.
+    ///
+    /// [`SnapshotTooLarge`] carries the size the line would have had and the
+    /// id of the node holding the longest string. A tree that runs over has
+    /// usually run away in one place, a draft, a log, a list holding every
+    /// row, and the counter alone cannot say which.
+    pub fn last_oversize(&self) -> Option<SnapshotTooLarge> {
+        self.inner.as_ref()?.last_oversize.clone()
     }
 
     /// Publish `nodes` as a snapshot, without going through a
@@ -721,6 +764,48 @@ impl TariaLayer {
     /// almost always to publish what the widget draws rather than the data
     /// behind it, which for a deep tree view is the expanded path and the
     /// rows currently on screen.
+    ///
+    /// # Trees too large to send
+    ///
+    /// A snapshot travels as one line, and a bridge reads a line up to
+    /// [`taria::wire::MAX_LINE_BYTES`] and no further: past that it cannot
+    /// find where the next message starts, so it drops the connection.
+    /// Dropping it fixes nothing. The bridge reconnects, is sent the latest
+    /// snapshot, which is the same one, and drops that connection too, so an
+    /// app holding one long value (a draft, a log tail, a transcript) leaves
+    /// the agent reconnecting for as long as the value stays long, with
+    /// nothing on either side saying why.
+    ///
+    /// So every tree is bounded here, after the depth cut, to fit that line
+    /// at any `seq`. The bound cuts what costs the most first and stops as
+    /// soon as the tree fits:
+    ///
+    /// 1. the longest values, all down to one shared length, so the biggest
+    ///    shrink first and shorter ones are untouched. A cut value ends in
+    ///    `…`, except that a [`Role::Log`] or [`Role::Terminal`] value keeps
+    ///    its end and starts with `…` instead, because the end is where
+    ///    those grow. No string is cut below 256 bytes of JSON;
+    /// 2. values and labels together, the same way, when values alone are
+    ///    not enough;
+    /// 3. the trailing children of the widest nodes, so a list of fifty
+    ///    thousand rows loses its last rows while a status bar beside it
+    ///    keeps its place;
+    /// 4. last, every child of the root, which leaves a root that always
+    ///    fits.
+    ///
+    /// Ids and custom action names are never changed, so whatever an agent
+    /// can read it can still act on. Focus is decided after the bound, for
+    /// the reason it is decided after the depth cut: the focused node can be
+    /// one of the rows dropped.
+    ///
+    /// A tree that fits pays one walk adding up its size and nothing else.
+    /// One that does not is measured and cut on every frame it is drawn, so
+    /// the bound is a guard, not a way to publish: see
+    /// [`oversized_snapshots`](Self::oversized_snapshots) and
+    /// [`last_oversize`](Self::last_oversize) for what was cut and where.
+    /// The fix is the one for depth, to publish what the widget draws: the
+    /// lines of a log the pane shows, the rows of a list on screen, the
+    /// visible part of a draft.
     pub fn publish(&mut self, nodes: impl IntoIterator<Item = Node>) {
         self.publish_nodes(nodes.into_iter().collect());
     }
@@ -733,8 +818,8 @@ impl TariaLayer {
     /// publish, and on a disabled layer. Never blocks the render path beyond
     /// a brief mutex hold.
     ///
-    /// A tree over [`MAX_NODE_DEPTH`] is cut before any of that; see
-    /// [`publish`](Self::publish).
+    /// A tree over [`MAX_NODE_DEPTH`] is cut before any of that, and then a
+    /// tree too large for one line; see [`publish`](Self::publish).
     pub(crate) fn publish_nodes(&mut self, nodes: Vec<Node>) {
         let Some(inner) = self.inner.as_mut() else {
             return;
@@ -746,18 +831,38 @@ impl TariaLayer {
         let mut root = Node::new("app", Role::App)
             .label(inner.shared.app_label.clone())
             .children(nodes);
-        if let Err(too_deep) = root.check_depth() {
+        let too_deep = root.check_depth().err();
+        if too_deep.is_some() {
             truncate_to_max_depth(&mut root);
-            inner.truncated += 1;
-            inner.last_truncation = Some(too_deep);
         }
-        let focus_recorded = root.children.iter().any(subtree_has_focus);
-        let root = root.focused(!focus_recorded);
+        // Then the size, which has to come after the depth cut: the bound
+        // walks the tree by recursing, as serialization does, and the cut is
+        // what makes that safe. Focus is set first only so that the size the
+        // bound reports is that of the tree as it would otherwise have gone
+        // out. It is decided again whenever the bound cut anything, because
+        // a dropped row can be the focused one.
+        root.focused = !root.children.iter().any(subtree_has_focus);
+        let too_large = bound::bound_root(&mut root, ROOT_BUDGET);
+        if too_large.is_some() {
+            root.focused = !root.children.iter().any(subtree_has_focus);
+        }
 
         if inner.last_root.as_ref() == Some(&root) {
             return;
         }
         inner.seq += 1;
+        // Counted here, past the dedupe, so both count snapshots the agent
+        // was sent rather than frames the app drew: an over-deep or
+        // oversized tree that sits still on screen would otherwise count
+        // sixty times a second.
+        if let Some(too_deep) = too_deep {
+            inner.truncated = inner.truncated.saturating_add(1);
+            inner.last_truncation = Some(too_deep);
+        }
+        if let Some(bounded) = too_large {
+            inner.oversized = inner.oversized.saturating_add(1);
+            inner.last_oversize = Some(SnapshotTooLarge::new(bounded));
+        }
         let snapshot = Snapshot::new(inner.seq, root.clone());
         inner.last_root = Some(root);
 
@@ -1981,6 +2086,8 @@ mod tests {
         assert_eq!(layer.unknown_inputs(), 0);
         assert_eq!(layer.truncated_snapshots(), 0);
         assert_eq!(layer.last_truncation(), None);
+        assert_eq!(layer.oversized_snapshots(), 0);
+        assert_eq!(layer.last_oversize(), None);
 
         assert_eq!(layer.try_recv(), None);
         assert_eq!(layer.try_recv_with_id(), None);
@@ -2116,6 +2223,139 @@ mod tests {
         assert_eq!(root.children[0].id.0, "shallow");
         assert_eq!(root.children[0].label.as_deref(), Some("kept"));
         assert_eq!(layer.truncated_snapshots(), 1);
+    }
+
+    /// The counter counts snapshots the agent was sent, not frames the app
+    /// drew. A deep tree redrawn unchanged is the snapshot already published
+    /// once it is cut, so it is not sent again and must not count again: at
+    /// sixty frames a second it would otherwise add sixty a second.
+    #[test]
+    fn the_same_over_deep_tree_published_twice_counts_once() {
+        let mut layer = bind_test_layer("taria-layer-", "deeptwice");
+        layer.publish([chain(MAX_NODE_DEPTH * 2)]);
+        layer.publish([chain(MAX_NODE_DEPTH * 2)]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.truncated_snapshots(), 1);
+
+        // A deep tree that changed is a new snapshot, cut again.
+        layer.publish([chain(MAX_NODE_DEPTH * 2), Node::new("new", Role::Text)]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
+        assert_eq!(layer.truncated_snapshots(), 2);
+    }
+
+    /// One focused text input holding `value`, as a draft would be published.
+    fn draft(value: String) -> Node {
+        Node::new("draft", Role::TextInput)
+            .value(value)
+            .focused(true)
+    }
+
+    /// The root the layer builds around [`draft`], for sizing values against
+    /// and for the line it would have been sent as.
+    fn root_around_draft(label: &str, value: String) -> Node {
+        Node::new("app", Role::App).label(label).child(draft(value))
+    }
+
+    fn line_len(snapshot: Snapshot) -> usize {
+        serde_json::to_vec(&AppToBridge::Snapshot(snapshot))
+            .expect("serialize a snapshot")
+            .len()
+    }
+
+    /// The size boundary, through the layer: a root exactly at the budget is
+    /// published as built and counted nowhere; one byte more is cut, counted,
+    /// and still fits the line.
+    #[test]
+    fn a_tree_at_the_size_budget_is_published_untouched_and_one_byte_over_is_cut() {
+        let mut layer = bind_test_layer("taria-layer-", "atsize");
+        let base = serde_json::to_vec(&root_around_draft("atsize", String::new()))
+            .expect("serialize a root")
+            .len();
+        let at = "x".repeat(ROOT_BUDGET - base);
+
+        layer.publish([draft(at.clone())]);
+        let snapshot = layer
+            .latest_snapshot()
+            .expect("a tree at the budget publishes");
+        assert_eq!(snapshot.root, root_around_draft("atsize", at.clone()));
+        assert!(line_len(snapshot) <= MAX_LINE_BYTES);
+        assert_eq!(layer.oversized_snapshots(), 0);
+        assert_eq!(layer.last_oversize(), None);
+
+        let over = format!("{at}x");
+        layer.publish([draft(over.clone())]);
+        let snapshot = layer
+            .latest_snapshot()
+            .expect("a tree over is published cut");
+        assert_eq!(snapshot.seq, 2);
+        let value = snapshot.root.children[0].value.clone().expect("a value");
+        assert!(value.ends_with('\u{2026}'), "the cut is marked");
+        assert!(over.starts_with(value.trim_end_matches('\u{2026}')));
+        assert!(snapshot.root.children[0].focused, "focus is untouched");
+        assert!(line_len(snapshot) <= MAX_LINE_BYTES);
+
+        assert_eq!(layer.oversized_snapshots(), 1);
+        let too_large = layer.last_oversize().expect("the cut is recorded");
+        // The line it would have been, counted at the largest seq the way
+        // the bound counts it: one byte over the root budget is one byte over
+        // the line.
+        let unbounded = Snapshot::new(u64::MAX, root_around_draft("atsize", over));
+        assert_eq!(too_large.bytes(), line_len(unbounded));
+        assert_eq!(too_large.bytes(), MAX_LINE_BYTES + 1);
+        assert_eq!(too_large.limit(), MAX_LINE_BYTES);
+        assert_eq!(too_large.strings_trimmed(), 1);
+        assert_eq!(too_large.nodes_dropped(), 0);
+        assert_eq!(too_large.largest().0, "draft");
+        let message = too_large.to_string();
+        assert!(message.contains("`draft`"), "{message}");
+        assert!(message.contains(&MAX_LINE_BYTES.to_string()), "{message}");
+    }
+
+    /// Counted like the depth cut: an oversized draft that sits still while
+    /// the app redraws it is one snapshot, and an edit to it is another.
+    #[test]
+    fn the_same_oversized_tree_published_twice_counts_once() {
+        let mut layer = bind_test_layer("taria-layer-", "bigtwice");
+        let big = "y".repeat(MAX_LINE_BYTES * 2);
+        layer.publish([draft(big.clone())]);
+        layer.publish([draft(big.clone())]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+
+        // An edit past the cut changes nothing the agent would be sent, so
+        // it is not a new snapshot either.
+        layer.publish([draft(format!("{big}z"))]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+
+        // One the agent would see is.
+        layer.publish([draft(format!("z{big}"))]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
+        assert_eq!(layer.oversized_snapshots(), 2);
+    }
+
+    /// Focus is decided after the bound, as it is after the depth cut: the
+    /// rows dropped to fit can include the focused one, and a snapshot has
+    /// to carry focus somewhere.
+    #[test]
+    fn a_size_bound_that_drops_the_only_focused_node_leaves_focus_on_the_root() {
+        let mut layer = bind_test_layer("taria-layer-", "bigfocus");
+        let rows = (0..60_000).map(|n| {
+            Node::new(format!("row-{n:05}"), Role::ListItem)
+                .label(format!("Task {n:05}"))
+                .focused(n == 59_999)
+        });
+        layer.publish([Node::new("list", Role::List).children(rows)]);
+
+        let root = layer.latest_snapshot().expect("published").root;
+        assert_eq!(layer.oversized_snapshots(), 1);
+        let too_large = layer.last_oversize().expect("recorded");
+        assert!(too_large.nodes_dropped() > 0, "the last row went");
+        assert!(
+            root.focused,
+            "the focused row was dropped, so the root has to carry focus"
+        );
+        assert!(!subtree_has_focus_below_root(&root));
     }
 
     #[test]

@@ -93,6 +93,33 @@ fn main() -> io::Result<()> {
              than the app answered them, so those agent calls waited out a timeout instead"
         );
     }
+    // The last two lose no input at all. They say the agent was shown less
+    // than this app drew: a tree cut for depth, or one cut to fit the single
+    // line a bridge reads. The agent cannot tell either from a tree that was
+    // simply smaller, so whoever runs the app is the one who has to hear it,
+    // with the node to look at, because the fix is to publish less there.
+    //
+    // This demo's tree is a few levels deep, so the first should never
+    // print. The second does once the new-task draft passes a megabyte,
+    // because the draft is published whole on purpose: it is the case the
+    // bound exists for. Both open with words of their own, like the four
+    // above, so a gate can tell each line from the rest.
+    let truncated = layer.truncated_snapshots();
+    if truncated > 0 {
+        let last = layer
+            .last_truncation()
+            .map(|err| format!("; the last: {err}"))
+            .unwrap_or_default();
+        eprintln!("taria-demo: cut {truncated} snapshot(s) to the depth limit{last}");
+    }
+    let oversized = layer.oversized_snapshots();
+    if oversized > 0 {
+        let last = layer
+            .last_oversize()
+            .map(|err| format!("; the last: {err}"))
+            .unwrap_or_default();
+        eprintln!("taria-demo: trimmed {oversized} snapshot(s) to fit one line{last}");
+    }
     result
 }
 
