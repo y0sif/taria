@@ -522,7 +522,9 @@ bytes of JSON or less is never cut. A cut is marked with `…`: a `Role::Log` or
 `Role::Terminal` value keeps its end, because that is where those grow, and
 every other string keeps its start. When more nodes have to go, a list keeps
 its first rows with no gap, and the strings left are cut only as far as the
-smaller tree needs, so a draft beside the dropped rows keeps as much as fits.
+smaller tree needs. Rows are chosen as if every string were at the floor, so a
+draft beside a list that had to lose rows ends up near the floor too; it stays
+whole only when the nodes that went were what ran over.
 Ids and custom action names are never touched, so an agent can still act on
 whatever it reads. The stages are in `architecture.md` (Snapshot size). The
 tree is trimmed rather than withheld for the reason it is cut for depth: a

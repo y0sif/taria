@@ -63,5 +63,6 @@ has a lint that catches it.
   at publish and tells the app (the stages are in architecture.md, Snapshot
   size): it drops any node that could never fit, shortens the longest values
   and labels, marking each cut with `…`, and drops more nodes only when that
-  is not enough, keeping each node's first children with no gap. Once nodes
-  are dropped, the strings left are cut only as far as the smaller tree needs.
+  is not enough, keeping each node's first children with no gap apart from a
+  node that could never fit. Once nodes are dropped, the strings left are cut
+  only as far as the smaller tree needs.

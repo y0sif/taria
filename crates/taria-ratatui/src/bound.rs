@@ -785,8 +785,8 @@ struct Slot {
 /// is the most a cut can take, not what the kept tree needs: the nodes that
 /// went are often what ran over. So the tree kept is measured as it is, and
 /// its strings are cut, by [`cut_strings`], only by what it is still over,
-/// which is often nothing. That cut always finds room, because every string
-/// at the floor is the plan, and it fits.
+/// which is often nothing. That cut, or failing it every string at the
+/// floor, always fits, because every string at the floor is the plan.
 ///
 /// Every pass is linear in the tree and the search runs a logarithmic number
 /// of them, so a list of two hundred thousand rows costs a few dozen walks
