@@ -76,7 +76,8 @@ leaves, so until then it sits there receiving no handshake and no snapshot;
 `read_tree` on that bridge says the socket is held by another client rather
 than sending you back to check the path. Anything it wrote while it waited is
 thrown away when its turn comes, because it was written before it had seen a
-tree. Multiple simultaneous clients are on the deferred list in
+tree. taria-mcp sends nothing until it has a tree, so a second agent loses
+nothing. Multiple simultaneous clients are on the deferred list in
 `docs/architecture.md`.
 
 **Is the protocol stable?**

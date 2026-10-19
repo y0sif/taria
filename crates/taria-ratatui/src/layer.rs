@@ -852,11 +852,12 @@ impl TariaLayer {
     ///    shrink first and shorter ones are untouched. A cut value ends in
     ///    `…`, except that a [`Role::Log`] or [`Role::Terminal`] value keeps
     ///    its end and starts with `…` instead, because the end is where
-    ///    those grow. No string is cut below 256 bytes of JSON;
+    ///    those grow. A string of 256 bytes of JSON or less is never cut;
     /// 2. values and labels together, the same way, when values alone are
     ///    not enough;
     /// 3. nodes. First any node too large to fit with nothing beside it, one
-    ///    whose id alone runs over, with everything under it, so that it
+    ///    whose id or custom actions alone run over, with everything under
+    ///    it, so that it
     ///    cannot take its siblings with it. Then the trailing children of the
     ///    widest nodes, so a list of fifty thousand rows loses its last rows
     ///    while a status bar beside it keeps its place. Then, shallowest

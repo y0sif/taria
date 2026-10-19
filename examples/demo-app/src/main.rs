@@ -58,13 +58,14 @@ fn main() -> io::Result<()> {
     }
     // The other silent discard: inputs the layer threw away because the
     // bridge connection they were aimed at ended before this loop dequeued
-    // them. Nothing on the agent side is left to hear about those, so the
-    // person running the demo is the only one who can.
+    // them, or because a bridge waiting for the socket wrote them before its
+    // hello. Nothing on the agent side hears about those, so the person
+    // running the demo is the only one who can.
     let stale = layer.stale_inputs();
     if stale > 0 {
         eprintln!(
-            "taria-demo: discarded {stale} agent input(s): the bridge connection they arrived on \
-             ended first"
+            "taria-demo: discarded {stale} agent input(s): their bridge connection ended first, \
+             or a waiting bridge wrote them before its hello"
         );
     }
     // The third: inputs the layer answered `Ignored` on this app's behalf

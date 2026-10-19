@@ -46,8 +46,10 @@ impl<'a> FrameRecorder<'a> {
     /// (`id: "app"`, role `App`, labeled with the app label). The root is
     /// marked focused only when no recorded node (or descendant) is, so a
     /// snapshot always carries focus somewhere. `seq` increments per
-    /// published snapshot; a frame identical to the previous one is skipped
-    /// entirely. This never blocks the render path.
+    /// published snapshot. A frame whose tree is the one the previous frame
+    /// built is skipped before anything is cut or measured, and one that is
+    /// cut to the snapshot already sent is not sent again. This never blocks
+    /// the render path.
     ///
     /// A tree deeper than [`taria::MAX_NODE_DEPTH`] is cut rather than sent
     /// or skipped, because a snapshot past that depth does not arrive at the

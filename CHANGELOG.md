@@ -28,27 +28,36 @@ it.
 adapter serves one bridge at a time, and a second one waits in the listen
 backlog, the kernel's queue of connections not yet accepted. Input it wrote
 while waiting sat in the kernel's buffer and was applied once the first bridge
-left. It is now thrown away, unacked, before the `hello` goes out.
+left. It is now thrown away, unacked, before the `hello` goes out. A client
+that connects to an idle app keeps what it writes, as before.
 
 **Answers the app gave on its way out arrive.** An app that answered an input
 and exited in the same frame closed the connection with the answer still
-queued, so the agent waited out a timeout on an input the app had taken. The
-adapter now writes the queued acks before it closes, within 250 ms.
+queued, so the agent was told the input's fate was unknown, for an input the
+app had taken. The adapter now writes the queued acks before it closes, within
+250 ms.
 
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1, and no message or field
-changed. `docs/protocol.md` gains a SHOULD (keep every snapshot under the line
-cap) and a MAY (discard input written before the `hello`), both describing
-what the reference peers do. The Rust API only grows. All three crates move to
-0.3.1 together: they share one workspace version.
+changed. `docs/protocol.md` gains a SHOULD (keep every snapshot within the
+line cap) and a MAY (discard input written before the `hello`), both
+describing what the reference peers do. The MAY answers Appendix B item 7, a
+question version 1 had left open and no peer could rely on, which is what
+makes it additive. The Rust API only grows. All three crates move to 0.3.1
+together: they share one workspace version.
 
 ### For whoever drives an app
 
 - **A tree over the line limit is named, not mistaken for an exit.** The
   bridge keeps an overrun as its reason, across reconnects, until a snapshot
-  parses. `read_tree` and every input tool then say the snapshot was over
-  1 MiB (1048576 bytes), that the app resends its latest snapshot on every
-  reconnect, and that nothing the agent sends can fix it, rather than that the
-  app may have exited or that the socket path may be wrong.
+  parses or a connect finds nothing listening at the socket. `read_tree` and
+  every input tool then say the snapshot was over 1 MiB (1048576 bytes), that
+  the app resends its latest snapshot on every reconnect, and that nothing the
+  agent sends can fix it, rather than that the app may have exited or that the
+  socket path may be wrong. An app that overran and then exited reads as
+  exited.
+- **A second bridge is told the app has not accepted it yet.** The answer
+  said the app "never accepted" the connection, but the app accepts it once
+  the first bridge leaves.
 - **The input sent just before it is not blamed for it.** The answer to an
   input the app acked just before the oversized snapshot said the app "may
   have exited, possibly because of this input". It now says the bridge closed
@@ -70,32 +79,50 @@ what the reference peers do. The Rust API only grows. All three crates move to
 
 ### For an app author adopting taria
 
-- **Every snapshot is bounded to fit one line.** After the depth cut, and
-  before the check that skips an identical tree, the adapter cuts the longest
-  values first, all to one shared length and never below 256 bytes, then
-  values and labels together, then the trailing children of the widest nodes,
-  and as a last resort every child of the root. A tree well inside the limit
-  costs one walk adding up its size.
+- **Every snapshot is bounded to fit one line.** After the depth cut, the
+  adapter cuts the longest values first, all to one shared length, then
+  values and labels together, then nodes, and as a last resort every child
+  of the root. A string of 256 bytes or less is never cut. The node stage
+  drops any node that could never fit on its own, so it cannot take its
+  siblings with it, caps how many children every node keeps, then gives back,
+  shallowest first, what the cap dropped while it fits. Each node keeps its
+  first children, with no gap.
+- **An unchanged frame costs a comparison.** A frame whose tree is the one
+  the frame before it built is skipped before anything is measured or cut. A
+  changed tree is measured exactly, by serializing it into a counter, and cut
+  only when it does not fit.
 - **You are told.** `oversized_snapshots()` counts the snapshots published
   trimmed, and `last_oversize()` returns a `SnapshotTooLarge`: the size the
   line would have had, the limit, how many strings were trimmed and nodes
-  dropped, and the id of the node holding the longest string. The fix is
-  yours: publish a log's tail, cap a draft or a transcript, publish the rows
-  on screen. The demo prints both snapshot counters at exit.
+  dropped, and the id of the node holding the longest string, ids and custom
+  action names included. The fix is yours: publish a log's tail, cap a draft
+  or a transcript, publish the rows on screen. The demo prints each snapshot
+  counter at exit when it is nonzero.
 - **`truncated_snapshots()` counts snapshots, as its doc always said.** It
   counted frames, so a deep tree that sat still while the app redrew it at
   60 fps added 60 a second. It now counts once per snapshot sent, and
   `oversized_snapshots()` counts the same way.
-- **Input written before the `hello` is discarded and counted.** The adapter
-  reads off what a waiting client wrote just before sending it the `hello`,
-  acks none of it, and counts each complete `input` line in `stale_inputs()`,
-  which now has a second cause. The rest of a line the read cut is skipped,
-  and more than 1 MiB waiting breaks the connection. A client that waits for
-  the `hello` before writing loses nothing, and taria-mcp is one.
+- **Input a waiting client wrote before its `hello` is discarded and
+  counted.** For a client that was already in the backlog when the previous
+  session ended, the adapter reads off what it wrote just before sending it
+  the `hello`, acks none of it, and counts each complete `input` line in
+  `stale_inputs()`, which now has a second cause. The rest of a line the read
+  cut is skipped, and more than 1 MiB waiting breaks the connection. The first
+  connection of a process, and a client that connects to an idle app, keep
+  what they write. A client that connects the instant a session ends counts
+  as one that waited. A client that waits for the `hello` before writing
+  loses nothing, and taria-mcp is one.
+- **Every line has 5 s in all.** In 0.3.0 the 5 s write timeout bounded each
+  wait for room in the socket, not the line, so a bridge that stopped reading
+  mid-snapshot, or read a little before each wait ran out, could hold one
+  line, and `Drop` with it, for 10 s or more. A line now goes out in 2 KiB
+  pieces with waits of at most 50 ms, against one deadline for the whole
+  line. A bridge that cannot take a whole line within 5 s is
+  dropped, and is sent the latest snapshot when it reconnects.
 - **The shutdown flush is bounded.** The acks queued at shutdown get 250 ms
   in all, and a snapshot still waiting is not sent. Dropping the layer takes
-  at most one 50 ms poll, one 5 s write timeout if a bridge stopped reading
-  mid-write, and that flush.
+  at most one 50 ms poll, the 5 s the line being written may take, and that
+  flush.
 - **`taria::wire::MAX_LINE_BYTES`** is the 1 MiB limit as a public constant,
   which both reference peers now share, for a peer or a test that sizes
   against it.
@@ -105,7 +132,10 @@ what the reference peers do. The Rust API only grows. All three crates move to
 - `scripts/adversarial.py` grows from 20 probes to 22. A stand-in app sends a
   tree over the line cap, once after a tree was served and once as its first,
   and every answer has to name the limit.
-- `scripts/e2e.py` grows from 22 steps to 23.
+- `scripts/e2e.py` grows from 22 steps to 23. Step w types the demo's draft
+  past 1 MiB through `type_text`, checks that the bridge stays up and the
+  draft comes back trimmed, that `set_value ""` clears it, and that the demo
+  reports the trim at exit.
 
 ## [0.3.0] - 2026-10-19
 

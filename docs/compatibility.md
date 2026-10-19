@@ -61,5 +61,5 @@ has a lint that catches it.
 - Snapshots are capped at one line of `MAX_LINE_BYTES`, 1 MiB, because a
   longer line costs the app its bridge on every reconnect. The adapter
   shortens the longest values and labels at publish, marking each cut with
-  `…`, drops trailing children only when that is not enough, and tells the
-  app.
+  `…`, drops nodes only when that is not enough, keeping each node's first
+  children with no gap, and tells the app.

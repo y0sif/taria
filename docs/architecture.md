@@ -58,9 +58,10 @@ and an input the app deliberately dropped looks like a slow one.
   when the app restarts, so the bridge detects change by comparing whole
   snapshots, not by `seq` ordering. `seq` signals staleness only within one
   connection.
-- Dedup: a frame whose tree is identical to the previous publish is skipped
-  entirely; `seq` does not move. The check runs after the depth cut and the
-  size bound, on the tree that would be sent.
+- Dedup: a frame whose tree is the one the previous frame built is skipped
+  before anything is cut or measured, and a frame whose cut tree is the
+  snapshot already sent is skipped after the cut. Either way `seq` does not
+  move.
 - `focused`: serialized on every node and accepted when absent, where absence
   reads as `false`. Nothing on the wire moves today; what the pairing buys is
   that omitting the field for the nodes that are not focused stays an additive
@@ -116,20 +117,27 @@ same one, and the bridge closes that connection too, for as long as the app
 holds the tree. One unbounded value is enough: a draft, a log, a transcript.
 
 The bridge keeps the overrun as a reason, across reconnects, until a snapshot
-parses. So `read_tree` and the input tools say the line was over the limit
-and that only a smaller tree fixes it, instead of that the app may have
-exited.
+parses or a connect finds nothing listening at the socket, which means the
+app has gone. So `read_tree` and the input tools say the line was over the
+limit and that only a smaller tree fixes it, instead of that the app may have
+exited, and an app that overran and then exited reads as exited.
 
-The ratatui adapter trims. Every tree is bounded at publish, after the depth
-cut, because the bound walks the tree recursively and the cut is what keeps
-that safe, and before the dedup check. A tree well inside the limit costs one
-walk adding up an upper bound on its size, with no serialization. One over it
-is cut in stages, each only when the one before was not enough:
+The ratatui adapter trims. A frame whose tree is the one the previous frame
+built stops before the bound, so a tree that sits still costs one comparison
+whether or not it fits. A changed tree is bounded at publish, after the depth
+cut, because measuring it serializes it, which recurses, and the cut is what
+keeps that safe. It is measured exactly, by serializing it into a counter
+that keeps nothing, and one over the limit is cut in stages, each only when
+the one before was not enough:
 
-1. the longest values, all down to one shared length, never below 256 bytes
-   of JSON;
+1. the longest values, all down to one shared length; a string of 256 bytes
+   of JSON or less is never cut;
 2. values and labels together, the same way;
-3. the trailing children of the widest nodes;
+3. nodes. First any node that could not fit with only its ancestors beside
+   it goes alone, so it cannot take its siblings with it. Then every node
+   loses its children past one shared cap, the largest that fits. Then,
+   shallowest first, the children the cap dropped come back while they fit,
+   and each node keeps an unbroken run of its first children;
 4. every child of the root, which leaves a root that always fits.
 
 A cut string is marked with `…` (U+2026). A `log` or `terminal` value keeps
@@ -143,9 +151,10 @@ cut of a trimmed value produces the tree already sent, and nothing goes out.
 
 The app is told through `oversized_snapshots()` and `last_oversize()`, whose
 `SnapshotTooLarge` carries the size the line would have had and the node
-holding the longest string. Like `truncated_snapshots()`, the count is of
-snapshots sent, not frames drawn. Trimming rather than withholding, for the
-reason the depth cut gives: a withheld tree leaves the agent on a stale one.
+holding the longest string, ids and custom action names included. Like
+`truncated_snapshots()`, the count is of snapshots sent, not frames drawn.
+Trimming rather than withholding, for the reason the depth cut gives: a
+withheld tree leaves the agent on a stale one.
 
 ### Key strings
 
@@ -477,12 +486,13 @@ App side (`TariaLayer::bind`, or `bind_or_disabled`):
    during startup, which is the one thing taria promises never to do.
 5. Bind, and serve one client at a time from a listener thread. Each
    connection gets the `hello` plus the latest snapshot, then streams every
-   new publish. Whatever a client wrote before its `hello` is discarded first
-   (see One connection owns its inputs). The listener socket is non-blocking
-   and the thread polls a shutdown flag every 50 ms rather than parking in
-   `accept()`: waking a parked `accept()` by connecting to the socket path
-   fails exactly when it matters, because by then the path may hold a socket
-   another process bound, whose listener takes the wake-up while this one
+   new publish. Whatever a client that waited behind the previous session
+   wrote before its `hello` is discarded first (see One connection owns its
+   inputs). The listener socket is non-blocking and the thread polls a
+   shutdown flag every 50 ms rather than parking in `accept()`: waking a
+   parked `accept()` by connecting to the socket path fails exactly when it
+   matters, because by then the path may hold a socket another process
+   bound, whose listener takes the wake-up while this one
    stays parked forever.
    Dropping the layer shuts the threads down and removes the socket file, but
    only while that file is still the one this layer bound, compared by device
@@ -490,10 +500,10 @@ App side (`TariaLayer::bind`, or `bind_or_disabled`):
    its own there, and unlinking it would leave that instance unreachable.
    Before a connected bridge's connection closes, the acks still queued are
    written, so an app that answers an input and exits in the same frame does
-   not leave the agent waiting out a timeout; a snapshot still waiting is not
-   sent, because it describes a UI about to be gone. The flush gets 250 ms in
-   all, so a drop takes at most one 50 ms poll, one 5 s write timeout if a
-   bridge stopped reading mid-write, and that 250 ms.
+   not leave the agent told that input's fate is unknown; a snapshot still
+   waiting is not sent, because it describes a UI about to be gone. The flush
+   gets 250 ms in all, so a drop takes at most one 50 ms poll, the 5 s the
+   line being written may take, and that 250 ms.
 
 `bind_or_disabled` turns any of those failures into an inert layer instead
 of an error, so taria can never stop an app from starting. Every method
@@ -514,13 +524,14 @@ Bridge side (`taria-mcp`):
    app went away instead of acting on a stale tree. When the bridge closed the
    connection itself, over a line past the cap, the error says that instead
    of "it may have exited": the app is still running, and sends the same line
-   on every reconnect.
+   on every reconnect. Once a connect finds nothing listening, the app is
+   gone, and the error says "it may have exited" again.
 3. On reconnect, inputs queued while disconnected are discarded, and the
    peer's `protocol_version` is forgotten so the next connection is not
    judged by the previous app's handshake.
 4. Lines it could not read are kept, one at a time, with the reason. A line
-   over the cap is kept as a fixed reason that survives reconnects, and only
-   a snapshot that parses clears it.
+   over the cap is kept as a fixed reason that survives reconnects, until a
+   snapshot parses or a connect finds nothing listening.
 5. Its own `connect` is published too: whether a connection is open, and
    since when.
 
@@ -571,16 +582,24 @@ discard is deliberately not acked: the peer that would read the ack is the
 one that left. The bridge drops its own queue on reconnect for the
 mirror-image reason, so both sides agree.
 
-A connection's inputs start after its `hello`. A client that connects while
-another is served waits in the listen backlog (the kernel's queue of
+A waiting client's inputs start after its `hello`. A client that connects
+while another is served waits in the listen backlog (the kernel's queue of
 connections not yet accepted), and whatever it writes there sits in the
 kernel's buffer until its turn. That client has seen no tree, so nothing it
-wrote can be a reply to one. Just before the `hello` goes out, the adapter
-reads off what is waiting and throws it away, unacked, counting each complete
-`input` line in `stale_inputs()`. If that read stops partway through a line,
-the rest of the line is skipped when it arrives. More than 1 MiB waiting
-breaks the connection, like a line that long. taria-mcp is never affected: its
-input tools refuse to send before the app's first snapshot.
+wrote can be a reply to one. So for a client that was already waiting when the
+previous session ended, the adapter reads off what is waiting just before the
+`hello` goes out and throws it away, unacked, counting each complete `input`
+line in `stale_inputs()`. If that read stops partway through a line, the rest
+of the line is skipped when it arrives. More than 1 MiB waiting breaks the
+connection, like a line that long.
+
+A client that waited behind nobody keeps what it wrote: the first connection
+of a process, and one that connects to an idle app, such as a script that
+connects and writes at once. The listener tells the two apart by whether an
+accept has found the backlog empty since the last session ended, so a client
+that connects the instant a session ends counts as one that waited. taria-mcp
+is never affected: its input tools refuse to send before the app's first
+snapshot.
 
 The same ownership decides who may still be answered. `ack` refuses an id
 whose connection has ended, because ids are unique only within a bridge
@@ -591,20 +610,22 @@ An id also stops being answerable once its own connection has delivered a
 queue's worth of newer inputs past it, which bounds what the layer remembers
 and costs at most a late ack the peer already has to survive.
 
-Guard rails on the app side: a 5 s write timeout drops a peer that stops
-reading, the acks flushed at shutdown get 250 ms in all, and a bounded input
-queue (256 entries) drops the newest input, acks it `dropped`, and counts it
-in `dropped_inputs()` instead of blocking the socket thread. The ack queue is
-bounded too, at 1024, and drops from the opposite end: the oldest, because an
-ack answers one specific input and the answers an agent is still waiting on
-are the newest, while the oldest name inputs whose waiter has long since timed
-out. It has to be bounded because a bridge that reads steadily but far slower
-than an agent sends never stalls long enough for the write timeout to fire,
-and would otherwise grow the app's memory until the process is killed. Drops
-are counted in `dropped_acks()`, which is a report about the bridge rather
-than the app: the input was applied and the caller was answered nowhere. On
-the bridge side, an input waits at most 500 ms for room in the queue to the
-app, so a stopped app fails a tool call instead of hanging it.
+Guard rails on the app side: every line has 5 s in all to be written, so a
+peer that stops reading, or reads too slowly to take a whole line in that
+time, is dropped; the acks flushed at shutdown get 250 ms in all; and a
+bounded input queue (256 entries) drops the newest input, acks it `dropped`,
+and counts it in `dropped_inputs()` instead of blocking the socket thread.
+The ack queue is bounded too, at 1024, and drops from the opposite end: the
+oldest, because an ack answers one specific input and the answers an agent is
+still waiting on are the newest, while the oldest name inputs whose waiter has
+long since timed out. It has to be bounded because a bridge that reads
+steadily but far slower than an agent sends never stalls long enough for the
+write timeout to fire, and would otherwise grow the app's memory until the
+process is killed. Drops are counted in `dropped_acks()`, which is a report
+about the bridge rather than the app: the input was applied and the caller
+was answered nowhere. On the bridge side, an input waits at most 500 ms for
+room in the queue to the app, so a stopped app fails a tool call instead of
+hanging it.
 
 Four counters in all record agent traffic that went nowhere:
 `dropped_inputs()`, `stale_inputs()`, `unknown_inputs()` and
