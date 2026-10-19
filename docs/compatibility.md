@@ -58,3 +58,8 @@ has a lint that catches it.
 - Trees are capped at `MAX_NODE_DEPTH`, 32 levels, because a snapshot past
   that exceeds what a JSON parser will recurse into and would arrive as
   nothing. The adapter cuts deeper branches at publish and tells the app.
+- Snapshots are capped at one line of `MAX_LINE_BYTES`, 1 MiB, because a
+  longer line costs the app its bridge on every reconnect. The adapter
+  shortens the longest values and labels at publish, marking each cut with
+  `…`, drops trailing children only when that is not enough, and tells the
+  app.

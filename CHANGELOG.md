@@ -13,6 +13,100 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [0.3.1] - Unreleased
+
+**An app whose tree outgrew one line keeps its bridge.** A snapshot travels as
+one line, and the bridge closes the connection on a line over 1 MiB. The
+adapter wrote snapshots of any size, so an app holding one unbounded value, a
+draft, a log or a transcript, lost its bridge, and since every reconnect is
+sent the latest snapshot, it lost it again on each one. The agent was told the
+app may have exited, while it ran the whole time. The adapter now trims every
+snapshot to fit, and the bridge names the limit when an app sends a line past
+it.
+
+**A bridge waiting its turn can no longer act on a UI it never saw.** The
+adapter serves one bridge at a time, and a second one waits in the listen
+backlog, the kernel's queue of connections not yet accepted. Input it wrote
+while waiting sat in the kernel's buffer and was applied once the first bridge
+left. It is now thrown away, unacked, before the `hello` goes out.
+
+**Answers the app gave on its way out arrive.** An app that answered an input
+and exited in the same frame closed the connection with the answer still
+queued, so the agent waited out a timeout on an input the app had taken. The
+adapter now writes the queued acks before it closes, within 250 ms.
+
+Nothing on the wire moved. `PROTOCOL_VERSION` stays 1, and no message or field
+changed. `docs/protocol.md` gains a SHOULD (keep every snapshot under the line
+cap) and a MAY (discard input written before the `hello`), both describing
+what the reference peers do. The Rust API only grows. All three crates move to
+0.3.1 together: they share one workspace version.
+
+### For whoever drives an app
+
+- **A tree over the line limit is named, not mistaken for an exit.** The
+  bridge keeps an overrun as its reason, across reconnects, until a snapshot
+  parses. `read_tree` and every input tool then say the snapshot was over
+  1 MiB (1048576 bytes), that the app resends its latest snapshot on every
+  reconnect, and that nothing the agent sends can fix it, rather than that the
+  app may have exited or that the socket path may be wrong.
+- **The input sent just before it is not blamed for it.** The answer to an
+  input the app acked just before the oversized snapshot said the app "may
+  have exited, possibly because of this input". It now says the bridge closed
+  the connection, not the app, and why. Without an ack it is still an error,
+  naming the same cause. Each
+  answer opens as before, so a caller matching on the opening reads the same
+  verdict.
+- **A trimmed string says so where it was cut.** A cut value or label ends in
+  `…`, and a `log` or `terminal` value, which keeps its tail, starts with it.
+  Ids and custom action names are never cut, so whatever an agent reads it
+  can still act on.
+- **An edit past the cut of a trimmed value shows no change.** The tree the
+  agent would be sent is the same, so nothing new is sent, and the input tool
+  reports the input received with no change.
+- **An advertised `quit` comes back acknowledged.** The ack the app queued as
+  it took the input now reaches the bridge before the connection closes, so
+  the answer is the acknowledged departure, not an input of unknown fate. An
+  input the app answered `Ignored` on its way out is answered too.
+
+### For an app author adopting taria
+
+- **Every snapshot is bounded to fit one line.** After the depth cut, and
+  before the check that skips an identical tree, the adapter cuts the longest
+  values first, all to one shared length and never below 256 bytes, then
+  values and labels together, then the trailing children of the widest nodes,
+  and as a last resort every child of the root. A tree well inside the limit
+  costs one walk adding up its size.
+- **You are told.** `oversized_snapshots()` counts the snapshots published
+  trimmed, and `last_oversize()` returns a `SnapshotTooLarge`: the size the
+  line would have had, the limit, how many strings were trimmed and nodes
+  dropped, and the id of the node holding the longest string. The fix is
+  yours: publish a log's tail, cap a draft or a transcript, publish the rows
+  on screen. The demo prints both snapshot counters at exit.
+- **`truncated_snapshots()` counts snapshots, as its doc always said.** It
+  counted frames, so a deep tree that sat still while the app redrew it at
+  60 fps added 60 a second. It now counts once per snapshot sent, and
+  `oversized_snapshots()` counts the same way.
+- **Input written before the `hello` is discarded and counted.** The adapter
+  reads off what a waiting client wrote just before sending it the `hello`,
+  acks none of it, and counts each complete `input` line in `stale_inputs()`,
+  which now has a second cause. The rest of a line the read cut is skipped,
+  and more than 1 MiB waiting breaks the connection. A client that waits for
+  the `hello` before writing loses nothing, and taria-mcp is one.
+- **The shutdown flush is bounded.** The acks queued at shutdown get 250 ms
+  in all, and a snapshot still waiting is not sent. Dropping the layer takes
+  at most one 50 ms poll, one 5 s write timeout if a bridge stopped reading
+  mid-write, and that flush.
+- **`taria::wire::MAX_LINE_BYTES`** is the 1 MiB limit as a public constant,
+  which both reference peers now share, for a peer or a test that sizes
+  against it.
+
+### The gates
+
+- `scripts/adversarial.py` grows from 20 probes to 22. A stand-in app sends a
+  tree over the line cap, once after a tree was served and once as its first,
+  and every answer has to name the limit.
+- `scripts/e2e.py` grows from 22 steps to 23.
+
 ## [0.3.0] - 2026-10-19
 
 **`taria-mcp --tree-format outline` serves the tree as an outline.** The
@@ -658,6 +752,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[0.3.1]: https://github.com/y0sif/taria/releases/tag/v0.3.1
 [0.3.0]: https://github.com/y0sif/taria/releases/tag/v0.3.0
 [0.2.1]: https://github.com/y0sif/taria/releases/tag/v0.2.1
 [0.2.0]: https://github.com/y0sif/taria/releases/tag/v0.2.0

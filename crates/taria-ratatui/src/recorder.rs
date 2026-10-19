@@ -51,9 +51,12 @@ impl<'a> FrameRecorder<'a> {
     ///
     /// A tree deeper than [`taria::MAX_NODE_DEPTH`] is cut rather than sent
     /// or skipped, because a snapshot past that depth does not arrive at the
-    /// bridge at all and nothing says so. See
+    /// bridge at all and nothing says so. A tree too large for one line of
+    /// [`taria::wire::MAX_LINE_BYTES`] is then trimmed to fit, because a
+    /// longer line costs the app its bridge on every reconnect. See
     /// [`TariaLayer::publish`](crate::TariaLayer::publish) for why, and
     /// [`TariaLayer::last_truncation`](crate::TariaLayer::last_truncation)
+    /// and [`TariaLayer::last_oversize`](crate::TariaLayer::last_oversize)
     /// for how an app finds out.
     pub fn publish(self) {
         let Self { layer, nodes } = self;

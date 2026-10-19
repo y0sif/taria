@@ -73,10 +73,11 @@ the app is the one that speaks first (section 3).
    limit in section 13.
 4. Answer every `input` message it reads on a live connection with at least
    one `ack` naming the same `id` (section 10). An input the app cannot act on
-   is answered `ignored`, not left unanswered. The two exceptions are a line
-   that did not parse, which carries no readable id (section 2.6), and an
-   input whose connection has since ended, which is deliberately not acked
-   (section 11).
+   is answered `ignored`, not left unanswered. The exceptions are a line
+   that did not parse, which carries no readable id (section 2.6), an input
+   whose connection has since ended, which is deliberately not acked
+   (section 11), and an input written before the app's `hello`, which an app
+   **MAY** discard unacked (section 14.5).
 5. Skip a line it cannot parse and keep the connection (section 2.6).
 6. Never apply an input that arrived on a connection that has since ended
    (section 11).
@@ -180,7 +181,8 @@ them, not a reason for a reader to be strict.
 
 ### 2.5 Line length cap
 
-Both peers refuse a line longer than **1 MiB (1048576 bytes)**.
+Both peers refuse a line longer than **1 MiB (1048576 bytes)**. Rust peers
+read the number from `taria::wire::MAX_LINE_BYTES`.
 
 - The cap is measured in **bytes**, not characters.
 - The terminating `\n` does **not** count. A frame whose content is exactly
@@ -190,7 +192,8 @@ Both peers refuse a line longer than **1 MiB (1048576 bytes)**.
   skippable line. A reader that reaches the cap without seeing a newline has
   no way to find the start of the next message, so both reference readers
   close the connection. The app's reader thread exits and the client is
-  dropped; the bridge logs the overrun and reconnects.
+  dropped; the bridge logs the overrun, keeps it as the reason it reports
+  (below), and reconnects.
 
 Verified against the reference adapter at the boundary: an `input` line of
 exactly 1048576 content bytes plus its newline was parsed and acked, and the
@@ -201,6 +204,22 @@ This is the reason every payload a bridge accepts from an agent has to be
 bounded before it goes on the wire: one oversized `value` or one megabyte of
 repeated `ctrl+` prefixes is a single legal call that cuts an app off from its
 bridge.
+
+The app's side of the same hole is its snapshots. A snapshot is one line, so
+the cap bounds the whole tree, and an app **SHOULD** keep every snapshot under
+it. One that does not loses its bridge, and since an app resends its latest
+snapshot to every new connection (section 3.4), every reconnect meets the same
+line and is closed over it again, for as long as the tree stays that large.
+One unbounded `value` is enough: a draft, a log, a transcript.
+
+**Reference implementation.** The bridge keeps the overrun as a reason, across
+reconnects, until a snapshot parses. While it holds, `read_tree` and every
+input tool say the line was over 1 MiB, that the app resends its latest
+snapshot on every reconnect, and that the app has to publish a smaller tree,
+rather than that the app may have exited or that the socket path may be
+wrong. So does the answer to an input sent just before the connection closed,
+whether the app acked it or not. The reference adapter trims every snapshot to
+fit before publishing it (section 13.2).
 
 ### 2.6 Unparseable lines
 
@@ -485,8 +504,11 @@ authors, not a wire rule. See section 18.3.
 `children` carries the node's children in order. Depth is bounded
 (section 13.1). No bound is specified on the number of children, on the number
 of nodes in a tree, or on the length of a `label` or a `value`; the 1 MiB line
-cap (section 2.5) bounds all of them together, and crossing it costs the
-connection rather than the tree.
+cap (section 2.5) bounds all of them together. An app **SHOULD** keep its
+snapshot under the cap, because crossing it costs the connection rather than
+the tree. The reference adapter shortens values and labels to fit, marking
+each cut with `…`, and drops nodes only when that is not enough
+(section 13.2).
 
 ## 7. Role vocabulary
 
@@ -874,7 +896,9 @@ indistinguishable, at the bridge, from the app saying nothing. A bridge
 **SHOULD** keep the reason a line was rejected and surface it when it reports
 "neither acknowledged nor changed", because that rejected line is the only
 trace left of the difference. Without it an agent reads silence as an app that
-does not ack.
+does not ack. The reference bridge keeps a reason for a line over the cap the
+same way, though that line ends the connection rather than being skipped: the
+kept reason is what lets it say the app is still running (section 2.5).
 
 This is also the mechanism by which a status added in a later version 1
 release is safe: a bridge that cannot read it skips that ack and keeps the
@@ -914,11 +938,13 @@ the ack exists to remove.
 generation, stamps every queued input with the generation it arrived on, and
 retires that generation as the reader thread exits, before the disconnect is
 observable anywhere. An input from a retired generation is discarded at
-dequeue and counted in `stale_inputs()`. The same bookkeeping decides who may
-still be answered: `ack` refuses an id whose connection has ended, and an id
-also stops being answerable once its own connection has delivered a queue's
-worth (256) of newer inputs past it, which bounds what the layer remembers and
-costs at most a late ack the peer already has to survive.
+dequeue and counted in `stale_inputs()`. So is input a client wrote before the
+app's `hello`, which the adapter reads off and discards just before writing
+the `hello` (section 14.5). The same bookkeeping decides who may still be
+answered: `ack` refuses an id whose connection has ended, and an id also stops
+being answerable once its own connection has delivered a queue's worth (256)
+of newer inputs past it, which bounds what the layer remembers and costs at
+most a late ack the peer already has to survive.
 
 ## 12. Key string grammar
 
@@ -1043,7 +1069,42 @@ on screen.
 
 ### 13.2 Line length
 
-1 MiB, 1048576 bytes, excluding the terminating newline. See section 2.5.
+1 MiB, 1048576 bytes, excluding the terminating newline, as
+`taria::wire::MAX_LINE_BYTES`. See section 2.5.
+
+A sender **SHOULD** keep every line under it, and the line that grows is a
+snapshot. Unlike a tree that is too deep, a tree that is too large is not
+skipped: it ends the connection, and does again on every reconnect
+(section 2.5).
+
+**What to do about a snapshot that is too large is the sender's choice**, as
+it is for depth. The reference adapter **trims**, after the depth cut and
+before it checks the tree against the last one it sent. It sizes the line for
+the largest possible `seq`, so the same tree is always cut the same way, and
+it stops as soon as the tree fits:
+
+1. the longest values, all cut to one shared length, so the biggest shrink
+   first and shorter ones are untouched. No string is cut below 256 bytes of
+   JSON;
+2. values and labels together, the same way, when values alone are not
+   enough;
+3. the trailing children of the widest nodes, with every string cut to that
+   floor;
+4. last, every child of the root.
+
+A cut string is marked with `…` (U+2026). A `log` or `terminal` value keeps
+its end and starts with the marker, because the end is where those grow; every
+other string keeps its start. Ids and custom action names are never changed,
+so whatever an agent can read it can still act on. If the focused node was
+dropped, the root carries focus (section 15). The app is told through
+`oversized_snapshots()` and `last_oversize()`, which names the node holding
+the longest string. Trimming, for the reason the depth limit cuts: sending the
+tree as built loses the bridge, and withholding it leaves the agent on a stale
+tree. The fix is nearly always to publish what the widget draws: the lines a
+log pane shows, the visible part of a draft.
+
+One consequence: an edit past the cut of a trimmed value leaves the trimmed
+tree as it was, so the adapter has nothing new to send.
 
 ### 13.3 Socket path length
 
@@ -1072,7 +1133,8 @@ reconnect loop, where it reads as "the app is not running".
 These are agent-facing tool bounds, not wire rules, but they exist to protect
 the wire and an implementer may want to match them. Each one closes a
 single-legal-call hole where an unbounded argument becomes a line over the
-1 MiB cap, which costs the app its bridge.
+1 MiB cap, which costs the app its bridge. The reference adapter closes the
+same hole on its side by trimming its snapshots (section 13.2).
 
 | Bound | Value | Why |
 |---|---|---|
@@ -1173,14 +1235,29 @@ does. On accept it sends, in this order:
 
 Multiple simultaneous bridge clients per app are a deferred feature, not a
 protocol rule. With a one-at-a-time adapter, a second bridge's `connect`
-succeeds into the listen backlog and is then never accepted, so that bridge
-sees an open connection on which nobody says a word. A bridge **SHOULD**
-report that state as itself rather than as a wrong socket path: in that state
-the bridge is connected to the right path, and sending an adopter back to
-check the path is the first wrong turn a retrofit takes.
+succeeds into the listen backlog (the kernel's queue of connections the app
+has not accepted yet) and is not accepted until the first bridge leaves, so
+until then that bridge sees an open connection on which nobody says a word. A
+bridge **SHOULD** report that state as itself rather than as a wrong socket
+path: in that state the bridge is connected to the right path, and sending an
+adopter back to check the path is the first wrong turn a retrofit takes.
 
-**Not specified.** What a second bridge should do about a connection nobody
-accepts, beyond reporting it.
+Anything a waiting bridge writes sits unread in the kernel's socket buffer
+until its turn comes, and would then be read as the new session's first lines.
+Nothing written before the `hello` can be a reply to it: that bridge has seen
+no tree, so its inputs name nodes and keys it guessed at. An app **MAY**
+discard input written before its `hello`, without acking it, since the session
+it would be answered in has not begun. A bridge that writes nothing before the
+`hello`, as the reference bridge does, loses nothing.
+
+**Reference implementation.** Just before writing the `hello`, the adapter
+reads off whatever is already waiting and discards it, counting each complete
+`input` line, of any kind, in `stale_inputs()`. If what it read stops partway
+through a line, the rest of that line is skipped when it arrives. More than
+1 MiB waiting is treated like a line over the cap and closes the connection.
+
+**Not specified.** What a second bridge should do while its connection waits,
+beyond reporting it.
 
 ### 14.6 Shutdown
 
@@ -1194,6 +1271,14 @@ thing taria promises never to do, and it is why the reference adapter turns
 every bind failure into an inert layer rather than an error, polls a shutdown
 flag instead of parking in `accept()`, and runs its liveness probe with a
 timeout on a thread of its own.
+
+**Reference implementation.** At shutdown the adapter writes the acks still
+queued for a connected bridge before it closes the connection, so an app that
+answers an input and exits in the same frame does not leave the agent waiting
+out a timeout for that answer. The flush gets 250 ms in all, and a snapshot
+still waiting is not sent: it describes a UI that is about to be gone. Exit
+stays bounded: at worst one 50 ms poll of the shutdown flag, one 5 s write
+timeout if a connected bridge stopped reading mid-write, and the 250 ms flush.
 
 ### 14.7 Reconnection
 
@@ -1507,11 +1592,15 @@ behaviour a peer may rely on.
 6. **A snapshot carrying zero or more than one focused node** (section 15).
 7. **Whether a bridge may send input before it has seen a `hello` or any
    snapshot.** The reference bridge refuses at the tool layer, but nothing on
-   the wire forbids it.
-8. **What a second bridge should do when its connection is never accepted**
-   (section 14.5). Multiple simultaneous clients are deferred.
+   the wire forbids it. An app **MAY** discard input written before its
+   `hello`, and the reference adapter does, counting it in `stale_inputs()`
+   (section 14.5).
+8. **What a second bridge should do while its connection waits to be
+   accepted** (section 14.5). Multiple simultaneous clients are deferred.
 9. **Any timing requirement.** No keepalive, no heartbeat, no deadline for an
    ack, no maximum publish rate.
 10. **Bounds on `app_label`, `label`, `value`, node count and children count.**
-    Only the 1 MiB line cap bounds them, and crossing it costs the connection
-    (sections 3.1, 6.3).
+    Only the 1 MiB line cap bounds them. An app **SHOULD** keep its snapshot
+    under it. The reference adapter shortens values and labels to fit,
+    marking each cut with `…`, and drops nodes only when that is not enough
+    (sections 3.1, 6.3, 13.2).
