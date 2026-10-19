@@ -7,6 +7,7 @@ use std::net::Shutdown;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -559,6 +560,7 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
         ),
         "the handshake is always first"
     );
+    let (alive_tx, alive_rx) = mpsc::channel();
     let collector = thread::spawn(move || {
         let mut messages = Vec::new();
         let mut line = String::new();
@@ -566,7 +568,17 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => break, // the layer closed the connection
-                Ok(_) => messages.push(serde_json::from_str::<AppToBridge>(&line).unwrap()),
+                Ok(_) => {
+                    let msg = serde_json::from_str::<AppToBridge>(&line).unwrap();
+                    if matches!(
+                        &msg,
+                        AppToBridge::Snapshot(snapshot) if snapshot.root.children[0].id.0 == "alive"
+                    ) {
+                        // Nobody is listening once the wait below gave up.
+                        let _ = alive_tx.send(());
+                    }
+                    messages.push(msg);
+                }
                 Err(err) => panic!("client read failed: {err}"),
             }
         }
@@ -579,7 +591,15 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
     }
 
     // The socket thread must stay live mid-flood: a publish still streams.
+    // Waited for before the half-close below, not after it: the reader's EOF
+    // ends the connection at once, and the writer sends nothing it has not
+    // sent by then, so a snapshot still behind a backlog of drop acks would
+    // be lost by design rather than by a blocked thread.
     publish_single_node(&mut layer, "alive");
+    assert!(
+        alive_rx.recv_timeout(TIMEOUT).is_ok(),
+        "a publish mid-flood must still reach the client"
+    );
 
     // Half-close the write side: the reader consumes the whole flood, sees
     // EOF, and tears the connection down, which the collector observes as
@@ -608,14 +628,6 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
         layer.dropped_inputs(),
         FLOOD - QUEUE,
         "each dropped input must be counted exactly once"
-    );
-
-    assert!(
-        messages.iter().any(|msg| matches!(
-            msg,
-            AppToBridge::Snapshot(snapshot) if snapshot.root.children[0].id.0 == "alive"
-        )),
-        "a publish mid-flood must still reach the client"
     );
 
     // The drops reach the agent, which used to see nothing at all. Not
