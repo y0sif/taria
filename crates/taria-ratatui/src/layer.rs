@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::mem;
 use std::net::Shutdown;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::FileTypeExt;
@@ -183,7 +184,18 @@ struct Inner {
     /// makes every comparison fail and leaves the path alone.
     socket_ident: Option<(u64, u64)>,
     seq: u64,
+    /// The root of the newest snapshot published.
     last_root: Option<Node>,
+    /// The tree the newest frame built, as assembled and before anything was
+    /// cut from it, when a cut made it differ from `last_root`. `None` when
+    /// that frame's tree is `last_root` itself, so a tree that fits is held
+    /// once rather than twice, and the next frame is compared against
+    /// `last_root` instead.
+    ///
+    /// Kept for a frame that was not published too: a tree that changed only
+    /// past a cut is cut to the snapshot already sent, and remembering it is
+    /// what lets the next frame, drawn unchanged, skip the cut.
+    last_raw: Option<Node>,
     /// Snapshots published with a branch cut for depth, and the failure
     /// behind the newest cut. Owned here rather than in [`Shared`] because
     /// only the app thread publishes and only the app thread reads these.
@@ -193,6 +205,19 @@ struct Inner {
     /// cut from the newest of them. Owned here for the same reason.
     oversized: u64,
     last_oversize: Option<SnapshotTooLarge>,
+}
+
+impl Inner {
+    /// Is `root` the tree the newest frame built, as assembled?
+    ///
+    /// Compared against what that frame kept: the tree it was cut from, when
+    /// it had to be cut, or else the snapshot, which is then the same tree.
+    fn is_newest_frame(&mut self, root: &mut Node) -> bool {
+        match self.last_raw.as_mut().or(self.last_root.as_mut()) {
+            Some(newest) => same_tree(root, newest),
+            None => false,
+        }
+    }
 }
 
 /// One agent input on its way from a connection's reader thread to the app.
@@ -329,6 +354,7 @@ impl TariaLayer {
                 socket_ident,
                 seq: 0,
                 last_root: None,
+                last_raw: None,
                 truncated: 0,
                 last_truncation: None,
                 oversized: 0,
@@ -829,9 +855,14 @@ impl TariaLayer {
     ///    those grow. No string is cut below 256 bytes of JSON;
     /// 2. values and labels together, the same way, when values alone are
     ///    not enough;
-    /// 3. the trailing children of the widest nodes, so a list of fifty
-    ///    thousand rows loses its last rows while a status bar beside it
-    ///    keeps its place;
+    /// 3. nodes. First any node too large to fit with nothing beside it, one
+    ///    whose id alone runs over, with everything under it, so that it
+    ///    cannot take its siblings with it. Then the trailing children of the
+    ///    widest nodes, so a list of fifty thousand rows loses its last rows
+    ///    while a status bar beside it keeps its place. Then, shallowest
+    ///    first, as many of those as still fit go back, each node's next
+    ///    children in their order until one does not, so a list keeps its
+    ///    first rows with no gap;
     /// 4. last, every child of the root, which leaves a root that always
     ///    fits.
     ///
@@ -840,10 +871,13 @@ impl TariaLayer {
     /// the reason it is decided after the depth cut: the focused node can be
     /// one of the rows dropped.
     ///
-    /// A tree that fits pays one walk adding up its size and nothing else.
-    /// One that does not is measured and cut on every frame it is drawn, so
-    /// the bound is a guard, not a way to publish: see
-    /// [`oversized_snapshots`](Self::oversized_snapshots) and
+    /// A frame whose tree is the one the frame before it built stops before
+    /// any of this: it is compared and nothing else, neither measured nor
+    /// cut, so a tree that sits still costs the same whether or not it fits.
+    /// A tree that changed is measured exactly, by serializing it into a
+    /// counter that keeps nothing, and one that does not fit is cut again on
+    /// every frame it changes, so the bound is a guard, not a way to publish:
+    /// see [`oversized_snapshots`](Self::oversized_snapshots) and
     /// [`last_oversize`](Self::last_oversize) for what was cut and where.
     /// The fix is the one for depth, to publish what the widget draws: the
     /// lines of a log the pane shows, the rows of a list on screen, the
@@ -856,9 +890,10 @@ impl TariaLayer {
     ///
     /// Wraps the nodes in an auto-generated `app` root (focused only if no
     /// recorded node is), bumps `seq`, and hands the snapshot to the writer
-    /// thread. Skipped entirely when the tree is identical to the previous
-    /// publish, and on a disabled layer. Never blocks the render path beyond
-    /// a brief mutex hold.
+    /// thread. Skipped when the tree is the one the previous frame built,
+    /// before anything is cut or measured; when what is left once it is cut
+    /// is the previous snapshot; and on a disabled layer. Never blocks the
+    /// render path beyond a brief mutex hold.
     ///
     /// A tree over [`MAX_NODE_DEPTH`] is cut before any of that, and then a
     /// tree too large for one line; see [`publish`](Self::publish).
@@ -866,30 +901,64 @@ impl TariaLayer {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        // The root added here counts towards the depth, so the check has to
-        // run on the assembled tree rather than on the caller's nodes, and
-        // before focus is decided: cutting a branch can remove the only
-        // focused node, and a snapshot has to carry focus somewhere.
         let mut root = Node::new("app", Role::App)
             .label(inner.shared.app_label.clone())
             .children(nodes);
-        let too_deep = root.check_depth().err();
-        if too_deep.is_some() {
-            truncate_to_max_depth(&mut root);
-        }
-        // Then the size, which has to come after the depth cut: the bound
-        // walks the tree by recursing, as serialization does, and the cut is
-        // what makes that safe. Focus is set first only so that the size the
-        // bound reports is that of the tree as it would otherwise have gone
-        // out. It is decided again whenever the bound cut anything, because
-        // a dropped row can be the focused one.
-        root.focused = !root.children.iter().any(subtree_has_focus);
-        let too_large = bound::bound_root(&mut root, ROOT_BUDGET);
-        if too_large.is_some() {
-            root.focused = !root.children.iter().any(subtree_has_focus);
+        // Focus is decided on the tree as built, so that a tree no cut
+        // touches is already the snapshot it goes out as, and the next frame
+        // can be compared against that snapshot with no second copy kept.
+        root.focused = !focused_below(&root);
+        // A frame drawn unchanged stops here, before anything is cut or
+        // measured. Everything below is a function of the tree alone: the
+        // root's label is the app's, fixed when the layer was bound, the
+        // depth limit and the budget are constants, and focus reads nothing
+        // but the tree. So the same tree would be cut to the same snapshot,
+        // the one already sent, and skipping the work changes nothing but
+        // what it costs, which for a tree too large for the line is the
+        // whole bound on every frame the app draws.
+        if inner.is_newest_frame(&mut root) {
+            return;
         }
 
-        if inner.last_root.as_ref() == Some(&root) {
+        // The root added here counts towards the depth, so the check has to
+        // run on the assembled tree rather than on the caller's nodes. A
+        // tree over the limit goes out as a copy cut to it, and the tree as
+        // built is kept to compare the next frame against. Focus is decided
+        // again on the copy: cutting a branch can remove the only focused
+        // node, and a snapshot has to carry focus somewhere.
+        let too_deep = root.check_depth().err();
+        let (mut tree, mut raw) = if too_deep.is_some() {
+            let mut cut = copy_within_depth(&mut root);
+            cut.focused = !focused_below(&cut);
+            (cut, Some(root))
+        } else {
+            (root, None)
+        };
+
+        // Then the size, which has to come after the depth cut: measuring
+        // serializes the tree, which recurses, and the cut is what makes
+        // that safe. Focus was decided before the measure so that the size
+        // the bound reports is that of the tree as it would otherwise have
+        // gone out, and is decided again after a cut, because a dropped row
+        // can be the focused one. The tree as built is copied only when it
+        // is about to be cut, so a tree that fits is never copied here.
+        let before = bound::measure_root(&tree);
+        let too_large = if before.is_some_and(|bytes| bytes <= ROOT_BUDGET) {
+            None
+        } else {
+            if raw.is_none() {
+                raw = Some(tree.clone());
+            }
+            let bounded = bound::cut_to_fit(&mut tree, ROOT_BUDGET, before);
+            tree.focused = !focused_below(&tree);
+            Some(bounded)
+        };
+        inner.last_raw = raw;
+
+        // Compared again once cut: a tree that changed only past a cut, a
+        // draft typed into beyond what fits, is cut to the snapshot already
+        // sent.
+        if inner.last_root.as_ref() == Some(&tree) {
             return;
         }
         inner.seq += 1;
@@ -905,8 +974,8 @@ impl TariaLayer {
             inner.oversized = inner.oversized.saturating_add(1);
             inner.last_oversize = Some(SnapshotTooLarge::new(bounded));
         }
-        let snapshot = Snapshot::new(inner.seq, root.clone());
-        inner.last_root = Some(root);
+        let snapshot = Snapshot::new(inner.seq, tree.clone());
+        inner.last_root = Some(tree);
 
         let mut state = inner.shared.lock_state();
         state.latest = Some(snapshot);
@@ -1164,27 +1233,122 @@ impl State {
     }
 }
 
-/// Does `node` or any of its descendants have focus?
-fn subtree_has_focus(node: &Node) -> bool {
-    node.focused || node.children.iter().any(subtree_has_focus)
+/// Is any node below `root` focused?
+///
+/// Walks with a stack of sibling iterators rather than by recursing, for the
+/// reason [`Node::check_depth`] does: it runs on the tree as built, before
+/// the depth cut, and a recursive walk would overflow on a tree deeper than
+/// the call stack. The stack holds one iterator per level, so a wide tree
+/// costs no more memory than a narrow one.
+fn focused_below(root: &Node) -> bool {
+    let mut pending = vec![root.children.iter()];
+    while let Some(siblings) = pending.last_mut() {
+        match siblings.next() {
+            Some(node) if node.focused => return true,
+            Some(node) => pending.push(node.children.iter()),
+            None => {
+                pending.pop();
+            }
+        }
+    }
+    false
 }
 
-/// Drop the children of every node at [`MAX_NODE_DEPTH`], so no node of the
-/// tree rooted at `root` is deeper than the limit.
+/// Are `a` and `b` the same tree?
 ///
-/// Walks with a vector for the reason [`Node::check_depth`] does: the input
-/// this exists for is a tree deeper than the call stack, and a recursive walk
-/// would overflow on exactly that. Only the branches that run over are
-/// touched; the rest of the tree keeps every node it had.
-fn truncate_to_max_depth(root: &mut Node) {
-    let mut pending = vec![(root, 1usize)];
-    while let Some((node, level)) = pending.pop() {
-        if level >= MAX_NODE_DEPTH {
-            node.children.clear();
-            continue;
-        }
-        pending.extend(node.children.iter_mut().map(|child| (child, level + 1)));
+/// What `==` on [`Node`] answers, without its recursion, because one side is
+/// the tree as built and can be deeper than the call stack. Each pair of
+/// nodes is compared with the children set aside, which still compares every
+/// field a node has, the ones a later taria adds included, and the children
+/// are then compared as pairs of their own. The `&mut` is only for setting
+/// the children aside; both trees come back as they were.
+fn same_tree(a: &mut Node, b: &mut Node) -> bool {
+    if !same_node(a, b) {
+        return false;
     }
+    let mut pending = vec![a.children.iter_mut().zip(b.children.iter_mut())];
+    while let Some(pairs) = pending.last_mut() {
+        match pairs.next() {
+            Some((a, b)) => {
+                if !same_node(a, b) {
+                    return false;
+                }
+                pending.push(a.children.iter_mut().zip(b.children.iter_mut()));
+            }
+            None => {
+                pending.pop();
+            }
+        }
+    }
+    true
+}
+
+/// Are `a` and `b` equal apart from their children, and do they have as
+/// many?
+fn same_node(a: &mut Node, b: &mut Node) -> bool {
+    if a.children.len() != b.children.len() {
+        return false;
+    }
+    let a_children = mem::take(&mut a.children);
+    let b_children = mem::take(&mut b.children);
+    let same = *a == *b;
+    a.children = a_children;
+    b.children = b_children;
+    same
+}
+
+/// `node` without its children, copied without copying them.
+fn shallow_copy(node: &mut Node) -> Node {
+    let children = mem::take(&mut node.children);
+    let copy = node.clone();
+    node.children = children;
+    copy
+}
+
+/// A copy of `root` cut to [`MAX_NODE_DEPTH`]: every node at the limit is
+/// copied without its children, and nothing below it is copied at all.
+///
+/// A copy, because the tree as built is kept to compare the next frame
+/// against; cut while it is copied, so the part cut away costs nothing. Built
+/// with a stack rather than by recursing, because the tree it reads is the
+/// one too deep for that. Only the branches that run over lose anything; the
+/// rest of the tree keeps every node it had.
+fn copy_within_depth(root: &mut Node) -> Node {
+    // A copy under construction, beside the children of its original still
+    // to copy into it. The stack's height is the level its top is at,
+    // counting the root as 1.
+    let mut stack = vec![(shallow_copy(root), root.children.iter_mut())];
+    while let Some((_, children)) = stack.last_mut() {
+        let next = children.next();
+        let level = stack.len() + 1;
+        match next {
+            Some(child) if level >= MAX_NODE_DEPTH => {
+                let copy = shallow_copy(child);
+                if let Some((parent, _)) = stack.last_mut() {
+                    parent.children.push(copy);
+                }
+            }
+            Some(child) => {
+                let copy = shallow_copy(child);
+                stack.push((copy, child.children.iter_mut()));
+            }
+            // The root stays on the stack once its last child is in, so the
+            // loop ends with it there.
+            None if stack.len() == 1 => break,
+            None => {
+                if let Some((done, _)) = stack.pop()
+                    && let Some((parent, _)) = stack.last_mut()
+                {
+                    parent.children.push(done);
+                }
+            }
+        }
+    }
+    let copied = stack.pop().map(|(copy, _)| copy);
+    drop(stack);
+    // The loop never empties the stack, so the fallback is never taken; it
+    // is the root alone, which is still a tree within the limit.
+    copied.unwrap_or_else(|| shallow_copy(root))
 }
 
 /// Accept loop: serves one bridge client at a time until shutdown.
@@ -2366,7 +2530,43 @@ mod tests {
     /// Focus anywhere under the root, which is what the root's own focus flag
     /// is the negation of.
     fn subtree_has_focus_below_root(root: &Node) -> bool {
-        root.children.iter().any(subtree_has_focus)
+        focused_below(root)
+    }
+
+    /// Drop a tree too deep for the recursive drop glue, one node at a time.
+    fn drop_iteratively(root: Node) {
+        let mut pending = vec![root];
+        while let Some(mut node) = pending.pop() {
+            pending.append(&mut node.children);
+        }
+    }
+
+    /// The tree as built is compared, searched for focus and copied before
+    /// the depth cut, so none of the three may recurse: the tree the cut
+    /// exists for can be deeper than the call stack.
+    #[test]
+    fn a_tree_deeper_than_the_call_stack_is_compared_and_cut_without_recursing() {
+        const DEEP: usize = 100_000;
+        let mut deep = chain(DEEP);
+        let mut same = chain(DEEP);
+        // Different only at the very bottom, so the comparison has to walk
+        // the whole way down to see it.
+        let mut other = Node::new(format!("n{DEEP}"), Role::TreeItem).label("changed");
+        for level in (1..DEEP).rev() {
+            other = Node::new(format!("n{level}"), Role::TreeItem).child(other);
+        }
+
+        assert!(!focused_below(&deep));
+        assert!(same_tree(&mut deep, &mut same));
+        assert!(!same_tree(&mut deep, &mut other));
+
+        let cut = copy_within_depth(&mut deep);
+        assert_eq!(cut.depth(), MAX_NODE_DEPTH);
+        assert!(cut.check_depth().is_ok());
+        assert_eq!(deep.depth(), DEEP, "the tree as built is left whole");
+        for tree in [deep, same, other] {
+            drop_iteratively(tree);
+        }
     }
 
     /// Only the branches that run over are cut. A wide tree with one runaway
@@ -2503,10 +2703,15 @@ mod tests {
     #[test]
     fn a_size_bound_that_drops_the_only_focused_node_leaves_focus_on_the_root() {
         let mut layer = bind_test_layer("taria-layer-", "bigfocus");
+        // The focused row is the last, and a little longer than the rest:
+        // the bound takes back any dropped row that still fits in what the
+        // others leave, which is always less than one row.
         let rows = (0..60_000).map(|n| {
+            let focused = n == 59_999;
+            let note = if focused { " (selected)" } else { "" };
             Node::new(format!("row-{n:05}"), Role::ListItem)
-                .label(format!("Task {n:05}"))
-                .focused(n == 59_999)
+                .label(format!("Task {n:05}{note}"))
+                .focused(focused)
         });
         layer.publish([Node::new("list", Role::List).children(rows)]);
 
@@ -2519,6 +2724,139 @@ mod tests {
             "the focused row was dropped, so the root has to carry focus"
         );
         assert!(!subtree_has_focus_below_root(&root));
+    }
+
+    /// The cost the comparison before the bound exists for. Deduplicating
+    /// after the bound meant a tree too large for the line paid the whole
+    /// bound on every frame it was drawn, changed or not, which for a few
+    /// megabytes is a hundred milliseconds a frame. Unchanged, a frame is now
+    /// compared and nothing else.
+    #[test]
+    fn an_unchanged_oversized_tree_is_bounded_once_however_often_it_is_drawn() {
+        let mut layer = bind_test_layer("taria-layer-", "bigstill");
+        let rows: Vec<Node> = (0..5000)
+            .map(|n| Node::new(format!("row-{n:05}"), Role::ListItem).label(format!("Task {n:05}")))
+            .collect();
+        let frame = |text: &str| {
+            [
+                draft(text.to_string()),
+                Node::new("list", Role::List).children(rows.clone()),
+            ]
+        };
+        let big = "d".repeat(MAX_LINE_BYTES * 3);
+
+        let start = bound::runs();
+        let nodes = frame(&big);
+        let started = Instant::now();
+        layer.publish(nodes);
+        let first = started.elapsed();
+        let once = bound::runs();
+        assert_eq!(once.measured - start.measured, 1);
+        assert_eq!(once.cut - start.cut, 1);
+
+        let mut redrawn = Duration::ZERO;
+        for _ in 1..100 {
+            // Built outside the clock: what is timed is the layer's work.
+            let nodes = frame(&big);
+            let started = Instant::now();
+            layer.publish(nodes);
+            redrawn += started.elapsed();
+        }
+        assert_eq!(
+            bound::runs(),
+            once,
+            "an unchanged frame is neither measured nor cut"
+        );
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+        let per_frame = redrawn / 99;
+        eprintln!("first frame {first:?}, each unchanged frame after it {per_frame:?}");
+        assert!(
+            per_frame * 4 < first,
+            "an unchanged frame took {per_frame:?}, against {first:?} for the one bounded"
+        );
+
+        // An edit past the cut is cut once and sends nothing, and the frames
+        // that redraw it unchanged after that are not cut again.
+        let edited = format!("{big}z");
+        for _ in 0..10 {
+            layer.publish(frame(&edited));
+        }
+        let after = bound::runs();
+        assert_eq!(after.cut - once.cut, 1);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+    }
+
+    /// The comparison costs a tree that fits nothing extra: it is measured
+    /// once, never cut, and held once, as the snapshot it went out as. Only a
+    /// tree that had to be cut keeps the tree it was cut from as well.
+    #[test]
+    fn a_tree_that_fits_is_measured_once_and_held_once() {
+        let mut layer = bind_test_layer("taria-layer-", "fitstill");
+        let frame = || {
+            [Node::new("list", Role::List)
+                .children((0..100).map(|n| Node::new(format!("row-{n}"), Role::ListItem)))]
+        };
+        let start = bound::runs();
+        for _ in 0..10 {
+            layer.publish(frame());
+        }
+        let runs = bound::runs();
+        assert_eq!(runs.measured - start.measured, 1);
+        assert_eq!(runs.cut, start.cut);
+        let inner = layer.inner.as_ref().expect("enabled");
+        assert!(
+            inner.last_raw.is_none(),
+            "no second copy of a tree that fits"
+        );
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+
+        layer.publish([draft("y".repeat(MAX_LINE_BYTES * 2))]);
+        let inner = layer.inner.as_ref().expect("enabled");
+        assert!(
+            inner.last_raw.is_some(),
+            "a cut tree keeps what it was cut from"
+        );
+    }
+
+    /// A deep tree whose runaway branch is the last child at every level: 40
+    /// levels, cut to 32 for depth and then to the line for size. Any one
+    /// cap on children that keeps the branch keeps everything, so a cap
+    /// alone kept the first level's leaves and a few percent of the line.
+    /// What the cap dropped is offered back, shallowest first, so the line
+    /// is used.
+    #[test]
+    fn a_deep_tree_cut_for_depth_and_then_for_size_still_fills_the_line() {
+        let mut layer = bind_test_layer("taria-layer-", "deepfill");
+        let leaves = |level: usize| {
+            (0..200).map(move |n| {
+                Node::new(format!("leaf-{level}-{n}"), Role::Text).label("x".repeat(250))
+            })
+        };
+        // 39 links under the root, so 40 levels counting it.
+        let mut branch = Node::new("n39", Role::TreeItem).children(leaves(39));
+        for level in (1..39).rev() {
+            branch = Node::new(format!("n{level}"), Role::TreeItem)
+                .children(leaves(level))
+                .child(branch);
+        }
+        layer.publish([branch]);
+
+        let snapshot = layer.latest_snapshot().expect("published");
+        assert_eq!(layer.truncated_snapshots(), 1);
+        assert_eq!(layer.oversized_snapshots(), 1);
+        assert_eq!(
+            snapshot.root.children[0].children.len(),
+            201,
+            "the first level is kept whole, branch and all"
+        );
+        let len = line_len(snapshot);
+        assert!(len <= MAX_LINE_BYTES);
+        assert!(
+            len * 10 >= MAX_LINE_BYTES * 9,
+            "{len} of {MAX_LINE_BYTES} bytes used"
+        );
     }
 
     #[test]
@@ -3192,12 +3530,17 @@ mod tests {
     }
 
     #[test]
-    fn focus_detection_is_recursive() {
-        let unfocused = Node::new("a", Role::Pane).child(Node::new("b", Role::Text));
-        assert!(!subtree_has_focus(&unfocused));
+    fn focus_detection_reaches_every_level_below_the_root() {
+        let unfocused = Node::new("a", Role::Pane)
+            .focused(true)
+            .child(Node::new("b", Role::Text));
+        assert!(
+            !focused_below(&unfocused),
+            "the root's own flag is not below it"
+        );
 
         let deep_focus = Node::new("a", Role::Pane)
             .child(Node::new("b", Role::List).child(Node::new("c", Role::ListItem).focused(true)));
-        assert!(subtree_has_focus(&deep_focus));
+        assert!(focused_below(&deep_focus));
     }
 }

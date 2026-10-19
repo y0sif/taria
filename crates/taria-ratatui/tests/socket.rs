@@ -222,9 +222,12 @@ fn an_oversized_tree_is_replayed_as_a_line_the_bridge_can_read() {
 
     let mut layer = bind_layer("oversized");
     let draft = "d".repeat(MAX_LINE_BYTES + 1);
-    layer.publish([Node::new("draft", Role::TextInput)
-        .value(draft.clone())
-        .focused(true)]);
+    let frame = || {
+        [Node::new("draft", Role::TextInput)
+            .value(draft.clone())
+            .focused(true)]
+    };
+    layer.publish(frame());
 
     let mut client = Client::connect(&layer);
     assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
@@ -250,6 +253,22 @@ fn an_oversized_tree_is_replayed_as_a_line_the_bridge_can_read() {
     client.send_input(1, key("q"));
     assert_eq!(poll_try_recv(&layer), Some(key("q")));
     assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
+
+    // Redrawn unchanged, the tree is not a new snapshot: the next one the
+    // bridge reads is the next change, under the very next seq.
+    for _ in 0..3 {
+        layer.publish(frame());
+    }
+    layer.publish([Node::new("draft", Role::TextInput)
+        .value(format!("x{draft}"))
+        .focused(true)]);
+    let AppToBridge::Snapshot(snapshot) = client.read_message() else {
+        panic!("expected the changed tree");
+    };
+    assert_eq!(snapshot.seq, 2, "the redraws published nothing");
+    let value = snapshot.root.children[0].value.as_deref().unwrap();
+    assert!(value.starts_with('x') && value.ends_with('\u{2026}'));
+    assert_eq!(layer.oversized_snapshots(), 2);
 }
 
 #[test]
