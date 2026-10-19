@@ -29,8 +29,10 @@
 //! and a connection nobody ever writes on both leave the state at
 //! [`BridgeState::Never`], and only the first of them is about the socket
 //! path. The adapter serves one bridge at a time, so a second bridge's connect
-//! succeeds into the listen backlog and is then never accepted, which is
-//! precisely the second case and the one a new adopter meets first.
+//! succeeds into the listen backlog and is not accepted until the first bridge
+//! leaves, which is precisely the second case and the one a new adopter meets
+//! first. (Once it is accepted, the reference adapter throws away whatever it
+//! wrote while it waited, unread and unacked.)
 
 use std::io;
 use std::path::PathBuf;
@@ -181,9 +183,10 @@ pub enum BridgeState {
 ///
 /// [`BridgeState`] answers "has an app published a tree" and cannot answer
 /// "did this bridge reach the socket at all". Both a `connect` that keeps
-/// failing and a connection the app never accepted leave the state at
-/// [`BridgeState::Never`], and the two call for opposite next steps: check the
-/// path, or leave the path alone because the bridge is connected to it.
+/// failing and a connection the app has not accepted (a second bridge's, until
+/// the first one leaves) leave the state at [`BridgeState::Never`], and the two
+/// call for opposite next steps: check the path, or leave the path alone
+/// because the bridge is connected to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkState {
     /// No connection is open: the last connect attempt failed, or the last
@@ -255,10 +258,14 @@ pub struct BridgeHandle {
     ///
     /// Also set for a line over [`MAX_LINE_BYTES`], which ends the connection
     /// instead of being skipped. That reason is a fixed string, and the one
-    /// value this channel ever clears: the next snapshot that parses retires
-    /// it, because the tree that overflowed has then been replaced by one that
-    /// fits. Until then it is kept across reconnects, since the app resends the
-    /// same tree to every connection and it overflows every time.
+    /// value this channel ever clears, on either of two events. The next
+    /// snapshot that parses retires it, because the tree that overflowed has
+    /// then been replaced by one that fits. A `connect` that finds nothing
+    /// listening retires it too, because the app that sent the tree is gone,
+    /// and "it resends that tree on every reconnect" is no longer true of
+    /// anything. Short of either it is kept across reconnects, since a running
+    /// app resends the same tree to every connection and it overflows every
+    /// time.
     ///
     /// Read only where no snapshot is available. Once a snapshot has arrived,
     /// a later rejected line says nothing about the tree being served, and
@@ -425,11 +432,48 @@ async fn manager_loop(
                     retry_in_ms = backoff.as_millis() as u64,
                     "connect failed; is the app running?"
                 );
+                // An app that overflowed and then exited leaves its reason
+                // behind, and the tools would go on telling the agent that a
+                // running app resends the same tree to every reconnect, about
+                // an app that is not there. Nothing listening is the one
+                // connect failure that says the app is gone.
+                forget_oversized_if_nothing_listens(&err, &rejected_tx);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RETRY_MAX);
             }
         }
     }
+}
+
+/// Retire [`OVERSIZED_LINE`] when a failed `connect` means nothing is
+/// listening at the path: a socket file nobody is bound to any more
+/// (`ConnectionRefused`), or no file at all (`NotFound`). Either way the app
+/// that sent the tree has gone. Any other failure (a permission, a resource
+/// limit) says nothing about whether the app is still there, and leaves the
+/// reason alone.
+fn forget_oversized_if_nothing_listens(
+    err: &io::Error,
+    rejected_tx: &watch::Sender<Option<String>>,
+) {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    ) {
+        forget_oversized(rejected_tx);
+    }
+}
+
+/// Retire [`OVERSIZED_LINE`], and only that reason: any other one stays, as it
+/// always has.
+fn forget_oversized(rejected_tx: &watch::Sender<Option<String>>) {
+    rejected_tx.send_if_modified(|rejected| {
+        if rejected.as_deref() == Some(OVERSIZED_LINE) {
+            *rejected = None;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// Drop any inputs queued while no app was connected.
@@ -607,14 +651,7 @@ fn handle_app_line(
             // could not. Any other reason stays, as it always has. Cleared
             // before the state is promoted, so a tool call that sees this tree
             // can never pair the next disconnect with the old size.
-            rejected_tx.send_if_modified(|rejected| {
-                if rejected.as_deref() == Some(OVERSIZED_LINE) {
-                    *rejected = None;
-                    true
-                } else {
-                    false
-                }
-            });
+            forget_oversized(rejected_tx);
             // The line is kept beside the parsed form, not instead of it: the
             // agent reads the line and the bridge reasons about the parse.
             // See [`AppSnapshot`].
@@ -766,6 +803,62 @@ mod tests {
             rejected_rx.borrow().as_deref(),
             Some("expected value at line 1")
         );
+    }
+
+    /// A `connect` that finds nothing listening retires the oversized reason,
+    /// because the app that resent that tree on every reconnect has gone.
+    /// The errors are the ones this platform really returns for a socket file
+    /// nobody is bound to and for a path with no file, so a kind the matcher
+    /// misses fails here rather than leaving the reason in place for good.
+    #[tokio::test]
+    async fn a_connect_that_finds_nothing_listening_forgets_the_oversized_reason() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let stale = dir.path().join("stale.sock");
+        // Bound, then dropped: the file stays and nothing listens on it, which
+        // is what an app that crashed leaves behind.
+        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
+        let gone = dir.path().join("gone.sock");
+
+        for (name, path) in [("stale socket", &stale), ("no socket", &gone)] {
+            let err = UnixStream::connect(path)
+                .await
+                .expect_err("nothing listens here");
+            let (rejected_tx, rejected_rx) = watch::channel(Some(OVERSIZED_LINE.to_string()));
+            forget_oversized_if_nothing_listens(&err, &rejected_tx);
+            assert_eq!(
+                rejected_rx.borrow().as_deref(),
+                None,
+                "{name}: {err} ({:?})",
+                err.kind()
+            );
+
+            // Any other reason is about a line, not about the app being there,
+            // and stays.
+            rejected_tx.send_replace(Some("expected value at line 1".to_string()));
+            forget_oversized_if_nothing_listens(&err, &rejected_tx);
+            assert_eq!(
+                rejected_rx.borrow().as_deref(),
+                Some("expected value at line 1"),
+                "{name}"
+            );
+        }
+
+        // A connect that failed for any other reason says nothing about the
+        // app, so the reason is left as it was.
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Other,
+        ] {
+            let (rejected_tx, rejected_rx) = watch::channel(Some(OVERSIZED_LINE.to_string()));
+            forget_oversized_if_nothing_listens(&io::Error::from(kind), &rejected_tx);
+            assert_eq!(
+                rejected_rx.borrow().as_deref(),
+                Some(OVERSIZED_LINE),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

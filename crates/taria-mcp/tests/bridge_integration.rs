@@ -461,6 +461,85 @@ async fn read_tree_names_an_oversized_first_snapshot_on_every_reconnect() {
     app.abort();
 }
 
+/// An app that overflowed and then went away, taking its listener with it.
+/// The size answer says the app is running and resends the tree on every
+/// reconnect, and that nothing the agent sends can fix it. Kept after the app
+/// exits, it held an agent to that story about an app that was gone, until
+/// some app sent a tree that fit. A connect that finds nothing listening is
+/// the bridge's evidence the app has gone, and the plain departure answer
+/// takes over from it.
+///
+/// `unlink` picks how the app leaves: removing its socket file (`connect`
+/// finds no file) or leaving it behind, the way a crash does (`connect` is
+/// refused).
+async fn forgets_the_size_once_the_app_is_gone(name: &str, unlink: bool) {
+    let (_dir, path) = test_socket_path(name);
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before-paste"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+    app.send_oversized(2).await;
+    app.wait_closed().await;
+
+    // The size is recorded while the app is still there: the bridge's
+    // reconnect lands in the listener's backlog.
+    let opening = "app 'fake-app' disconnected (last snapshot seq 1); ";
+    timeout(WAIT, async {
+        loop {
+            let err = server.read_tree().await.expect_err("no tree fits");
+            if err.message.starts_with(opening) && err.message.contains(OVER_THE_LIMIT) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the oversized line should reach the tool surface");
+
+    drop(app);
+    drop(listener);
+    if unlink {
+        std::fs::remove_file(&path).expect("remove the app's socket file");
+    }
+
+    // The backlogged connection is reset with the listener, and the next
+    // connect finds nothing listening, so this is one backoff away.
+    let plain = "app 'fake-app' disconnected (last snapshot seq 1); it may have exited. The \
+                 bridge reconnects automatically; retry once the app is back.";
+    let err = timeout(WAIT, async {
+        loop {
+            let err = server.read_tree().await.expect_err("the app is gone");
+            if !err.message.contains(OVER_THE_LIMIT) {
+                return err;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the size should be forgotten once nothing listens");
+    assert_eq!(err.message, plain);
+
+    // And it stays forgotten across the failed reconnects that follow: nothing
+    // is there to send the tree again.
+    for poll in 0..10 {
+        let err = server.read_tree().await.expect_err("the app is gone");
+        assert_eq!(err.message, plain, "poll {poll}");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+}
+
+#[tokio::test]
+async fn read_tree_forgets_the_size_once_the_app_removed_its_socket() {
+    forgets_the_size_once_the_app_is_gone("oversized-then-unlinked", true).await;
+}
+
+#[tokio::test]
+async fn read_tree_forgets_the_size_once_the_app_left_a_stale_socket() {
+    forgets_the_size_once_the_app_is_gone("oversized-then-stale", false).await;
+}
+
 /// A message whose `type` this bridge has no variant for is additive under the
 /// freeze, so it must be ignored like an unknown enum variant, not reported as
 /// a malformed line. Regression for the v0.1 review: an internally tagged enum
@@ -526,15 +605,15 @@ async fn read_tree_ignores_an_unknown_future_message_type() {
 }
 
 /// The state that stopped the first agent to meet this project before it
-/// could try anything: a bridge whose `connect` succeeded onto a socket
-/// nobody was ever going to accept it from.
+/// could try anything: a bridge whose `connect` succeeded onto a socket that
+/// was not going to accept it while another bridge held the app.
 ///
 /// The adapter serves one bridge at a time, so a second bridge's connection is
-/// completed by the kernel into the listen backlog and then left unread: no
-/// handshake, no snapshot, and the same "is the socket path correct?" an app
-/// that was never started gets. Both answers were yes, and the real cause was
-/// another session's `taria-mcp` still holding the app. The bridge knows its
-/// own connect succeeded, which is the whole difference.
+/// completed by the kernel into the listen backlog and left unread until the
+/// first bridge leaves: no handshake, no snapshot, and the same "is the socket
+/// path correct?" an app that was never started gets. Both answers were yes,
+/// and the real cause was another session's `taria-mcp` still holding the app.
+/// The bridge knows its own connect succeeded, which is the whole difference.
 #[tokio::test]
 async fn read_tree_names_a_connection_the_app_never_accepted() {
     let (_dir, path) = test_socket_path("never-accepted");

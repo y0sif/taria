@@ -764,7 +764,8 @@ fn is_oversized(rejected: Option<&str>) -> bool {
 /// - A connection is open and nobody has said a word on it. An adapter greets
 ///   a bridge the moment it accepts one, and serves one bridge at a time, so
 ///   this is what the second bridge gets: a connection the kernel completed
-///   into the listen backlog and the app never accepted.
+///   into the listen backlog, which the app does not accept until the first
+///   bridge leaves.
 /// - Nothing is connected. Here, and only here, the path and whether the app
 ///   is running are the questions.
 fn no_snapshot_reason(report: LinkReport) -> String {
@@ -773,7 +774,10 @@ fn no_snapshot_reason(report: LinkReport) -> String {
     // arrived whole and failed to parse, and this one never arrived whole. It
     // outranks the link too, because every reconnect greets the bridge and
     // then sends the same line, so an open connection or a fresh handshake is
-    // the lead-up to the next overflow rather than news.
+    // the lead-up to the next overflow rather than news. A link that is down
+    // with the reason still held is between two of those reconnects: the
+    // bridge drops the reason as soon as a connect finds nothing listening,
+    // and this answer then gives way to the plain ones below.
     if is_oversized(report.rejected.as_deref()) {
         return format!(
             "no snapshot from the app yet, but not because nothing is there: an app reached \
@@ -826,7 +830,7 @@ fn no_snapshot_reason(report: LinkReport) -> String {
          snapshot on it. A taria adapter greets a bridge the moment it accepts one, and serves \
          one bridge at a time, so an open connection that says nothing is what a second bridge \
          gets: the kernel completed it into the listen backlog and the app, still serving the \
-         first bridge, never accepted it. The likely cause is another taria-mcp process holding \
+         first bridge, has not accepted it. The likely cause is another taria-mcp process holding \
          this app, often one left running by an earlier session; stopping that one hands the app \
          to this bridge, which needs no restart of its own. Failing that, the peer at this path \
          wedged before its handshake, or is not a taria adapter at all.",
@@ -1568,10 +1572,17 @@ mod tests {
     /// (down between attempts, just opened, greeted) is one an agent polls
     /// into, and each used to answer it with something else: the socket path,
     /// "worth one retry", an app that never publishes nodes.
+    ///
+    /// Down means between attempts only. The bridge drops the reason when a
+    /// connect finds nothing listening, so a link that stays down because the
+    /// app has gone arrives here without it and gets the plain answers the
+    /// tests above pin (the bridge's
+    /// `a_connect_that_finds_nothing_listening_forgets_the_oversized_reason`
+    /// covers the drop).
     #[test]
     fn an_oversized_line_outranks_every_link_state() {
         let links = [
-            ("down", LinkState::Down, None),
+            ("down between attempts", LinkState::Down, None),
             ("just opened", open_for(10), None),
             ("open and silent", open_for(4_000), None),
             ("greeted", open_for(10), Some(PROTOCOL_VERSION)),

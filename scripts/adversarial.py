@@ -111,7 +111,7 @@ SILENT_PEER_RE = re.compile(
     r"handshake and no snapshot on it\. A taria adapter greets a bridge the moment it accepts "
     r"one, and serves one bridge at a time, so an open connection that says nothing is what a "
     r"second bridge gets: the kernel completed it into the listen backlog and the app, still "
-    r"serving the first bridge, never accepted it\. The likely cause is another taria-mcp "
+    r"serving the first bridge, has not accepted it\. The likely cause is another taria-mcp "
     r"process holding this app, often one left running by an earlier session; stopping that one "
     r"hands the app to this bridge, which needs no restart of its own\. Failing that, the peer "
     r"at this path wedged before its handshake, or is not a taria adapter at all\.$"
@@ -203,8 +203,8 @@ class FakeApp:
             # Bound and listening, and that is all. The bridge's connect
             # succeeds into the listen backlog and nothing is ever read from
             # it or written to it: the adapter serving one bridge at a time
-            # does this to the second one, and there is no way to ask a real
-            # app for it without a second live bridge.
+            # does this to the second one until the first leaves, and there
+            # is no way to ask a real app for it without a second live bridge.
             return
         try:
             conn, _ = self.srv.accept()
@@ -1523,12 +1523,12 @@ def probe_lost_acks(client, ctx):
 
 
 def probe_socket_held_by_another_bridge(client, ctx):
-    """A bridge connected to a socket nobody will accept it from.
+    """A bridge connected to a socket that will not accept it yet.
 
     The adapter serves one bridge at a time, so a second bridge's connection
-    is completed by the kernel into the listen backlog and then left unread:
-    the connect succeeded, and no handshake and no snapshot will ever arrive
-    on it. That is what a `taria-mcp` left running by an earlier session does
+    is completed by the kernel into the listen backlog and left unread until
+    the first bridge leaves: the connect succeeded, and no handshake and no
+    snapshot arrives on it until then. That is what a `taria-mcp` left running by an earlier session does
     to the next one, and it is the first thing a fresh agent meets, before any
     feature of the release can be tried at all. The answer used to be "is the
     taria-enabled app running, and is the socket path correct?"; both were
