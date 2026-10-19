@@ -13,7 +13,7 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
-## [0.3.1] - Unreleased
+## [0.3.1] - 2026-10-19
 
 **An app whose tree outgrew one line keeps its bridge.** A snapshot travels as
 one line, and the bridge closes the connection on a line over 1 MiB. The
