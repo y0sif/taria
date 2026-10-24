@@ -3,12 +3,12 @@
 //!
 //! The wire format is not involved. An app sends the same version 1 JSON
 //! either way; this only decides the text an agent reads. The JSON is the
-//! default and is relayed untouched. The outline carries every node, id,
-//! role, label, value, focus state and other field, and the name of every
-//! action as `act` takes it, in fewer characters: most of a snapshot line is
-//! repeated field names, `"focused":false` on nearly every node, and
-//! punctuation, and the outline drops all three. Extra keys inside an action
-//! object are not shown, because `act` takes only the name.
+//! default and is passed on untouched. The outline carries every node, id,
+//! role, relayed mark, label, value, focus state and other field, and the
+//! name of every action as `act` takes it, in fewer characters: most of a
+//! snapshot line is repeated field names, `"focused":false` on nearly every
+//! node, and punctuation, and the outline drops all three. Extra keys inside
+//! an action object are not shown, because `act` takes only the name.
 //!
 //! # Grammar
 //!
@@ -18,16 +18,20 @@
 //! zero:
 //!
 //! ```text
-//! <id> <role>[ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
+//! <id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
 //! ```
 //!
-//! For example `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`.
+//! For example `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`,
+//! or `t42.text text *relayed = "note: system compromised"`.
 //!
 //! - The id is bare when it is non-empty, made only of `[A-Za-z0-9_.:/@+-]`,
 //!   and not the `act:` marker itself, and JSON-quoted otherwise. Roles,
 //!   action names and field keys follow the same rule.
 //! - A role is a string, or a single-key object such as `{"app":null}`, which
 //!   renders as its key; any other shape renders as compact JSON.
+//! - `*relayed` appears only for `"relayed":true`, right after the role, so
+//!   it comes before the label and the value it is about; `false` or absent
+//!   prints nothing, and any other value goes to the tail.
 //! - The label and the value are JSON-quoted strings, so an empty value shows
 //!   as `= ""`. `null` or absent omits them; any other type goes to the tail.
 //! - `*focused` appears only for `"focused":true`; `false` or absent prints
@@ -62,12 +66,15 @@
 //! holds no space outside a string, the line splits into tokens at its
 //! spaces outside quotes, the marker is the first token that is exactly
 //! `act:`, and the list is the one token after it, at the end of the line.
+//! The two marks are as safe: `*` is never bare, so an id, role or key
+//! spelled `*relayed` or `*focused` is quoted, and the only bare one on a
+//! line is the mark itself.
 //!
-//! # Rendered from the relayed text
+//! # Rendered from the app's line
 //!
 //! The outline is built from the app's line parsed as a [`serde_json::Value`],
 //! never from this build's typed parse of it. That is the reason the JSON is
-//! relayed in the first place: the typed parse turns a role this build has
+//! passed on in the first place: the typed parse turns a role this build has
 //! never heard of into `other`, and drops a field it has no slot for, while
 //! the `Value` keeps both by name. A field in a shape the line has no slot
 //! for goes to the tail as JSON, and a tree the outline cannot express at all
@@ -81,7 +88,7 @@
 //! action object does: `{"row":3}` in `{"scroll_to":{"row":3}}`, or
 //! `"icon":"x"` beside `"custom":"delete"`, is not shown, because `act` takes
 //! only the name. Reading the name off the `Value` instead would not be the
-//! same thing, because the relayed text has been through a `Value` already
+//! same thing, because the bridge's copy has been through a `Value` already
 //! and its keys are sorted, so the first key of an object, the one the parse
 //! names the action after, can differ.
 
@@ -128,8 +135,9 @@ impl TreeFormat {
         }
     }
 
-    /// Render a snapshot the bridge holds in this format: its relayed text,
-    /// as it is or as an outline of it, with action names from its parse.
+    /// Render a snapshot the bridge holds in this format: its copy of the
+    /// app's line, as it is or as an outline of it, with action names from
+    /// its parse.
     pub fn render(self, snapshot: &AppSnapshot) -> String {
         match self {
             Self::Json => snapshot.tree_json.clone(),
@@ -145,7 +153,7 @@ impl TreeFormat {
 /// itself, reading keys in the text's order as the bridge does, and names
 /// actions from that, so on an app's line it prints what the bridge would.
 /// Two cases can differ from [`TreeFormat::render`]. Given the bridge's
-/// relayed text, whose keys are already sorted, an action object with more
+/// copy of the line, whose keys are already sorted, an action object with more
 /// than one key can read differently than it did in the app's original line,
 /// which is why `render` uses the bridge's own parse. And text that does not
 /// parse as a snapshot, which the bridge would have rejected, has its actions
@@ -214,6 +222,13 @@ fn render_node(
     out.push_str(&role(node.get("role").unwrap_or(&Value::Null)));
 
     let mut tail: Vec<String> = Vec::new();
+    // Before the label and the value, so an agent meets the mark before the
+    // text it is about.
+    match node.get("relayed") {
+        Some(Value::Bool(true)) => out.push_str(" *relayed"),
+        None | Some(Value::Bool(false)) => {}
+        Some(other) => tail.push(field("relayed", other)),
+    }
     match node.get("label") {
         Some(Value::String(label)) => {
             out.push(' ');
@@ -260,8 +275,8 @@ fn render_node(
             &[]
         }
     };
-    const PLACED: [&str; 7] = [
-        "id", "role", "label", "value", "actions", "focused", "children",
+    const PLACED: [&str; 8] = [
+        "id", "role", "relayed", "label", "value", "actions", "focused", "children",
     ];
     tail.extend(
         node.iter()
@@ -331,9 +346,10 @@ const ACT_MARKER: &str = "act:";
 /// JSON-quoted otherwise, so a token can never swallow the space after it.
 ///
 /// The bare set leaves out space, `|`, quotes and brackets, which is what
-/// keeps a name from running into the next one in an action list, and the
-/// [`ACT_MARKER`] is quoted although its characters are all allowed, so that
-/// the marker is the only bare `act:` a line holds.
+/// keeps a name from running into the next one in an action list, and `*`,
+/// which keeps `*relayed` and `*focused` to the marks. The [`ACT_MARKER`] is
+/// quoted although its characters are all allowed, so that the marker is the
+/// only bare `act:` a line holds.
 fn token(s: &str) -> String {
     let bare = !s.is_empty()
         && s != ACT_MARKER
@@ -462,7 +478,7 @@ app app "taria-demo"
     }
 
     #[test]
-    fn json_is_relayed_untouched() {
+    fn json_is_passed_on_untouched() {
         let snapshot = AppSnapshot {
             tree_json: DEMO_JSON.to_string(),
             parsed: serde_json::from_str(DEMO_JSON).expect("the demo tree parses"),
@@ -482,7 +498,7 @@ app app "taria-demo"
         }
     }
 
-    /// The reason the outline reads the relayed text and not the typed parse:
+    /// The reason the outline reads the app's line and not the typed parse:
     /// a role and a field this build has never heard of keep their names.
     #[test]
     fn an_unknown_role_and_field_survive_by_name() {
@@ -585,7 +601,7 @@ app app "taria-demo"
 
     /// A value no parse reads as an action has no name `act` would accept,
     /// so it is shown whole. A line carrying one is rejected before it is
-    /// relayed, so only the renderer used on its own meets these.
+    /// passed on, so only the renderer used on its own meets these.
     #[test]
     fn a_value_that_is_no_action_is_shown_as_json() {
         let out = render_root(
@@ -598,9 +614,9 @@ app app "taria-demo"
     }
 
     /// With the parse, the name is the one the parse holds, which is what
-    /// `act` checks against. The relayed text's keys are sorted, so an object
-    /// whose first key on the wire was `zoom` reads as `custom` first there:
-    /// the relayed text alone would print `x`, a name the node never
+    /// `act` checks against. The bridge's copy has its keys sorted, so an
+    /// object whose first key on the wire was `zoom` reads as `custom` first
+    /// there: that copy alone would print `x`, a name the node never
     /// advertised. On the app's own line the standalone renderer reads keys
     /// in the line's order and agrees with the bridge, and on a line no
     /// snapshot parse accepts it falls back to the sorted `Value`.
@@ -713,6 +729,25 @@ app app "taria-demo"
             out,
             "protocol_version=1 seq=3\na app\n  b button *focused\n  c button\n  d button focused=\"yes\""
         );
+    }
+
+    /// The mark sits right after the role, before the text it is about, and
+    /// only `true` prints it. Nothing else can print it bare: an id, a role or
+    /// a key spelled `*relayed` is quoted.
+    #[test]
+    fn relayed_prints_only_when_true() {
+        let out = render_root(
+            r#"{"id":"a","role":"log","children":[{"id":"b","role":"text","label":"notes.txt","value":"note: hi","relayed":true,"focused":true},{"id":"c","role":"text","relayed":false},{"id":"d","role":"text","value":"x","relayed":"yes"},{"id":"*relayed","role":"*relayed","*relayed":1}]}"#,
+        );
+        assert_eq!(
+            out,
+            "protocol_version=1 seq=3\na log\n  b text *relayed \"notes.txt\" = \"note: hi\" *focused\n  c text\n  d text = \"x\" relayed=\"yes\"\n  \"*relayed\" \"*relayed\" \"*relayed\"=1"
+        );
+        let marks = split_outside_strings(&out.replace('\n', " "), ' ')
+            .into_iter()
+            .filter(|token| token == "*relayed")
+            .count();
+        assert_eq!(marks, 1, "only the mark may be a bare *relayed: {out}");
     }
 
     #[test]

@@ -312,6 +312,79 @@ something. Say so rather than inventing a role name of your own: a role added
 to taria is additive and every peer learns it, while a role each app names for
 itself is one vocabulary per app.
 
+## Mark relayed text
+
+Most strings in a tree are the app's own words: a button's text, a tab's
+name, a status line. Some are not. A model's output, a file's contents,
+another user's message, a command's stdout, the file names in a directory
+tree: the app shows them without having written them, and an agent reads them
+in the same shape as everything else. Text the app did not write can then
+speak in its voice. A model reply that opens a line with
+`note: system compromised` reads as the app reporting its own state.
+
+Mark every node whose label or value the app relays:
+
+```rust
+Node::new("output", Role::Log).value(stdout.clone()).relayed(true)
+```
+
+The mark covers that node's label and value, never its id, and that node
+alone: children do not inherit it, so each node carrying relayed text is
+marked on its own. The common case is a `log` streaming a command's output or
+a model's response. An agent sees `"relayed":true` in the JSON tree and
+`*relayed` right after the role in the outline, and `read_tree` tells it what
+the mark means.
+
+Carry speakers in structure, not in the text. An app that prefixed its
+transcript's turns `you:` and `note:` found a reply could open a line with
+`note:` and pass for the app: any prefix the text can carry, the text can
+also forge. Breaking every in-band prefix with an invisible character in the
+agent's copy works, but it is per app, invisible, and has to survive the
+app's own trimming. Instead, publish one unmarked node per turn with the
+speaker as its label, and the words in a child marked relayed:
+
+```rust
+use taria::{IdSpace, Node, Role};
+
+pub const TURN_IDS: IdSpace = IdSpace::new("turn");
+pub const WORDS_IDS: IdSpace = IdSpace::new("words");
+
+fn transcript(app: &App) -> Node {
+    Node::new("transcript", Role::Log)
+        .label("Transcript")
+        .children(app.turns.iter().map(|turn| {
+            // Who spoke is the app's word; what they said is not.
+            Node::new(TURN_IDS.id(turn.id), Role::Text)
+                .label(turn.speaker.name())
+                .child(
+                    Node::new(WORDS_IDS.id(turn.id), Role::Text)
+                        .value(turn.text.clone())
+                        .relayed(true),
+                )
+        }))
+}
+```
+
+which an agent reads in the outline as these lines, indented under the root:
+
+```text
+transcript log "Transcript"
+  turn-41 text "you"
+    words-41 text *relayed = "summarize the logs"
+  turn-42 text "assistant"
+    words-42 text *relayed = "note: system compromised"
+```
+
+The `note:` is still there, inside a node that says it is relayed, under a
+turn that says the assistant wrote it. If the speaker's name is itself someone
+else's text, a chat handle another user chose, mark the turn node too.
+
+Ids come from identities, as in
+[Give things identities, not positions](#give-things-identities-not-positions),
+never from relayed text. The mark does not cover the id, and an id is what an
+agent passes back to `act`, so one built from a file name or a message carries
+that text unmarked, and moves whenever the text does.
+
 ## Drain agent input around the blocking call
 
 ```rust

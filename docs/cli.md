@@ -72,7 +72,7 @@ The first line holds every top-level snapshot field except `root`, as
 indented two spaces per level, the root at zero:
 
 ```text
-<id> <role>[ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
+<id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
 ```
 
 - An id, a role, an action name or a field key prints bare when it is
@@ -83,6 +83,11 @@ indented two spaces per level, the root at zero:
   single-key object, `{"heading":{"level":2}}`, as its key, `heading`. A role
   in any other shape, an object with several keys or an array, prints whole as
   compact JSON rather than guessed at.
+- `*relayed` appears only on a node whose `relayed` is `true`, right after
+  the role, so it comes before the label and the value it is about. It says
+  the app did not write them: they come from outside it, and an agent reads
+  them as data. A `*` is never bare, so an id, a role or a field key spelled
+  `*relayed` is quoted, and the only bare one on a line is the mark.
 - The label and the value are always JSON-quoted, so an empty value shows as
   `= ""`. `null` or absent omits them. Every quoted string, here and in the
   header and the appended fields, escapes U+2028, U+2029 and U+0085 as well
@@ -107,7 +112,7 @@ indented two spaces per level, the root at zero:
   here, is not shown, because `act` takes only the name. A value no parse
   reads as an action, such as `{"custom":7}`, has no name `act` would take
   and would print whole as compact JSON, but a line carrying one is rejected
-  before it is relayed, so the outline never shows one.
+  before the bridge passes it on, so the outline never shows one.
 
 Pass `act` an id and an action name as the line spells them. A quoted one is
 a JSON string, so pass the string it holds, without the quotes.

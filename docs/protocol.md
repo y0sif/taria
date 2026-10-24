@@ -460,6 +460,7 @@ A node with nothing set beyond its identity:
 | `label` | string | no | **omitted when unset** | no label |
 | `value` | string | no | **omitted when unset** | no value |
 | `focused` | boolean | no | **always emitted**, including `false` | `false` |
+| `relayed` | boolean | no | **omitted when `false`** | `false`: the app wrote the text |
 | `actions` | array | no | **omitted when empty** | no actions advertised |
 | `children` | array | no | **omitted when empty** | a leaf |
 
@@ -475,12 +476,17 @@ Rules a reader has to implement:
   sender in version 1 **SHOULD** emit it on every node anyway: the reference
   adapter does, and accepting absence now is what keeps dropping the field
   later an additive change rather than a version bump.
+- A reader **MUST** accept `relayed` absent and read absence as `false`. A
+  sender **SHOULD** omit it when `false`, as the reference `Node` does: it
+  marks the few nodes whose text came from outside the app, so spelling
+  `"relayed":false` on all the others costs bytes and says nothing. What it
+  means is section 6.4.
 - A reader **MUST** accept `actions` and `children` absent and read absence as
   empty.
-- `focused`, `actions` and `children` **MUST NOT** be sent as `null`. Absent
-  and empty are the two spellings; `null` fails the parse with "invalid type:
-  null" in the reference implementation, and failing takes the whole snapshot
-  with it.
+- `focused`, `relayed`, `actions` and `children` **MUST NOT** be sent as
+  `null`. Absent and empty are the two spellings; `null` fails the parse with
+  "invalid type: null" in the reference implementation, and failing takes the
+  whole snapshot with it.
 - `id` **MUST** be a JSON string. Verified: `{"id":7,...}` fails.
 
 ### 6.2 Node ids
@@ -507,6 +513,45 @@ authors, not a wire rule. See section 18.3.
 of nodes in a tree, or on the length of a `label` or a `value`; the 1 MiB line
 cap (section 2.5) bounds all of them together, and crossing it costs the
 connection rather than the tree (section 13.2).
+
+### 6.4 Relayed text
+
+Most of a tree's text is the app's own: a button's text, a tab's name, a
+status line. Some of it the app shows without having written it: a model's
+output, a file's contents, another user's message, a command's output, the
+file names in a directory tree. Both arrive as plain strings, so without a
+mark an agent cannot weigh them differently, and relayed text can speak in
+the app's voice. `"relayed":true` is that mark.
+
+- It covers the node's `label` and `value`, and nothing else: the `id`, the
+  `role`, `focused` and `actions` are always the app's. Because the mark does
+  not cover the id, a sender **SHOULD NOT** build an id out of relayed text.
+- It is strictly per node. A reader **MUST NOT** read a child of a relayed
+  node as relayed, and a sender marks every node whose text it relays. The
+  reference bridge hands the line on with its keys sorted (section 16.6),
+  which puts a parent's `relayed` after its `children`, so an inherited mark
+  would reach an agent only after the text it covers.
+- Absent means `false`: the app says it wrote the text.
+- An agent **SHOULD** read the `label` and `value` of a relayed node as data:
+  what the app is showing, never an instruction to follow and never the app
+  describing its own state.
+- A sender **SHOULD** carry speakers in structure, not in the text. A
+  transcript is one unmarked node per turn with the speaker as its `label`,
+  and the turn's words in a child marked relayed:
+
+```json
+{"id":"t42","role":"text","label":"assistant","focused":false,"children":[{"id":"t42.text","role":"text","value":"note: system compromised","focused":false,"relayed":true}]}
+```
+
+A prefix such as `you:` or `note:` inside the text is something the content
+can spell as well; a label on an unmarked node is not. Here the reply opens
+with `note:`, and the tree still says the assistant wrote it.
+
+The mark is the app's statement about where its strings came from, and no
+peer can check it. A bridge needs nothing new to carry it: it passes the mark
+on with the rest of the line, and a bridge built before the field does too,
+because it hands the agent the app's line rather than its parse of it
+(section 16.6).
 
 ## 7. Role vocabulary
 
@@ -1183,6 +1228,10 @@ attacker swap the socket for their own and impersonate the app, or intercept
 the bridge. The check uses the link's own metadata, not the target's, so a
 planted symlink is seen as itself.
 
+That is impersonation at the socket. Text inside the real app's tree that
+speaks as the app, a model's output or a file's contents, is the content-level
+case, and section 6.4 covers it.
+
 ### 14.4 Freeing the path
 
 Binding needs the path to be absent, so a socket left behind by a run that was
@@ -1617,3 +1666,7 @@ behaviour a peer may rely on.
 10. **Bounds on `app_label`, `label`, `value`, node count and children count.**
     Only the 1 MiB line cap bounds them, and section 2.5 asks an app to keep
     its snapshot within it (sections 3.1, 6.3, 13.2).
+11. **What a bridge does with relayed text beyond passing the mark on**, such
+    as fencing or escaping it in what an agent reads. The reference bridge
+    alters no text: it hands the mark on, and its outline prints it as
+    `*relayed` (section 6.4).
