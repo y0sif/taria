@@ -16,13 +16,22 @@ Options:
 | Flag | Effect |
 |---|---|
 | `--tree-format <json\|outline>` | How `read_tree`, and every input tool that answers with a tree, show the tree to the agent. `json`, the default, relays the app's own snapshot line minus its `type` framing key. `outline` renders that same line as one indented line per node (see [The outline](#the-outline)). The wire format is the same either way. A missing or unknown value is a usage error. |
+| `--idle-release <SECS>` | How long, in whole seconds, the bridge keeps the app with no tool calls before it lets go. The default is 60, and `0` never lets go. Once that long has passed, the bridge closes its connection, or leaves the listen backlog (the kernel's queue of connections the app has not accepted yet) if it was waiting behind another bridge, and stops reconnecting until the next tool call. It does not let go while an input it sent is still waiting for the app's ack, for up to 30 s past the window. A missing value, or one that is not a whole number, is a usage error. |
+
+The bridge opens no connection to the app until its first tool call, whatever
+`--idle-release` says: starting it, and the harness's `initialize` and
+`tools/list`, connect to nothing. That first call waits briefly, at most
+about a second, for the connection, the app's `hello` and its tree, so it
+still answers with the live tree. A bridge locked out of the app says the app
+is held by another bridge, and that a taria-mcp lets go of the app after 60 s
+with no tool calls, so a retry is the way in.
 
 Environment variables:
 
 | Variable | Effect |
 |---|---|
 | `TARIA_SOCK` | Socket path, used verbatim. Replaces the default on the app side always, and on the bridge side only when the path is derived from `--app`; an explicit `--socket` wins over it. |
-| `TARIA_LOG` | Bridge log filter (tracing env-filter syntax), default `info`. Logs go to stderr; stdout carries MCP. |
+| `TARIA_LOG` | Bridge log filter (tracing env-filter syntax), default `info`. Logs go to stderr; stdout carries MCP. Each time the bridge lets go of the app it logs, at `info`, how long it went without a tool call, and whether an input awaiting its ack held it past the `--idle-release` window. If inputs are still unacked when that 30 s hold runs out, the line is a `warn` that names how many, since the app may discard them. |
 
 With `--app <label>`, the bridge resolves the socket path the same way the
 app-side adapter does when binding:

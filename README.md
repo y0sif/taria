@@ -11,7 +11,7 @@ terminals and guessing at structure. taria works on the other side of the
 terminal: the app publishes what is on screen semantically, the way
 accessibility trees transformed GUI automation.
 
-> Status: pre-alpha, at version 0.3.1. The vertical slice works end to end: a
+> Status: pre-alpha, at version 0.3.2. The vertical slice works end to end: a
 > ratatui adapter, an MCP bridge, and a demo app an agent can drive today. The
 > wire format is frozen at `PROTOCOL_VERSION` 1. See `CHANGELOG.md` for what
 > this release changed and what the freeze promises, `docs/comparison.md` for
@@ -100,7 +100,9 @@ socket, one JSON object per line (ndjson), on every meaningful change. The
 bridge holds the latest snapshot and exposes it, plus input back into the
 app, as MCP tools. Agent input reaches the app's event loop like any other
 input source, and the app acknowledges each input by id, so the bridge can
-tell an input the app acted on from one it never saw.
+tell an input the app acted on from one it never saw. The bridge connects on
+its first tool call and lets the app go after 60 s with no tool calls by
+default, so an idle agent session does not keep the app from another.
 
 ```text
 +---------------+   Unix socket  +-----------+  MCP over stdio  +---------------+
@@ -138,8 +140,10 @@ before acknowledging it.
 The bridge takes exactly one of `--socket <path>` or `--app <label>`. With
 `--app`, it resolves the socket path the same way the app-side adapter does
 when binding. `--tree-format outline` serves the tree as an indented outline
-instead of JSON. The flags, the environment variables, the resolution order,
-the rule on labels and the outline's grammar: [docs/cli.md](docs/cli.md).
+instead of JSON. `--idle-release <SECS>` sets how long the bridge waits with
+no tool calls before it lets the app go: 60 by default, `0` for never. The
+flags, the environment variables, the resolution order, the rule on labels
+and the outline's grammar: [docs/cli.md](docs/cli.md).
 
 ## Workspace layout
 
@@ -164,8 +168,8 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-python3 scripts/e2e.py           # end-to-end: 23 steps, demo app + bridge + MCP
-python3 scripts/adversarial.py   # 22 edge-case probes
+python3 scripts/e2e.py           # end-to-end: 26 steps, demo app + bridge + MCP
+python3 scripts/adversarial.py   # 23 edge-case probes
 ```
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers the rest: the setup, the CI gate,
@@ -180,7 +184,8 @@ three that decide whether taria fits at all:
 - **Unix only for now**: the adapter is built on unix-only APIs, and Linux is
   the tested platform. [Limitations](docs/compatibility.md#limitations).
 - **One bridge client per app at a time**: the adapter serves one, so two
-  agents cannot drive the same app at once.
+  agents cannot drive the same app at once. They can take turns: an idle
+  bridge lets the app go after 60 s by default.
   [Limitations](docs/compatibility.md#limitations).
 - **The wire format is frozen at `PROTOCOL_VERSION` 1**: changes within
   version 1 are additive, so a version difference costs a degraded field
