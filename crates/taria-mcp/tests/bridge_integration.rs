@@ -614,6 +614,10 @@ async fn read_tree_ignores_an_unknown_future_message_type() {
 /// path correct?" an app that was never started gets. Both answers were yes,
 /// and the real cause was another session's `taria-mcp` still holding the app.
 /// The bridge knows its own connect succeeded, which is the whole difference.
+///
+/// Since 0.3.2 the answer says the app is held by another bridge and that a
+/// taria-mcp lets go of it after a quiet minute, so the way out is a retry,
+/// not a hunt for the other process.
 #[tokio::test]
 async fn read_tree_names_a_connection_the_app_never_accepted() {
     let (_dir, path) = test_socket_path("never-accepted");
@@ -632,7 +636,7 @@ async fn read_tree_names_a_connection_the_app_never_accepted() {
                 .read_tree()
                 .await
                 .expect_err("nothing will ever publish a tree here");
-            if err.message.contains("the socket path is not what is wrong") {
+            if err.message.contains("held by another bridge") {
                 return err;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -642,14 +646,17 @@ async fn read_tree_names_a_connection_the_app_never_accepted() {
     .expect("a connection nobody accepts should be diagnosed, not waited on forever");
 
     assert!(
-        err.message.contains("serves one bridge at a time")
-            && err.message.contains("another taria-mcp process"),
+        err.message
+            .starts_with("no snapshot from the app yet: the app is held by another bridge. ")
+            && err.message.contains("serves one bridge at a time")
+            && err.message.contains("lets go of the app after 60 s"),
         "the answer has to name the cause and what to do about it: {}",
         err.message
     );
     assert!(
-        !err.message.contains("is the socket path correct"),
-        "the bridge is connected to that path: {}",
+        !err.message.contains("is the socket path correct")
+            && !err.message.contains("may have exited"),
+        "the bridge is connected to that path, and the app is running: {}",
         err.message
     );
 
@@ -663,7 +670,7 @@ async fn read_tree_names_a_connection_the_app_never_accepted() {
         .await
         .expect_err("there is no app to send a key to");
     assert!(
-        err.message.contains("another taria-mcp process"),
+        err.message.contains("held by another bridge"),
         "an input tool must diagnose this as read_tree does: {}",
         err.message
     );
@@ -2325,4 +2332,545 @@ async fn a_line_that_does_not_parse_is_never_relayed() {
         text.contains("good-tree") && text.contains(r#""seq":1"#),
         "a malformed line must leave the last good tree standing: {text}"
     );
+}
+
+// On-demand bridges: what the `taria-mcp` binary runs since 0.3.2. They
+// connect on the first tool call and let go of the app once no call has run
+// for their idle window, so an idle session no longer locks every other one
+// out of an app that serves one bridge at a time (issue #13).
+
+/// An idle window the on-demand tests can wait out: long enough that a test's
+/// own calls run inside it.
+const SHORT_IDLE: Duration = Duration::from_millis(300);
+
+fn on_demand(path: PathBuf, idle_release: Duration) -> TariaMcpServer {
+    TariaMcpServer::on_demand(path, TreeFormat::Json, idle_release)
+}
+
+/// An app that serves one bridge at a time, the way the adapter does, for as
+/// many bridges as connect. Each gets `hello` (declaring `protocol_version`)
+/// and a snapshot numbered by its turn and marked `gen-N`, and is held until
+/// the bridge closes it. The first receiver gets each turn as its connection
+/// closes; the second gets every input that reached the app, which acks it
+/// `Delivered`.
+fn serve_generations(
+    listener: UnixListener,
+    protocol_version: u32,
+) -> (
+    mpsc::UnboundedReceiver<u64>,
+    mpsc::UnboundedReceiver<AgentInput>,
+) {
+    let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut turn = 0;
+        while let Ok((stream, _addr)) = listener.accept().await {
+            turn += 1;
+            let mut app = FakeApp::from_stream(stream);
+            app.send(&AppToBridge::hello("fake-app", protocol_version))
+                .await;
+            app.send(&AppToBridge::Snapshot(Snapshot::new(
+                turn,
+                demo_root(&format!("gen-{turn}")),
+            )))
+            .await;
+            while let Ok(Some(line)) = app.lines.next_line().await {
+                if let Ok(BridgeToApp::Input { id, input, .. }) = serde_json::from_str(&line) {
+                    app.ack(id, InputStatus::Delivered).await;
+                    let _ = input_tx.send(input);
+                }
+            }
+            if closed_tx.send(turn).is_err() {
+                return;
+            }
+        }
+    });
+    (closed_rx, input_rx)
+}
+
+/// Wait for [`serve_generations`] to see a bridge close its connection, and
+/// return that connection's turn.
+async fn wait_released(closed: &mut mpsc::UnboundedReceiver<u64>) -> u64 {
+    timeout(WAIT, closed.recv())
+        .await
+        .expect("the bridge should let go of the app")
+        .expect("the fake app is still serving")
+}
+
+/// A harness starts every configured MCP server with its session, and lists
+/// its tools, long before an agent calls one. None of that may connect: an
+/// app serves one bridge at a time, and a bridge that connected at startup
+/// held it for a session that might never use it. The first call connects,
+/// and still answers with the tree, in that one call.
+#[tokio::test]
+async fn on_demand_connects_on_the_first_tool_call_and_not_before() {
+    use rmcp::ServerHandler;
+
+    let (_dir, path) = test_socket_path("lazy");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path, Duration::from_secs(30));
+
+    // What a harness reads before its first tool call.
+    assert!(server.get_info().instructions.is_some());
+    assert!(server.get_tool("read_tree").is_some());
+    // An eager bridge connects within milliseconds, and a connection made at
+    // any point here would be waiting in the backlog for this accept.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let early = timeout(Duration::from_millis(300), listener.accept()).await;
+    assert!(
+        early.is_err(),
+        "the bridge connected before any tool call: {early:?}"
+    );
+
+    let app = tokio::spawn(async move {
+        let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("first-call"))).await;
+        (listener, app)
+    });
+    let result = server
+        .read_tree()
+        .await
+        .expect("the first call waits for the app and answers with its tree");
+    assert!(
+        result_text(&result).contains("first-call"),
+        "{}",
+        result_text(&result)
+    );
+    drop(app.await.expect("fake app task"));
+}
+
+/// Issue #13 end to end. Two sessions share one app, which serves one bridge
+/// at a time. The first holds it; the second's first call lands in the listen
+/// backlog and says the app is held, and how it gets free. The first then
+/// goes quiet, lets go after its window with no call from anyone, and the
+/// second is accepted from the backlog, with no restart.
+#[tokio::test]
+async fn an_idle_bridge_hands_the_app_to_the_bridge_waiting_behind_it() {
+    let (_dir, path) = test_socket_path("hand-over");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let holder = on_demand(path.clone(), Duration::from_millis(1_500));
+    let waiting = on_demand(path, Duration::from_secs(30));
+
+    let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+    let app = tokio::spawn(async move {
+        let mut first = FakeApp::accept(&listener, Snapshot::new(1, demo_root("holder"))).await;
+        first.wait_closed().await;
+        let _ = released_tx.send(Instant::now());
+        let second = FakeApp::accept(&listener, Snapshot::new(1, demo_root("waiting"))).await;
+        (listener, second)
+    });
+
+    let tree = holder.read_tree().await.expect("the holder gets the app");
+    assert!(result_text(&tree).contains("holder"), "{tree:?}");
+    let holder_done = Instant::now();
+
+    let err = waiting
+        .read_tree()
+        .await
+        .expect_err("the app is serving the holder");
+    assert!(
+        err.message
+            .starts_with("no snapshot from the app yet: the app is held by another bridge. ")
+            && err.message.contains("lets go of the app after 60 s")
+            && !err.message.contains("may have exited"),
+        "{}",
+        err.message
+    );
+
+    let released_at = timeout(WAIT, released_rx)
+        .await
+        .expect("the holder should let go after its window")
+        .expect("the fake app task");
+    let quiet = released_at.duration_since(holder_done);
+    assert!(
+        quiet >= Duration::from_millis(1_400),
+        "the holder let go {quiet:?} after its last call, inside its 1.5 s window"
+    );
+
+    // Accepted from the backlog now; the tree follows the accept by a moment.
+    let tree = timeout(WAIT, async {
+        loop {
+            if let Ok(result) = waiting.read_tree().await {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the waiting bridge should be handed the app");
+    assert!(result_text(&tree).contains("waiting"), "{tree:?}");
+    drop(app.await.expect("fake app task"));
+}
+
+/// A bridge that let go reconnects on the next call, and that call answers
+/// with the tree the app serves now, in one call.
+#[tokio::test]
+async fn a_call_after_a_release_reconnects_and_gets_a_fresh_tree() {
+    let (_dir, path) = test_socket_path("after-release");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path, SHORT_IDLE);
+    let (mut closed, _inputs) = serve_generations(listener, PROTOCOL_VERSION);
+
+    let tree = server.read_tree().await.expect("the first connection");
+    assert!(result_text(&tree).contains("gen-1"), "{tree:?}");
+    assert_eq!(wait_released(&mut closed).await, 1);
+
+    let tree = server
+        .read_tree()
+        .await
+        .expect("the call after the release reconnects");
+    assert!(result_text(&tree).contains("gen-2"), "{tree:?}");
+}
+
+/// A call cancelled partway (a harness that gave up on it) still ends, as far
+/// as the idle window is concerned. Counted in and never out, it would keep
+/// the bridge holding the app for the rest of the session.
+#[tokio::test]
+async fn a_cancelled_call_still_starts_the_idle_window() {
+    let (_dir, path) = test_socket_path("cancelled");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path, SHORT_IDLE);
+    // Accepted and silent, so the call waits on it until it is cancelled.
+    let app = tokio::spawn(async move {
+        let (stream, _addr) = timeout(WAIT, listener.accept())
+            .await
+            .expect("bridge should connect")
+            .expect("accept");
+        let mut app = FakeApp::from_stream(stream);
+        app.wait_closed().await;
+        listener
+    });
+
+    let cut = timeout(Duration::from_millis(100), server.read_tree()).await;
+    assert!(cut.is_err(), "the call should still be waiting: {cut:?}");
+    // `wait_closed` fails the task if the bridge never lets go.
+    drop(
+        app.await
+            .expect("the bridge should let go after the window"),
+    );
+}
+
+/// Letting go ends the connection, and an adapter discards whatever that
+/// connection queued that it had not dequeued yet. So a bridge holds the app
+/// past its window while an input it wrote awaits its ack, and lets go as
+/// soon as the ack arrives.
+#[tokio::test]
+async fn an_input_awaiting_its_ack_holds_the_app_past_the_idle_window() {
+    let (_dir, path) = test_socket_path("slow-ack");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path, SHORT_IDLE);
+    let app = tokio::spawn(async move {
+        let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("slow-ack")))
+            .await
+            .never_acking();
+        let (id, input) = app.recv_input().await;
+        // Well past the window: the call ends half a second after the send,
+        // and its window 300 ms after that. Failing here means the bridge let
+        // go with the input unacknowledged.
+        app.expect_no_input(Duration::from_millis(1_500)).await;
+        app.ack(id, InputStatus::Delivered).await;
+        let acked = Instant::now();
+        app.wait_closed().await;
+        (listener, input, acked.elapsed())
+    });
+
+    let result = server
+        .key(Parameters(KeyParams {
+            key: "x".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect("an unanswered input is not a failed call");
+    assert!(
+        result_text(&result).contains("neither acknowledged"),
+        "{}",
+        result_text(&result)
+    );
+
+    let (_listener, input, closed_after_ack) = app.await.expect("fake app task");
+    assert_eq!(input, AgentInput::key("x"));
+    assert!(
+        closed_after_ack < Duration::from_secs(1),
+        "the window had closed, so the ack should free the app at once, not after \
+         {closed_after_ack:?}"
+    );
+}
+
+/// The first call to an app that another bridge holds answers in that call,
+/// and says so: it does not take a second call to diagnose a silence the
+/// first one waited through. The input tools say the same.
+#[tokio::test]
+async fn the_first_call_to_a_held_app_says_it_is_held() {
+    let (_dir, path) = test_socket_path("held-first-call");
+    // Listening and never accepting: the app serving another bridge.
+    let _listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path, Duration::from_secs(30));
+
+    let read_err = server.read_tree().await.expect_err("the app is held");
+    let key_err = server
+        .key(Parameters(KeyParams {
+            key: "q".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect_err("the app is held");
+    for err in [&read_err, &key_err] {
+        assert!(
+            err.message
+                .starts_with("no snapshot from the app yet: the app is held by another bridge. ")
+                && err.message.contains("The socket path is right")
+                && err.message.contains("lets go of the app after 60 s")
+                && !err.message.contains("may have exited"),
+            "{}",
+            err.message
+        );
+    }
+}
+
+/// The restart race: the app restarts, two bridges reconnect, and the other
+/// one wins. This one waits in the new instance's backlog holding the
+/// `Disconnected` record of the instance it served, and "it may have exited"
+/// was its answer, about an app that was up and serving the winner.
+#[tokio::test]
+async fn the_bridge_that_loses_a_restart_race_says_the_app_is_held() {
+    let (_dir, path) = test_socket_path("restart-race");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let mut handle = bridge::spawn(path.clone());
+    let server = TariaMcpServer::new(handle.clone());
+    let app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("before-restart"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 3).await;
+
+    // The restarted instance binds the path and serves another bridge, so it
+    // never accepts this one.
+    drop(listener);
+    std::fs::remove_file(&path).expect("remove old socket file");
+    let _restarted = UnixListener::bind(&path).expect("rebind fake app socket");
+    drop(app);
+    wait_for_disconnect(&mut handle.state_rx).await;
+
+    let err = timeout(WAIT, async {
+        loop {
+            let err = server.read_tree().await.expect_err("the app is held");
+            if err.message.contains("held by another bridge") {
+                return err;
+            }
+            // Until the silence outlasts the grace, the departure answer
+            // stands, unchanged.
+            assert!(
+                err.message.starts_with(
+                    "app 'fake-app' disconnected (last snapshot seq 3); it may have exited."
+                ),
+                "{}",
+                err.message
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a reconnect nobody accepts should be diagnosed");
+    assert!(
+        err.message.starts_with(
+            "app 'fake-app' disconnected (last snapshot seq 3), and the app is now held by \
+             another bridge. The socket path is right"
+        ) && err.message.contains("lets go of the app after 60 s")
+            && !err.message.contains("may have exited"),
+        "{}",
+        err.message
+    );
+    let act_err = server
+        .act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+        .await
+        .expect_err("the app is held");
+    assert!(
+        act_err.message.contains("held by another bridge"),
+        "{}",
+        act_err.message
+    );
+}
+
+/// A release is demoted like a disconnect, so when the app has really gone by
+/// the next call, that call says so in the words every departure gets, byte
+/// for byte, and at once: the connect that finds nothing listening answers it.
+#[tokio::test]
+async fn after_a_release_an_app_that_has_gone_is_reported_as_before() {
+    let (_dir, path) = test_socket_path("gone-after-release");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path.clone(), SHORT_IDLE);
+    let app = tokio::spawn(async move {
+        let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("leaving"))).await;
+        app.wait_closed().await;
+        listener
+    });
+    server.read_tree().await.expect("the app is there");
+    let listener = app
+        .await
+        .expect("the bridge should let go after the window");
+
+    // The app exits while the bridge is let go.
+    drop(listener);
+    std::fs::remove_file(&path).expect("remove the app's socket file");
+
+    let err = server.read_tree().await.expect_err("the app is gone");
+    assert_eq!(
+        err.message,
+        "app 'fake-app' disconnected (last snapshot seq 1); it may have exited. The bridge \
+         reconnects automatically; retry once the app is back."
+    );
+}
+
+/// A tree over the line limit is a reason that outlives the connection it
+/// arrived on, because the app resends it to every bridge. Letting go is not
+/// evidence of anything about the app, so the reason survives it exactly as it
+/// survives a reconnect. Here the app greets the call after the release and
+/// publishes nothing, so the reason is the only thing that can name the size.
+#[tokio::test]
+async fn the_oversized_reason_survives_a_release() {
+    let (_dir, path) = test_socket_path("oversized-release");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path, Duration::from_secs(1));
+    let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+    let app = tokio::spawn(async move {
+        let accept = || async {
+            let (stream, _addr) = timeout(WAIT, listener.accept())
+                .await
+                .expect("bridge should connect")
+                .expect("accept");
+            FakeApp::from_stream(stream)
+        };
+        // The first call's connection: a tree over the limit.
+        let mut first = accept().await;
+        first
+            .send(&AppToBridge::hello("big-app", PROTOCOL_VERSION))
+            .await;
+        first.send_oversized(1).await;
+        // The reconnect after it, held silent until the bridge lets go.
+        let mut second = accept().await;
+        second.wait_closed().await;
+        let _ = released_tx.send(());
+        // The next call's connection: a greeting and no tree.
+        let mut third = accept().await;
+        third
+            .send(&AppToBridge::hello("big-app", PROTOCOL_VERSION))
+            .await;
+        (first, third)
+    });
+
+    let err = server.read_tree().await.expect_err("no tree fits");
+    assert!(err.message.contains(OVER_THE_LIMIT), "{}", err.message);
+    timeout(WAIT, released_rx)
+        .await
+        .expect("the bridge should let go after the window")
+        .expect("the fake app task");
+
+    let err = server.read_tree().await.expect_err("still no tree");
+    assert!(
+        err.message.starts_with("no snapshot from the app yet")
+            && err.message.contains(OVER_THE_LIMIT)
+            && err.message.contains("The socket path is right"),
+        "the release must not forget the size: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("completed the taria handshake"),
+        "{}",
+        err.message
+    );
+    drop(app.await.expect("fake app task"));
+}
+
+/// A peer on another protocol version cannot parse this bridge's inputs. The
+/// version is learned from each connection's `hello` and forgotten when the
+/// connection ends, a release included, so the first call after a release has
+/// to wait for the new `hello` before it decides, or it sends to a peer that
+/// cannot read it.
+#[tokio::test]
+async fn a_protocol_mismatch_still_refuses_input_on_the_first_call_after_a_release() {
+    let (_dir, path) = test_socket_path("mismatch-release");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path, SHORT_IDLE);
+    let other = PROTOCOL_VERSION + 1;
+    let (mut closed, mut inputs) = serve_generations(listener, other);
+    let act = || {
+        server.act(Parameters(ActParams {
+            node: "btn".to_string(),
+            action: "activate".to_string(),
+            value: None,
+        }))
+    };
+
+    server.read_tree().await.expect("snapshots parse across it");
+    let err = act().await.expect_err("a peer that cannot read input");
+    assert!(err.message.contains(&format!("protocol version {other}")));
+    assert_eq!(wait_released(&mut closed).await, 1);
+
+    let err = act()
+        .await
+        .expect_err("the first call after a release refuses too");
+    assert!(
+        err.message.contains(&format!("protocol version {other}"))
+            && err
+                .message
+                .contains(&format!("bridge speaks {PROTOCOL_VERSION}")),
+        "{}",
+        err.message
+    );
+    assert!(
+        inputs.try_recv().is_err(),
+        "nothing may reach a peer that cannot parse it"
+    );
+}
+
+/// `--idle-release 0`: once connected, the bridge keeps the app for the rest
+/// of the session, the way every bridge before 0.3.2 did. The connection
+/// stays open for five idle windows of the other tests.
+#[tokio::test]
+async fn a_zero_idle_window_never_lets_go() {
+    let (_dir, path) = test_socket_path("never-release");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path, Duration::ZERO);
+    let app = tokio::spawn(async move {
+        let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("kept"))).await;
+        (listener, app)
+    });
+    server.read_tree().await.expect("the first call connects");
+    let (_listener, mut app) = app.await.expect("fake app task");
+
+    app.expect_no_input(SHORT_IDLE * 5).await;
+    let tree = server.read_tree().await.expect("still connected");
+    assert!(result_text(&tree).contains("kept"), "{tree:?}");
+}
+
+/// A bridge that found no app keeps retrying while its window is open, with a
+/// backoff that grows to two seconds. A call that comes meanwhile does not sit
+/// out the rest of the pause: it reconnects at once, so an app that came up
+/// in between answers that call.
+#[tokio::test]
+async fn a_call_cuts_the_reconnect_backoff_short() {
+    let (_dir, path) = test_socket_path("backoff-cut");
+    let server = on_demand(path.clone(), Duration::from_secs(30));
+
+    let err = server.read_tree().await.expect_err("nothing is listening");
+    assert!(
+        err.message.contains("holds no connection to the socket"),
+        "{}",
+        err.message
+    );
+    // Retries at 250 ms and 750 ms, then a pause until 1750 ms. A call at
+    // 900 ms that waited the pause out would find nothing within its wait.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let app = tokio::spawn(async move {
+        let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("came-up"))).await;
+        (listener, app)
+    });
+
+    let tree = server
+        .read_tree()
+        .await
+        .expect("the call reconnects at once and finds the app");
+    assert!(result_text(&tree).contains("came-up"), "{tree:?}");
+    drop(app.await.expect("fake app task"));
 }

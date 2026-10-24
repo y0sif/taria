@@ -1,6 +1,13 @@
 //! MCP bridge for taria: connects agent harnesses to a running
 //! taria-enabled TUI app.
 //!
+//! The binary connects to the app on demand: on the first tool call, not at
+//! startup, and it lets go of the app again once no tool call has run for an
+//! idle window (`--idle-release`, 60 s by default). A taria adapter serves one
+//! bridge at a time, so letting go is what lets several agent sessions share
+//! one app; see [`server::TariaMcpServer::on_demand`]. [`bridge::spawn`], for a
+//! caller wiring its own server, still connects at once and holds the app.
+//!
 //! The binary speaks MCP over stdio to the harness and the taria ndjson
 //! protocol over a Unix domain socket to the app. It exposes four tools:
 //! `read_tree` (latest semantic snapshot), `act` (invoke an advertised

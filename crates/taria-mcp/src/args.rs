@@ -8,8 +8,18 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::tree_format::TreeFormat;
+
+/// How long the bridge keeps the app with no tool calls before it lets go,
+/// when `--idle-release` does not say: 60 seconds.
+///
+/// Long enough that an agent working through a task never pays a reconnect
+/// between its calls, and short enough that a session that has gone quiet
+/// hands the app to the next one within a minute. The answer a held bridge
+/// gives names this number, as the default every other taria-mcp runs with.
+pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(60);
 
 /// Help text printed for `--help` and appended to argument errors.
 pub const HELP: &str = "\
@@ -39,6 +49,8 @@ Options:
                               snapshot as one indented line per node, in
                               fewer characters. It names each action as act
                               takes it, without other keys in its object.
+  --idle-release <SECS>       Let go of the app after SECS seconds with no
+                              tool call (default 60, 0 never lets go).
 
 Environment:
   TARIA_LOG    Log filter (tracing env-filter syntax), default `info`.
@@ -59,6 +71,11 @@ pub enum Cli {
         socket: PathBuf,
         /// How the tree is shown to the agent (`--tree-format`).
         tree_format: TreeFormat,
+        /// How long the bridge keeps the app with no tool calls before it
+        /// lets go (`--idle-release`, whole seconds). [`Duration::ZERO`]
+        /// never lets go. See
+        /// [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand).
+        idle_release: Duration,
     },
     /// `--help` was requested.
     Help,
@@ -71,6 +88,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut socket: Option<String> = None;
     let mut app: Option<String> = None;
     let mut tree_format = TreeFormat::default();
+    let mut idle_release = DEFAULT_IDLE_RELEASE;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -98,6 +116,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                     )
                 })?;
             }
+            "--idle-release" => {
+                let secs = iter.next().ok_or_else(|| {
+                    "--idle-release requires a number of seconds (0 never lets go)".to_string()
+                })?;
+                idle_release = secs.parse::<u64>().map(Duration::from_secs).map_err(|_| {
+                    format!("--idle-release takes whole seconds (0 never lets go), not `{secs}`")
+                })?;
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -120,6 +146,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     Ok(Cli::Run {
         socket,
         tree_format,
+        idle_release,
     })
 }
 
@@ -165,6 +192,7 @@ mod tests {
             Cli::Run {
                 socket: PathBuf::from("/run/user/1000/taria/demo.sock"),
                 tree_format: TreeFormat::Json,
+                idle_release: DEFAULT_IDLE_RELEASE,
             }
         );
     }
@@ -280,6 +308,52 @@ mod tests {
     #[test]
     fn help_names_the_tree_format_flag() {
         assert!(HELP.contains("--tree-format <json|outline>"), "{HELP}");
+    }
+
+    #[test]
+    fn help_names_the_idle_release_flag() {
+        assert!(HELP.contains("--idle-release <SECS>"), "{HELP}");
+        assert!(
+            HELP.contains("default 60") && HELP.contains("0 never lets go"),
+            "the help must say the default and what 0 means: {HELP}"
+        );
+    }
+
+    /// The default is the minute a held bridge's answer promises, `0` is the
+    /// one value that never lets go, and the flag works on either side of the
+    /// socket selector.
+    #[test]
+    fn idle_release_defaults_to_a_minute_and_takes_whole_seconds() {
+        let idle = |args: &[&str]| match parse_strs(args) {
+            Ok(Cli::Run { idle_release, .. }) => idle_release,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        assert_eq!(DEFAULT_IDLE_RELEASE, Duration::from_secs(60));
+        assert_eq!(idle(&["--socket", "/x.sock"]), DEFAULT_IDLE_RELEASE);
+        assert_eq!(
+            idle(&["--socket", "/x.sock", "--idle-release", "0"]),
+            Duration::ZERO
+        );
+        assert_eq!(
+            idle(&["--idle-release", "300", "--app", "demo"]),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn idle_release_without_whole_seconds_is_an_error() {
+        let err = parse_strs(&["--socket", "/x.sock", "--idle-release"]).unwrap_err();
+        assert!(
+            err.contains("--idle-release") && err.contains("seconds"),
+            "a missing value names the flag and its unit: {err}"
+        );
+        for value in ["", "-1", "1.5", "60s", "abc", "99999999999999999999999"] {
+            let err = parse_strs(&["--socket", "/x.sock", "--idle-release", value]).unwrap_err();
+            assert!(
+                err.contains("--idle-release") && err.contains(&format!("`{value}`")),
+                "a bad value names the flag and itself: {err}"
+            );
+        }
     }
 
     /// A path the kernel would refuse must be caught while the user is still

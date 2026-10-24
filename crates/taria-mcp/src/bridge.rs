@@ -1,6 +1,13 @@
 //! Socket manager: owns the connection to the app's taria Unix socket.
 //!
-//! A single background task connects (retrying forever with capped backoff),
+//! A single background task connects, retrying with capped backoff for as long
+//! as it wants the app. [`spawn`] wants it from the start and for good: it
+//! connects at once and holds the app until the session ends. The `taria-mcp`
+//! binary starts the manager on demand instead (through
+//! [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand)):
+//! it opens no connection until the first tool call, and once no tool call has
+//! run for its idle window it lets go of the app, closing its connection and
+//! reconnecting only when the next call comes. Either way the task
 //! reads `AppToBridge` ndjson lines into a [`watch`] channel holding the
 //! latest [`BridgeState`], and writes queued [`AgentInput`]s out as
 //! `BridgeToApp::Input` lines. A snapshot is stored as an [`AppSnapshot`],
@@ -32,10 +39,16 @@
 //! succeeds into the listen backlog and is not accepted until the first bridge
 //! leaves, which is precisely the second case and the one a new adopter meets
 //! first. (Once it is accepted, the reference adapter throws away whatever it
-//! wrote while it waited, unread and unacked.)
+//! wrote while it waited, unread and unacked.) A bridge started on demand is
+//! the first bridge leaving: a session that has gone quiet lets go of the app
+//! after its idle window, and the bridge waiting behind it is accepted then.
+//! Before 0.3.2 every bridge held the app for its whole session, so an idle
+//! session locked out the one that wanted it.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -46,7 +59,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::OwnedReadHalf;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::server::MAX_KEY_REPEAT;
+use crate::server::{MAX_KEY_REPEAT, SILENT_LINK_GRACE};
 
 /// First reconnect delay after a failed connect attempt.
 const RETRY_MIN: Duration = Duration::from_millis(250);
@@ -70,6 +83,40 @@ const INPUT_QUEUE: usize = 32;
 /// a slow read that catches up: the broadcast channel drops the oldest acks,
 /// and the oldest are exactly the `Dropped` answers a burst is watching for.
 const ACK_QUEUE: usize = 8 * MAX_KEY_REPEAT as usize;
+
+/// Longest a tool call waits for an on-demand bridge to reach the app before
+/// it answers from whatever the bridge then knows.
+///
+/// The call that wakes an idle bridge would otherwise always find no tree,
+/// since the connect it caused has not happened yet. A taria adapter accepts
+/// within 50 ms and writes its `hello` and its latest snapshot the moment it
+/// does, so the wait normally ends in milliseconds, on the tree. It runs this
+/// long only when the connection stays silent, and is set just past
+/// [`SILENT_LINK_GRACE`], the age at which silence is diagnosed as the app
+/// being held by another bridge, so that answer is the one the call gives.
+const FIRST_CALL_WAIT: Duration = Duration::from_millis(600);
+
+/// How long past the idle window an input still waiting for its ack keeps an
+/// on-demand bridge holding the app.
+///
+/// Letting go while the app has not dequeued an input costs the input: a
+/// taria adapter discards (and counts as `stale_inputs`) whatever is queued
+/// from a connection once that connection ends. So the release waits for the
+/// ack of every input this connection wrote. Not forever, because an app may
+/// never ack at all (an adapter older than the ack contract never does), and
+/// a bridge that holds the app for good is the bug the release exists to fix.
+/// Thirty seconds is far past any ack a live app sends, and it is counted from
+/// the end of the window, so from at least the idle window plus this after the
+/// input was sent: every input is sent while a tool call is in flight.
+const UNACKED_HOLD: Duration = Duration::from_secs(30);
+
+/// Most unacked input ids one connection remembers.
+///
+/// Only whether any is outstanding matters, so the oldest is forgotten past
+/// this many, which keeps the set bounded for an app that never acks. Ids
+/// count up, so the smallest is the oldest. Far above anything a live app has
+/// in flight at once: the bridge's own queue to it holds [`INPUT_QUEUE`].
+const MAX_UNACKED: usize = 1024;
 
 /// The reason [`BridgeHandle::rejected_rx`] holds for a line that ran past
 /// [`MAX_LINE_BYTES`].
@@ -184,7 +231,8 @@ pub enum BridgeState {
 /// [`BridgeState`] answers "has an app published a tree" and cannot answer
 /// "did this bridge reach the socket at all". Both a `connect` that keeps
 /// failing and a connection the app has not accepted (a second bridge's, until
-/// the first one leaves) leave the state at [`BridgeState::Never`], and the two
+/// the first one leaves or lets go after its idle window) leave the state at
+/// [`BridgeState::Never`], and the two
 /// call for opposite next steps: check the path, or leave the path alone
 /// because the bridge is connected to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,7 +353,45 @@ impl BridgeHandle {
 }
 
 /// Spawn the socket-manager task for `socket_path` on the current runtime.
+///
+/// The manager connects at once and holds the app for as long as the returned
+/// handle (or a clone of its `input_tx`) lives, reconnecting whenever the
+/// connection ends. That is every bridge before 0.3.2, and what a library
+/// caller driving its own [`TariaMcpServer`](crate::server::TariaMcpServer)
+/// keeps getting. The `taria-mcp` binary connects on demand instead, through
+/// [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand),
+/// so that a session with no tool calls in flight does not keep every other
+/// session away from the app.
 pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
+    spawn_manager(socket_path, None)
+}
+
+/// Spawn a socket manager that connects only while tool calls want the app.
+///
+/// It opens no connection until the first [`Demand::begin`], and lets go of
+/// the app once no call has run for `idle_release`: it closes its connection
+/// (an accepted one, or one still waiting in the listen backlog, which leaves
+/// the backlog with it) and makes no further connect attempt until the next
+/// call. [`Duration::ZERO`] never lets go once connected. The handle is the
+/// same as [`spawn`]'s; the [`Demand`] is how the tool layer reports its
+/// calls.
+pub(crate) fn spawn_on_demand(
+    socket_path: PathBuf,
+    idle_release: Duration,
+) -> (BridgeHandle, Demand) {
+    let (activity_tx, activity_rx) = watch::channel(Activity::default());
+    let activity = Arc::new(activity_tx);
+    let idle = Idle {
+        activity: Arc::clone(&activity),
+        rx: activity_rx,
+        release_after: idle_release,
+        calls_answered: 0,
+    };
+    (spawn_manager(socket_path, Some(idle)), Demand { activity })
+}
+
+/// The channels both kinds of manager share, and the task serving them.
+fn spawn_manager(socket_path: PathBuf, idle: Option<Idle>) -> BridgeHandle {
     let (state_tx, state_rx) = watch::channel(BridgeState::Never);
     let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
     let (ack_tx, _) = broadcast::channel(ACK_QUEUE);
@@ -320,6 +406,7 @@ pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
         protocol_tx,
         rejected_tx,
         link_tx,
+        idle,
     ));
     BridgeHandle {
         state_rx,
@@ -331,6 +418,315 @@ pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
     }
 }
 
+/// What the tool calls and an on-demand manager share.
+///
+/// Kept in one [`watch`] channel because its lock is what makes the release
+/// safe: a call counts itself in, and the manager decides to let go, each
+/// under that one lock, so either the manager sees the call and stays, or the
+/// call sees the manager gone ([`awake`](Self::awake) false) and waits for it
+/// to come back with a fresh connection. A call can never send input to a
+/// connection the manager has already decided to close. The change
+/// notification is what wakes each side for the other.
+#[derive(Debug, Default)]
+struct Activity {
+    /// Tool calls running now.
+    in_flight: usize,
+    /// When the last tool call ended, if any has. The idle window runs from
+    /// here.
+    last_end: Option<Instant>,
+    /// Whether the manager wants the app: connecting, connected, or between
+    /// attempts. False before the first call and after every release.
+    ///
+    /// Set true by the manager only once it has finished cleaning up after
+    /// the last release, so a call that finds it true can trust the bridge's
+    /// other channels to describe the current connection, not the one that
+    /// was let go.
+    awake: bool,
+    /// Tool calls begun since the start. A manager between reconnect
+    /// attempts watches it to cut its backoff short.
+    calls: u64,
+    /// Connect attempts that failed, and connections that ended, since the
+    /// start: the events that answer a waiting call when no tree does.
+    outcomes: u64,
+}
+
+/// Whether `activity` is inside the idle window: a call in flight, or less
+/// than `release_after` since the last one ended. [`Duration::ZERO`] keeps the
+/// window open for good once a call has run.
+fn window_open(activity: &Activity, release_after: Duration) -> bool {
+    activity.in_flight > 0
+        || activity
+            .last_end
+            .is_some_and(|end| release_after.is_zero() || end.elapsed() < release_after)
+}
+
+/// When a manager with the idle window `release_after` may let go: the end of
+/// the window, or [`UNACKED_HOLD`] past it while an input still awaits its
+/// ack. `None` while a call is in flight, and for good with a zero window (or
+/// one too long to reach).
+fn release_at(activity: &Activity, release_after: Duration, unacked: bool) -> Option<Instant> {
+    if release_after.is_zero() || activity.in_flight > 0 {
+        return None;
+    }
+    let window_end = activity.last_end?.checked_add(release_after)?;
+    if unacked {
+        window_end.checked_add(UNACKED_HOLD)
+    } else {
+        Some(window_end)
+    }
+}
+
+/// The tool layer's handle on an on-demand manager.
+#[derive(Clone)]
+pub(crate) struct Demand {
+    activity: Arc<watch::Sender<Activity>>,
+}
+
+impl Demand {
+    /// Count one tool call in, waking the manager if it is idle.
+    ///
+    /// The call stays counted until the returned [`Call`] drops, which is
+    /// also what happens to a call that is cancelled, so a cancelled call
+    /// still starts the idle window.
+    pub(crate) fn begin(&self) -> Call {
+        let mut outcomes = 0;
+        self.activity.send_modify(|activity| {
+            activity.in_flight += 1;
+            activity.calls += 1;
+            outcomes = activity.outcomes;
+        });
+        Call {
+            activity: Arc::clone(&self.activity),
+            outcomes,
+        }
+    }
+}
+
+/// One tool call, counted in the activity window until it drops.
+///
+/// Holds no borrow, only a share of the channel, so dropping it anywhere is
+/// sound, cancellation included.
+pub(crate) struct Call {
+    activity: Arc<watch::Sender<Activity>>,
+    /// [`Activity::outcomes`] when this call began: a higher count is an
+    /// attempt that settled after it.
+    outcomes: u64,
+}
+
+impl Call {
+    /// Wait, for at most [`FIRST_CALL_WAIT`], until the bridge has an answer
+    /// for this call: a snapshot, a connect that failed, a connection that
+    /// ended, or a connection silent for [`SILENT_LINK_GRACE`] (the app held
+    /// by another bridge, or greeting and publishing nothing).
+    ///
+    /// Returns at once while a tree is being served, so only the call that
+    /// wakes an idle bridge, or finds it between attempts, waits at all. The
+    /// bridge's other channels are read only once the manager is awake, since
+    /// until then they describe the connection it let go of, and the snapshot
+    /// left from that one is not an answer.
+    pub(crate) async fn settle(&self, bridge: &BridgeHandle) {
+        let deadline = tokio::time::Instant::now() + FIRST_CALL_WAIT;
+        let mut activity = self.activity.subscribe();
+        let mut state = bridge.state_rx.clone();
+        let mut link = bridge.link_rx.clone();
+        loop {
+            let (awake, outcomes) = {
+                let now = activity.borrow_and_update();
+                (now.awake, now.outcomes)
+            };
+            let connected = matches!(&*state.borrow_and_update(), BridgeState::Connected(_));
+            let open = *link.borrow_and_update();
+            let mut wake_at = deadline;
+            if awake {
+                if connected || outcomes != self.outcomes {
+                    return;
+                }
+                if let LinkState::Open { since } = open {
+                    let Some(silent_at) = since.checked_add(SILENT_LINK_GRACE) else {
+                        return;
+                    };
+                    if Instant::now() >= silent_at {
+                        return;
+                    }
+                    wake_at = wake_at.min(tokio::time::Instant::from_std(silent_at));
+                }
+            }
+            // A closed channel means the manager is gone, and nothing it
+            // could still say is worth the rest of the wait.
+            tokio::select! {
+                changed = activity.changed() => if changed.is_err() { return },
+                changed = state.changed() => if changed.is_err() { return },
+                changed = link.changed() => if changed.is_err() { return },
+                () = tokio::time::sleep_until(wake_at) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        self.activity.send_modify(|activity| {
+            activity.in_flight = activity.in_flight.saturating_sub(1);
+            activity.last_end = Some(Instant::now());
+        });
+    }
+}
+
+/// The manager's half of a [`Demand`]: when to connect and when to let go.
+struct Idle {
+    activity: Arc<watch::Sender<Activity>>,
+    /// The manager's own view of the activity, for waiting on it.
+    rx: watch::Receiver<Activity>,
+    /// The idle window; [`Duration::ZERO`] never lets go.
+    release_after: Duration,
+    /// [`Activity::calls`] as of the last [`settled`](Self::settled): every
+    /// call begun after it is one that outcome did not answer, and cuts the
+    /// pause that follows it short.
+    calls_answered: u64,
+}
+
+/// How a pause between connect attempts ended.
+enum Pause {
+    /// The backoff ran out, or a tool call cut it short: connect again.
+    Over,
+    /// The idle window closed with nothing connected: stop trying.
+    Released,
+}
+
+impl Idle {
+    /// Sleep until a tool call wants the app, then mark the manager awake.
+    /// Returns false when the session ended instead.
+    ///
+    /// Inputs that reach the queue meanwhile were not sent by a tool call
+    /// (every call wakes the manager first and refuses to send without a
+    /// tree), and have no app to go to, so they are dropped here exactly as
+    /// a reconnect drops them.
+    async fn until_wanted(&mut self, input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>) -> bool {
+        let release_after = self.release_after;
+        loop {
+            let woke = self.activity.send_if_modified(|activity| {
+                if window_open(activity, release_after) {
+                    activity.awake = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if woke {
+                return true;
+            }
+            tokio::select! {
+                changed = self.rx.changed() => if changed.is_err() { return false },
+                input = input_rx.recv() => match input {
+                    None => return false,
+                    Some(_) => tracing::warn!(
+                        "dropped an agent input queued while the bridge held no connection"
+                    ),
+                },
+            }
+        }
+    }
+
+    /// Resolve once [`release_at`] has passed. Recomputed
+    /// on every change in activity, since every call that begins or ends
+    /// moves it; the caller recreates this future after anything else that
+    /// moves it (an ack arriving, an input going out).
+    async fn release_due(&mut self, unacked: bool) {
+        loop {
+            let at = release_at(&self.rx.borrow_and_update(), self.release_after, unacked);
+            let wait = async {
+                match at {
+                    Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = wait => return,
+                changed = self.rx.changed() => if changed.is_err() {
+                    std::future::pending::<()>().await;
+                },
+            }
+        }
+    }
+
+    /// Decide to let go, under the same lock a call counts itself in under:
+    /// true when the manager is now released and must close what it holds,
+    /// false when a call arrived first and it stays.
+    fn try_release(&self, unacked: bool) -> bool {
+        let release_after = self.release_after;
+        self.activity.send_if_modified(|activity| {
+            match release_at(activity, release_after, unacked) {
+                Some(at) if Instant::now() >= at => {
+                    activity.awake = false;
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Record a failed connect or an ended connection, which answers any
+    /// call waiting in [`Call::settle`]. The calls it answered are read under
+    /// the same lock, so a call that begins a moment later still cuts the
+    /// pause after it short instead of waiting the pause out.
+    fn settled(&mut self) {
+        let mut calls = 0;
+        self.activity.send_modify(|activity| {
+            activity.outcomes += 1;
+            calls = activity.calls;
+        });
+        self.calls_answered = calls;
+    }
+
+    /// Wait out `backoff` after a [`settled`](Self::settled) outcome. A tool
+    /// call begun since that outcome cuts it short, and the idle window
+    /// closing ends it with a release.
+    async fn pause(&mut self, backoff: Duration) -> Pause {
+        let sleep = tokio::time::sleep(backoff);
+        tokio::pin!(sleep);
+        loop {
+            let at = {
+                let activity = self.rx.borrow_and_update();
+                if activity.calls != self.calls_answered {
+                    return Pause::Over;
+                }
+                release_at(&activity, self.release_after, false)
+            };
+            let due = async {
+                match at {
+                    Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = &mut sleep => return Pause::Over,
+                changed = self.rx.changed() => if changed.is_err() {
+                    (&mut sleep).await;
+                    return Pause::Over;
+                },
+                () = due => if self.try_release(false) {
+                    return Pause::Released;
+                },
+            }
+        }
+    }
+}
+
+/// Wait out `backoff` between connect attempts, the on-demand way when there
+/// is an [`Idle`], and as a plain sleep for an eager manager.
+async fn pause(idle: Option<&mut Idle>, backoff: Duration) -> Pause {
+    match idle {
+        Some(idle) => idle.pause(backoff).await,
+        None => {
+            tokio::time::sleep(backoff).await;
+            Pause::Over
+        }
+    }
+}
+
 /// Why one served connection ended.
 enum ConnectionEnd {
     /// The app closed the socket (or an I/O error occurred).
@@ -338,9 +734,14 @@ enum ConnectionEnd {
     /// Every [`BridgeHandle::input_tx`] clone was dropped: the MCP session is
     /// over, so the manager should exit instead of reconnecting.
     SessionClosed,
+    /// An on-demand manager let go of the app after its idle window.
+    Released,
 }
 
-/// Connect-serve-reconnect forever (until the session is torn down).
+/// Connect-serve-reconnect until the session is torn down. With an [`Idle`],
+/// only while tool calls want the app: it starts asleep, and goes back to
+/// sleep whenever the idle window closes.
+#[allow(clippy::too_many_arguments)]
 async fn manager_loop(
     path: PathBuf,
     state_tx: watch::Sender<BridgeState>,
@@ -349,100 +750,149 @@ async fn manager_loop(
     protocol_tx: watch::Sender<Option<u32>>,
     rejected_tx: watch::Sender<Option<String>>,
     link_tx: watch::Sender<LinkState>,
+    mut idle: Option<Idle>,
 ) {
     let mut backoff = RETRY_MIN;
-    loop {
-        match UnixStream::connect(&path).await {
-            Ok(stream) => {
-                tracing::info!(path = %path.display(), "connected to app socket");
-                drain_stale_inputs(&mut input_rx);
-                let connected_at = Instant::now();
-                // Published before the connection is served, not after it has
-                // said something: the whole point of this channel is the
-                // connection that never says anything.
-                link_tx.send_replace(LinkState::Open {
-                    since: connected_at,
-                });
-                let mut conn_label = None;
-                let end = run_connection(
-                    stream,
-                    &state_tx,
-                    &mut input_rx,
-                    &ack_tx,
-                    &protocol_tx,
-                    &rejected_tx,
-                    &mut conn_label,
-                )
-                .await;
-                // The connection is over: nothing is open again until the next
-                // `connect` returns.
-                link_tx.send_replace(LinkState::Down);
-                // The peer's protocol version belongs to the connection that
-                // declared it; forget it here so the next connection is never
-                // judged by the previous app's handshake.
-                protocol_tx.send_replace(None);
-                // The watch only ever holds `Connected` while this connection
-                // was being served (it is demoted below after every
-                // connection), so `Connected` here means this connection
-                // delivered a snapshot.
-                let delivered_snapshot = matches!(&*state_tx.borrow(), BridgeState::Connected(_));
-                // Demote `Connected` to `Disconnected`, remembering which app
-                // died and its last seq. A connection that died before
-                // delivering a snapshot leaves the previous state (`Never`,
-                // or the `Disconnected` record of an older app) untouched.
-                state_tx.send_if_modified(|state| {
-                    if let BridgeState::Connected(snapshot) = state {
-                        *state = BridgeState::Disconnected {
-                            app_label: conn_label.take(),
-                            last_seq: snapshot.parsed.seq,
-                        };
-                        true
+    'asleep: loop {
+        if let Some(idle) = idle.as_mut() {
+            if !idle.until_wanted(&mut input_rx).await {
+                tracing::debug!("session ended while the bridge was idle; bridge task exiting");
+                return;
+            }
+            tracing::debug!(path = %path.display(), "a tool call wants the app; connecting");
+            backoff = RETRY_MIN;
+        }
+        loop {
+            match UnixStream::connect(&path).await {
+                Ok(stream) => {
+                    tracing::info!(path = %path.display(), "connected to app socket");
+                    drain_stale_inputs(&mut input_rx);
+                    let connected_at = Instant::now();
+                    // Published before the connection is served, not after it
+                    // has said something: the whole point of this channel is
+                    // the connection that never says anything.
+                    link_tx.send_replace(LinkState::Open {
+                        since: connected_at,
+                    });
+                    let mut conn_label = None;
+                    let end = serve_connection(
+                        stream,
+                        &state_tx,
+                        &mut input_rx,
+                        &ack_tx,
+                        &protocol_tx,
+                        &rejected_tx,
+                        &mut conn_label,
+                        idle.as_mut(),
+                    )
+                    .await;
+                    // The connection is over: nothing is open again until the
+                    // next `connect` returns.
+                    link_tx.send_replace(LinkState::Down);
+                    // The peer's protocol version belongs to the connection
+                    // that declared it; forget it here so the next connection
+                    // is never judged by the previous app's handshake.
+                    protocol_tx.send_replace(None);
+                    // The watch only ever holds `Connected` while this
+                    // connection was being served (it is demoted below after
+                    // every connection), so `Connected` here means this
+                    // connection delivered a snapshot.
+                    let delivered_snapshot =
+                        matches!(&*state_tx.borrow(), BridgeState::Connected(_));
+                    // Demote `Connected` to `Disconnected`, remembering which
+                    // app died and its last seq. A connection that died before
+                    // delivering a snapshot leaves the previous state (`Never`,
+                    // or the `Disconnected` record of an older app) untouched.
+                    // A release is demoted the same way, so that if the app
+                    // has really gone by the next call, that call says so in
+                    // the words a departure always gets.
+                    state_tx.send_if_modified(|state| {
+                        if let BridgeState::Connected(snapshot) = state {
+                            *state = BridgeState::Disconnected {
+                                app_label: conn_label.take(),
+                                last_seq: snapshot.parsed.seq,
+                            };
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    match end {
+                        ConnectionEnd::AppClosed => {
+                            tracing::warn!(path = %path.display(), "app disconnected; reconnecting");
+                            // Counted only now, with the channels above
+                            // already describing the ended connection, since
+                            // the count is what tells a waiting call to read
+                            // them.
+                            if let Some(idle) = idle.as_mut() {
+                                idle.settled();
+                            }
+                        }
+                        ConnectionEnd::SessionClosed => {
+                            tracing::debug!("all input senders dropped; bridge task exiting");
+                            return;
+                        }
+                        ConnectionEnd::Released => {
+                            log_release(&path, idle.as_ref(), "closed its connection to the app");
+                            continue 'asleep;
+                        }
+                    }
+                    if delivered_snapshot || connected_at.elapsed() >= HEALTHY_CONNECTION_MIN {
+                        // A healthy connection: reconnect eagerly, from
+                        // scratch.
+                        backoff = RETRY_MIN;
                     } else {
-                        false
-                    }
-                });
-                match end {
-                    ConnectionEnd::AppClosed => {
-                        tracing::warn!(path = %path.display(), "app disconnected; reconnecting");
-                    }
-                    ConnectionEnd::SessionClosed => {
-                        tracing::debug!("all input senders dropped; bridge task exiting");
-                        return;
+                        // Accepted but died young without a snapshot: back
+                        // off exactly like a failed connect, or a peer that
+                        // always accept-and-drops spins this loop at full CPU.
+                        tracing::debug!(
+                            retry_in_ms = backoff.as_millis() as u64,
+                            "connection died without a snapshot; backing off"
+                        );
+                        if let Pause::Released = pause(idle.as_mut(), backoff).await {
+                            log_release(&path, idle.as_ref(), "stopped reconnecting");
+                            continue 'asleep;
+                        }
+                        backoff = (backoff * 2).min(RETRY_MAX);
                     }
                 }
-                if delivered_snapshot || connected_at.elapsed() >= HEALTHY_CONNECTION_MIN {
-                    // A healthy connection: reconnect eagerly, from scratch.
-                    backoff = RETRY_MIN;
-                } else {
-                    // Accepted but died young without a snapshot: back off
-                    // exactly like a failed connect, or a peer that always
-                    // accept-and-drops spins this loop at full CPU.
+                Err(err) => {
                     tracing::debug!(
+                        path = %path.display(),
+                        %err,
                         retry_in_ms = backoff.as_millis() as u64,
-                        "connection died without a snapshot; backing off"
+                        "connect failed; is the app running?"
                     );
-                    tokio::time::sleep(backoff).await;
+                    // An app that overflowed and then exited leaves its reason
+                    // behind, and the tools would go on telling the agent that
+                    // a running app resends the same tree to every reconnect,
+                    // about an app that is not there. Nothing listening is the
+                    // one connect failure that says the app is gone.
+                    forget_oversized_if_nothing_listens(&err, &rejected_tx);
+                    if let Some(idle) = idle.as_mut() {
+                        idle.settled();
+                    }
+                    if let Pause::Released = pause(idle.as_mut(), backoff).await {
+                        log_release(&path, idle.as_ref(), "stopped reconnecting");
+                        continue 'asleep;
+                    }
                     backoff = (backoff * 2).min(RETRY_MAX);
                 }
             }
-            Err(err) => {
-                tracing::debug!(
-                    path = %path.display(),
-                    %err,
-                    retry_in_ms = backoff.as_millis() as u64,
-                    "connect failed; is the app running?"
-                );
-                // An app that overflowed and then exited leaves its reason
-                // behind, and the tools would go on telling the agent that a
-                // running app resends the same tree to every reconnect, about
-                // an app that is not there. Nothing listening is the one
-                // connect failure that says the app is gone.
-                forget_oversized_if_nothing_listens(&err, &rejected_tx);
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RETRY_MAX);
-            }
         }
     }
+}
+
+/// Say, at info level, that an on-demand manager let go of the app and why it
+/// is safe for another bridge to take it now.
+fn log_release(path: &std::path::Path, idle: Option<&Idle>, what: &str) {
+    let idle_release_s = idle.map_or(0, |idle| idle.release_after.as_secs());
+    tracing::info!(
+        path = %path.display(),
+        idle_release_s,
+        "no tool call for {idle_release_s} s: released the app ({what}); the next tool call \
+         reconnects"
+    );
 }
 
 /// Retire [`OVERSIZED_LINE`] when a failed `connect` means nothing is
@@ -533,9 +983,9 @@ async fn read_line_capped(
     }
 }
 
-/// Serve one connection: pump app lines into the watch and agent inputs onto
-/// the socket until either side goes away. The label from the app's `Hello`
-/// (if any) is stored in `conn_label` for the disconnect record.
+/// [`serve_connection`] for a manager that never lets go, which is how the
+/// tests below drive one connection by hand.
+#[cfg(test)]
 async fn run_connection(
     stream: UnixStream,
     state_tx: &watch::Sender<BridgeState>,
@@ -545,14 +995,74 @@ async fn run_connection(
     rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) -> ConnectionEnd {
+    serve_connection(
+        stream,
+        state_tx,
+        input_rx,
+        ack_tx,
+        protocol_tx,
+        rejected_tx,
+        conn_label,
+        None,
+    )
+    .await
+}
+
+/// The inputs this connection wrote that the app has not acked yet, for an
+/// on-demand manager deciding whether it may let go. Bounded by
+/// [`MAX_UNACKED`].
+#[derive(Default)]
+struct Unacked(BTreeSet<InputId>);
+
+impl Unacked {
+    fn sent(&mut self, id: InputId) {
+        self.0.insert(id);
+        if self.0.len() > MAX_UNACKED {
+            self.0.pop_first();
+        }
+    }
+
+    /// Any ack settles its input: `Delivered` is sent as the app dequeues it,
+    /// and an input the app has dequeued is no longer at risk from a release.
+    fn acked(&mut self, id: InputId) {
+        self.0.remove(&id);
+    }
+
+    fn any(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
+/// Serve one connection: pump app lines into the watch and agent inputs onto
+/// the socket until either side goes away. The label from the app's `Hello`
+/// (if any) is stored in `conn_label` for the disconnect record.
+///
+/// With an [`Idle`], also the release: once the idle window has closed (and
+/// no input this connection wrote still awaits its ack, up to
+/// [`UNACKED_HOLD`]), the manager lets go, and the connection ends as
+/// [`ConnectionEnd::Released`]. Returning drops the socket, which closes it
+/// whether the app accepted it or it is still waiting in the backlog.
+#[allow(clippy::too_many_arguments)]
+async fn serve_connection(
+    stream: UnixStream,
+    state_tx: &watch::Sender<BridgeState>,
+    input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>,
+    ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
+    protocol_tx: &watch::Sender<Option<u32>>,
+    rejected_tx: &watch::Sender<Option<String>>,
+    conn_label: &mut Option<String>,
+    mut idle: Option<&mut Idle>,
+) -> ConnectionEnd {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line_buf: Vec<u8> = Vec::new();
+    let mut unacked = Unacked::default();
     loop {
+        let awaiting_acks = unacked.any();
         tokio::select! {
             read = read_line_capped(&mut reader, &mut line_buf) => match read {
                 Ok(LineRead::Line) => {
-                    handle_app_line(
+                    let acked = handle_app_line(
                         &line_buf,
                         state_tx,
                         ack_tx,
@@ -560,6 +1070,9 @@ async fn run_connection(
                         rejected_tx,
                         conn_label,
                     );
+                    if let Some(id) = acked {
+                        unacked.acked(id);
+                    }
                     line_buf.clear();
                 }
                 Ok(LineRead::Eof) => return ConnectionEnd::AppClosed,
@@ -598,8 +1111,23 @@ async fn run_connection(
                     tracing::warn!(%err, "write error on app socket");
                     return ConnectionEnd::AppClosed;
                 }
+                unacked.sent(id);
+            }
+            () = release_due(idle.as_deref_mut(), awaiting_acks) => {
+                if idle.as_deref().is_some_and(|idle| idle.try_release(awaiting_acks)) {
+                    return ConnectionEnd::Released;
+                }
             }
         }
+    }
+}
+
+/// [`Idle::release_due`] for a manager that has one; never, for one that does
+/// not.
+async fn release_due(idle: Option<&mut Idle>, unacked: bool) {
+    match idle {
+        Some(idle) => idle.release_due(unacked).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -607,6 +1135,9 @@ async fn run_connection(
 /// in `rejected_tx` and skipped, so a buggy app cannot kill the bridge and an
 /// agent asking for a tree is told what went wrong instead of being sent to
 /// check the socket path.
+///
+/// Returns the id an ack answered, for the connection's own record of what is
+/// still awaiting one.
 fn handle_app_line(
     line: &[u8],
     state_tx: &watch::Sender<BridgeState>,
@@ -614,7 +1145,7 @@ fn handle_app_line(
     protocol_tx: &watch::Sender<Option<u32>>,
     rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
-) {
+) -> Option<InputId> {
     // Decoded from `&str` rather than `&[u8]` because the snapshot arm keeps
     // the line: JSON is defined over UTF-8, so a line that parses is valid
     // UTF-8 anyway, and taking the check first means the kept line is a
@@ -622,7 +1153,7 @@ fn handle_app_line(
     let Ok(line) = str::from_utf8(line) else {
         tracing::warn!("ignoring a line from app that is not valid UTF-8");
         rejected_tx.send_replace(Some("the line is not valid UTF-8".to_string()));
-        return;
+        return None;
     };
     match serde_json::from_str::<AppToBridge>(line) {
         Ok(AppToBridge::Hello {
@@ -663,6 +1194,7 @@ fn handle_app_line(
             // that sent the input has already returned), so a send with no
             // subscribers is not an error worth reporting.
             let _ = ack_tx.send((id, status));
+            return Some(id);
         }
         // A message variant added to the protocol after this bridge was
         // written. Not a warning like a malformed line: the app is conforming
@@ -692,6 +1224,7 @@ fn handle_app_line(
             rejected_tx.send_replace(Some(err.to_string()));
         }
     }
+    None
 }
 
 /// True when `line` is a JSON object whose `type` names a message this bridge
