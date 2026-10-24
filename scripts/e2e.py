@@ -10,6 +10,7 @@ and exits non-zero on any FAIL.
 Python 3 stdlib only. Usage:  python3 scripts/e2e.py [--no-build]
 """
 
+import contextlib
 import fcntl
 import json
 import os
@@ -17,6 +18,7 @@ import pty
 import re
 import select
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -80,6 +82,65 @@ MAX_LINE_BYTES = 1024 * 1024
 DEMO_TRIMMED_RE = re.compile(
     r"^taria-demo: trimmed (\d+) snapshot\(s\) to fit one line; the last: (.*)$", re.M
 )
+
+# What a bridge says when another bridge holds the app (issue #13). A taria
+# adapter serves one bridge at a time, so the second one's connect lands in the
+# listen backlog and nothing is ever said on it until the first lets go. The
+# explanation is shared word for word by the two openings: one for a bridge
+# that never had a tree, one for a bridge that had the app before (the loser
+# of a restart race, or a bridge that let go and came back to find it taken).
+# The connection's age is whatever the call caught, so it is captured; every
+# other word is verbatim, for the reason the input-tool prefixes above are.
+HELD_EXPLANATION = (
+    r"The socket path is right: this bridge has been connected for (?P<open>\d+\.\d)s "
+    r"with no handshake, which is what a second bridge gets, because a taria adapter "
+    r"serves one bridge at a time and greets each one only when it accepts it\. A "
+    r"taria-mcp lets go of the app after 60 s with no tool calls \(its default\), and "
+    r"this bridge takes over as soon as it does, with no restart; retry in a minute\. "
+    r"If the app stays held, another session is using it, or the holder is a taria-mcp "
+    r"older than 0\.3\.2, which holds the app until its session ends\. Failing that, the "
+    r"peer at this path wedged before its handshake, or is not a taria adapter at all\.$"
+)
+HELD_NEVER_RE = re.compile(
+    r"^no snapshot from the app yet: the app is held by another bridge\. " + HELD_EXPLANATION
+)
+HELD_GONE_RE = re.compile(
+    r"^app '(?P<label>[^']*)' disconnected \(last snapshot seq (?P<seq>\d+)\), and the "
+    r"app is now held by another bridge\. " + HELD_EXPLANATION
+)
+# The answer for an app that really went away. A held app is running, so this
+# is the one answer a held bridge must never give.
+EXITED_MARKER = "may have exited"
+
+# What an on-demand bridge logs, at info, when it lets go of the app; and what
+# every bridge logs when the app greets it. Steps x-z read them from the
+# bridge's stderr to tell which bridge did what.
+RELEASED_LOG = "released the app ("
+CLOSED_LOG = "released the app (closed its connection to the app)"
+CONNECTED_LOG = "connected to app socket"
+
+# The demo's report of agent input it lost, printed once the terminal is
+# restored and only for a count above zero. A clean run prints none of them.
+SILENT_LOSS_MARKERS = (
+    ("taria-demo: dropped ", "dropped inputs (the app's queue overflowed)"),
+    (
+        "taria-demo: discarded ",
+        "discarded inputs (their bridge connection ended first)",
+    ),
+    (
+        "taria-demo: could not read ",
+        "unreadable inputs (a taria version gap the demo cannot act across)",
+    ),
+    (
+        "taria-demo: lost the answer to ",
+        "unanswered inputs (the bridge read the app's acks too slowly)",
+    ),
+)
+
+
+def silent_losses(stderr):
+    """Every kind of lost input the demo's exit report owns up to."""
+    return [what for marker, what in SILENT_LOSS_MARKERS if marker in stderr]
 
 
 class ToolError(Exception):
@@ -1541,25 +1602,7 @@ def step_t_shutdown(client, ctx, app):
         "nothing",
     )
     stderr = app.stderr_tail()
-    silent_loss = [
-        what
-        for marker, what in (
-            ("taria-demo: dropped ", "dropped inputs (the app's queue overflowed)"),
-            (
-                "taria-demo: discarded ",
-                "discarded inputs (their bridge connection ended first)",
-            ),
-            (
-                "taria-demo: could not read ",
-                "unreadable inputs (a taria version gap the demo cannot act across)",
-            ),
-            (
-                "taria-demo: lost the answer to ",
-                "unanswered inputs (the bridge read the app's acks too slowly)",
-            ),
-        )
-        if marker in stderr
-    ]
+    silent_loss = silent_losses(stderr)
     require(
         not silent_loss,
         f"a clean run reported {' and '.join(silent_loss)}; demo stderr:\n{stderr}",
@@ -2164,6 +2207,377 @@ def step_w_oversized_draft(ctx):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# --- One app, several bridges (issue #13) -----------------------------------
+#
+# A taria adapter serves one bridge at a time. Up to 0.3.1 a taria-mcp
+# connected at startup and held the app until its session ended, so a session
+# that had gone quiet locked every other one out, and the loser of a restart
+# race was told the app "may have exited" about an app that was running. Steps
+# x, y and z are the user-visible halves of the fix, each on a demo and bridges
+# of its own, because the scenario's bridge is the only one its app may see.
+
+
+class PrivateDemo:
+    """A demo of a step's own, the bridges it starts against it, and the
+    teardown of all of them, whatever the step did."""
+
+    def __init__(self, prefix):
+        self.tmpdir = tempfile.mkdtemp(prefix=prefix)
+        self.sock = os.path.join(self.tmpdir, "s.sock")
+        self.apps = []
+        self.bridges = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        for bridge in self.bridges:
+            bridge.close()
+            if bridge.proc.poll() is None:
+                bridge.proc.kill()
+        for app in self.apps:
+            app.kill()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        return False
+
+    def start_app(self):
+        app = PtyApp(self.sock)
+        self.apps.append(app)
+        require(app.wait_for_socket(), f"the demo never bound {self.sock}")
+        return app
+
+    def bridge(self, idle_release):
+        client = McpClient(self.sock, ("--idle-release", str(idle_release)))
+        self.bridges.append(client)
+        client.initialize()
+        return client
+
+
+# The answer for a connection younger than the bridge's half-second grace,
+# before its silence means anything. The call that opens a connection waits
+# out the grace, so it is seen only when that connect ran late.
+YOUNG_LINK_MARKER = "worth one retry"
+
+
+def held_error(client, pattern, what, calls=1):
+    """read_tree, refused with the held answer in `pattern`: (match, calls).
+
+    Up to `calls` calls, and only the young-connection answer is asked again:
+    any other answer is final. "May have exited" is checked on its own as
+    well, so a failure names the answer this fix replaced when that is what
+    came back.
+    """
+    for made in range(1, calls + 1):
+        try:
+            text = client.call_raw("read_tree")
+        except ToolError as err:
+            message = err.message
+        else:
+            raise StepFailure(
+                f"{what} was served a tree while another bridge holds the app: {text[:200]}"
+            )
+        if YOUNG_LINK_MARKER not in message:
+            break
+    require(
+        EXITED_MARKER not in message,
+        f"{what} was told the app may have exited, about an app another "
+        f"bridge holds: {message[:300]}",
+    )
+    match = pattern.match(message)
+    require(match, f"{what} did not get the held answer: {message[:400]}")
+    return match, made
+
+
+def wait_log(client, needle, timeout):
+    """Wait for `needle` in a bridge's stderr; True if it showed up."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if needle in client.stderr_tail():
+            return True
+        time.sleep(0.05)
+    return needle in client.stderr_tail()
+
+
+def raw_hello(sock_path, timeout):
+    """Connect to the app as a bare client and read its greeting.
+
+    Returns (hello message, seconds it took). The adapter greets a connection
+    the moment it accepts it, so a prompt greeting is the proof that no other
+    client holds the app. Closed right after: the app then goes back to
+    accepting, exactly as it does when a bridge leaves.
+    """
+    started = time.monotonic()
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(sock_path)
+        buf = b""
+        while b"\n" not in buf:
+            try:
+                chunk = conn.recv(65536)
+            except socket.timeout:
+                raise StepFailure(
+                    f"the app greeted nobody within {timeout}s: something else holds it"
+                )
+            if not chunk:
+                raise StepFailure("the app closed a bare connection without a greeting")
+            buf += chunk
+    finally:
+        conn.close()
+    return json.loads(buf.split(b"\n", 1)[0]), time.monotonic() - started
+
+
+def step_x_unused_bridge_takes_nothing(ctx):
+    """A started bridge that is never called leaves the app free.
+
+    Issue #13's first half. An MCP client starts its servers when the session
+    starts, whether or not the agent ever uses them, so a bridge that
+    connected at startup took the app away from every other session for as
+    long as its own lasted. Now nothing connects before the first tool call:
+    not the process starting, not `initialize`, not `tools/list`.
+
+    The idle bridge never lets go once connected (`--idle-release 0`), so a
+    bridge that connected at startup would hold the app for the whole step:
+    the checks below cannot be passed by a release. Two of them, from either
+    side: a bare client is greeted at once, and a second bridge's very first
+    read_tree is the tree, with no retry.
+    """
+    with PrivateDemo("taria-e2e-unused-") as demo:
+        demo.start_app()
+        idle = demo.bridge(0)
+        tools = idle.tools_list()
+        require(
+            sorted(tools) == ["act", "key", "read_tree", "type_text"],
+            f"the idle bridge lists {tools}",
+        )
+        # What a bridge that connects at startup needs to connect and be
+        # greeted, many times over: the adapter accepts within 50 ms.
+        time.sleep(0.5)
+
+        hello, waited = raw_hello(demo.sock, timeout=2.0)
+        require(
+            hello.get("type") == "hello",
+            f"the app's first line to a bare client was {hello}",
+        )
+
+        second = demo.bridge(1)
+        try:
+            kind, tree = second.call_outcome("read_tree")
+        except ToolError as err:
+            raise StepFailure(
+                f"a second bridge's first read_tree, with the first bridge "
+                f"started and never called, was refused: {err.message[:300]}"
+            )
+        require(kind == "tree" and find(tree, "tasks") is not None, f"read_tree gave {kind}")
+        require(
+            CONNECTED_LOG not in idle.stderr_tail(),
+            f"the bridge that was never called connected anyway:\n{idle.stderr_tail()}",
+        )
+        require(idle.proc.poll() is None, "the idle bridge exited on its own")
+    return (
+        f"initialize + tools/list opened nothing: a bare client was greeted in "
+        f"{waited * 1000:.0f}ms and a second bridge's first read_tree was the tree"
+    )
+
+
+def step_y_idle_bridge_hands_over(ctx):
+    """A bridge whose session goes quiet hands the app to the next one.
+
+    Issue #13's second half. Bridge A takes the app and sends it an input;
+    bridge B, asking meanwhile, is told the app is held by another bridge,
+    never that it may have exited. Once A has gone its idle window without a
+    call it lets go, and B, which is still connected in the app's backlog, is
+    accepted with no restart and no reconnect of its own. A, asked again, now
+    gets the held answer about B, in its "disconnected" form because it had
+    the app before. The demo then quits through B, and its exit report must
+    show no input lost: A let go only after its input was acked, and nothing
+    either bridge sent was discarded with a connection.
+
+    A's window is 2 s rather than 1, so B's first answer (half a second, the
+    bridge's grace for a silent connection) lands well inside it on a slow
+    machine. B's is 3 s, so B still holds the app when A asks again.
+    """
+    window_a = 2
+    with PrivateDemo("taria-e2e-handover-") as demo:
+        app = demo.start_app()
+        first = demo.bridge(window_a)
+        second = demo.bridge(3)
+
+        first.read_tree()
+        # An input A sent and the app acked: the release must not cost it,
+        # and the demo's exit report is where that would show.
+        key(first, "down")
+        quiet_from = time.monotonic()
+
+        # A silent connection is diagnosed once it is half a second old; the
+        # call that opened it waits that long, so one call is normally enough.
+        held, calls = held_error(second, HELD_NEVER_RE, "bridge B, behind A", calls=2)
+        require(
+            time.monotonic() - quiet_from < window_a,
+            "B's held answer came after A's window closed, so it proves nothing",
+        )
+        require(
+            RELEASED_LOG not in first.stderr_tail(),
+            f"A let go of the app inside its window:\n{first.stderr_tail()}",
+        )
+
+        # B is not called in between, except to watch: every answer until A
+        # lets go is the held one, and the first tree comes after A's window.
+        deadline = quiet_from + window_a + READ_TIMEOUT
+        tree = None
+        while time.monotonic() < deadline:
+            try:
+                kind, tree = second.call_outcome("read_tree")
+                require(kind == "tree", f"read_tree answered {kind!r}")
+                break
+            except ToolError as err:
+                require(
+                    EXITED_MARKER not in err.message and HELD_NEVER_RE.match(err.message),
+                    f"B, waiting on A, got another answer: {err.message[:300]}",
+                )
+            time.sleep(0.1)
+        require(tree is not None, "B never got the app after A's window closed")
+        handed_over = time.monotonic() - quiet_from
+        require(
+            handed_over >= window_a - 0.1,
+            f"B got the app {handed_over:.1f}s after A's last call, inside A's {window_a}s window",
+        )
+        require(
+            wait_log(first, CLOSED_LOG, 1.0),
+            f"A logged no release:\n{first.stderr_tail()}",
+        )
+
+        gone, _ = held_error(first, HELD_GONE_RE, "bridge A, back after letting go")
+        require(
+            gone["label"] == "taria-demo",
+            f"A's held answer names the app {gone['label']!r}",
+        )
+
+        # Out through the advertised quit, from the bridge that holds the app.
+        try:
+            kind, _ = second.call_outcome("act", {"node": "quit", "action": "activate"})
+            require(kind == "gone", f"the quit act answered {kind!r}")
+        except ToolError as err:
+            require(
+                "disconnected before acknowledging this input" in err.message,
+                f"unexpected report from the quit act: {err.message[:200]}",
+            )
+        try:
+            app.proc.wait(timeout=READ_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise StepFailure("the handover demo did not exit after the quit act")
+        require(app.proc.returncode == 0, f"the handover demo exited with {app.proc.returncode}")
+        require(
+            app.wait_stderr(),
+            "the handover demo's stderr never reached EOF, so its lost-input "
+            "counts may not have been written yet",
+        )
+        stderr = app.stderr_tail()
+        lost = silent_losses(stderr)
+        require(
+            not lost,
+            f"a handover lost agent input: {' and '.join(lost)}; demo stderr:\n{stderr}",
+        )
+    return (
+        f"B held after {held['open']}s ({calls} call(s)); A let go and B had the "
+        f"tree {handed_over:.1f}s after A's last call; A, back, was told seq "
+        f"{gone['seq']} is held; demo quit with nothing lost"
+    )
+
+
+def step_z_restart_race_loser_is_held(ctx):
+    """The loser of a restart race is told the app is held, not gone.
+
+    Two bridges that have each had the app, so each has a last snapshot to
+    name. The app is killed and restarted, and both bridges are asked at once
+    (which wakes one that had let go, and cuts short a reconnect backoff):
+    exactly one is accepted and answers with the tree, and the other, in the
+    backlog, must give the held answer in its "disconnected" form. Up to 0.3.1
+    it said the app "may have exited" while the app ran and served the
+    winner. The restart is repeated, and every loser is held to it, whichever
+    bridge it is; asking both before each kill checks the same answer between
+    restarts.
+    """
+    rounds = 4
+    with PrivateDemo("taria-e2e-race-") as demo:
+        demo.start_app()
+        bridges = {"P": demo.bridge(1), "Q": demo.bridge(1)}
+
+        # Both get the app once: P first, then Q once P has let go.
+        bridges["P"].read_tree()
+        require(
+            wait_log(bridges["P"], CLOSED_LOG, 1 + READ_TIMEOUT),
+            f"P never let go of the app:\n{bridges['P'].stderr_tail()}",
+        )
+        try:
+            kind, _ = bridges["Q"].call_outcome("read_tree")
+        except ToolError as err:
+            raise StepFailure(f"Q could not take the app P let go of: {err.message[:300]}")
+        require(kind == "tree", f"Q's read_tree answered {kind!r}")
+
+        def ask_both():
+            """read_tree on both bridges at once: {name: (tree or None, error)}."""
+            ids = {name: client.send_call("read_tree") for name, client in bridges.items()}
+            answers = {}
+            for name, client in bridges.items():
+                resp = client.collect([ids[name]])[ids[name]]
+                try:
+                    answers[name] = (parse_result(response_text(resp))[1], None)
+                except ToolError as err:
+                    answers[name] = (None, err.message)
+            return answers
+
+        def judge(answers, when):
+            """The one with a tree, after checking the other is held."""
+            winners = [name for name, (tree, _) in answers.items() if tree is not None]
+            for name, (tree, err) in answers.items():
+                if tree is not None:
+                    continue
+                require(
+                    EXITED_MARKER not in err,
+                    f"{when}: {name} was told the app may have exited while it "
+                    f"runs: {err[:300]}",
+                )
+                match = HELD_GONE_RE.match(err)
+                require(match, f"{when}: {name} did not get the held answer: {err[:400]}")
+                require(match["label"] == "taria-demo", f"{when}: {name} names {match['label']!r}")
+            require(len(winners) <= 1, f"{when}: both bridges were served a tree")
+            return winners[0] if winners else None
+
+        holder = judge(ask_both(), "before the first restart")
+        require(holder == "Q", f"before the first restart the holder was {holder}, not Q")
+        winners = []
+        for round_no in range(1, rounds + 1):
+            when = f"restart {round_no}"
+            old = demo.apps[-1]
+            old.proc.kill()
+            try:
+                old.proc.wait(timeout=READ_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                raise StepFailure(f"{when}: the demo survived SIGKILL")
+            # SIGKILL leaves the socket file behind; removed so that its
+            # reappearing means the new demo is listening.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(demo.sock)
+            demo.start_app()
+            winner = None
+            for _ in range(8):
+                winner = judge(ask_both(), when)
+                if winner is not None:
+                    break
+            require(winner is not None, f"{when}: neither bridge was served the restarted app")
+            # And again, with the race settled: the loser stays held.
+            require(
+                judge(ask_both(), f"{when}, settled") == winner,
+                f"{when}: the app changed hands with nobody letting go",
+            )
+            winners.append(winner)
+    return (
+        f"{rounds} restarts won by {', '.join(winners)}; every loser was told the "
+        "app is held, with its last snapshot seq, never that it may have exited"
+    )
+
+
 # --- Runner -----------------------------------------------------------------
 
 
@@ -2366,6 +2780,22 @@ def main():
         except (StepFailure, ToolError, TimeoutError) as err:
             results.append((name, False, str(err)))
             print(f"FAIL {name}: {err}", flush=True)
+
+        # One app and several bridges (issue #13), each step on a demo and
+        # bridges of its own for the same reason as u: the scenario's app
+        # only ever sees the scenario's bridge.
+        for name, fn in (
+            ("x a bridge never called leaves the app free", step_x_unused_bridge_takes_nothing),
+            ("y an idle bridge hands the app over", step_y_idle_bridge_hands_over),
+            ("z restart race: the loser is told held", step_z_restart_race_loser_is_held),
+        ):
+            try:
+                evidence = fn(ctx)
+                results.append((name, True, evidence))
+                print(f"PASS {name}: {evidence}", flush=True)
+            except (StepFailure, ToolError, TimeoutError) as err:
+                results.append((name, False, str(err)))
+                print(f"FAIL {name}: {err}", flush=True)
     finally:
         failures = [r for r in results if not r[1]]
         if failures:

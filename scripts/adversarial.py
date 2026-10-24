@@ -10,7 +10,8 @@ an INFO line for observed-but-debatable behavior.
 Some states the demo cannot be driven into honestly -- a peer on another
 protocol version, a snapshot using a role this build has never heard of, an
 app that drops half a burst, an app that stops reading its socket, a tree
-past the bridge's 1 MiB line cap. Those are
+past the bridge's 1 MiB line cap, an app slower to ack than a bridge's idle
+window. Those are
 probed against [`FakeApp`], which speaks the ndjson wire directly, so the
 bridge under test is the real one and only the app is a stand-in.
 
@@ -32,8 +33,13 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from e2e import (  # noqa: E402
+    CLOSED_LOG,
+    EXITED_MARKER,
     EXPECT_ACK,
+    HELD_NEVER_RE,
     INVALID_PARAMS,
+    RELEASED_LOG,
+    YOUNG_LINK_MARKER,
     McpClient,
     PtyApp,
     StepFailure,
@@ -101,21 +107,14 @@ QUEUE_FULL_ERROR = (
 )
 
 
-# The bridge connected and the peer never spoke. The age of the connection is
-# whatever the probe's polling caught, so it is captured; every other word is
-# verbatim. This is the answer that replaced "is the socket path correct?" for
-# a bridge that is demonstrably connected to that path.
-SILENT_PEER_RE = re.compile(
-    r"^no snapshot from the app yet, and the socket path is not what is wrong: this bridge "
-    r"is connected to it, and the connection has been open for (?P<open>\d+\.\d)s with no "
-    r"handshake and no snapshot on it\. A taria adapter greets a bridge the moment it accepts "
-    r"one, and serves one bridge at a time, so an open connection that says nothing is what a "
-    r"second bridge gets: the kernel completed it into the listen backlog and the app, still "
-    r"serving the first bridge, has not accepted it\. The likely cause is another taria-mcp "
-    r"process holding this app, often one left running by an earlier session; stopping that one "
-    r"hands the app to this bridge, which needs no restart of its own\. Failing that, the peer "
-    r"at this path wedged before its handshake, or is not a taria adapter at all\.$"
-)
+# The bridge connected and the peer never spoke: the app is held by another
+# bridge. The age of the connection is whatever the probe's call caught, so it
+# is captured; every other word is verbatim. This is the answer that replaced
+# "is the socket path correct?" for a bridge that is demonstrably connected to
+# that path, and since 0.3.2 it says the holder lets go on its own (after its
+# idle window) instead of sending the agent to find and stop it. Shared with
+# e2e.py, whose steps y and z meet the same answer from a real demo.
+SILENT_PEER_RE = HELD_NEVER_RE
 
 
 def partial_drop_error(dropped, sent):
@@ -192,6 +191,10 @@ class FakeApp:
         self._lock = threading.Lock()
         self._connected = threading.Event()
         self._closing = threading.Event()
+        # The bridge closing its end: what letting go of the app looks like
+        # from the app's side. Only seen by an app that reads its socket.
+        self._eof = threading.Event()
+        self.eof_at = None
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(path)
         self.srv.listen(1)
@@ -244,8 +247,10 @@ class FakeApp:
                     return
                 continue
             except OSError:
+                self._saw_eof()
                 return
             if not chunk:
+                self._saw_eof()
                 return
             buf += chunk
             while b"\n" in buf:
@@ -266,6 +271,17 @@ class FakeApp:
                     continue
                 with self._lock:
                     self._lines.append(parsed)
+
+    def _saw_eof(self):
+        # Teardown closes the socket under the reader, which is not the
+        # bridge going anywhere.
+        if not self._closing.is_set():
+            self.eof_at = time.monotonic()
+            self._eof.set()
+
+    def wait_eof(self, timeout):
+        """True once the bridge has closed its end of the connection."""
+        return self._eof.wait(timeout)
 
     def send(self, msg):
         self.send_raw((json.dumps(msg) + "\n").encode())
@@ -393,22 +409,44 @@ LIVE_CLIENTS = set()
 
 
 @contextlib.contextmanager
-def fake_session(**kwargs):
+def fake_session(bridge_args=(), **kwargs):
     """A real bridge wired to a [`FakeApp`], torn down together.
 
     Its own socket and its own taria-mcp process, so a probe using one cannot
-    disturb the demo the other probes share.
+    disturb the demo the other probes share. `bridge_args` go on the bridge's
+    command line; the rest configure the stand-in.
+
+    The bridge connects on its first tool call, not at startup, so for a
+    stand-in that accepts, the session makes that call itself: one read_tree,
+    which has to wait for the connect and the greeting and then say the app
+    has published no tree, because this one has not. Probes start from where
+    an eager bridge used to leave them, connected and greeted with no call in
+    flight. A stand-in that never accepts is left for its probe to reach,
+    because what the first call says to it is what that probe is about.
     """
     tmpdir = tempfile.mkdtemp(prefix="taria-fake-")
     app = None
     client = None
     try:
         app = FakeApp(os.path.join(tmpdir, "fake.sock"), **kwargs)
-        client = McpClient(app.path)
+        client = McpClient(app.path, bridge_args)
         LIVE_CLIENTS.add(client)
         client.initialize()
         if app.accepts:
+            first = client.send_call("read_tree")
             require(app.wait_connected(), "the bridge never connected to the fake app")
+            try:
+                text = response_text(client.collect([first])[first])
+            except ToolError as err:
+                require(
+                    "completed the taria handshake" in err.message,
+                    f"the read_tree that connected the bridge did not report the "
+                    f"greeting it waited for: {err.message[:300]}",
+                )
+            else:
+                raise StepFailure(
+                    f"read_tree served a tree the fake app never published: {text[:200]}"
+                )
         yield client, app
         # Only on the success path: a probe's own failure is the better
         # report, and this one would otherwise hide it.
@@ -1528,24 +1566,30 @@ def probe_socket_held_by_another_bridge(client, ctx):
     The adapter serves one bridge at a time, so a second bridge's connection
     is completed by the kernel into the listen backlog and left unread until
     the first bridge leaves: the connect succeeded, and no handshake and no
-    snapshot arrives on it until then. That is what a `taria-mcp` left running by an earlier session does
-    to the next one, and it is the first thing a fresh agent meets, before any
-    feature of the release can be tried at all. The answer used to be "is the
-    taria-enabled app running, and is the socket path correct?"; both were
-    yes, and finding the real cause took nine shell calls of `ps`, `ss` and
-    `/proc/net/unix` forensics.
+    snapshot arrives on it until then. Up to 0.3.1 that is what a `taria-mcp`
+    left running by an earlier session did to the next one, for as long as
+    that session lasted, and it is the first thing a fresh agent met, before
+    any feature of the release could be tried at all. The answer used to be
+    "is the taria-enabled app running, and is the socket path correct?"; both
+    were yes, and finding the real cause took nine shell calls of `ps`, `ss`
+    and `/proc/net/unix` forensics. From 0.3.2 a holder lets go once its
+    session goes quiet, and the answer says so.
 
     `client` is the shared demo's bridge and goes unused: this probe brings
     its own bridge and its own peer, because the state needs a socket that
     accepts nothing.
     """
     with fake_session(accept=False) as (silent, _app):
-        # Polled: the connection has to be open past the bridge's grace before
-        # its silence means anything, and until then the honest answer is the
-        # shorter "worth one retry" one.
+        # The bridge connects on this first call, and the call waits out the
+        # grace before a silent connection means anything, so the first answer
+        # is normally the diagnosis itself. A connect that ran late gets the
+        # shorter "worth one retry" answer first, and only that one is asked
+        # again: any other answer on the way is a wrong one.
         deadline = time.monotonic() + READ_TIMEOUT
         message = ""
+        calls = 0
         while time.monotonic() < deadline:
+            calls += 1
             try:
                 tree = silent.call_raw("read_tree")
                 raise StepFailure(
@@ -1554,19 +1598,21 @@ def probe_socket_held_by_another_bridge(client, ctx):
                 )
             except ToolError as err:
                 message = err.message
-                if SILENT_PEER_RE.match(message):
-                    break
+            if SILENT_PEER_RE.match(message) or YOUNG_LINK_MARKER not in message:
+                break
             time.sleep(0.1)
         matched = SILENT_PEER_RE.match(message)
         require(
             matched is not None,
-            f"read_tree never diagnosed the unaccepted connection: {message[:400]}",
+            f"read_tree never diagnosed the unaccepted connection (call {calls}): "
+            f"{message[:400]}",
         )
-        require(
-            "is the socket path correct" not in message,
-            f"the bridge is connected to that path and must not ask about it: "
-            f"{message[:200]}",
-        )
+        for wrong in ("is the socket path correct", EXITED_MARKER):
+            require(
+                wrong not in message,
+                f"the bridge is connected to that path and the app is running, "
+                f"so {wrong!r} is the wrong answer: {message[:200]}",
+            )
         # The input tools ask for a tree before they send anything, so they
         # carry the same diagnosis instead of a second vocabulary for it.
         try:
@@ -1578,8 +1624,8 @@ def probe_socket_held_by_another_bridge(client, ctx):
                 f"an input tool answered this state differently: {err.message[:400]}",
             )
     return (
-        f"connect succeeded and the peer never spoke; read_tree named the held socket "
-        f"after {matched.group('open')}s open, and key said the same"
+        f"connect succeeded and the peer never spoke; read_tree call {calls} named the "
+        f"held socket after {matched.group('open')}s open, and key said the same"
     )
 
 
@@ -1699,8 +1745,9 @@ def probe_oversized_first_tree(client, ctx):
     a reason, an app the bridge had plainly reached was asked whether it was
     running and whether the socket path was right. Here the reconnect then
     sits unaccepted in the stand-in's backlog, because it accepts only once,
-    and that silence has an answer of its own too; the size has to outrank
-    it, for as long as the agent keeps asking.
+    and that silence has an answer of its own too (the app "held by another
+    bridge"); the size has to outrank it, for as long as the agent keeps
+    asking.
     """
     with fake_session() as (mcp, app):
         send_oversized(app, 1)
@@ -1742,8 +1789,8 @@ def probe_oversized_first_tree(client, ctx):
             )
             for wrong in (
                 "is the socket path correct",
-                "another taria-mcp process",
-                "worth one retry",
+                "held by another bridge",
+                YOUNG_LINK_MARKER,
                 "never publishes nodes",
             ):
                 require(
@@ -1754,6 +1801,76 @@ def probe_oversized_first_tree(client, ctx):
     return (
         f"{len(answers)} read_tree calls across {span:.1f}s all named the 1 MiB cap, "
         "none asked about the socket path"
+    )
+
+
+def probe_release_waits_for_ack(client, ctx):
+    """Letting go of the app never costs an input still awaiting its ack.
+
+    An on-demand bridge closes its connection once its session has gone quiet
+    for the idle window, so another session can have the app. A taria adapter
+    discards whatever input it has not dequeued from a connection once that
+    connection ends, and acks each input as it dequeues it, so an input with
+    no ack yet is one a release would throw away. The bridge holds on while
+    any input it wrote awaits its ack (for up to 30 s past the window), and
+    lets go once the last one is answered.
+
+    The stand-in is an app slow to dequeue: it withholds the ack far past a
+    one-second window. The connection has to survive that (no EOF reaches the
+    app, and the bridge logs no release), and has to end promptly once the
+    ack is sent. The call itself cannot see the ack, and is not meant to: a
+    call in flight holds the window open, so the window can only close after
+    the call has answered, and the ack has to come later still. Its answer is
+    the honest one for its own half second, no acknowledgement.
+
+    `client` goes unused: the state needs an app that withholds its ack.
+    """
+    window = 1
+    with fake_session(bridge_args=("--idle-release", str(window))) as (mcp, app):
+        app.snapshot(1, FAKE_ROOT)
+        mcp.read_tree()
+
+        req = mcp.send_call("key", {"key": "down"})
+        require(app.wait_inputs(1), "the key never reached the fake app")
+        input_id = app.inputs()[0]["id"]
+        kind, _ = parse_result(response_text(mcp.collect([req])[req]))
+        quiet_from = time.monotonic()
+        require(
+            kind == "no_ack",
+            f"an input the app never acked answered {kind!r}, expected no_ack",
+        )
+
+        # Well past the window: a bridge that ignored the pending ack would
+        # have let go a second after the call answered.
+        held_for = 3 * window
+        if app.wait_eof(held_for):
+            raise StepFailure(
+                f"the bridge let go of the app {app.eof_at - quiet_from:.1f}s after "
+                f"its last call, with input {input_id} still awaiting its ack"
+            )
+        require(
+            RELEASED_LOG not in mcp.stderr_tail(),
+            f"the bridge logged a release with an input unacked:\n{mcp.stderr_tail()}",
+        )
+
+        acked_at = time.monotonic()
+        app.ack(input_id, "delivered")
+        require(
+            app.wait_eof(2 * window + 1),
+            f"the bridge still held the app {2 * window + 1}s after the last ack, "
+            f"{time.monotonic() - quiet_from:.1f}s after its last call",
+        )
+        released_after = app.eof_at - acked_at
+        deadline = time.monotonic() + 1.0
+        while CLOSED_LOG not in mcp.stderr_tail() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        require(
+            CLOSED_LOG in mcp.stderr_tail(),
+            f"the connection ended without the release being logged:\n{mcp.stderr_tail()}",
+        )
+    return (
+        f"ack withheld {held_for}s after the call, a {window}s window: connection "
+        f"kept; acked, then let go {released_after * 1000:.0f}ms later"
     )
 
 
@@ -1889,6 +2006,7 @@ def main():
         ("socket held by another bridge", probe_socket_held_by_another_bridge),
         ("tree over the line cap after one was served", probe_oversized_after_tree),
         ("first tree over the line cap", probe_oversized_first_tree),
+        ("release waits for a pending ack", probe_release_waits_for_ack),
     ]
 
     def teardown():
