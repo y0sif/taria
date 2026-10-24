@@ -2618,7 +2618,7 @@ async fn calls_on_the_edge_of_the_window_are_always_served() {
         // Around the window's end: a little before, on either side of it,
         // and far enough after it that the release has had time to run on
         // a loaded host, which is what the count below relies on.
-        let offset = Duration::from_millis([90, 97, 103, 120][(round % 4) as usize]);
+        let offset = Duration::from_millis([90, 97, 103, 150][(round % 4) as usize]);
         tokio::time::sleep(offset).await;
         server
             .key(Parameters(KeyParams {

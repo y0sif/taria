@@ -113,8 +113,8 @@ HELD_GONE_RE = re.compile(
 EXITED_MARKER = "may have exited"
 
 # What an on-demand bridge logs, at info, when it lets go of the app; and what
-# every bridge logs when the app greets it. Steps x-z read them from the
-# bridge's stderr to tell which bridge did what.
+# every bridge logs each time it connects to the app's socket. Steps x-z read
+# them from the bridge's stderr to tell which bridge did what.
 RELEASED_LOG = "released the app ("
 CLOSED_LOG = "released the app (closed its connection to the app)"
 CONNECTED_LOG = "connected to app socket"
@@ -329,11 +329,18 @@ class McpClient:
         self._next_id = 0
         self._buf = b""
         self._stderr = bytearray()
+        # Counted as the lines arrive: the tail keeps 8 KiB, and a bridge
+        # asked in a loop logs about 1 KiB per refused call, which pushes its
+        # connect lines out of the tail.
+        self.connects = 0
         self._errdrain = threading.Thread(target=self._drain_stderr, daemon=True)
         self._errdrain.start()
 
     def _drain_stderr(self):
+        connected = CONNECTED_LOG.encode()
         for line in self.proc.stderr:
+            if connected in line:
+                self.connects += 1
             self._stderr += line
             del self._stderr[:-8192]
 
@@ -2453,7 +2460,9 @@ def step_y_idle_bridge_hands_over(ctx):
         # lets go is the held one, and the first tree comes after A's window.
         # The app greets B before it sends B the tree, and a call can land
         # between the two: that answer is a retry, but only once A's window
-        # has closed, since a greeting is the app accepting B.
+        # has closed, since a greeting is the app accepting B. The young-link
+        # answer is not one: it comes from a reconnect, and B must not make
+        # one, which its log checks below.
         deadline = quiet_from + window_a + READ_TIMEOUT
         tree = None
         transient = 0
@@ -2467,11 +2476,11 @@ def step_y_idle_bridge_hands_over(ctx):
                     EXITED_MARKER not in err.message,
                     f"B, waiting on A, was told the app may have exited: {err.message[:300]}",
                 )
-                if transient_answer(err.message):
+                if GREETED_MARKER in err.message:
                     transient += 1
                     require(
                         transient <= TRANSIENT_RETRIES,
-                        f"B got {transient} transient answers in a row: {err.message[:300]}",
+                        f"B got {transient} greeted answers in a row: {err.message[:300]}",
                     )
                     require(
                         GREETED_MARKER not in err.message
@@ -2494,6 +2503,11 @@ def step_y_idle_bridge_hands_over(ctx):
         require(
             wait_log(first, CLOSED_LOG, 1.0),
             f"A logged no release:\n{first.stderr_tail()}",
+        )
+        require(
+            second.connects == 1,
+            f"B connected {second.connects} times; the app must take it from the "
+            f"backlog on its first connection:\n{second.stderr_tail()}",
         )
 
         gone, _ = held_error(
