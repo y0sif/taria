@@ -74,10 +74,10 @@ the app is the one that speaks first (section 3).
 4. Answer every `input` message it reads on a live connection with at least
    one `ack` naming the same `id` (section 10). An input the app cannot act on
    is answered `ignored`, not left unanswered. The exceptions are a line
-   that did not parse, which carries no readable id (section 2.6), an input
-   whose connection has since ended, which is deliberately not acked
-   (section 11), and an input written before the app's `hello`, which it may
-   discard unacked (section 14.5).
+   that did not parse, whose id is lost with it even when the text shows one
+   (sections 2.6 and 9.4), an input whose connection has since ended, which
+   is deliberately not acked (section 11), and an input written before the
+   app's `hello`, which it may discard unacked (section 14.5).
 5. Skip a line it cannot parse and keep the connection (section 2.6).
 6. Never apply an input that arrived on a connection that has since ended
    (section 11).
@@ -758,7 +758,11 @@ newline or a tab means there.
   failure, not an unknown kind.
 - A known `kind` missing the field it is made of is a parse failure, not an
   unknown kind. `{"kind":"key"}` fails, the whole line is skipped, and the id
-  inside it is lost: verified, the reference adapter sent no ack for it.
+  inside it is lost: verified, the reference adapter sent no ack for it. No
+  conforming version 1 sender writes such a line, because the reference
+  bridge serializes every input from typed values and a kind cannot gain a
+  required field without a version bump (sections 16.2 and 16.7), so the
+  adapter skips it like any broken line rather than salvaging the id.
 - The name `unknown` is effectively reserved: it is what this build
   re-serializes an unreadable input as (section 9.5).
 

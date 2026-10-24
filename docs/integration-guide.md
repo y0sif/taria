@@ -106,7 +106,8 @@ never branches on whether taria came up.
 
 The layer prints nothing itself, ever, and that is the reason `bind_error()`
 exists as a getter. It is your app that knows when the screen is safe to
-write to.
+write to, and an app that draws only a panel has no alternate screen to time
+it by (see [Apps that draw only a panel](#apps-that-draw-only-a-panel)).
 
 ## Build the tree in its own module
 
@@ -158,6 +159,106 @@ is hardest to test.
 
 Either way the nodes are wrapped in an auto-generated `app` root, so the two
 produce the same tree.
+
+## Apps that draw only a panel
+
+Not every app hands ratatui the screen. A chat REPL or a build runner can
+leave its output in the terminal's own scrollback and have ratatui draw only a
+panel pinned under it; `Viewport::Inline` plus `insert_before` is the common
+way. ramvamp, a local LLM runtime, does it by hand in `chat --tui`: it prints
+its transcript into a scroll region over the rows above the panel, and ratatui
+draws the panel through `Viewport::Fixed`. Three things this guide otherwise
+takes for granted change there.
+
+**Publish the output from state.** `layer.frame()` and `sem` record a node
+only when its widget renders inside a draw, so they see the panel and nothing
+else. Output printed above it is drawn once, outside any frame, and a `sem`
+inside an `insert_before` closure lands in one snapshot and is gone from the
+next. Build the output's node from the state that holds it, and publish on
+every pass rather than after each draw, because a line printed above the
+panel changes the tree without redrawing it:
+
+```rust
+// tree.rs: the transcript is app state, not a widget in the frame.
+pub fn build_nodes(app: &App) -> Vec<Node> {
+    vec![
+        Node::new("transcript", Role::Log)
+            .label("Conversation, oldest line first")
+            .value(app.transcript.text()),
+        panel_node(app),
+    ]
+}
+
+// The event loop: every pass, whether or not the panel redrew. A tree
+// identical to the last one costs a comparison.
+layer.publish(tree::build_nodes(&app));
+```
+
+**Publish a bounded tail, as a `log`.** The output grows for the whole
+session, and a snapshot is one line of at most 1 MiB
+([Keep the snapshot small enough to arrive](#keep-the-snapshot-small-enough-to-arrive)).
+A reply streamed into it also changes the tree on every token, so each token
+republishes the whole tail
+([Watch your publish rate](#watch-your-publish-rate)). ramvamp keeps the last
+6 KiB, about two screens of prose, trimmed a whole line at a time from the
+front; `Role::Log` tells an agent the value is a tail, and if the adapter ever
+has to trim it, a log keeps its end.
+
+```rust
+/// About two screens of prose: a whole reply, without the tail being most
+/// of every snapshot.
+const TAIL_CAP: usize = 6 * 1024;
+
+impl Transcript {
+    fn trim(&mut self) {
+        let mut cut = 0;
+        // Whole lines from the front, but never the last one: a single line
+        // over the cap would otherwise empty the tail.
+        while self.text.len() - cut > TAIL_CAP {
+            match self.text[cut..].find('\n') {
+                Some(at) if cut + at + 1 < self.text.len() => cut += at + 1,
+                _ => break,
+            }
+        }
+        // That line alone is over the cap: cut into it on a char boundary.
+        if self.text.len() - cut > TAIL_CAP {
+            cut = (self.text.len() - TAIL_CAP..self.text.len())
+                .find(|&at| self.text.is_char_boundary(at))
+                .unwrap_or(cut);
+        }
+        self.text.drain(..cut);
+    }
+}
+```
+
+A transcript that mixes your app's own lines with a model's text needs one
+more thing before an agent can tell the two apart; see
+[Mark relayed text](#mark-relayed-text).
+
+**Report after teardown.** There is no alternate screen to print around. The
+panel shares the primary buffer with the output above it, so an `eprintln!`
+while it is up lands in the scrolling output or tears the panel, and in raw
+mode a bare newline does not even return to column 0. Bind before raw mode,
+and send diagnostics through your app's own output path while the panel is
+up, or print them once it is down:
+
+```rust
+// Before raw mode: a bind that blocks on the filesystem must not leave a
+// half-taken terminal behind it.
+let mut layer = TariaLayer::bind_or_disabled("my-app");
+let mut panel = Panel::enter()?; // raw mode, scroll region, Viewport::Fixed
+let result = run(&mut panel, &mut layer);
+panel.leave()?; // scroll region reset, raw mode off
+
+// Only now is stderr the user's again.
+if let Some(err) = layer.bind_error() {
+    eprintln!("my-app: taria disabled: {err}");
+}
+```
+
+ramvamp sends that one line to its debug log instead, because a second
+instance in another window is the ordinary way to fail to bind, and an error
+about a feature nobody asked for is worse than silence.
 
 ## Pick the role that says what the widget is
 
@@ -815,7 +916,8 @@ primary path.
 ## Report what the layer threw away
 
 Four counters record agent traffic that went nowhere. Read them after the
-terminal is restored, never while the alternate screen is up.
+terminal is restored, never while the alternate screen or a pinned panel is
+up ([Apps that draw only a panel](#apps-that-draw-only-a-panel)).
 
 ```rust
 ratatui::restore();
