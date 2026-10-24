@@ -13,7 +13,7 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
-## [0.3.2] - Unreleased
+## [0.3.2] - 2026-10-24
 
 **An idle agent session no longer holds the app.** The adapter serves one
 bridge at a time, and `taria-mcp` connected at startup and never let go. A
