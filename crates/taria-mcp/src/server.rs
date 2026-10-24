@@ -50,9 +50,9 @@ const QUEUE_WAIT: Duration = Duration::from_millis(500);
 /// a socket somebody else is holding.
 ///
 /// A bridge started on demand connects on the first tool call, and that call
-/// waits up to just past this grace for the connection to say something (see
-/// [`Call::settle`]), so a held app is diagnosed on the first call rather
-/// than the second.
+/// waits until its connection is this old for the connection to say
+/// something (see [`Call::settle`], bounded at 1.2 s from the call's start),
+/// so a held app is diagnosed on the first call rather than the second.
 pub(crate) const SILENT_LINK_GRACE: Duration = Duration::from_millis(500);
 
 /// Most presses one `key` call may send.
@@ -244,8 +244,9 @@ impl TariaMcpServer {
     /// No connection is opened until the first tool call: starting the
     /// server, MCP `initialize` and `tools/list` connect to nothing. A call
     /// that finds the bridge idle (or between reconnect attempts) wakes it
-    /// and waits a moment, well under a second, for the app's tree, so the
-    /// first call still answers with the live tree. Once no tool call has run
+    /// and waits a moment for the app's tree, normally milliseconds and never
+    /// more than 1.2 s, so the first call still answers with the live tree.
+    /// Once no tool call has run
     /// for `idle_release`, the bridge lets go of the app: it closes its
     /// connection, or leaves the listen backlog if it was waiting behind
     /// another bridge, and stops reconnecting until the next call. A taria
@@ -750,8 +751,9 @@ pub fn action_name(action: &Action) -> String {
 /// alone: a rejected line, an open connection, and a completed handshake are
 /// three facts about the same silence, and which of them is the story depends
 /// on the others. Read nowhere else. Once a tree is being served, none of this
-/// is what an agent needs to hear about. A disconnect reads only `rejected`,
-/// and only for [`OVERSIZED_LINE`]: see [`available_snapshot`].
+/// is what an agent needs to hear about. A disconnect reads `rejected` only
+/// for [`OVERSIZED_LINE`], and the link and the handshake only while a
+/// connection is open again: see [`available_snapshot`].
 struct LinkReport {
     /// Why the most recent line from an app was thrown away, if one was.
     rejected: Option<String>,
@@ -768,10 +770,8 @@ struct LinkReport {
 /// exited or crashed; waiting for it to come back is enough), the same state
 /// reached because the bridge cut the app off over a line too long to read
 /// (waiting fixes nothing), the same state again with this bridge reconnected
-/// and left unanswered because another bridge holds the app (the one that won
-/// the reconnect race when the app restarted, or the one that took it while
-/// this bridge had let go), and the ways [`BridgeState::Never`] is reached,
-/// which [`no_snapshot_reason`] tells apart.
+/// and not yet served a tree (see [`reconnected_reason`]), and the ways
+/// [`BridgeState::Never`] is reached, which [`no_snapshot_reason`] tells apart.
 fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnapshot, McpError> {
     match state {
         BridgeState::Connected(snapshot) => Ok(snapshot),
@@ -791,14 +791,12 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
                     "{gone}; its latest snapshot was over 1 MiB ({MAX_LINE_BYTES} bytes), this \
                      bridge's line limit, so the bridge closed the connection. {OVERSIZED_REPEATS}"
                 )
-            } else if let Some(open_for) = held_for(&report) {
-                // "It may have exited" was the answer here, about an app that
-                // was running and serving another bridge.
-                format!(
-                    "{gone}, and the app is now held by another bridge. {}",
-                    held_by_another_bridge(open_for)
-                )
+            } else if let Some(open_for) = report.link.open_for() {
+                reconnected_reason(&gone, open_for, report.peer_protocol)
             } else {
+                // Only with no connection open: the one state in which this
+                // bridge cannot tell an app that is gone from one between
+                // two of its connects, and the 0.3.1 answer, byte for byte.
                 format!(
                     "{gone}; it may have exited. The bridge reconnects automatically; retry once \
                      the app is back."
@@ -807,6 +805,43 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
             Err(McpError::internal_error(message, None))
         }
     }
+}
+
+/// Why a bridge that had the app, and has a connection to the socket open
+/// again, has no tree to serve: `gone` is the departure opening, `open_for`
+/// the age of the new connection, and `peer_protocol` its handshake, if one
+/// arrived.
+///
+/// An open connection means something at the path accepted the connect, so
+/// "it may have exited", the answer all three of these once got, was about an
+/// app that was running: one serving another bridge (the winner of the
+/// reconnect race when the app restarted, or the bridge that took it while
+/// this one had let go), one that greeted this bridge and had not drawn yet,
+/// and one this bridge reached a moment ago. They are told apart the way
+/// [`no_snapshot_reason`] tells them apart for an app that never published,
+/// and in the same words where the cause is the same: the handshake, then the
+/// age of a silent connection.
+fn reconnected_reason(gone: &str, open_for: Duration, peer_protocol: Option<u32>) -> String {
+    if let Some(version) = peer_protocol {
+        return format!(
+            "{gone}, and this bridge has reconnected: the app completed the taria handshake \
+             (protocol version {version}) and has not published a tree on this connection yet. \
+             The socket path is right and the app is running, so nothing needs restarting; \
+             retry, and the first snapshot it publishes is served."
+        );
+    }
+    if open_for < SILENT_LINK_GRACE {
+        return format!(
+            "{gone}, and this bridge reconnected to the socket {}ms ago; no handshake has \
+             arrived yet. The path is right, so this is worth one retry; a connection that is \
+             still silent on the next call is diagnosed rather than waited on.",
+            open_for.as_millis()
+        );
+    }
+    format!(
+        "{gone}, and the app is now held by another bridge. {}",
+        held_by_another_bridge(open_for)
+    )
 }
 
 /// What follows from a snapshot over [`MAX_LINE_BYTES`], said the same way by
@@ -911,21 +946,6 @@ fn no_snapshot_reason(report: LinkReport) -> String {
         "no snapshot from the app yet: the app is held by another bridge. {}",
         held_by_another_bridge(open_for)
     )
-}
-
-/// How long this bridge's open connection has gone without a handshake, once
-/// that is past [`SILENT_LINK_GRACE`]: a connection the app has not accepted,
-/// because another bridge holds it. `None` for a link that is down, one still
-/// inside the grace, and one the peer has greeted, which is no longer waiting
-/// to be accepted.
-fn held_for(report: &LinkReport) -> Option<Duration> {
-    if report.peer_protocol.is_some() {
-        return None;
-    }
-    report
-        .link
-        .open_for()
-        .filter(|open_for| *open_for >= SILENT_LINK_GRACE)
 }
 
 /// What follows "held by another bridge", said the same way by both answers
@@ -1670,12 +1690,14 @@ mod tests {
             err.message
         );
 
-        // A link that is down, one just opened, and one the app greeted are
-        // not held, and keep the departure answer byte for byte.
+        // A link that is down keeps the departure answer byte for byte; one
+        // just opened and one the app greeted are not held either, and have
+        // answers of their own (pinned below).
         let plain = "app 'demo' disconnected (last snapshot seq 7); it may have exited. The \
                      bridge reconnects automatically; retry once the app is back.";
+        let err = available_snapshot(gone(), silent_link()).expect_err("no tree");
+        assert_eq!(err.message, plain);
         for (name, link, peer_protocol) in [
-            ("down", LinkState::Down, None),
             ("just opened", open_for(10), None),
             ("greeted", open_for(4_000), Some(PROTOCOL_VERSION)),
         ] {
@@ -1688,7 +1710,11 @@ mod tests {
                 },
             )
             .expect_err("a disconnected app has no tree");
-            assert_eq!(err.message, plain, "{name}");
+            assert!(
+                !err.message.contains("held by another bridge"),
+                "{name}: {}",
+                err.message
+            );
         }
 
         // And a tree over the limit still outranks it: the bridge closed the
@@ -1708,6 +1734,93 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// A bridge that had the app and is connected to the socket again is
+    /// talking to something that accepted its connect, so "it may have
+    /// exited" is never its answer, whatever else the link says: an app that
+    /// restarted and greeted it without drawing yet, or a connection too
+    /// young for its silence to mean anything. Each keeps the departure
+    /// opening and says what it is in the words the never-served answers use.
+    /// Only a link that is down keeps the 0.3.1 answer.
+    #[test]
+    fn a_reconnected_bridge_never_says_the_app_may_have_exited() {
+        let gone = || BridgeState::Disconnected {
+            app_label: Some("demo".to_string()),
+            last_seq: 7,
+        };
+        let greeted = available_snapshot(
+            gone(),
+            LinkReport {
+                link: open_for(800),
+                peer_protocol: Some(PROTOCOL_VERSION),
+                ..silent_link()
+            },
+        )
+        .expect_err("a greeting is not a tree");
+        assert_eq!(
+            greeted.message,
+            "app 'demo' disconnected (last snapshot seq 7), and this bridge has reconnected: the \
+             app completed the taria handshake (protocol version 1) and has not published a tree \
+             on this connection yet. The socket path is right and the app is running, so nothing \
+             needs restarting; retry, and the first snapshot it publishes is served."
+        );
+        // A greeting outranks the age: a greeted connection is not waiting
+        // to be accepted, however young or old it is.
+        for age in [10, 4_000] {
+            let err = available_snapshot(
+                gone(),
+                LinkReport {
+                    link: open_for(age),
+                    peer_protocol: Some(PROTOCOL_VERSION),
+                    ..silent_link()
+                },
+            )
+            .expect_err("a greeting is not a tree");
+            assert_eq!(err.message, greeted.message, "{age} ms");
+        }
+
+        let young = available_snapshot(
+            gone(),
+            LinkReport {
+                link: open_for(120),
+                ..silent_link()
+            },
+        )
+        .expect_err("no handshake yet");
+        let ms = young
+            .message
+            .strip_prefix(
+                "app 'demo' disconnected (last snapshot seq 7), and this bridge reconnected to \
+                 the socket ",
+            )
+            .and_then(|rest| rest.split_once("ms ago"))
+            .map(|(ms, _)| ms.parse::<u64>().expect("a whole number of ms"))
+            .unwrap_or_else(|| panic!("{}", young.message));
+        assert!((120..500).contains(&ms), "{}", young.message);
+        assert!(
+            young.message.ends_with(
+                "ms ago; no handshake has arrived yet. The path is right, so this is worth one \
+                 retry; a connection that is still silent on the next call is diagnosed rather \
+                 than waited on."
+            ),
+            "{}",
+            young.message
+        );
+
+        for (name, message) in [("greeted", &greeted.message), ("young", &young.message)] {
+            assert!(
+                !message.contains("may have exited")
+                    && !message.contains("socket path correct")
+                    && !message.contains('\u{2014}'),
+                "{name}: {message}"
+            );
+        }
+
+        // Down, between two connects or for good, is the one state the bridge
+        // cannot tell apart from an app that exited.
+        let down = available_snapshot(gone(), silent_link()).expect_err("no tree");
+        assert!(down.message.contains("may have exited"), "{}", down.message);
     }
 
     /// Below the grace the same silence is a handshake still arriving, and

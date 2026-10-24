@@ -58,6 +58,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedReadHalf;
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio::time::Instant as TokioInstant;
 
 use crate::server::{MAX_KEY_REPEAT, SILENT_LINK_GRACE};
 
@@ -85,16 +86,28 @@ const INPUT_QUEUE: usize = 32;
 const ACK_QUEUE: usize = 8 * MAX_KEY_REPEAT as usize;
 
 /// Longest a tool call waits for an on-demand bridge to reach the app before
-/// it answers from whatever the bridge then knows.
+/// it answers from whatever the bridge then knows, counted from the call's
+/// start: 1.2 s.
 ///
 /// The call that wakes an idle bridge would otherwise always find no tree,
 /// since the connect it caused has not happened yet. A taria adapter accepts
 /// within 50 ms and writes its `hello` and its latest snapshot the moment it
-/// does, so the wait normally ends in milliseconds, on the tree. It runs this
-/// long only when the connection stays silent, and is set just past
-/// [`SILENT_LINK_GRACE`], the age at which silence is diagnosed as the app
-/// being held by another bridge, so that answer is the one the call gives.
-const FIRST_CALL_WAIT: Duration = Duration::from_millis(600);
+/// does, so the wait normally ends in milliseconds, on the tree. A connect
+/// that fails, or a connection that ends, answers the call at once too.
+///
+/// What runs longer is a connection that stays silent, and that wait is
+/// counted from when the connection opened, not from when the call began: it
+/// ends once the connection is [`SILENT_LINK_GRACE`] old, the age at which
+/// silence is diagnosed as the app being held by another bridge, so that
+/// answer is the one the call gives. Counted from the call's start instead, a
+/// connect that ran late (a loaded host, a reconnect that came late) left the
+/// call answering about a connection too young to mean anything. This bound
+/// keeps that wait finite: it covers the whole grace
+/// for any connection opened within the call's first 700 ms, and a connection
+/// opened later than that is answered as the young connection it is, with a
+/// retry. A held app normally costs the call just over the grace, since the
+/// connect into the backlog takes a millisecond.
+const FIRST_CALL_WAIT: Duration = Duration::from_millis(1_200);
 
 /// How long past the idle window an input still waiting for its ack keeps an
 /// on-demand bridge holding the app.
@@ -379,6 +392,13 @@ pub(crate) fn spawn_on_demand(
     socket_path: PathBuf,
     idle_release: Duration,
 ) -> (BridgeHandle, Demand) {
+    let (idle, demand) = idle_and_demand(idle_release);
+    (spawn_manager(socket_path, Some(idle)), demand)
+}
+
+/// The two halves of an on-demand manager's activity window: the manager's,
+/// and the tool layer's.
+fn idle_and_demand(idle_release: Duration) -> (Idle, Demand) {
     let (activity_tx, activity_rx) = watch::channel(Activity::default());
     let activity = Arc::new(activity_tx);
     let idle = Idle {
@@ -387,7 +407,7 @@ pub(crate) fn spawn_on_demand(
         release_after: idle_release,
         calls_answered: 0,
     };
-    (spawn_manager(socket_path, Some(idle)), Demand { activity })
+    (idle, Demand { activity })
 }
 
 /// The channels both kinds of manager share, and the task serving them.
@@ -433,7 +453,14 @@ struct Activity {
     in_flight: usize,
     /// When the last tool call ended, if any has. The idle window runs from
     /// here.
-    last_end: Option<Instant>,
+    ///
+    /// On tokio's clock, like every instant the idle window is reckoned in:
+    /// the waits on it are tokio timers, and judging them by another clock
+    /// is what lets a timer fire before the instant it was set for has come.
+    /// Under a paused test clock that is a loop that wakes, finds the window
+    /// still open by the wall clock, and sleeps until a deadline tokio has
+    /// already passed.
+    last_end: Option<TokioInstant>,
     /// Whether the manager wants the app: connecting, connected, or between
     /// attempts. False before the first call and after every release.
     ///
@@ -464,7 +491,7 @@ fn window_open(activity: &Activity, release_after: Duration) -> bool {
 /// the window, or [`UNACKED_HOLD`] past it while an input still awaits its
 /// ack. `None` while a call is in flight, and for good with a zero window (or
 /// one too long to reach).
-fn release_at(activity: &Activity, release_after: Duration, unacked: bool) -> Option<Instant> {
+fn release_at(activity: &Activity, release_after: Duration, unacked: bool) -> Option<TokioInstant> {
     if release_after.is_zero() || activity.in_flight > 0 {
         return None;
     }
@@ -514,10 +541,17 @@ pub(crate) struct Call {
 }
 
 impl Call {
-    /// Wait, for at most [`FIRST_CALL_WAIT`], until the bridge has an answer
-    /// for this call: a snapshot, a connect that failed, a connection that
-    /// ended, or a connection silent for [`SILENT_LINK_GRACE`] (the app held
-    /// by another bridge, or greeting and publishing nothing).
+    /// Wait until the bridge has an answer for this call: a snapshot, a
+    /// connect that failed, a connection that ended, or a connection that has
+    /// been open for [`SILENT_LINK_GRACE`] without one (the app held by
+    /// another bridge, or greeting and publishing nothing). Never longer than
+    /// [`FIRST_CALL_WAIT`] from the call's start.
+    ///
+    /// The grace is counted from when the connection opened, so a connect
+    /// that ran late still gets all of it, and the tool layer, which reads
+    /// the connection's age again after this returns, sees it past the grace
+    /// too. Only a connection opened in the bound's last 500 ms is still
+    /// young when the call answers.
     ///
     /// Returns at once while a tree is being served, so only the call that
     /// wakes an idle bridge, or finds it between attempts, waits at all. The
@@ -525,7 +559,7 @@ impl Call {
     /// until then they describe the connection it let go of, and the snapshot
     /// left from that one is not an answer.
     pub(crate) async fn settle(&self, bridge: &BridgeHandle) {
-        let deadline = tokio::time::Instant::now() + FIRST_CALL_WAIT;
+        let deadline = TokioInstant::now() + FIRST_CALL_WAIT;
         let mut activity = self.activity.subscribe();
         let mut state = bridge.state_rx.clone();
         let mut link = bridge.link_rx.clone();
@@ -535,20 +569,25 @@ impl Call {
                 (now.awake, now.outcomes)
             };
             let connected = matches!(&*state.borrow_and_update(), BridgeState::Connected(_));
-            let open = *link.borrow_and_update();
+            let open_for = link.borrow_and_update().open_for();
             let mut wake_at = deadline;
             if awake {
                 if connected || outcomes != self.outcomes {
                     return;
                 }
-                if let LinkState::Open { since } = open {
-                    let Some(silent_at) = since.checked_add(SILENT_LINK_GRACE) else {
-                        return;
-                    };
-                    if Instant::now() >= silent_at {
-                        return;
+                if let Some(open_for) = open_for {
+                    // The age is the link's own, on the wall clock its
+                    // `since` was taken from; what is left of the grace is
+                    // then slept on tokio's. Never an instant converted from
+                    // one clock to the other, which a paused test clock turns
+                    // into a timer that has fired before the wall clock
+                    // agrees, and a loop around it.
+                    match SILENT_LINK_GRACE.checked_sub(open_for) {
+                        Some(left) if !left.is_zero() => {
+                            wake_at = wake_at.min(TokioInstant::now() + left);
+                        }
+                        _ => return,
                     }
-                    wake_at = wake_at.min(tokio::time::Instant::from_std(silent_at));
                 }
             }
             // A closed channel means the manager is gone, and nothing it
@@ -559,7 +598,7 @@ impl Call {
                 changed = link.changed() => if changed.is_err() { return },
                 () = tokio::time::sleep_until(wake_at) => {}
             }
-            if tokio::time::Instant::now() >= deadline {
+            if TokioInstant::now() >= deadline {
                 return;
             }
         }
@@ -570,7 +609,7 @@ impl Drop for Call {
     fn drop(&mut self) {
         self.activity.send_modify(|activity| {
             activity.in_flight = activity.in_flight.saturating_sub(1);
-            activity.last_end = Some(Instant::now());
+            activity.last_end = Some(TokioInstant::now());
         });
     }
 }
@@ -592,8 +631,9 @@ struct Idle {
 enum Pause {
     /// The backoff ran out, or a tool call cut it short: connect again.
     Over,
-    /// The idle window closed with nothing connected: stop trying.
-    Released,
+    /// The idle window closed with nothing connected: stop trying. Carries
+    /// when the last tool call ended, for the log line that says so.
+    Released(TokioInstant),
 }
 
 impl Idle {
@@ -639,7 +679,7 @@ impl Idle {
             let at = release_at(&self.rx.borrow_and_update(), self.release_after, unacked);
             let wait = async {
                 match at {
-                    Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                    Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             };
@@ -652,20 +692,29 @@ impl Idle {
         }
     }
 
-    /// Decide to let go, under the same lock a call counts itself in under:
-    /// true when the manager is now released and must close what it holds,
-    /// false when a call arrived first and it stays.
-    fn try_release(&self, unacked: bool) -> bool {
+    /// Decide to let go, under the same lock a call counts itself in under.
+    ///
+    /// `Some` when the manager is now released and must close what it holds,
+    /// carrying when the last tool call ended (read under that lock, for the
+    /// log line). `None` when it stays: a call is in flight, or arrived first,
+    /// or the window has not closed.
+    fn try_release(&self, unacked: bool) -> Option<TokioInstant> {
         let release_after = self.release_after;
+        let mut quiet_since = None;
         self.activity.send_if_modified(|activity| {
-            match release_at(activity, release_after, unacked) {
-                Some(at) if Instant::now() >= at => {
+            match (
+                release_at(activity, release_after, unacked),
+                activity.last_end,
+            ) {
+                (Some(at), Some(last_end)) if TokioInstant::now() >= at => {
                     activity.awake = false;
+                    quiet_since = Some(last_end);
                     true
                 }
                 _ => false,
             }
-        })
+        });
+        quiet_since
     }
 
     /// Record a failed connect or an ended connection, which answers any
@@ -697,7 +746,7 @@ impl Idle {
             };
             let due = async {
                 match at {
-                    Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                    Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             };
@@ -707,8 +756,8 @@ impl Idle {
                     (&mut sleep).await;
                     return Pause::Over;
                 },
-                () = due => if self.try_release(false) {
-                    return Pause::Released;
+                () = due => if let Some(quiet_since) = self.try_release(false) {
+                    return Pause::Released(quiet_since);
                 },
             }
         }
@@ -735,7 +784,31 @@ enum ConnectionEnd {
     /// over, so the manager should exit instead of reconnecting.
     SessionClosed,
     /// An on-demand manager let go of the app after its idle window.
-    Released,
+    Released(Release),
+}
+
+/// When an on-demand manager let go of the app, and what held it past the end
+/// of its idle window, for the log line that says so.
+#[derive(Clone, Copy, Debug)]
+struct Release {
+    /// When the last tool call ended: the idle window ran from here.
+    quiet_since: TokioInstant,
+    /// What held the app past the end of the window, if anything did.
+    hold: Hold,
+}
+
+/// What an input awaiting its ack did to a release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    /// Nothing: no input was awaiting its ack when the window closed, and
+    /// the release came at the end of the window.
+    None,
+    /// An input was still awaiting its ack when the window closed, and the
+    /// release came when the app acked the last of them.
+    UntilAcked,
+    /// Inputs were still unacked [`UNACKED_HOLD`] past the window, and the
+    /// release came anyway, with this many unacked.
+    Expired { unacked: usize },
 }
 
 /// Connect-serve-reconnect until the session is torn down. With an [`Idle`],
@@ -819,21 +892,49 @@ async fn manager_loop(
                     });
                     match end {
                         ConnectionEnd::AppClosed => {
-                            tracing::warn!(path = %path.display(), "app disconnected; reconnecting");
-                            // Counted only now, with the channels above
-                            // already describing the ended connection, since
-                            // the count is what tells a waiting call to read
-                            // them.
                             if let Some(idle) = idle.as_mut() {
+                                // Counted only now, with the channels above
+                                // already describing the ended connection,
+                                // since the count is what tells a waiting
+                                // call to read them.
                                 idle.settled();
+                                // The window can have closed already, while
+                                // the connection was held for an ack. The app
+                                // leaving ends that hold, and a reconnect now
+                                // would take the app again for a session that
+                                // is not using it, only to let go of it at
+                                // once. Checked before the reconnect for that
+                                // reason, a healthy connection's included.
+                                if let Some(quiet_since) = idle.try_release(false) {
+                                    tracing::info!(path = %path.display(), "app disconnected");
+                                    log_release(
+                                        &path,
+                                        idle.release_after,
+                                        Release {
+                                            quiet_since,
+                                            hold: Hold::None,
+                                        },
+                                        "the app closed the connection; not reconnecting",
+                                    );
+                                    continue 'asleep;
+                                }
                             }
+                            tracing::warn!(path = %path.display(), "app disconnected; reconnecting");
                         }
                         ConnectionEnd::SessionClosed => {
                             tracing::debug!("all input senders dropped; bridge task exiting");
                             return;
                         }
-                        ConnectionEnd::Released => {
-                            log_release(&path, idle.as_ref(), "closed its connection to the app");
+                        ConnectionEnd::Released(release) => {
+                            let release_after = idle
+                                .as_ref()
+                                .map_or(Duration::ZERO, |idle| idle.release_after);
+                            log_release(
+                                &path,
+                                release_after,
+                                release,
+                                "closed its connection to the app",
+                            );
                             continue 'asleep;
                         }
                     }
@@ -849,8 +950,8 @@ async fn manager_loop(
                             retry_in_ms = backoff.as_millis() as u64,
                             "connection died without a snapshot; backing off"
                         );
-                        if let Pause::Released = pause(idle.as_mut(), backoff).await {
-                            log_release(&path, idle.as_ref(), "stopped reconnecting");
+                        if let Pause::Released(quiet_since) = pause(idle.as_mut(), backoff).await {
+                            log_pause_release(&path, idle.as_ref(), quiet_since);
                             continue 'asleep;
                         }
                         backoff = (backoff * 2).min(RETRY_MAX);
@@ -872,8 +973,8 @@ async fn manager_loop(
                     if let Some(idle) = idle.as_mut() {
                         idle.settled();
                     }
-                    if let Pause::Released = pause(idle.as_mut(), backoff).await {
-                        log_release(&path, idle.as_ref(), "stopped reconnecting");
+                    if let Pause::Released(quiet_since) = pause(idle.as_mut(), backoff).await {
+                        log_pause_release(&path, idle.as_ref(), quiet_since);
                         continue 'asleep;
                     }
                     backoff = (backoff * 2).min(RETRY_MAX);
@@ -883,16 +984,58 @@ async fn manager_loop(
     }
 }
 
-/// Say, at info level, that an on-demand manager let go of the app and why it
-/// is safe for another bridge to take it now.
-fn log_release(path: &std::path::Path, idle: Option<&Idle>, what: &str) {
-    let idle_release_s = idle.map_or(0, |idle| idle.release_after.as_secs());
-    tracing::info!(
-        path = %path.display(),
-        idle_release_s,
-        "no tool call for {idle_release_s} s: released the app ({what}); the next tool call \
-         reconnects"
-    );
+/// Say that an on-demand manager let go of the app, after how long with no
+/// tool call, and what held it past its idle window if anything did: info
+/// level, except a release with inputs still unacked, which the app may now
+/// discard.
+///
+/// The idle time is measured, not the window restated: an input awaiting its
+/// ack holds the app past the window, by up to [`UNACKED_HOLD`], and a log
+/// that said "60 s" for a release at 75 s sent whoever read it looking for
+/// the missing 15.
+fn log_release(path: &std::path::Path, release_after: Duration, release: Release, what: &str) {
+    let idle = release.quiet_since.elapsed();
+    let idle_s = idle.as_secs_f64();
+    let idle_release_s = release_after.as_secs_f64();
+    let past_s = idle.saturating_sub(release_after).as_secs_f64();
+    match release.hold {
+        Hold::None => tracing::info!(
+            path = %path.display(),
+            idle_s,
+            idle_release_s,
+            "no tool call for {idle_s:.1} s: released the app ({what}); the next tool call \
+             reconnects"
+        ),
+        Hold::UntilAcked => tracing::info!(
+            path = %path.display(),
+            idle_s,
+            idle_release_s,
+            "no tool call for {idle_s:.1} s, {past_s:.1} s past the {idle_release_s} s idle \
+             window, held there until the app acked every input it was sent: released the app \
+             ({what}); the next tool call reconnects"
+        ),
+        Hold::Expired { unacked } => tracing::warn!(
+            path = %path.display(),
+            idle_s,
+            idle_release_s,
+            unacked,
+            "no tool call for {idle_s:.1} s, {past_s:.1} s past the {idle_release_s} s idle \
+             window, the longest an input awaiting its ack holds the app: released the app \
+             ({what}) with {unacked} input(s) never acked, which the app may discard; the next \
+             tool call reconnects"
+        ),
+    }
+}
+
+/// [`log_release`] for a manager that let go between connect attempts, which
+/// had no connection to hold an input on.
+fn log_pause_release(path: &std::path::Path, idle: Option<&Idle>, quiet_since: TokioInstant) {
+    let release_after = idle.map_or(Duration::ZERO, |idle| idle.release_after);
+    let release = Release {
+        quiet_since,
+        hold: Hold::None,
+    };
+    log_release(path, release_after, release, "stopped reconnecting");
 }
 
 /// Retire [`OVERSIZED_LINE`] when a failed `connect` means nothing is
@@ -1012,24 +1155,52 @@ async fn run_connection(
 /// on-demand manager deciding whether it may let go. Bounded by
 /// [`MAX_UNACKED`].
 #[derive(Default)]
-struct Unacked(BTreeSet<InputId>);
+struct Unacked {
+    ids: BTreeSet<InputId>,
+    /// When the ack that left none outstanding arrived, for telling a release
+    /// the hold delayed from one at the end of the window.
+    cleared_at: Option<TokioInstant>,
+}
 
 impl Unacked {
     fn sent(&mut self, id: InputId) {
-        self.0.insert(id);
-        if self.0.len() > MAX_UNACKED {
-            self.0.pop_first();
+        self.ids.insert(id);
+        if self.ids.len() > MAX_UNACKED {
+            self.ids.pop_first();
         }
     }
 
     /// Any ack settles its input: `Delivered` is sent as the app dequeues it,
     /// and an input the app has dequeued is no longer at risk from a release.
     fn acked(&mut self, id: InputId) {
-        self.0.remove(&id);
+        if self.ids.remove(&id) && self.ids.is_empty() {
+            self.cleared_at = Some(TokioInstant::now());
+        }
     }
 
     fn any(&self) -> bool {
-        !self.0.is_empty()
+        !self.ids.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// What held a release decided now, with `quiet_since` the end of the
+    /// last tool call and `release_after` the window. An ack that cleared
+    /// the last input after the window closed is what the release waited
+    /// for; one that cleared it before had nothing to hold.
+    fn hold(&self, quiet_since: TokioInstant, release_after: Duration) -> Hold {
+        if self.any() {
+            return Hold::Expired {
+                unacked: self.len(),
+            };
+        }
+        let window_end = quiet_since.checked_add(release_after);
+        match (self.cleared_at, window_end) {
+            (Some(cleared), Some(end)) if cleared > end => Hold::UntilAcked,
+            _ => Hold::None,
+        }
     }
 }
 
@@ -1114,8 +1285,13 @@ async fn serve_connection(
                 unacked.sent(id);
             }
             () = release_due(idle.as_deref_mut(), awaiting_acks) => {
-                if idle.as_deref().is_some_and(|idle| idle.try_release(awaiting_acks)) {
-                    return ConnectionEnd::Released;
+                if let Some(idle) = idle.as_deref()
+                    && let Some(quiet_since) = idle.try_release(awaiting_acks)
+                {
+                    return ConnectionEnd::Released(Release {
+                        quiet_since,
+                        hold: unacked.hold(quiet_since, idle.release_after),
+                    });
                 }
             }
         }
@@ -1419,5 +1595,477 @@ mod tests {
         assert!(!is_unknown_message_type(r#"["an","array"]"#));
         assert!(!is_unknown_message_type(r#"{"no":"type field"}"#));
         assert!(!is_unknown_message_type(r#"{"type":42}"#));
+    }
+
+    // The idle window and the unacked hold. The waits are tokio timers, so
+    // these run on a paused clock: thirty seconds of hold cost nothing, and an
+    // instant judged by another clock than the timer's would show up here as
+    // a test that spins on the wall clock instead of finishing at once.
+
+    /// The channels one connection is served with, for driving
+    /// [`serve_connection`] by hand.
+    struct Wiring {
+        state_tx: watch::Sender<BridgeState>,
+        input_tx: mpsc::Sender<(InputId, AgentInput)>,
+        input_rx: mpsc::Receiver<(InputId, AgentInput)>,
+        ack_tx: broadcast::Sender<(InputId, InputStatus)>,
+        protocol_tx: watch::Sender<Option<u32>>,
+        rejected_tx: watch::Sender<Option<String>>,
+    }
+
+    impl Wiring {
+        fn new() -> Self {
+            let (state_tx, _) = watch::channel(BridgeState::Never);
+            let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE);
+            let (ack_tx, _) = broadcast::channel(ACK_QUEUE);
+            let (protocol_tx, _) = watch::channel(None);
+            let (rejected_tx, _) = watch::channel(None);
+            Self {
+                state_tx,
+                input_tx,
+                input_rx,
+                ack_tx,
+                protocol_tx,
+                rejected_tx,
+            }
+        }
+
+        /// Serve `stream` the on-demand way until it ends: how, and when on
+        /// tokio's clock.
+        async fn serve(
+            &mut self,
+            stream: UnixStream,
+            idle: &mut Idle,
+        ) -> (ConnectionEnd, TokioInstant) {
+            let mut label = None;
+            let end = serve_connection(
+                stream,
+                &self.state_tx,
+                &mut self.input_rx,
+                &self.ack_tx,
+                &self.protocol_tx,
+                &self.rejected_tx,
+                &mut label,
+                Some(idle),
+            )
+            .await;
+            (end, TokioInstant::now())
+        }
+    }
+
+    /// The app's end of a connection, held open until the bridge closes it.
+    async fn hold_open(app_end: UnixStream) {
+        let mut rest = Vec::new();
+        let mut app_end = app_end;
+        app_end
+            .read_to_end(&mut rest)
+            .await
+            .expect("read until the bridge closes");
+    }
+
+    /// Run `io` with the paused clock held to millisecond steps.
+    ///
+    /// A paused clock jumps to the next timer whenever the runtime has nothing
+    /// to run, and a socket that the other end has already written to is not
+    /// something to run until the I/O driver has turned once, which happens in
+    /// the same park the jump is decided in. So a read that is ready at once
+    /// can find the clock already moved to the next deadline (here, typically
+    /// the end of the hold), as if the peer had taken that long. A 1 ms timer,
+    /// rearmed for as long as `io` runs, caps every such jump at 1 ms.
+    async fn in_small_steps<T>(io: impl Future<Output = T>) -> T {
+        tokio::pin!(io);
+        loop {
+            tokio::select! {
+                out = &mut io => return out,
+                () = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+        }
+    }
+
+    /// The id of the next input the bridge writes on `reader`.
+    async fn next_input_id<R: tokio::io::AsyncRead + Unpin>(reader: &mut BufReader<R>) -> InputId {
+        let mut line = String::new();
+        in_small_steps(reader.read_line(&mut line))
+            .await
+            .expect("an input line");
+        match serde_json::from_str(&line).expect("a bridge message") {
+            BridgeToApp::Input { id, .. } => id,
+            other => panic!("expected an input, got {other:?}"),
+        }
+    }
+
+    /// The release of `end`, failing the test for any other ending.
+    fn released(end: ConnectionEnd) -> Release {
+        match end {
+            ConnectionEnd::Released(release) => release,
+            ConnectionEnd::AppClosed => panic!("the connection ended as AppClosed"),
+            ConnectionEnd::SessionClosed => panic!("the connection ended as SessionClosed"),
+        }
+    }
+
+    /// `at` is `want` after `from`, give or take the milliseconds tokio's
+    /// timers round their deadlines up to and [`in_small_steps`] leaves.
+    fn assert_at(from: TokioInstant, at: TokioInstant, want: Duration) {
+        let took = at - from;
+        assert!(
+            took >= want && took <= want + Duration::from_millis(5),
+            "released {took:?} after the window started, not {want:?}"
+        );
+    }
+
+    /// The release comes when the window closes, not a tick before, and the
+    /// window runs from the end of the last call: one that ends just before
+    /// the window closes starts it again, and one still running when it
+    /// would close holds it open until it ends.
+    #[tokio::test(start_paused = true)]
+    async fn the_window_runs_from_the_end_of_the_last_call() {
+        let window = Duration::from_secs(1);
+        let (mut idle, demand) = idle_and_demand(window);
+        let mut wiring = Wiring::new();
+        let wall = Instant::now();
+
+        // One call, and nothing after it.
+        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let t0 = TokioInstant::now();
+        drop(demand.begin());
+        let ((end, at), ()) = tokio::join!(wiring.serve(bridge_end, &mut idle), hold_open(app_end));
+        let release = released(end);
+        assert_eq!(release.quiet_since, t0);
+        assert_eq!(release.hold, Hold::None);
+        assert_at(t0, at, window);
+
+        // A call that ends a millisecond before the window closes.
+        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let t1 = TokioInstant::now();
+        drop(demand.begin());
+        let late_call = async {
+            tokio::time::sleep_until(t1 + window - Duration::from_millis(1)).await;
+            drop(demand.begin());
+        };
+        let ((end, at), (), ()) = tokio::join!(
+            wiring.serve(bridge_end, &mut idle),
+            late_call,
+            hold_open(app_end)
+        );
+        assert_eq!(released(end).hold, Hold::None);
+        assert_at(t1, at, window * 2 - Duration::from_millis(1));
+
+        // A call that is still running when the window would close, and ends
+        // three seconds in.
+        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let t2 = TokioInstant::now();
+        drop(demand.begin());
+        let long_call = async {
+            tokio::time::sleep_until(t2 + window / 2).await;
+            let call = demand.begin();
+            tokio::time::sleep_until(t2 + Duration::from_secs(3)).await;
+            drop(call);
+        };
+        let ((end, at), (), ()) = tokio::join!(
+            wiring.serve(bridge_end, &mut idle),
+            long_call,
+            hold_open(app_end)
+        );
+        assert_eq!(released(end).quiet_since, t2 + Duration::from_secs(3));
+        assert_at(t2, at, Duration::from_secs(3) + window);
+
+        // Five seconds of windows on the paused clock, in no time on the
+        // wall clock: nothing waited on a deadline by another clock.
+        assert!(
+            wall.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            wall.elapsed()
+        );
+    }
+
+    /// An app that never acks an input holds the app past the window, and
+    /// for [`UNACKED_HOLD`] past it, not for good: an adapter older than the
+    /// ack contract never acks anything, and a bridge that held such an app
+    /// forever is the lock-out the release exists to end.
+    #[tokio::test(start_paused = true)]
+    async fn an_input_never_acked_holds_the_app_for_the_cap_and_no_longer() {
+        let window = Duration::from_secs(1);
+        let (mut idle, demand) = idle_and_demand(window);
+        let mut wiring = Wiring::new();
+        let wall = Instant::now();
+        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+
+        // Sent while a call is in flight, as every input is.
+        let call = demand.begin();
+        wiring
+            .input_tx
+            .send((7, AgentInput::key("x")))
+            .await
+            .expect("queued");
+        let t0 = TokioInstant::now();
+        drop(call);
+        let app = async move {
+            let mut reader = BufReader::new(app_end);
+            assert_eq!(next_input_id(&mut reader).await, 7);
+            let mut rest = Vec::new();
+            reader
+                .read_to_end(&mut rest)
+                .await
+                .expect("read until the bridge closes");
+        };
+        let ((end, at), ()) = tokio::join!(wiring.serve(bridge_end, &mut idle), app);
+        let release = released(end);
+        assert_eq!(release.quiet_since, t0);
+        assert_eq!(release.hold, Hold::Expired { unacked: 1 });
+        assert_at(t0, at, window + UNACKED_HOLD);
+        // Thirty-one seconds on the paused clock. A release judged by the
+        // wall clock against a tokio deadline spins here until the wall clock
+        // catches up.
+        assert!(
+            wall.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            wall.elapsed()
+        );
+    }
+
+    /// An ack that arrives during the hold ends it at once, and the release
+    /// says the hold delayed it; an ack before the window closed held
+    /// nothing.
+    #[tokio::test(start_paused = true)]
+    async fn an_ack_during_the_hold_releases_at_once() {
+        let window = Duration::from_secs(1);
+        let (mut idle, demand) = idle_and_demand(window);
+        let mut wiring = Wiring::new();
+
+        for (acked_after, hold) in [
+            (Duration::from_secs(5), Hold::UntilAcked),
+            (window / 2, Hold::None),
+        ] {
+            let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+            let call = demand.begin();
+            wiring
+                .input_tx
+                .send((9, AgentInput::key("x")))
+                .await
+                .expect("queued");
+            let t0 = TokioInstant::now();
+            drop(call);
+            let mut acks = wiring.ack_tx.subscribe();
+            let app = async move {
+                let (read, mut write) = app_end.into_split();
+                let mut reader = BufReader::new(read);
+                assert_eq!(next_input_id(&mut reader).await, 9);
+                tokio::time::sleep_until(t0 + acked_after).await;
+                let mut ack = serde_json::to_string(&AppToBridge::ack(9, InputStatus::Delivered))
+                    .expect("an ack serializes");
+                ack.push('\n');
+                write.write_all(ack.as_bytes()).await.expect("send the ack");
+                // Until the bridge has read it: the next timer is the end of
+                // the hold, and the clock must not jump there first.
+                in_small_steps(acks.recv())
+                    .await
+                    .expect("the bridge read the ack");
+                let mut rest = Vec::new();
+                reader
+                    .read_to_end(&mut rest)
+                    .await
+                    .expect("read until the bridge closes");
+            };
+            let ((end, at), ()) = tokio::join!(wiring.serve(bridge_end, &mut idle), app);
+            assert_eq!(released(end).hold, hold, "acked after {acked_after:?}");
+            assert_at(t0, at, acked_after.max(window));
+        }
+    }
+
+    /// The set of unacked inputs is bounded, forgetting the oldest, so an app
+    /// that never acks cannot grow it without limit; and what matters, whether
+    /// any input is outstanding, is still answered by the ones it kept.
+    #[test]
+    fn the_unacked_inputs_are_bounded_and_the_oldest_forgotten() {
+        let mut unacked = Unacked::default();
+        let past = MAX_UNACKED as InputId + 5;
+        for id in 1..=past {
+            unacked.sent(id);
+        }
+        assert_eq!(unacked.len(), MAX_UNACKED);
+        assert_eq!(
+            unacked.ids.first(),
+            Some(&6),
+            "the five oldest are forgotten"
+        );
+
+        // Acking a forgotten input changes nothing, and is no error.
+        unacked.acked(1);
+        assert_eq!(unacked.len(), MAX_UNACKED);
+        assert!(unacked.cleared_at.is_none());
+
+        let now = TokioInstant::now();
+        let window = Duration::from_secs(60);
+        assert_eq!(
+            unacked.hold(now, window),
+            Hold::Expired {
+                unacked: MAX_UNACKED
+            }
+        );
+        for id in 6..=past {
+            unacked.acked(id);
+        }
+        assert!(!unacked.any());
+        assert!(unacked.cleared_at.is_some());
+        // Cleared now, inside a window that started now: nothing held it.
+        assert_eq!(unacked.hold(now, window), Hold::None);
+        // Cleared after a window that had already closed: the hold did.
+        let long_ago = now
+            .checked_sub(window * 2)
+            .expect("the test clock is not that young");
+        assert_eq!(unacked.hold(long_ago, window), Hold::UntilAcked);
+    }
+
+    /// The lock protocol, with no timing in it. A call counts itself in, and
+    /// the manager decides to let go, each under the activity lock, so exactly
+    /// one of them wins: either the manager sees the call and stays, or the
+    /// call sees the manager gone and waits for a fresh connection. A call
+    /// may never send to a connection the manager has decided to close.
+    #[test]
+    fn a_call_and_a_release_cannot_both_win() {
+        let window = Duration::from_secs(1);
+        let closed_window = |idle: &Idle| {
+            idle.activity.send_modify(|activity| {
+                activity.awake = true;
+                activity.last_end = Some(
+                    TokioInstant::now()
+                        .checked_sub(window * 2)
+                        .expect("the test clock is not that young"),
+                );
+            });
+        };
+
+        // The release first: the call that follows finds the manager gone,
+        // and is a reason for it to wake.
+        let (idle, demand) = idle_and_demand(window);
+        closed_window(&idle);
+        assert!(idle.try_release(false).is_some(), "the window had closed");
+        let call = demand.begin();
+        {
+            let activity = demand.activity.borrow();
+            assert!(
+                !activity.awake,
+                "the call must not see the released connection"
+            );
+            assert!(
+                window_open(&activity, window),
+                "the manager must wake for the call"
+            );
+        }
+        assert!(idle.try_release(false).is_none(), "nothing left to let go");
+        drop(call);
+
+        // The call first: the release that follows finds it and stays, with
+        // an input outstanding or without, and the call's end restarts the
+        // window rather than releasing.
+        let (idle, demand) = idle_and_demand(window);
+        closed_window(&idle);
+        let call = demand.begin();
+        assert!(idle.try_release(false).is_none());
+        assert!(idle.try_release(true).is_none());
+        assert!(
+            demand.activity.borrow().awake,
+            "the call's connection stays"
+        );
+        drop(call);
+        assert!(idle.try_release(false).is_none());
+        assert!(idle.try_release(true).is_none());
+        assert!(demand.activity.borrow().awake);
+
+        // A zero window never lets go at all.
+        let (idle, demand) = idle_and_demand(Duration::ZERO);
+        closed_window(&idle);
+        drop(demand.begin());
+        assert!(idle.try_release(false).is_none());
+    }
+
+    /// A [`BridgeHandle`] wired by hand, with every sender kept, so no
+    /// channel closes under a call that waits on it.
+    struct HandWired {
+        handle: BridgeHandle,
+        link_tx: watch::Sender<LinkState>,
+        _state_tx: watch::Sender<BridgeState>,
+        _protocol_tx: watch::Sender<Option<u32>>,
+        _rejected_tx: watch::Sender<Option<String>>,
+        _input_rx: mpsc::Receiver<(InputId, AgentInput)>,
+    }
+
+    impl HandWired {
+        fn new() -> Self {
+            let (state_tx, state_rx) = watch::channel(BridgeState::Never);
+            let (input_tx, input_rx) = mpsc::channel(1);
+            let (ack_tx, _) = broadcast::channel(1);
+            let (protocol_tx, protocol_rx) = watch::channel(None);
+            let (rejected_tx, rejected_rx) = watch::channel(None);
+            let (link_tx, link_rx) = watch::channel(LinkState::Down);
+            Self {
+                handle: BridgeHandle {
+                    state_rx,
+                    input_tx,
+                    ack_tx,
+                    protocol_rx,
+                    rejected_rx,
+                    link_rx,
+                },
+                link_tx,
+                _state_tx: state_tx,
+                _protocol_tx: protocol_tx,
+                _rejected_tx: rejected_tx,
+                _input_rx: input_rx,
+            }
+        }
+    }
+
+    /// The grace a silent connection gets is counted from when it opened, so
+    /// a connect that ran late still gets all of it: the call answers once the
+    /// connection is old enough for its silence to be diagnosed, and the tool
+    /// layer, reading the age after it, says the app is held rather than
+    /// calling the connection young. One opened too late for that is answered
+    /// at the bound, still young, which the tool layer says too.
+    ///
+    /// Real time: the link's age is read on the wall clock it was stamped by.
+    /// The first case opens 250 ms in, where the 600 ms bound counted from
+    /// the call's start answered about a link 350 ms old; the 950 ms it should
+    /// then take leaves 250 ms before the bound for a loaded host.
+    #[tokio::test]
+    async fn the_first_call_counts_the_grace_from_when_its_connection_opened() {
+        for (opens_after, diagnosed) in [
+            (Duration::from_millis(250), true),
+            (Duration::from_millis(900), false),
+        ] {
+            let (idle, demand) = idle_and_demand(Duration::from_secs(30));
+            let wired = HandWired::new();
+            // The manager is awake and connecting.
+            idle.activity.send_modify(|activity| activity.awake = true);
+            let call = demand.begin();
+            let started = Instant::now();
+            let opener = async {
+                tokio::time::sleep(opens_after).await;
+                wired.link_tx.send_replace(LinkState::Open {
+                    since: Instant::now(),
+                });
+            };
+            tokio::join!(call.settle(&wired.handle), opener);
+            let waited = started.elapsed();
+            let age = wired
+                .handle
+                .link_rx
+                .borrow()
+                .open_for()
+                .expect("the link is open");
+            if diagnosed {
+                assert!(
+                    age >= SILENT_LINK_GRACE && waited < FIRST_CALL_WAIT,
+                    "opened {opens_after:?} in, the call answered at {waited:?} about a link \
+                     {age:?} old"
+                );
+            } else {
+                assert!(
+                    waited >= FIRST_CALL_WAIT && waited < FIRST_CALL_WAIT * 2,
+                    "{waited:?}"
+                );
+                assert!(age < SILENT_LINK_GRACE, "{age:?}");
+            }
+        }
     }
 }

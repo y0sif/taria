@@ -192,12 +192,18 @@ fn the_binary_connects_on_the_first_tool_call_and_lets_go_when_idle() {
         listener
     });
 
+    // Taken before the call is sent, so the release is at least the window
+    // after it however late the response reaches this process: the window
+    // starts when the call ends, which is after this, and the response's
+    // trip back through stdout is not in the measurement at all. Measured
+    // from the response instead, the margin was that trip, which a loaded
+    // host can stretch past any slack worth leaving.
+    let call_sent = Instant::now();
     let result = bridge.call(
         3,
         "tools/call",
         json!({"name": "read_tree", "arguments": {}}),
     );
-    let call_done = Instant::now();
     assert_ne!(result["result"]["isError"], json!(true), "{result}");
     let text = result["result"]["content"][0]["text"]
         .as_str()
@@ -210,10 +216,11 @@ fn the_binary_connects_on_the_first_tool_call_and_lets_go_when_idle() {
     let closed_at = closed_rx
         .recv_timeout(WAIT)
         .expect("taria-mcp should let go of the app after --idle-release 1");
-    let quiet = closed_at.duration_since(call_done);
+    let quiet = closed_at.duration_since(call_sent);
     assert!(
-        quiet >= Duration::from_millis(900),
-        "let go {quiet:?} after the last call, inside the 1 s window"
+        quiet >= Duration::from_secs(1),
+        "let go {quiet:?} after the last call was sent, inside the 1 s window that starts when it \
+         ends"
     );
     drop(app.join().expect("fake app thread"));
 
@@ -237,4 +244,12 @@ fn the_binary_connects_on_the_first_tool_call_and_lets_go_when_idle() {
         .find(|line| line.contains("released the app"))
         .expect("found above");
     assert!(release.contains("INFO"), "{release}");
+    // The idle time is measured, not the window restated: at least the
+    // window, and nothing held it past it.
+    assert!(
+        release.contains("no tool call for 1.")
+            && release.contains("released the app (closed its connection to the app)")
+            && !release.contains("past the"),
+        "{release}"
+    );
 }
