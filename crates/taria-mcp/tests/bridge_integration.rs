@@ -2598,20 +2598,27 @@ async fn cancelled_call() {
 /// either served by the connection the manager kept or by a fresh one it made
 /// for that call, never refused for a connection it let go of under the call,
 /// and an input sent by such a call always reaches the app.
+///
+/// Some rounds must find the app let go: were the release never to run, every
+/// call would be served by the kept connection, and the test would pass
+/// without a single call racing a release.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn calls_on_the_edge_of_the_window_are_always_served() {
     let (_dir, path) = test_socket_path("edge-calls");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let window = Duration::from_millis(100);
     let server = on_demand(path, window);
-    let (_closed, mut inputs) = serve_generations(listener, PROTOCOL_VERSION);
+    let (mut closed, mut inputs) = serve_generations(listener, PROTOCOL_VERSION);
 
     server.read_tree().await.expect("the first connection");
+    let mut releases = 0;
     // Each round is a key call, which waits its half second for a change
     // that never comes, then a pause that lands the next call on the edge.
     for round in 0..8u64 {
-        // Around the window's end: a little before, on it, a little after.
-        let offset = Duration::from_millis(90 + (round % 4) * 5);
+        // Around the window's end: a little before, on either side of it,
+        // and far enough after it that the release has had time to run on
+        // a loaded host, which is what the count below relies on.
+        let offset = Duration::from_millis([90, 97, 103, 120][(round % 4) as usize]);
         tokio::time::sleep(offset).await;
         server
             .key(Parameters(KeyParams {
@@ -2625,7 +2632,17 @@ async fn calls_on_the_edge_of_the_window_are_always_served() {
             .expect("the input should reach the app")
             .expect("the fake app is still serving");
         assert_eq!(input, AgentInput::key("x"), "round {round}");
+        // A connection the manager let go of before this round's call is
+        // closed before the app accepts the one the call made, so it is
+        // counted by now.
+        while closed.try_recv().is_ok() {
+            releases += 1;
+        }
     }
+    assert!(
+        releases > 0,
+        "no round found the app let go, so no call raced a release"
+    );
 }
 
 /// Letting go ends the connection, and an adapter discards whatever that

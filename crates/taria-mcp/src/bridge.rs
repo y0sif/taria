@@ -778,8 +778,10 @@ async fn pause(idle: Option<&mut Idle>, backoff: Duration) -> Pause {
 
 /// Why one served connection ended.
 enum ConnectionEnd {
-    /// The app closed the socket (or an I/O error occurred).
-    AppClosed,
+    /// The app closed the socket (or an I/O error occurred), with this many
+    /// inputs the connection wrote still awaiting their ack: past the idle
+    /// window, the ones it was being held for.
+    AppClosed { unacked: usize },
     /// Every [`BridgeHandle::input_tx`] clone was dropped: the MCP session is
     /// over, so the manager should exit instead of reconnecting.
     SessionClosed,
@@ -809,6 +811,10 @@ enum Hold {
     /// Inputs were still unacked [`UNACKED_HOLD`] past the window, and the
     /// release came anyway, with this many unacked.
     Expired { unacked: usize },
+    /// Inputs were still awaiting their ack past the window, and the app
+    /// closed the connection before acking them, with this many unacked: the
+    /// app leaving cut the hold short.
+    AppClosed { unacked: usize },
 }
 
 /// Connect-serve-reconnect until the session is torn down. With an [`Idle`],
@@ -891,7 +897,7 @@ async fn manager_loop(
                         }
                     });
                     match end {
-                        ConnectionEnd::AppClosed => {
+                        ConnectionEnd::AppClosed { unacked } => {
                             if let Some(idle) = idle.as_mut() {
                                 // Counted only now, with the channels above
                                 // already describing the ended connection,
@@ -907,14 +913,28 @@ async fn manager_loop(
                                 // reason, a healthy connection's included.
                                 if let Some(quiet_since) = idle.try_release(false) {
                                     tracing::info!(path = %path.display(), "app disconnected");
+                                    // With the window closed, an input still
+                                    // awaiting its ack is what the connection
+                                    // was being held for, and the log says
+                                    // the app's leaving ended that hold
+                                    // rather than calling it a plain release.
+                                    let (hold, what) = if unacked > 0 {
+                                        (
+                                            Hold::AppClosed { unacked },
+                                            "the app closed the connection during the ack \
+                                             hold; not reconnecting",
+                                        )
+                                    } else {
+                                        (
+                                            Hold::None,
+                                            "the app closed the connection; not reconnecting",
+                                        )
+                                    };
                                     log_release(
                                         &path,
                                         idle.release_after,
-                                        Release {
-                                            quiet_since,
-                                            hold: Hold::None,
-                                        },
-                                        "the app closed the connection; not reconnecting",
+                                        Release { quiet_since, hold },
+                                        what,
                                     );
                                     continue 'asleep;
                                 }
@@ -1023,6 +1043,15 @@ fn log_release(path: &std::path::Path, release_after: Duration, release: Release
              window, the longest an input awaiting its ack holds the app: released the app \
              ({what}) with {unacked} input(s) never acked, which the app may discard; the next \
              tool call reconnects"
+        ),
+        Hold::AppClosed { unacked } => tracing::info!(
+            path = %path.display(),
+            idle_s,
+            idle_release_s,
+            unacked,
+            "no tool call for {idle_s:.1} s, {past_s:.1} s past the {idle_release_s} s idle \
+             window, held there while {unacked} input(s) awaited the app's ack: released the \
+             app ({what}); the next tool call reconnects"
         ),
     }
 }
@@ -1246,7 +1275,11 @@ async fn serve_connection(
                     }
                     line_buf.clear();
                 }
-                Ok(LineRead::Eof) => return ConnectionEnd::AppClosed,
+                Ok(LineRead::Eof) => {
+                    return ConnectionEnd::AppClosed {
+                        unacked: unacked.len(),
+                    };
+                }
                 Ok(LineRead::Overflow) => {
                     tracing::warn!(
                         cap_bytes = MAX_LINE_BYTES,
@@ -1258,11 +1291,15 @@ async fn serve_connection(
                     // went away, and the agent would wait for an app that is
                     // still running and about to send the same line again.
                     rejected_tx.send_replace(Some(OVERSIZED_LINE.to_string()));
-                    return ConnectionEnd::AppClosed;
+                    return ConnectionEnd::AppClosed {
+                        unacked: unacked.len(),
+                    };
                 }
                 Err(err) => {
                     tracing::warn!(%err, "read error on app socket");
-                    return ConnectionEnd::AppClosed;
+                    return ConnectionEnd::AppClosed {
+                        unacked: unacked.len(),
+                    };
                 }
             },
             input = input_rx.recv() => {
@@ -1280,7 +1317,9 @@ async fn serve_connection(
                 line.push('\n');
                 if let Err(err) = write_half.write_all(line.as_bytes()).await {
                     tracing::warn!(%err, "write error on app socket");
-                    return ConnectionEnd::AppClosed;
+                    return ConnectionEnd::AppClosed {
+                        unacked: unacked.len(),
+                    };
                 }
                 unacked.sent(id);
             }
@@ -1467,7 +1506,7 @@ mod tests {
             &mut label,
         )
         .await;
-        assert!(matches!(end, ConnectionEnd::AppClosed));
+        assert!(matches!(end, ConnectionEnd::AppClosed { .. }));
         assert_eq!(rejected_rx.borrow().as_deref(), Some(OVERSIZED_LINE));
         drop(writer.await.expect("the writer task"));
     }
@@ -1672,15 +1711,30 @@ mod tests {
     /// can find the clock already moved to the next deadline (here, typically
     /// the end of the hold), as if the peer had taken that long. A 1 ms timer,
     /// rearmed for as long as `io` runs, caps every such jump at 1 ms.
+    ///
+    /// What `io` waits on is something the other end has already done, so it
+    /// is ready within a step or two. One still pending after
+    /// [`SMALL_STEPS_BOUND`] of the paused clock never will be (a bridge that
+    /// stopped reading, say), and fails the test rather than stepping the
+    /// clock forever.
     async fn in_small_steps<T>(io: impl Future<Output = T>) -> T {
+        let bound = TokioInstant::now() + SMALL_STEPS_BOUND;
         tokio::pin!(io);
         loop {
             tokio::select! {
                 out = &mut io => return out,
-                () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                () = tokio::time::sleep(Duration::from_millis(1)) => assert!(
+                    TokioInstant::now() < bound,
+                    "still pending after {SMALL_STEPS_BOUND:?} of 1 ms steps"
+                ),
             }
         }
     }
+
+    /// How long [`in_small_steps`] steps the paused clock before giving up:
+    /// far longer than anything it waits on takes, and far shorter than
+    /// [`UNACKED_HOLD`], so a missed ack fails before the hold ends.
+    const SMALL_STEPS_BOUND: Duration = Duration::from_secs(5);
 
     /// The id of the next input the bridge writes on `reader`.
     async fn next_input_id<R: tokio::io::AsyncRead + Unpin>(reader: &mut BufReader<R>) -> InputId {
@@ -1698,7 +1752,7 @@ mod tests {
     fn released(end: ConnectionEnd) -> Release {
         match end {
             ConnectionEnd::Released(release) => release,
-            ConnectionEnd::AppClosed => panic!("the connection ended as AppClosed"),
+            ConnectionEnd::AppClosed { .. } => panic!("the connection ended as AppClosed"),
             ConnectionEnd::SessionClosed => panic!("the connection ended as SessionClosed"),
         }
     }
@@ -1831,6 +1885,7 @@ mod tests {
         let window = Duration::from_secs(1);
         let (mut idle, demand) = idle_and_demand(window);
         let mut wiring = Wiring::new();
+        let wall = Instant::now();
 
         for (acked_after, hold) in [
             (Duration::from_secs(5), Hold::UntilAcked),
@@ -1870,6 +1925,67 @@ mod tests {
             assert_eq!(released(end).hold, hold, "acked after {acked_after:?}");
             assert_at(t0, at, acked_after.max(window));
         }
+        // Six seconds of window and hold on the paused clock, in no time on
+        // the wall clock.
+        assert!(
+            wall.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            wall.elapsed()
+        );
+    }
+
+    /// An app that closes the connection while it is held for an ack ends
+    /// the connection with the inputs still unacked counted, which is how
+    /// the release that follows is logged as the hold cut short rather than
+    /// as a plain end of the window.
+    #[tokio::test(start_paused = true)]
+    async fn the_app_leaving_during_the_hold_is_reported_with_the_inputs_it_held() {
+        let window = Duration::from_secs(1);
+        let (mut idle, demand) = idle_and_demand(window);
+        let mut wiring = Wiring::new();
+        let wall = Instant::now();
+        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+
+        let call = demand.begin();
+        wiring
+            .input_tx
+            .send((11, AgentInput::key("x")))
+            .await
+            .expect("queued");
+        let t0 = TokioInstant::now();
+        drop(call);
+        let leaves_after = window + Duration::from_secs(5);
+        let (served_tx, served_rx) = tokio::sync::oneshot::channel();
+        let serve = async {
+            let out = wiring.serve(bridge_end, &mut idle).await;
+            let _ = served_tx.send(());
+            out
+        };
+        let app = async move {
+            let mut reader = BufReader::new(app_end);
+            assert_eq!(next_input_id(&mut reader).await, 11);
+            tokio::time::sleep_until(t0 + leaves_after).await;
+            // Gone with the input unacked, five seconds into the hold.
+            drop(reader);
+            // Until the bridge has seen the end: the next timer is the end
+            // of the hold, and the clock must not jump there first.
+            in_small_steps(served_rx)
+                .await
+                .expect("the bridge ended the connection");
+        };
+        let ((end, at), ()) = tokio::join!(serve, app);
+        assert!(
+            matches!(end, ConnectionEnd::AppClosed { unacked: 1 }),
+            "the connection did not end as the app leaving with one input unacked"
+        );
+        assert_at(t0, at, leaves_after);
+        // The window had closed, so the manager lets go rather than reconnect.
+        assert_eq!(idle.try_release(false), Some(t0));
+        assert!(
+            wall.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            wall.elapsed()
+        );
     }
 
     /// The set of unacked inputs is bounded, forgetting the oldest, so an app
@@ -2023,15 +2139,20 @@ mod tests {
     /// calling the connection young. One opened too late for that is answered
     /// at the bound, still young, which the tool layer says too.
     ///
-    /// Real time: the link's age is read on the wall clock it was stamped by.
-    /// The first case opens 250 ms in, where the 600 ms bound counted from
-    /// the call's start answered about a link 350 ms old; the 950 ms it should
-    /// then take leaves 250 ms before the bound for a loaded host.
+    /// Real time: the link's age is read on the wall clock it was stamped by,
+    /// so each case leaves a loaded host room on the side it can fail on. The
+    /// first opens 250 ms in, where a grace counted from the call's start
+    /// would answer at 500 ms about a link 250 ms old; the 750 ms it should
+    /// take leaves 450 ms before the 1.2 s bound. The second opens 1.1 s in
+    /// and is answered at the bound about a link 100 ms old, which leaves
+    /// 400 ms for the answer to run late before the link is old enough to
+    /// pass for one the call waited the grace out on (that answer would come
+    /// at 1.6 s, about a link 500 ms old).
     #[tokio::test]
     async fn the_first_call_counts_the_grace_from_when_its_connection_opened() {
         for (opens_after, diagnosed) in [
             (Duration::from_millis(250), true),
-            (Duration::from_millis(900), false),
+            (Duration::from_millis(1_100), false),
         ] {
             let (idle, demand) = idle_and_demand(Duration::from_secs(30));
             let wired = HandWired::new();

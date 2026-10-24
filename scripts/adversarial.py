@@ -1804,6 +1804,18 @@ def probe_oversized_first_tree(client, ctx):
     )
 
 
+# What the bridge logs, at info, when it held the app past its idle window for
+# an input awaiting its ack and let go once the app acked it: the release
+# measured from the last call, how far past the window the hold ran, and that
+# the ack is what ended it.
+HELD_UNTIL_ACKED_LOG_RE = re.compile(
+    r"no tool call for (?P<idle>\d+\.\d) s, (?P<past>\d+\.\d) s past the "
+    r"(?P<window>\d+(?:\.\d+)?) s idle window, held there until the app acked every "
+    r"input it was sent: released the app \(closed its connection to the app\); the "
+    r"next tool call reconnects"
+)
+
+
 def probe_release_waits_for_ack(client, ctx):
     """Letting go of the app never costs an input still awaiting its ack.
 
@@ -1867,6 +1879,20 @@ def probe_release_waits_for_ack(client, ctx):
         require(
             CLOSED_LOG in mcp.stderr_tail(),
             f"the connection ended without the release being logged:\n{mcp.stderr_tail()}",
+        )
+        # And logged as the release the ack ended, not a plain end of the
+        # window: the hold ran from the window's end to the ack, at least
+        # `held_for - window` seconds.
+        logged = HELD_UNTIL_ACKED_LOG_RE.search(mcp.stderr_tail())
+        require(
+            logged is not None,
+            f"the release was not logged as held until the app acked:\n{mcp.stderr_tail()}",
+        )
+        require(
+            float(logged["window"]) == window
+            and float(logged["past"]) >= held_for - window - 0.1,
+            f"the release log has the hold wrong for a {window}s window and an ack "
+            f"{held_for}s after the call: {logged.group(0)}",
         )
     return (
         f"ack withheld {held_for}s after the call, a {window}s window: connection "

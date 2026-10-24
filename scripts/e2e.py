@@ -313,11 +313,18 @@ class McpClient:
     """taria-mcp over stdio: newline-delimited JSON-RPC 2.0."""
 
     def __init__(self, sock_path, extra_args=()):
+        # The log level is the script's, not the caller's shell's: steps x-z
+        # and the adversarial release probe read info lines from stderr, and
+        # an exported TARIA_LOG=warn would make a check for a line's absence
+        # pass vacuously and one for its presence fail.
+        env = dict(os.environ)
+        env["TARIA_LOG"] = "info"
         self.proc = subprocess.Popen(
             [MCP_BIN, "--socket", sock_path, *extra_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
         self._next_id = 0
         self._buf = b""
@@ -2257,6 +2264,27 @@ class PrivateDemo:
 # before its silence means anything. The call that opens a connection waits
 # out the grace, so it is seen only when that connect ran late.
 YOUNG_LINK_MARKER = "worth one retry"
+# The answer for a connection the app has greeted and sent no tree on yet, in
+# the never-had-a-tree form and the reconnected one. When an app takes a
+# bridge from the backlog the tree follows the greeting by microseconds, and a
+# call can land between them.
+GREETED_MARKER = "the app completed the taria handshake (protocol version"
+# How many of those two answers a step takes, in a row, before it calls the
+# moment a state.
+TRANSIENT_RETRIES = 5
+
+
+def transient_answer(message):
+    """True for an answer that is a moment of a handover, not a verdict.
+
+    A connection too young to diagnose, or one the app greeted and has not
+    sent a tree on yet: either becomes the tree or the held answer on the
+    next call. "May have exited" is never one of them, whatever else the
+    answer says.
+    """
+    return EXITED_MARKER not in message and (
+        YOUNG_LINK_MARKER in message or GREETED_MARKER in message
+    )
 
 
 def held_error(client, pattern, what, calls=1):
@@ -2423,8 +2451,12 @@ def step_y_idle_bridge_hands_over(ctx):
 
         # B is not called in between, except to watch: every answer until A
         # lets go is the held one, and the first tree comes after A's window.
+        # The app greets B before it sends B the tree, and a call can land
+        # between the two: that answer is a retry, but only once A's window
+        # has closed, since a greeting is the app accepting B.
         deadline = quiet_from + window_a + READ_TIMEOUT
         tree = None
+        transient = 0
         while time.monotonic() < deadline:
             try:
                 kind, tree = second.call_outcome("read_tree")
@@ -2432,9 +2464,26 @@ def step_y_idle_bridge_hands_over(ctx):
                 break
             except ToolError as err:
                 require(
-                    EXITED_MARKER not in err.message and HELD_NEVER_RE.match(err.message),
-                    f"B, waiting on A, got another answer: {err.message[:300]}",
+                    EXITED_MARKER not in err.message,
+                    f"B, waiting on A, was told the app may have exited: {err.message[:300]}",
                 )
+                if transient_answer(err.message):
+                    transient += 1
+                    require(
+                        transient <= TRANSIENT_RETRIES,
+                        f"B got {transient} transient answers in a row: {err.message[:300]}",
+                    )
+                    require(
+                        GREETED_MARKER not in err.message
+                        or time.monotonic() - quiet_from >= window_a - 0.1,
+                        f"the app greeted B inside A's {window_a}s window: {err.message[:300]}",
+                    )
+                else:
+                    transient = 0
+                    require(
+                        HELD_NEVER_RE.match(err.message),
+                        f"B, waiting on A, got another answer: {err.message[:300]}",
+                    )
             time.sleep(0.1)
         require(tree is not None, "B never got the app after A's window closed")
         handed_over = time.monotonic() - quiet_from
@@ -2447,7 +2496,9 @@ def step_y_idle_bridge_hands_over(ctx):
             f"A logged no release:\n{first.stderr_tail()}",
         )
 
-        gone, _ = held_error(first, HELD_GONE_RE, "bridge A, back after letting go")
+        gone, _ = held_error(
+            first, HELD_GONE_RE, "bridge A, back after letting go", calls=2
+        )
         require(
             gone["label"] == "taria-demo",
             f"A's held answer names the app {gone['label']!r}",
@@ -2497,16 +2548,25 @@ def step_z_restart_race_loser_is_held(ctx):
     winner. The restart is repeated, and every loser is held to it, whichever
     bridge it is; asking both before each kill checks the same answer between
     restarts.
+
+    Both windows are 2 s. The winner's starts when its own answer, the tree,
+    returns at once, and the re-ask that checks the race has settled goes out
+    only after the loser's answer, which takes the half-second grace: with a
+    1 s window, a host stalled for half a second let the winner go first, and
+    the app changed hands under the check. A young connection's answer, or a
+    greeted one's in the moment before its tree, is asked again rather than
+    judged.
     """
     rounds = 4
+    window = 2
     with PrivateDemo("taria-e2e-race-") as demo:
         demo.start_app()
-        bridges = {"P": demo.bridge(1), "Q": demo.bridge(1)}
+        bridges = {"P": demo.bridge(window), "Q": demo.bridge(window)}
 
         # Both get the app once: P first, then Q once P has let go.
         bridges["P"].read_tree()
         require(
-            wait_log(bridges["P"], CLOSED_LOG, 1 + READ_TIMEOUT),
+            wait_log(bridges["P"], CLOSED_LOG, window + READ_TIMEOUT),
             f"P never let go of the app:\n{bridges['P'].stderr_tail()}",
         )
         try:
@@ -2527,9 +2587,14 @@ def step_z_restart_race_loser_is_held(ctx):
                     answers[name] = (None, err.message)
             return answers
 
+        retry = object()
+
         def judge(answers, when):
-            """The one with a tree, after checking the other is held."""
+            """The one with a tree, after checking the other is held; `retry`
+            when an answer is a transient one, which the next ask settles."""
             winners = [name for name, (tree, _) in answers.items() if tree is not None]
+            require(len(winners) <= 1, f"{when}: both bridges were served a tree")
+            transient = False
             for name, (tree, err) in answers.items():
                 if tree is not None:
                     continue
@@ -2538,13 +2603,25 @@ def step_z_restart_race_loser_is_held(ctx):
                     f"{when}: {name} was told the app may have exited while it "
                     f"runs: {err[:300]}",
                 )
+                if transient_answer(err):
+                    transient = True
+                    continue
                 match = HELD_GONE_RE.match(err)
                 require(match, f"{when}: {name} did not get the held answer: {err[:400]}")
                 require(match["label"] == "taria-demo", f"{when}: {name} names {match['label']!r}")
-            require(len(winners) <= 1, f"{when}: both bridges were served a tree")
+            if transient:
+                return retry
             return winners[0] if winners else None
 
-        holder = judge(ask_both(), "before the first restart")
+        def settled(when):
+            """judge(ask_both()), asked again while an answer is transient."""
+            for _ in range(TRANSIENT_RETRIES):
+                verdict = judge(ask_both(), when)
+                if verdict is not retry:
+                    return verdict
+            raise StepFailure(f"{when}: {TRANSIENT_RETRIES} asks in a row met a transient answer")
+
+        holder = settled("before the first restart")
         require(holder == "Q", f"before the first restart the holder was {holder}, not Q")
         winners = []
         for round_no in range(1, rounds + 1):
@@ -2562,13 +2639,14 @@ def step_z_restart_race_loser_is_held(ctx):
             demo.start_app()
             winner = None
             for _ in range(8):
-                winner = judge(ask_both(), when)
-                if winner is not None:
+                verdict = judge(ask_both(), when)
+                if verdict is not None and verdict is not retry:
+                    winner = verdict
                     break
             require(winner is not None, f"{when}: neither bridge was served the restarted app")
             # And again, with the race settled: the loser stays held.
             require(
-                judge(ask_both(), f"{when}, settled") == winner,
+                settled(f"{when}, settled") == winner,
                 f"{when}: the app changed hands with nobody letting go",
             )
             winners.append(winner)
