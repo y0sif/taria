@@ -91,22 +91,58 @@ DEMO_TRIMMED_RE = re.compile(
 # of a restart race, or a bridge that let go and came back to find it taken).
 # The connection's age is whatever the call caught, so it is captured; every
 # other word is verbatim, for the reason the input-tool prefixes above are.
+#
+# When the holder lets go is said by the asking bridge's own idle window, the
+# best guess at the holder's: the 0.3.2 sentence on the default, one naming
+# the window for any other (captured as `window`, which a step holds to the
+# bridge's `--idle-release`), and one for a bridge that never lets go.
+HELD_RETRY = (
+    r"(?:A taria-mcp lets go of the app after 60 s with no tool calls \(its default\), "
+    r"and this bridge takes over as soon as it does, with no restart; retry in a "
+    r"minute\."
+    r"|A taria-mcp started like this one lets go of the app after "
+    r"(?P<window>\d+(?:\.\d+)?) s with no tool calls \(one on the default, after 60 s\), "
+    r"and this bridge takes over as soon as the holder does, with no restart; retry in "
+    r"(?P=window) s\."
+    r"|This bridge never lets go of the app, and a taria-mcp started like it keeps the "
+    r"app until its session ends \(one on the default lets go after 60 s with no tool "
+    r"calls\); this bridge takes over as soon as the holder lets go, with no restart; "
+    r"retry in a minute\.)"
+)
+HELD_STAYS = (
+    r"If the app stays held, another session is using it, or the holder is a taria-mcp "
+    r"older than 0\.3\.2, which holds the app until its session ends\."
+)
 HELD_EXPLANATION = (
     r"The socket path is right: this bridge has been connected for (?P<open>\d+\.\d)s "
     r"with no handshake, which is what a second bridge gets, because a taria adapter "
-    r"serves one bridge at a time and greets each one only when it accepts it\. A "
-    r"taria-mcp lets go of the app after 60 s with no tool calls \(its default\), and "
-    r"this bridge takes over as soon as it does, with no restart; retry in a minute\. "
-    r"If the app stays held, another session is using it, or the holder is a taria-mcp "
-    r"older than 0\.3\.2, which holds the app until its session ends\. Failing that, the "
-    r"peer at this path wedged before its handshake, or is not a taria adapter at all\.$"
+    r"serves one bridge at a time and greets each one only when it accepts it\. "
+    + HELD_RETRY
+    + " "
+    + HELD_STAYS
+    + r" Failing that, the peer at this path wedged before its handshake, or is not a "
+    r"taria adapter at all\.$"
+)
+HELD_GONE_OPENING = (
+    r"^app '(?P<label>[^']*)' disconnected \(last snapshot seq (?P<seq>\d+)\), and the "
+    r"app is now held by another bridge\. "
 )
 HELD_NEVER_RE = re.compile(
     r"^no snapshot from the app yet: the app is held by another bridge\. " + HELD_EXPLANATION
 )
-HELD_GONE_RE = re.compile(
-    r"^app '(?P<label>[^']*)' disconnected \(last snapshot seq (?P<seq>\d+)\), and the "
-    r"app is now held by another bridge\. " + HELD_EXPLANATION
+HELD_GONE_RE = re.compile(HELD_GONE_OPENING + HELD_EXPLANATION)
+# The same, from a bridge whose own departure was letting go after its idle
+# window (`released_after`, its `--idle-release`): it says so, so that the
+# "disconnected" it opens with is not chased as a fault, then when to retry.
+HELD_RELEASED_RE = re.compile(
+    HELD_GONE_OPENING
+    + r"That disconnect was this bridge letting go on purpose after "
+    r"(?P<released_after>\d+(?:\.\d+)?) s with no tool calls, so another session could "
+    r"use the app; it is not a fault and needs no investigating\. "
+    + HELD_RETRY
+    + " "
+    + HELD_STAYS
+    + "$"
 )
 # The answer for an app that really went away. A held app is running, so this
 # is the one answer a held bridge must never give.
@@ -2424,7 +2460,9 @@ def step_y_idle_bridge_hands_over(ctx):
     call it lets go, and B, which is still connected in the app's backlog, is
     accepted with no restart and no reconnect of its own. A, asked again, now
     gets the held answer about B, in its "disconnected" form because it had
-    the app before. The demo then quits through B, and its exit report must
+    the app before, saying that the disconnect was its own release and no
+    fault. Each held answer names its own bridge's window as the time to
+    retry in. The demo then quits through B, and its exit report must
     show no input lost: A let go only after its input was acked, and nothing
     either bridge sent was discarded with a connection.
 
@@ -2433,10 +2471,11 @@ def step_y_idle_bridge_hands_over(ctx):
     machine. B's is 3 s, so B still holds the app when A asks again.
     """
     window_a = 2
+    window_b = 3
     with PrivateDemo("taria-e2e-handover-") as demo:
         app = demo.start_app()
         first = demo.bridge(window_a)
-        second = demo.bridge(3)
+        second = demo.bridge(window_b)
 
         first.read_tree()
         # An input A sent and the app acked: the release must not cost it,
@@ -2447,6 +2486,10 @@ def step_y_idle_bridge_hands_over(ctx):
         # A silent connection is diagnosed once it is half a second old; the
         # call that opened it waits that long, so one call is normally enough.
         held, calls = held_error(second, HELD_NEVER_RE, "bridge B, behind A", calls=2)
+        require(
+            held["window"] == str(window_b),
+            f"B's held answer names a {held['window']} s window, not its own {window_b} s",
+        )
         require(
             time.monotonic() - quiet_from < window_a,
             "B's held answer came after A's window closed, so it proves nothing",
@@ -2511,11 +2554,15 @@ def step_y_idle_bridge_hands_over(ctx):
         )
 
         gone, _ = held_error(
-            first, HELD_GONE_RE, "bridge A, back after letting go", calls=2
+            first, HELD_RELEASED_RE, "bridge A, back after letting go", calls=2
         )
         require(
             gone["label"] == "taria-demo",
             f"A's held answer names the app {gone['label']!r}",
+        )
+        require(
+            gone["released_after"] == str(window_a) and gone["window"] == str(window_a),
+            f"A's held answer has its {window_a} s window wrong: {gone.group(0)[:400]}",
         )
 
         # Out through the advertised quit, from the bridge that holds the app.
@@ -2546,7 +2593,7 @@ def step_y_idle_bridge_hands_over(ctx):
     return (
         f"B held after {held['open']}s ({calls} call(s)); A let go and B had the "
         f"tree {handed_over:.1f}s after A's last call; A, back, was told seq "
-        f"{gone['seq']} is held; demo quit with nothing lost"
+        f"{gone['seq']} is held and its own release no fault; demo quit with nothing lost"
     )
 
 
@@ -2561,7 +2608,8 @@ def step_z_restart_race_loser_is_held(ctx):
     it said the app "may have exited" while the app ran and served the
     winner. The restart is repeated, and every loser is held to it, whichever
     bridge it is; asking both before each kill checks the same answer between
-    restarts.
+    restarts. A loser whose last departure was its own release says so, in
+    the released form of the same answer.
 
     Both windows are 2 s. The winner's starts when its own answer, the tree,
     returns at once, and the re-ask that checks the race has settled goes out
@@ -2620,9 +2668,14 @@ def step_z_restart_race_loser_is_held(ctx):
                 if transient_answer(err):
                     transient = True
                     continue
-                match = HELD_GONE_RE.match(err)
+                match = HELD_GONE_RE.match(err) or HELD_RELEASED_RE.match(err)
                 require(match, f"{when}: {name} did not get the held answer: {err[:400]}")
                 require(match["label"] == "taria-demo", f"{when}: {name} names {match['label']!r}")
+                require(
+                    match["window"] == str(window),
+                    f"{when}: {name}'s held answer names a {match['window']} s window, not "
+                    f"its own {window} s",
+                )
             if transient:
                 return retry
             return winners[0] if winners else None
@@ -2652,12 +2705,27 @@ def step_z_restart_race_loser_is_held(ctx):
                 os.unlink(demo.sock)
             demo.start_app()
             winner = None
-            for _ in range(8):
-                verdict = judge(ask_both(), when)
+            asks = 8
+            for _ in range(asks):
+                answers = ask_both()
+                verdict = judge(answers, when)
                 if verdict is not None and verdict is not retry:
                     winner = verdict
                     break
-            require(winner is not None, f"{when}: neither bridge was served the restarted app")
+            if winner is None:
+                # The last ask's answers, either way: they are the evidence.
+                quoted = "; ".join(
+                    f"{name}: {'a tree' if err is None else err[:300]}"
+                    for name, (_, err) in answers.items()
+                )
+                if verdict is retry:
+                    raise StepFailure(
+                        f"{when}: {asks} asks in a row met a transient answer; {quoted}"
+                    )
+                raise StepFailure(
+                    f"{when}: neither bridge was served the restarted app; both were "
+                    f"held; {quoted}"
+                )
             # And again, with the race settled: the loser stays held.
             require(
                 settled(f"{when}, settled") == winner,
