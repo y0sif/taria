@@ -69,6 +69,17 @@ and an input the app deliberately dropped looks like a slow one.
   `"focused":false` against an agent's output budget. Relaxing what a peer
   accepts is only free while no peer yet relies on it, which is why it lands
   under the freeze rather than when it is needed.
+- `relayed`: an optional boolean, omitted when `false`, saying a node's label
+  and value come from outside the app (a model's output, a file's contents,
+  another user's message), so an agent reads them as data rather than as the
+  app's own words. Per node, never inherited, and never covering the id. An
+  additive field that reaches an agent through any bridge, since a bridge
+  hands on the app's own line and one built before the field passes it on
+  too. What it means is said once, in `read_tree`'s description in both
+  formats, and not again in the instructions, which are resent with every
+  model call as well. Protocol section 6.4 has the rule, and the integration
+  guide shows a transcript that carries speakers in structure instead of in
+  prefixes the content can spell.
 
 ### Tree depth
 

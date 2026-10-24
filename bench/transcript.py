@@ -520,7 +520,7 @@ def _snapshot_tools(att):
 
 
 # How taria-mcp's read_tree description names the tree's format: "Read the
-# TUI app's current semantic tree as JSON. Call this first." by default, "...
+# TUI app's current semantic tree as JSON. Call this first. ..." by default, "...
 # semantic tree as an outline, one node per line, ..." under --tree-format
 # outline (crates/taria-mcp/src/server.rs, READ_TREE_PASSAGE). The first
 # round's batches (full1, outline1, probe3) were served the longer texts of
