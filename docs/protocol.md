@@ -1240,6 +1240,15 @@ connects the instant a session ends counts as one that waited.
 **Not specified.** What a second bridge should do while its connection waits,
 beyond reporting it.
 
+**Reference implementation.** The reference bridge takes turns, which is its
+own policy and not a rule. It opens no connection until its first tool call,
+so a bridge that is started and never used never takes the app. A bridge
+that waits says the app is held by another bridge, and that a taria-mcp lets
+go of the app after 60 s with no tool calls, so the agent retries. The holder
+lets go after 60 s with no tool calls (section 14.7), and the waiting bridge
+is then accepted. A waiting bridge that itself goes 60 s with no tool calls
+leaves the backlog.
+
 ### 14.6 Shutdown
 
 The app **SHOULD** remove the socket file on exit, but only while that file is
@@ -1266,13 +1275,28 @@ bridge that cannot take a whole line in that time is dropped.
 ### 14.7 Reconnection
 
 A bridge **SHOULD** reconnect with capped backoff rather than give up: the
-reference bridge starts at 250 ms, doubles, and caps at 2 s, retrying forever.
+reference bridge starts at 250 ms, doubles, and caps at 2 s, retrying for as
+long as it is in use.
 A connection that dies young without delivering a snapshot **SHOULD** keep the
 backoff growing instead of resetting it, or a peer that accepts and
 immediately drops pulls the bridge into a full-CPU loop.
 
 On disconnect a bridge **SHOULD** fail tool calls fast with an error naming
 the app that went away, rather than acting on a stale tree.
+
+**Reference implementation.** The reference bridge connects on demand. It
+opens no connection until its first tool call, which waits briefly, well
+under a second, for the `hello` and the latest snapshot the app sends on
+accept (section 3.4), so that call still answers with the live tree. After
+60 s with no tool calls it closes its connection, or leaves the listen
+backlog, and stops reconnecting until the next tool call, so a bridge waiting
+for the app gets it. `--idle-release` sets the delay, and `0` never lets go.
+It does not let go while an input it sent is still waiting for its ack, up to
+a cap, because the app discards an input whose connection has ended
+(section 11). A bridge that reconnects into the backlog behind another, as
+the one that loses the race does when an app restarts, says the app is held
+by another bridge rather than that it may have exited. None of this is a
+protocol rule. To the app, a bridge that let go is one that left.
 
 ## 15. Focus contract
 
@@ -1554,7 +1578,8 @@ that followed.
 - **`text_to_keys`** and its `\n` to Enter, `\t` to Tab, `\r` dropped
   convention (section 9.3).
 - **Every 500 ms window, queue size, backoff and retry figure** in the
-  reference peers. Nothing in the protocol specifies timing.
+  reference peers, and the reference bridge's 60 s idle release (section
+  14.7). Nothing in the protocol specifies timing.
 - **The reference bridge's tool argument bounds** (section 13.4).
 
 ## 19. Appendix B: what is not specified
@@ -1578,7 +1603,8 @@ behaviour a peer may rely on.
    the wire forbids it. A bridge cannot rely on it: an app may discard such
    input (section 14.5).
 8. **What a second bridge should do while its connection waits to be
-   accepted** (section 14.5). Multiple simultaneous clients are deferred.
+   accepted** (section 14.5). Multiple simultaneous clients are deferred. The
+   reference bridge's turn-taking is its own policy (sections 14.5 and 14.7).
 9. **Any timing requirement.** No keepalive, no heartbeat, no deadline for an
    ack, no maximum publish rate.
 10. **Bounds on `app_label`, `label`, `value`, node count and children count.**

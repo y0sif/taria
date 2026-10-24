@@ -17,8 +17,8 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace
-python3 scripts/e2e.py           # end-to-end: 23 steps, demo app + bridge + MCP
-python3 scripts/adversarial.py   # 22 edge-case probes
+python3 scripts/e2e.py           # end-to-end: 26 steps, demo app + bridge + MCP
+python3 scripts/adversarial.py   # 23 edge-case probes
 ```
 
 CI runs all six; zero warnings is the bar. The two scripts use nothing outside

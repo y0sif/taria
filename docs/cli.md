@@ -16,6 +16,15 @@ Options:
 | Flag | Effect |
 |---|---|
 | `--tree-format <json\|outline>` | How `read_tree`, and every input tool that answers with a tree, show the tree to the agent. `json`, the default, relays the app's own snapshot line minus its `type` framing key. `outline` renders that same line as one indented line per node (see [The outline](#the-outline)). The wire format is the same either way. A missing or unknown value is a usage error. |
+| `--idle-release <SECS>` | How long, in whole seconds, the bridge keeps the app with no tool calls before it lets go. The default is 60, and `0` never lets go. Once that long has passed, the bridge closes its connection, or leaves the listen backlog if it was waiting behind another bridge, and stops reconnecting until the next tool call. It does not let go while an input it sent is still waiting for the app's ack. A missing value, or one that is not a whole number, is a usage error. |
+
+The bridge opens no connection to the app until its first tool call, whatever
+`--idle-release` says: starting it, and the harness's `initialize` and
+`tools/list`, connect to nothing. That first call waits briefly, well under a
+second, for the connection, the app's `hello` and its tree, so it still
+answers with the live tree. A bridge locked out of the app says the app is
+held by another bridge, and that a taria-mcp lets go of the app after 60 s
+with no tool calls, so a retry is the way in.
 
 Environment variables:
 

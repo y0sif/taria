@@ -40,7 +40,9 @@ has a lint that catches it.
 
 ## Limitations
 
-- The adapter serves one bridge client per app at a time.
+- The adapter serves one bridge client per app at a time. Agents can take
+  turns: since 0.3.2, taria-mcp connects on its first tool call and lets the
+  app go after 60 s with no tool calls (`--idle-release`).
 - An app on a different `protocol_version` can still be read for as long as
   its snapshots parse, which is the common case rather than a guarantee: a
   version bump is defined by the changes that break parsing, so a peer whose

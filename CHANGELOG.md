@@ -13,6 +13,65 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [0.3.2] - Unreleased
+
+**An idle agent session no longer holds the app.** The adapter serves one
+bridge at a time, and `taria-mcp` connected at startup and never let go. A
+harness starts every server it has registered in every session, so with a
+project `.mcp.json` the first session opened kept the app, and the session
+that wanted it had to kill a bridge. `taria-mcp` now connects on its first
+tool call and lets the app go after 60 s with no tool calls.
+
+Nothing on the wire moved. `PROTOCOL_VERSION` stays 1, no message or field
+changed, and the code of `taria` and `taria-ratatui` is unchanged. The Rust
+API only grows: `bridge::spawn`, `TariaMcpServer::new` and `with_tree_format`
+still connect at once and never let go, as in 0.3.1, and the new
+`TariaMcpServer::on_demand(socket, tree_format, idle_release)` is what the
+binary uses. The MCP instructions and tool descriptions are unchanged, byte
+for byte. All three crates move to 0.3.2 together: they share one workspace
+version.
+
+### For whoever drives an app
+
+- **The bridge connects on its first tool call.** MCP `initialize` and
+  `tools/list` open nothing, so a session that never calls a taria tool never
+  takes the app. The first call waits briefly, well under a second, for the
+  connection, the app's `hello` and its tree, so it still returns the live
+  tree in one call.
+- **An idle bridge lets go after 60 s.** After 60 s with no tool calls it
+  closes its connection, or leaves the listen backlog if it was waiting there,
+  and stops reconnecting, so a bridge waiting for the app gets it at once. The
+  next call reconnects. It does not let go while an input it sent still
+  awaits the app's ack, up to a cap.
+- **`--idle-release <SECS>`** sets that delay in whole seconds. The default is
+  60, and `0` never lets go. The bridge connects on demand either way.
+- **A bridge locked out by another says the app is held.** It says the app is
+  held by another bridge, and that a taria-mcp lets go of the app after 60 s
+  with no tool calls, so the agent retries instead of asking someone to kill a
+  process. The same answer replaces "may have exited" for a bridge that lost
+  the reconnect race when the app restarted, since that app is running. An
+  app that has really gone reads as before: "disconnected (last snapshot seq
+  N); it may have exited".
+- **A holder older than 0.3.2 still holds the app until its session ends.**
+  Until every session runs the new bridge, disable taria with `/mcp` in the
+  Claude Code sessions that do not drive the app.
+
+### For an app author adopting taria
+
+- **Nothing to change.** A project `.mcp.json` that registers the bridge no
+  longer hands the app to whichever session opened first.
+
+### The gates
+
+- `scripts/e2e.py` grows from 23 steps to 26. Step x starts a bridge and never
+  calls it, and that bridge must not take the app. Step y runs a bridge with
+  `--idle-release 1`: a second bridge is told the app is held, then gets it
+  once the first lets go. Step z restarts the app, and the bridge that loses
+  the reconnect race must say the app is held, not that it exited.
+- `scripts/adversarial.py` grows from 22 probes to 23. The new one checks that
+  a release never drops an input still awaiting its ack, and the held-socket
+  probe matches the new wording.
+
 ## [0.3.1] - 2026-10-19
 
 **An app whose tree outgrew one line keeps its bridge.** A snapshot travels as
@@ -751,6 +810,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[0.3.2]: https://github.com/y0sif/taria/releases/tag/v0.3.2
 [0.3.1]: https://github.com/y0sif/taria/releases/tag/v0.3.1
 [0.3.0]: https://github.com/y0sif/taria/releases/tag/v0.3.0
 [0.2.1]: https://github.com/y0sif/taria/releases/tag/v0.2.1

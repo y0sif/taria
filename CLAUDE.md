@@ -11,8 +11,8 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
-python3 scripts/e2e.py                      # end-to-end gate, 23 steps
-python3 scripts/adversarial.py              # edge-case probes, 22 of them
+python3 scripts/e2e.py                      # end-to-end gate, 26 steps
+python3 scripts/adversarial.py              # edge-case probes, 23 of them
 ```
 
 Run all six before pushing. CI runs the same gate with `cargo build
@@ -78,12 +78,21 @@ refuses a `target/debug` older than the sources.
   second instance cannot steal it, and the listener polls a shutdown flag so
   exit never waits on a connection.
 - `crates/taria-mcp`: rmcp stdio server exposing
-  `read_tree`/`act`/`key`/`type_text`. A socket-manager task reconnects with
-  capped backoff, holds the latest snapshot in a watch channel, and
-  rebroadcasts acks. A snapshot is kept as the app's own line (minus the
-  `type` framing key) beside the parse of it: the line is what the agent
-  reads, so an unknown role, action or field survives by name; the parse is
-  what the bridge validates and diffs against. `--tree-format outline`
+  `read_tree`/`act`/`key`/`type_text`. A socket-manager task holds the latest
+  snapshot in a watch channel and rebroadcasts acks. The binary connects on
+  demand (`TariaMcpServer::on_demand`): nothing until the first tool call
+  (`initialize` and `tools/list` open nothing), which waits briefly for the
+  `hello` and the tree; then it reconnects with capped backoff while in use,
+  and after 60 s with no tool calls (`--idle-release`, `0` never) closes the
+  connection or leaves the backlog and stops reconnecting, but never while an
+  input awaits its ack (up to a cap). `bridge::spawn` and
+  `TariaMcpServer::new`/`with_tree_format` still connect eagerly and never
+  release. That is the fix for issue #13: the adapter serves one bridge at a
+  time and a repo `.mcp.json` starts one in every session. A snapshot is kept
+  as the app's own line (minus the `type` framing key) beside the parse of
+  it: the line is what the agent reads, so an unknown role, action or field
+  survives by name; the parse is what the bridge validates and diffs against.
+  `--tree-format outline`
   (default `json`) renders that line as one indented line per node for every
   tree an agent receives, with action names taken from the parse because that
   is what `act` checks, and swaps only the format passages of the
@@ -104,8 +113,11 @@ refuses a `target/debug` older than the sources.
   A line over `MAX_LINE_BYTES` ends the connection and leaves the reason
   `OVERSIZED_LINE`, kept across reconnects until a snapshot parses or a
   connect finds nothing listening; while it holds, every answer names the
-  1 MiB limit instead of "may have exited". A second bridge waiting in the
-  backlog is told the app "has not accepted" it.
+  1 MiB limit instead of "may have exited". A bridge locked out by another
+  (waiting in the backlog, or the loser of the reconnect race when the app
+  restarts) is told the app is "held by another bridge" and that a taria-mcp
+  lets go after 60 s with no tool calls, so the agent retries; an app really
+  gone still reads "it may have exited".
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
   identities (`IdSpace`), stable across deletes and restarts; the list

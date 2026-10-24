@@ -959,6 +959,13 @@ claude mcp add taria -- /path/to/taria/target/debug/taria-mcp --app my-app
 That registration line is Claude Code's; any MCP harness works, and the
 README's quick start walks the same steps against the demo app.
 
+Your app serves one bridge at a time, and a project `.mcp.json` starts a
+bridge in every session opened in the project. Since 0.3.2 that costs
+nothing: taria-mcp opens no connection until its first tool call, and lets
+the app go after 60 s with no tool calls, so an idle session does not keep
+your app from the one driving it. A bridge older than 0.3.2 holds the app
+for as long as its session lasts.
+
 The six things worth confirming by hand:
 
 - Exactly one node is focused in every state, including the empty ones.

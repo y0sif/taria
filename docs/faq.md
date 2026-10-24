@@ -73,12 +73,23 @@ exercises macOS end to end. Windows is not supported.
 No. The adapter serves one bridge client at a time. A second bridge's
 connection is completed by the kernel and not served until the first client
 leaves, so until then it sits there receiving no handshake and no snapshot;
-`read_tree` on that bridge says the socket is held by another client rather
-than sending you back to check the path. Anything it wrote while it waited is
+`read_tree` on that bridge says the app is held by another bridge rather than
+sending you back to check the path. Anything it wrote while it waited is
 thrown away when its turn comes, because it was written before it had seen a
 tree. taria-mcp sends nothing until it has a tree, so a second agent loses
 nothing. Multiple simultaneous clients are on the deferred list in
 `docs/architecture.md`.
+
+They can take turns, though. Since 0.3.2, taria-mcp opens no connection until
+its first tool call, and lets the app go after 60 s with no tool calls. A
+harness starts every registered server in every session, so a session that
+never calls a taria tool, or has stopped calling them, no longer keeps the
+app from the one that wants it. The waiting bridge's answer says the holder
+lets go after 60 s idle, so the agent retries rather than asking you to kill
+a process. `--idle-release` changes the 60 s (`docs/cli.md`). A bridge older
+than 0.3.2 still holds the app until its session ends; until every session
+runs the new one, disable taria with `/mcp` in the Claude Code sessions that
+do not drive the app.
 
 **Is the protocol stable?**
 
