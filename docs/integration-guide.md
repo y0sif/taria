@@ -4,11 +4,12 @@ Adding taria to a ratatui app you already have. For how the pieces fit, see
 `architecture.md`; for what the wire format requires of a peer, message by
 message, see `protocol.md`; for why taria exists, see `landscape.md`.
 
-Two apps have been through this. One is `examples/demo-app`, written taria
-first. The other was an existing typing tutor, retrofitted after the fact: a
+Three apps have been through this. One is `examples/demo-app`, written taria
+first. The second was an existing typing tutor, retrofitted after the fact: a
 real event loop, live metrics, and its own idea of node identity. Several of
-the APIs below exist because of the second one. Where a rule here comes from
-a bug rather than a preference, the bug is named.
+the APIs below exist because of it. The third, ramvamp, draws only a panel
+and was retrofitted too. Where a rule here comes from a bug rather than a
+preference, the bug is named.
 
 The work is five edits, in this order:
 
@@ -201,8 +202,11 @@ A reply streamed into it also changes the tree on every token, so each token
 republishes the whole tail
 ([Watch your publish rate](#watch-your-publish-rate)). ramvamp keeps the last
 6 KiB, about two screens of prose, trimmed a whole line at a time from the
-front; `Role::Log` tells an agent the value is a tail, and if the adapter ever
-has to trim it, a log keeps its end.
+front; `Role::Log` tells an agent the value grows at the end. If the adapter
+ever has to trim the tree, a log's own value keeps its end, but a transcript
+of turn nodes, as in [Mark relayed text](#mark-relayed-text), is cut like any
+list: each turn's words keep their start, and if that is not enough the
+newest turns are dropped, so cap the turn list yourself.
 
 ```rust
 /// About two screens of prose: a whole reply, without the tail being most
@@ -365,7 +369,8 @@ fn transcript(app: &App) -> Node {
 }
 ```
 
-which an agent reads in the outline as these lines, indented under the root:
+which an agent reads in the outline as these lines, shown without the root
+line:
 
 ```text
 transcript log "Transcript"
@@ -383,7 +388,8 @@ Ids come from identities, as in
 [Give things identities, not positions](#give-things-identities-not-positions),
 never from relayed text. The mark does not cover the id, and an id is what an
 agent passes back to `act`, so one built from a file name or a message carries
-that text unmarked, and moves whenever the text does.
+that text unmarked, and moves whenever the text does. The same goes for a
+custom action's name.
 
 ## Drain agent input around the blocking call
 

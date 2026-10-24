@@ -306,12 +306,13 @@ pub struct Node {
     /// instructions, and never the app's own words.
     ///
     /// It covers the label and the value, never the id, and this node alone:
-    /// children do not inherit it. An inherited mark would reach an agent
-    /// late, since the bridge hands on the line with its keys sorted, which
-    /// puts a parent's `relayed` after its `children`. Omitted when `false`,
-    /// unlike `focused`, because most nodes are the app's own. Absence reads
-    /// as `false`, and anything but a boolean, `null` included, fails the
-    /// line as a malformed `focused` does.
+    /// children do not inherit it. The reference bridge hands on the line
+    /// with its keys sorted, so an inherited mark would arrive after the
+    /// node's whole subtree, not just its own label. Omitted when `false`,
+    /// unlike `focused`, because most nodes carry no relayed text. Absence
+    /// reads as `false`, which says only that the node is not marked, not
+    /// that the app wrote it, and anything but a boolean, `null` included,
+    /// fails the line as a malformed `focused` does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relayed: bool,
     /// Actions an agent may invoke on this node right now.
@@ -625,7 +626,7 @@ mod tests {
     }
 
     /// The opposite pairing to `focused`: omitted when `false` (above), so
-    /// the many nodes the app wrote itself pay nothing for it, absence reads
+    /// the many nodes with nothing to mark pay nothing for it, absence reads
     /// as `false`, and `true` goes on the wire and comes back. The line is
     /// the turn docs/protocol.md section 6.4 shows: the speaker unmarked, the
     /// words in a relayed child, and the mark on that child alone.
