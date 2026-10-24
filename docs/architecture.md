@@ -526,25 +526,45 @@ the app owns the alternate screen garbles the display.
 
 Bridge side (`taria-mcp`):
 
-1. Connect on demand: nothing until the first tool call, then retrying for
-   as long as the bridge is in use. Backoff starts at 250 ms, doubles, and
-   caps at 2 s. A connection that dies young without delivering a snapshot
-   keeps the backoff growing instead of resetting it. After 60 s with no tool
-   calls the bridge lets the app go and stops retrying until the next call
-   (see On-demand connect and idle release). A library caller that builds the
-   bridge with `bridge::spawn`, `TariaMcpServer::new` or `with_tree_format`
-   gets the old behaviour: connect at once, retry forever, never let go.
+1. Connect on demand: nothing until the first tool call, then retrying
+   while tool calls want the app. Backoff starts at 250 ms, doubles, and caps
+   at 2 s. A connection that dies young without delivering a snapshot keeps
+   the backoff growing instead of resetting it. After 60 s with no tool calls
+   the bridge lets the app go and stops retrying until the next call (see
+   On-demand connect and idle release). A library caller that builds the
+   bridge with `bridge::spawn` gets the old behaviour: connect at once, retry
+   forever, never let go. `TariaMcpServer::new` and `with_tree_format` serve
+   such a handle as in 0.3.1.
 2. On disconnect, the watch flips to `Disconnected`, keeping the app label
    and the last `seq`, so tool calls fail fast with an error that says which
-   app went away instead of acting on a stale tree. When the bridge closed the
-   connection itself, over a line past the cap, the error says that instead
-   of "it may have exited": the app is still running, and sends the same line
-   on every reconnect. Once a connect finds nothing listening, the app is
-   gone, and the error says "it may have exited" again. When the reconnect
-   lands in the listen backlog behind another bridge, which is what happens
-   to the bridge that loses the race when an app restarts with two bridges
-   after it, the error says the app is held by another bridge. That app is
-   running, and "it may have exited" was wrong about it.
+   app went away instead of acting on a stale tree. Every such error opens
+   "app 'X' disconnected (last snapshot seq N)", which is what a caller
+   matches on, and the rest says why there is no tree:
+   - When the bridge closed the connection itself, over a line past the cap,
+     the error says that instead of "it may have exited": the app is still
+     running, and sends the same line on every reconnect. This outranks the
+     answers below until a connect finds nothing listening.
+   - With a connection open again and the app's `hello` on it, the bridge
+     says it has reconnected, that the app is running and nothing needs
+     restarting, and that a retry is served the first snapshot the app
+     publishes.
+   - With a connection open again, no `hello` yet, and the connection under
+     the 500 ms grace, the bridge says how many milliseconds ago it
+     reconnected, and that this is worth one retry.
+   - With the same silence past the grace, the reconnect has landed in the
+     listen backlog (the kernel's queue of connections the app has not
+     accepted yet) behind another bridge. That is what happens to the bridge
+     that loses the race when an app restarts with two bridges after it, and
+     to one that let go while another took the app. The error says the app
+     is held by another bridge.
+   - With no connection open, between two connects or because nothing is
+     listening, the error says "it may have exited", in the words 0.3.1 used.
+     This is the one state in which the bridge cannot tell an app that is
+     gone from one it has not reached yet.
+
+   In 0.3.1 all three answers about an open connection said "it may have
+   exited". Each of those apps is running, since something at the path
+   accepted the connect, so that answer was wrong about every one of them.
 3. On reconnect, inputs queued while disconnected are discarded, and the
    peer's `protocol_version` is forgotten so the next connection is not
    judged by the previous app's handshake.
@@ -600,11 +620,16 @@ The binary now does two things:
 
 - **It connects on demand.** Starting it, and the MCP `initialize` and
   `tools/list` that follow, open nothing. The first tool call opens the
-  connection and waits briefly, well under a second, for the app's `hello`
-  and its tree, so that call still answers with the live tree. The wait is
-  short because the adapter's listener thread writes the `hello` and the
-  latest snapshot the moment it accepts a bridge, so an app sitting idle
-  answers as fast as a busy one.
+  connection and waits for the app's `hello` and its tree, so that call
+  still answers with the live tree. The wait is normally milliseconds,
+  because the adapter's listener thread writes the `hello` and the latest
+  snapshot the moment it accepts a bridge, so an app sitting idle answers as
+  fast as a busy one. It runs longer only on a connection that stays silent,
+  until that connection is 500 ms old, the age at which silence means
+  another bridge holds the app, so the first call gives that answer. The
+  500 ms is counted from when the connection opened, so a connect that ran
+  late still gets all of it, and the whole wait never runs past 1.2 s from
+  the start of the call.
 - **It lets go when idle.** After 60 s with no tool calls, the bridge closes
   its connection, or leaves the listen backlog if it was waiting there, and
   stops reconnecting. A bridge waiting in the backlog is then accepted at
@@ -616,8 +641,8 @@ It does not let go while an input it sent is still waiting for the app's ack.
 Closing then would end the connection that input belongs to, and the adapter
 discards an input whose connection has ended rather than apply it (see One
 connection owns its inputs), so the agent would never learn what became of
-it. That wait is capped, so an app that never acks cannot keep the bridge
-from letting go.
+it. That wait is capped at 30 s past the idle window, so an app that never
+acks cannot keep the bridge from letting go.
 
 Why 60 s: it is longer than the pause an agent takes between two calls while
 it works, and far shorter than the gap between one session using the app and

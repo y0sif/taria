@@ -101,8 +101,8 @@ bridge holds the latest snapshot and exposes it, plus input back into the
 app, as MCP tools. Agent input reaches the app's event loop like any other
 input source, and the app acknowledges each input by id, so the bridge can
 tell an input the app acted on from one it never saw. The bridge connects on
-its first tool call and lets the app go after 60 s with no tool calls, so an
-idle agent session does not keep the app from another.
+its first tool call and lets the app go after 60 s with no tool calls by
+default, so an idle agent session does not keep the app from another.
 
 ```text
 +---------------+   Unix socket  +-----------+  MCP over stdio  +---------------+
@@ -185,7 +185,7 @@ three that decide whether taria fits at all:
   the tested platform. [Limitations](docs/compatibility.md#limitations).
 - **One bridge client per app at a time**: the adapter serves one, so two
   agents cannot drive the same app at once. They can take turns: an idle
-  bridge lets the app go after 60 s.
+  bridge lets the app go after 60 s by default.
   [Limitations](docs/compatibility.md#limitations).
 - **The wire format is frozen at `PROTOCOL_VERSION` 1**: changes within
   version 1 are additive, so a version difference costs a degraded field

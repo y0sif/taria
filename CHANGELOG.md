@@ -24,34 +24,47 @@ tool call and lets the app go after 60 s with no tool calls.
 
 Nothing on the wire moved. `PROTOCOL_VERSION` stays 1, no message or field
 changed, and the code of `taria` and `taria-ratatui` is unchanged. The Rust
-API only grows: `bridge::spawn`, `TariaMcpServer::new` and `with_tree_format`
-still connect at once and never let go, as in 0.3.1, and the new
-`TariaMcpServer::on_demand(socket, tree_format, idle_release)` is what the
-binary uses. The MCP instructions and tool descriptions are unchanged, byte
-for byte. All three crates move to 0.3.2 together: they share one workspace
-version.
+API only grows: `bridge::spawn` still connects at once and never lets go, and
+`TariaMcpServer::new` and `with_tree_format` serve such a handle as in 0.3.1.
+The new `TariaMcpServer::on_demand(socket, tree_format, idle_release)` is what
+the binary uses. The MCP instructions and tool descriptions are unchanged,
+byte for byte. All three crates move to 0.3.2 together: they share one
+workspace version.
 
 ### For whoever drives an app
 
 - **The bridge connects on its first tool call.** MCP `initialize` and
   `tools/list` open nothing, so a session that never calls a taria tool never
-  takes the app. The first call waits briefly, well under a second, for the
-  connection, the app's `hello` and its tree, so it still returns the live
+  takes the app. The first call waits briefly, at most about a second, for
+  the connection, the app's `hello` and its tree, so it still returns the live
   tree in one call.
 - **An idle bridge lets go after 60 s.** After 60 s with no tool calls it
-  closes its connection, or leaves the listen backlog if it was waiting there,
-  and stops reconnecting, so a bridge waiting for the app gets it at once. The
+  closes its connection, or leaves the listen backlog (the kernel's queue of
+  connections the app has not accepted yet) if it was waiting there, and
+  stops reconnecting, so a bridge waiting for the app gets it at once. The
   next call reconnects. It does not let go while an input it sent still
-  awaits the app's ack, up to a cap.
+  awaits the app's ack, for at most 30 s more.
 - **`--idle-release <SECS>`** sets that delay in whole seconds. The default is
   60, and `0` never lets go. The bridge connects on demand either way.
 - **A bridge locked out by another says the app is held.** It says the app is
   held by another bridge, and that a taria-mcp lets go of the app after 60 s
   with no tool calls, so the agent retries instead of asking someone to kill a
-  process. The same answer replaces "may have exited" for a bridge that lost
-  the reconnect race when the app restarted, since that app is running. An
-  app that has really gone reads as before: "disconnected (last snapshot seq
-  N); it may have exited".
+  process. A bridge that lost the reconnect race when the app restarted gets
+  this answer too, since that app is running. Its answer still opens
+  `app '<label>' disconnected (last snapshot seq N)`, the part a caller
+  matches on, and goes on `, and the app is now held by another bridge.`
+- **A bridge that reconnects to a running app no longer says it may have
+  exited.** This bug was already in 0.3.1: a bridge that reconnected to a
+  restarted app, which had greeted it but not yet published a tree, was told
+  the app may have exited. Every answer from a bridge with a connection open
+  again keeps the same opening, then says what that connection shows. If the
+  app has greeted it, the bridge has reconnected, nothing needs restarting,
+  and a retry gets the first snapshot the app publishes. If the connection is
+  under half a second old and nothing has greeted it yet, the answer says how
+  many milliseconds ago it reconnected, and that this is worth one retry. Past
+  that, it is the held answer above. Only a bridge with no connection open
+  says "disconnected (last snapshot seq N); it may have exited", word for word
+  as in 0.3.1.
 - **A holder older than 0.3.2 still holds the app until its session ends.**
   Until every session runs the new bridge, disable taria with `/mcp` in the
   Claude Code sessions that do not drive the app.
@@ -63,14 +76,15 @@ version.
 
 ### The gates
 
-- `scripts/e2e.py` grows from 23 steps to 26. Step x starts a bridge and never
-  calls it, and that bridge must not take the app. Step y runs a bridge with
-  `--idle-release 1`: a second bridge is told the app is held, then gets it
-  once the first lets go. Step z restarts the app, and the bridge that loses
-  the reconnect race must say the app is held, not that it exited.
 - `scripts/adversarial.py` grows from 22 probes to 23. The new one checks that
   a release never drops an input still awaiting its ack, and the held-socket
   probe matches the new wording.
+- `scripts/e2e.py` grows from 23 steps to 26. Step x starts a bridge and never
+  calls it, and that bridge must not take the app. Step y gives the holder
+  `--idle-release 2` and the waiting bridge 3: the waiting bridge is told the
+  app is held, gets it once the first lets go, and the demo exits with no
+  input lost. Step z restarts the app, and the bridge that loses the
+  reconnect race must say the app is held, not that it exited.
 
 ## [0.3.1] - 2026-10-19
 

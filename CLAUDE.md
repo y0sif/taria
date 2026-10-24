@@ -81,43 +81,47 @@ refuses a `target/debug` older than the sources.
   `read_tree`/`act`/`key`/`type_text`. A socket-manager task holds the latest
   snapshot in a watch channel and rebroadcasts acks. The binary connects on
   demand (`TariaMcpServer::on_demand`): nothing until the first tool call
-  (`initialize` and `tools/list` open nothing), which waits briefly for the
-  `hello` and the tree; then it reconnects with capped backoff while in use,
-  and after 60 s with no tool calls (`--idle-release`, `0` never) closes the
-  connection or leaves the backlog and stops reconnecting, but never while an
-  input awaits its ack (up to a cap). `bridge::spawn` and
-  `TariaMcpServer::new`/`with_tree_format` still connect eagerly and never
-  release. That is the fix for issue #13: the adapter serves one bridge at a
+  (`initialize` and `tools/list` open nothing), which waits briefly (at most
+  1.2 s) for the `hello` and the tree; then it reconnects with capped backoff
+  while tool calls want the app, and after 60 s with no tool calls
+  (`--idle-release`, `0` never) closes the connection or leaves the backlog
+  and stops reconnecting, but not while an input awaits its ack, for up to
+  30 s past the window. `bridge::spawn` still connects at once and never lets
+  go, and `TariaMcpServer::new`/`with_tree_format` serve such a handle as in
+  0.3.1. That is the fix for issue #13: the adapter serves one bridge at a
   time and a repo `.mcp.json` starts one in every session. A snapshot is kept
-  as the app's own line (minus the `type` framing key) beside the parse of
-  it: the line is what the agent reads, so an unknown role, action or field
+  as the app's own line (minus the `type` framing key) beside the parse of it:
+  the line is what the agent reads, so an unknown role, action or field
   survives by name; the parse is what the bridge validates and diffs against.
-  `--tree-format outline`
-  (default `json`) renders that line as one indented line per node for every
-  tree an agent receives, with action names taken from the parse because that
-  is what `act` checks, and swaps only the format passages of the
-  instructions and of the `read_tree` and `act` descriptions. Those texts are
-  short because they are resent with every model call: no parameter is
-  described but `repeat`'s default, the `{"custom":...}` rule is in `act`'s
-  description only, and a test pins both modes' text byte for byte. The input
-  tools promise the tree only if it changed: three answers that are not errors
-  carry a note and no tree. `act` validates node ids and advertised actions
-  and bounds `value` (4096 chars), `key` parses the shared grammar and bounds
-  `repeat` (1-64), `type_text` bounds the payload (4096 chars). Results are
-  anchored on the app's ack, not on whatever the tree did: dropped, ignored,
-  delivered-and-changed, delivered-and-unchanged, no ack, partial burst, lost
-  acks, and the app disconnecting. A protocol mismatch keeps `read_tree` for
-  as long as the peer's snapshots parse, and refuses every input tool. When
-  lines from the app were rejected, `read_tree` says the socket path is right
-  and quotes the reason rather than sending an adopter back to check the path.
-  A line over `MAX_LINE_BYTES` ends the connection and leaves the reason
-  `OVERSIZED_LINE`, kept across reconnects until a snapshot parses or a
-  connect finds nothing listening; while it holds, every answer names the
-  1 MiB limit instead of "may have exited". A bridge locked out by another
-  (waiting in the backlog, or the loser of the reconnect race when the app
-  restarts) is told the app is "held by another bridge" and that a taria-mcp
-  lets go after 60 s with no tool calls, so the agent retries; an app really
-  gone still reads "it may have exited".
+  `--tree-format outline` (default `json`) renders that line as one indented
+  line per node for every tree an agent receives, with action names taken from
+  the parse because that is what `act` checks, and swaps only the format
+  passages of the instructions and of the `read_tree` and `act` descriptions.
+  Those texts are short because they are resent with every model call: no
+  parameter is described but `repeat`'s default, the `{"custom":...}` rule is
+  in `act`'s description only, and a test pins both modes' text byte for byte.
+  The input tools promise the tree only if it changed: three answers that are
+  not errors carry a note and no tree. `act` validates node ids and advertised
+  actions and bounds `value` (4096 chars), `key` parses the shared grammar and
+  bounds `repeat` (1-64), `type_text` bounds the payload (4096 chars). Results
+  are anchored on the app's ack, not on whatever the tree did: dropped,
+  ignored, delivered-and-changed, delivered-and-unchanged, no ack, partial
+  burst, lost acks, and the app disconnecting. A protocol mismatch keeps
+  `read_tree` for as long as the peer's snapshots parse, and refuses every
+  input tool. When lines from the app were rejected, `read_tree` says the
+  socket path is right and quotes the reason rather than sending an adopter
+  back to check the path. A line over `MAX_LINE_BYTES` ends the connection and
+  leaves the reason `OVERSIZED_LINE`, kept across reconnects until a snapshot
+  parses or a connect finds nothing listening; while it holds, every answer
+  names the 1 MiB limit instead of "may have exited". A bridge locked out by
+  another (waiting in the backlog, or the loser of the reconnect race when the
+  app restarts) is told the app is "held by another bridge" and that a
+  taria-mcp lets go after 60 s with no tool calls, so the agent retries. A
+  bridge that had the app and reconnects answers from the new link, after the
+  same "disconnected (last snapshot seq N)" opening: greeted with no tree yet,
+  retry and the first snapshot is served; no handshake inside the 500 ms
+  grace, worth one retry; past it, held. Only a link that is down still reads
+  "it may have exited", byte for byte as in 0.3.1.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
   identities (`IdSpace`), stable across deletes and restarts; the list
