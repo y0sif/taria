@@ -555,6 +555,17 @@ Bridge side (`taria-mcp`):
      the error says that instead of "it may have exited": the app is still
      running, and sends the same line on every reconnect. This outranks the
      answers below until a connect finds nothing listening.
+   - With a connection open again and a line on it the bridge could not
+     read, the bridge says it has reconnected and quotes the reason, with
+     the same two causes the never-served answer names (a tree past
+     `MAX_NODE_DEPTH`, a taria whose snapshot shape differs). This outranks
+     the handshake and the link. It is how an adopter who restarts the app
+     after a change that broke its tree hears about it; until 0.3.3 the
+     answer was one of the three below, each of which says to retry, and no
+     retry fixes a tree the bridge cannot read (issue #16). The bridge
+     forgets every such reason but the oversized one at each connect, before
+     the connection reads as open, so a reason seen with a connection open
+     is that connection's and never a previous instance's.
    - With a connection open again and the app's `hello` on it, the bridge
      says it has reconnected, that the app is running and nothing needs
      restarting, and that a retry is served the first snapshot the app
@@ -567,7 +578,24 @@ Bridge side (`taria-mcp`):
      accepted yet) behind another bridge. That is what happens to the bridge
      that loses the race when an app restarts with two bridges after it, and
      to one that let go while another took the app. The error says the app
-     is held by another bridge.
+     is held by another bridge. When the departure the error opens with was
+     this bridge letting go after its idle window, it says so after that
+     phrase: the disconnect was on purpose, so another session could use the
+     app, and is not a fault. Agents read the bare "disconnected" as one,
+     and went after it with `ss`, `ps` and `pgrep`.
+     The bridge records that its last departure was a release beside the
+     record itself, and clears it once a connection serves a tree or the app
+     closes one, so it cannot outlive the departure it describes.
+   - On Linux, with the same silence, the bridge first reads the state of
+     the process at the other end, the listener named by the connection's
+     peer credentials, from `/proc/<pid>/stat`. A stopped app (`SIGSTOP`, a
+     shell's Ctrl-Z, a debugger) keeps its socket listening and accepts
+     nothing, which is exactly a held app's silence, and waiting for a
+     release does not help it. Such an app is named with its pid and how to
+     resume it (`kill -CONT`, or `fg`). Any failure to read the state leaves
+     the held answer, and other platforms always get it. Only a bridge
+     started on demand records the pid; one handed to
+     `TariaMcpServer::new` gets the held answer, as in 0.3.2.
    - With no connection open, between two connects or because nothing is
      listening, the error says "it may have exited", in the words 0.3.1 used.
      This is the one state in which the bridge cannot tell an app that is
@@ -578,10 +606,14 @@ Bridge side (`taria-mcp`):
    accepted the connect, so that answer was wrong about every one of them.
 3. On reconnect, inputs queued while disconnected are discarded, and the
    peer's `protocol_version` is forgotten so the next connection is not
-   judged by the previous app's handshake.
-4. Lines it could not read are kept, one at a time, with the reason. A line
-   over the cap is kept as a fixed reason that survives reconnects, until a
-   snapshot parses or a connect finds nothing listening.
+   judged by the previous app's handshake. A peer that publishes before it
+   greets is taken at the version its snapshot states until a `hello`
+   replaces it, so a hand-written peer that skips the handshake is still
+   refused input it cannot parse.
+4. Lines it could not read are kept, one at a time, with the reason, until
+   the next connect. A line over the cap is kept as a fixed reason that
+   survives reconnects, until a snapshot parses or a connect finds nothing
+   listening.
 5. Its own `connect` is published too: whether a connection is open, and
    since when.
 
@@ -591,9 +623,9 @@ wearing one name, and the bridge holds the facts that separate them:
 | What is true | What `read_tree` says |
 |---|---|
 | A line ran past the 1 MiB cap and the bridge closed the connection over it | The socket path is right, so the tree is what is wrong: it is over the line limit, the app resends it on every reconnect, and only a smaller tree fixes it. Outranks every row below, since each reconnect greets the bridge and then overflows again. |
-| A line arrived and could not be read | The app found the socket, so the line is what is wrong; the reason is quoted, and the two things that produce it named (a tree past `MAX_NODE_DEPTH`, an app built against a taria whose snapshot shape differs from this bridge's). |
+| A line arrived and could not be read, on the open connection or, with none open, the last one | The app found the socket, so the line is what is wrong; the reason is quoted, and the two things that produce it named (a tree past `MAX_NODE_DEPTH`, an app built against a taria whose snapshot shape differs from this bridge's). |
 | The peer greeted this bridge and published nothing | The app is connected; what is missing is the tree. An app that binds the layer and never publishes nodes looks exactly like this. |
-| A connection is open and nobody has said a word on it (past a 500 ms grace) | The path is not what is wrong. An adapter greets a bridge the moment it accepts one and serves one at a time, so this is the second bridge's view of an app held by another bridge. The answer says that a taria-mcp lets go of the app after 60 s with no tool calls, so the agent retries rather than asking for a process to be killed. A holder older than 0.3.2 keeps the app until its session ends. |
+| A connection is open and nobody has said a word on it (past a 500 ms grace) | The path is not what is wrong. An adapter greets a bridge the moment it accepts one and serves one at a time, so this is the second bridge's view of an app held by another bridge. The answer says when a holder lets go, so the agent retries rather than asking for a process to be killed. The holder's window cannot be known, so it goes by this bridge's own, the best guess for a holder started from the same `.mcp.json`: after 60 s and "retry in a minute" on the default, after N s and "retry in N s" for `--idle-release N`, and for `0` that a holder started the same way keeps the app until its session ends. A holder older than 0.3.2 keeps the app until its session ends. On Linux, a stopped app leaves the same silence and is named as stopped instead, with its pid. |
 | Nothing is connected | Is the app running, and is the socket path correct? |
 
 All of them used to be answered by asking whether the socket path was right,

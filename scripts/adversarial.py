@@ -13,7 +13,9 @@ app that drops half a burst, an app that stops reading its socket, a tree
 past the bridge's 1 MiB line cap, an app slower to ack than a bridge's idle
 window. Those are
 probed against [`FakeApp`], which speaks the ndjson wire directly, so the
-bridge under test is the real one and only the app is a stand-in.
+bridge under test is the real one and only the app is a stand-in. An app
+stopped by a signal is a stand-in process of its own, so that stopping it
+stops nothing else.
 
 Usage:  python3 scripts/adversarial.py [--no-build]
 """
@@ -22,7 +24,9 @@ import contextlib
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1629,6 +1633,148 @@ def probe_socket_held_by_another_bridge(client, ctx):
     )
 
 
+# What a bridge says, on Linux, when the process listening at the socket is
+# stopped by a signal: the pid, and how to resume it. The age of the silent
+# connection is captured; every other word is verbatim.
+STOPPED_RE = re.compile(
+    r"^no snapshot from the app yet: the app \(pid (?P<pid>\d+)\) is stopped, so it "
+    r"cannot answer; resume it \(kill -CONT (?P=pid), or fg in its terminal\) and "
+    r"retry\. The socket path is right: this bridge has been connected for "
+    r"(?P<open>\d+\.\d)s with no handshake, and a stopped app accepts no connection\.$"
+)
+
+# A process that binds and listens at the path given it, says so on stdout,
+# and accepts nothing: an app's socket, with nobody to answer on it once the
+# process is stopped.
+SILENT_LISTENER = """
+import socket, sys, time
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1])
+listener.listen(8)
+print("listening", flush=True)
+while True:
+    time.sleep(1)
+"""
+
+
+def process_state(pid):
+    """The state code in /proc/<pid>/stat, read after the last `)`, since the
+    command name before it may hold spaces and parentheses; None if unread."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
+
+
+def probe_stopped_app(client, ctx):
+    """An app stopped by a signal is named as stopped, not held.
+
+    A stopped app (SIGSTOP, a shell's Ctrl-Z) keeps its socket listening, so
+    a bridge's connect succeeds into the listen backlog and nothing is said
+    on it: exactly the silence of an app another bridge holds, and the held
+    answer sent the agent to wait for a release that a stopped app never
+    makes. The bridge reads the listener's pid from the connection's peer
+    credentials and its state from /proc, and a stopped one is named with its
+    pid and the way to resume it. Once it is resumed and still accepts
+    nothing, the same connection reads as held again.
+
+    The stand-in is a separate process, since stopping this script would stop
+    the probe. Only its pid is ever signalled, and it is killed at the end.
+    `client` goes unused.
+    """
+    if not sys.platform.startswith("linux"):
+        return "skipped: the bridge reads a process's state from /proc, on Linux only"
+    tmpdir = tempfile.mkdtemp(prefix="taria-stopped-")
+    path = os.path.join(tmpdir, "stopped.sock")
+    listener = subprocess.Popen(
+        [sys.executable, "-I", "-c", SILENT_LISTENER, path],
+        stdout=subprocess.PIPE,
+    )
+    bridge = None
+    try:
+        ready, _, _ = select.select([listener.stdout], [], [], READ_TIMEOUT)
+        require(
+            ready and listener.stdout.readline().strip() == b"listening",
+            "the stand-in listener never bound its socket",
+        )
+        os.kill(listener.pid, signal.SIGSTOP)
+        deadline = time.monotonic() + READ_TIMEOUT
+        while process_state(listener.pid) != "T":
+            require(
+                time.monotonic() < deadline,
+                f"pid {listener.pid} never read as stopped: {process_state(listener.pid)!r}",
+            )
+            time.sleep(0.02)
+
+        bridge = McpClient(path)
+        LIVE_CLIENTS.add(bridge)
+        bridge.initialize()
+        # The call that connects waits out the grace, so its answer is the
+        # diagnosis; a connect that ran late gets the young answer first, and
+        # only that one is asked again.
+        message = ""
+        for _ in range(3):
+            try:
+                text = bridge.call_raw("read_tree")
+                raise StepFailure(f"a stopped app served a tree: {text[:200]}")
+            except ToolError as err:
+                message = err.message
+            if YOUNG_LINK_MARKER not in message:
+                break
+        stopped = STOPPED_RE.match(message)
+        require(stopped is not None, f"read_tree did not name a stopped app: {message[:400]}")
+        require(
+            int(stopped["pid"]) == listener.pid,
+            f"the answer names pid {stopped['pid']}, the stopped listener is {listener.pid}",
+        )
+        require(
+            "held by another bridge" not in message,
+            f"a stopped app was called held: {message[:300]}",
+        )
+        try:
+            text = bridge.call_raw("key", {"key": "down"})
+            raise StepFailure(f"key was answered by a stopped app: {text[:200]}")
+        except ToolError as err:
+            require(
+                STOPPED_RE.match(err.message) is not None,
+                f"an input tool answered a stopped app differently: {err.message[:400]}",
+            )
+
+        os.kill(listener.pid, signal.SIGCONT)
+        deadline = time.monotonic() + READ_TIMEOUT
+        while process_state(listener.pid) == "T":
+            require(time.monotonic() < deadline, f"pid {listener.pid} never resumed")
+            time.sleep(0.02)
+        try:
+            text = bridge.call_raw("read_tree")
+            raise StepFailure(f"a listener that accepts nothing served a tree: {text[:200]}")
+        except ToolError as err:
+            message = err.message
+        require(
+            SILENT_PEER_RE.match(message) is not None,
+            f"once resumed, a listener that accepts nothing was not called held: "
+            f"{message[:400]}",
+        )
+    finally:
+        if bridge is not None:
+            LIVE_CLIENTS.discard(bridge)
+            bridge.close()
+            if bridge.proc.poll() is None:
+                bridge.proc.kill()
+        if listener.poll() is None:
+            os.kill(listener.pid, signal.SIGCONT)
+            listener.kill()
+        listener.wait(timeout=READ_TIMEOUT)
+        if listener.stdout is not None:
+            listener.stdout.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return (
+        f"SIGSTOPped listener pid {listener.pid}: read_tree and key named it stopped, "
+        f"with its pid and kill -CONT, after {stopped['open']}s; resumed, it read as held"
+    )
+
+
 # The bridge's line cap, taria::wire::MAX_LINE_BYTES, and the words every
 # answer about a line past it carries. Hard coded like the protocol numbers
 # above, so a change to the cap is a deliberate edit here too.
@@ -2030,6 +2176,7 @@ def main():
         ("app stops reading its socket", probe_input_queue_full),
         ("acks lost to the bridge's channel", probe_lost_acks),
         ("socket held by another bridge", probe_socket_held_by_another_bridge),
+        ("app stopped by a signal", probe_stopped_app),
         ("tree over the line cap after one was served", probe_oversized_after_tree),
         ("first tree over the line cap", probe_oversized_first_tree),
         ("release waits for a pending ack", probe_release_waits_for_ack),

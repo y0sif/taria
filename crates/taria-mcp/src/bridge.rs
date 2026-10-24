@@ -296,11 +296,14 @@ pub struct BridgeHandle {
     pub ack_tx: broadcast::Sender<(InputId, InputStatus)>,
     /// The `protocol_version` the connected app declared in its handshake.
     ///
-    /// `None` before any handshake, and again once the app goes away, so a
-    /// stale version is never read as the current peer's. An app that sends
-    /// no `Hello` at all leaves it `None`, which reads as "no mismatch
-    /// known": the compatibility path for adapters that predate the
-    /// handshake.
+    /// `None` before the peer has said anything, and again once the app goes
+    /// away, so a stale version is never read as the current peer's. A peer
+    /// that sends a snapshot before any `Hello` is taken at the version that
+    /// snapshot carries, and a `Hello` later on the same connection replaces
+    /// it. Every taria adapter has greeted the bridge since its first
+    /// release, so this is for hand-written peers; until 0.3.3 such a peer
+    /// left the version `None`, which reads as "no mismatch known", and
+    /// input went to a peer on another version.
     ///
     /// The tool layer needs this because a peer on another protocol version
     /// still delivers parseable snapshots while being unable to parse the
@@ -310,16 +313,20 @@ pub struct BridgeHandle {
     /// Why the most recent line from an app was thrown away, if one was.
     ///
     /// Set for every line the reader could not turn into an [`AppToBridge`],
-    /// and kept past the connection, because the question it answers outlives
-    /// it: an app that connects, publishes nothing this bridge can read and
-    /// dies leaves the state at [`BridgeState::Never`], which on its own is
+    /// and kept past the connection it arrived on, until the next connection
+    /// opens, because the question it answers outlives the connection: an app
+    /// that connects, publishes nothing this bridge can read and dies leaves
+    /// the state at [`BridgeState::Never`], which on its own is
     /// indistinguishable from an app that never started. Reporting the reason
     /// is what stops `read_tree` sending an adopter to check a socket path the
-    /// app plainly reached.
+    /// app plainly reached. A successful `connect` clears it, before the link
+    /// reads as open, so a reason seen while a connection is open came from
+    /// that connection: a restarted app is never blamed for a line its
+    /// previous instance sent.
     ///
     /// Also set for a line over [`MAX_LINE_BYTES`], which ends the connection
-    /// instead of being skipped. That reason is a fixed string, and the one
-    /// value this channel ever clears, on either of two events. The next
+    /// instead of being skipped. That reason is a fixed string that a connect
+    /// does not clear, and it is retired on either of two events. The next
     /// snapshot that parses retires it, because the tree that overflowed has
     /// then been replaced by one that fits. A `connect` that finds nothing
     /// listening retires it too, because the app that sent the tree is gone,
@@ -475,6 +482,23 @@ struct Activity {
     /// Connect attempts that failed, and connections that ended, since the
     /// start: the events that answer a waiting call when no tree does.
     outcomes: u64,
+    /// Whether the departure the bridge's [`BridgeState::Disconnected`]
+    /// record names was this bridge letting go of the app after its idle
+    /// window, rather than the app leaving.
+    ///
+    /// The tool layer reads it to tell an agent that the disconnect in front
+    /// of a held answer was this bridge's own doing: agents read "app 'X'
+    /// disconnected" as a fault, and went after it with `ss`, `ps` and
+    /// `pgrep`. Written where that record is (see [`Idle::note_disconnect`]), so
+    /// it describes the same departure, and cleared once a connection serves
+    /// a tree, so it can never outlive the record it is about.
+    pub(crate) released: bool,
+    /// The process at the other end of the open connection, as the kernel
+    /// reported it at `connect`, or `None` with no connection open or no pid
+    /// reported. For a connection still waiting in the listen backlog that is
+    /// the process listening at the path, which is how the tool layer tells a
+    /// held app from a stopped one: both leave the connection silent.
+    pub(crate) peer_pid: Option<i32>,
 }
 
 /// Whether `activity` is inside the idle window: a call in flight, or less
@@ -526,6 +550,19 @@ impl Demand {
             activity: Arc::clone(&self.activity),
             outcomes,
         }
+    }
+
+    /// Whether the departure the bridge's `Disconnected` record names was
+    /// this bridge letting go after its idle window. See
+    /// [`Activity::released`].
+    pub(crate) fn released(&self) -> bool {
+        self.activity.borrow().released
+    }
+
+    /// The pid of the process at the other end of the open connection, if
+    /// the kernel reported one. See [`Activity::peer_pid`].
+    pub(crate) fn peer_pid(&self) -> Option<i32> {
+        self.activity.borrow().peer_pid
     }
 }
 
@@ -717,6 +754,39 @@ impl Idle {
         quiet_since
     }
 
+    /// Change what the activity says about the connection without waking
+    /// anyone: these facts answer a tool call's question once it asks, and
+    /// neither a call waiting in [`Call::settle`] nor the manager's own
+    /// waits have anything to recompute over them.
+    fn note(&self, change: impl FnOnce(&mut Activity)) {
+        self.activity.send_if_modified(|activity| {
+            change(activity);
+            false
+        });
+    }
+
+    /// Record how a connection ended, beside the `Disconnected` record the
+    /// manager is about to write for it: before that record, so a tool call
+    /// that reads the record and then this finds the two in step.
+    ///
+    /// Only a connection that served a tree writes the record, so only that
+    /// one says whether its end was a release. A connection the app closed
+    /// before serving one clears the flag anyway: something happened to the
+    /// app after the release, and "it is not a fault" is no longer a claim
+    /// this bridge can make. A release of a connection that served nothing
+    /// (one held in the backlog, say) leaves it, since the record it is
+    /// about is unchanged.
+    fn note_disconnect(&self, delivered_snapshot: bool, end: &ConnectionEnd) {
+        self.note(|activity| {
+            activity.peer_pid = None;
+            if delivered_snapshot {
+                activity.released = matches!(end, ConnectionEnd::Released(_));
+            } else if matches!(end, ConnectionEnd::AppClosed { .. }) {
+                activity.released = false;
+            }
+        });
+    }
+
     /// Record a failed connect or an ended connection, which answers any
     /// call waiting in [`Call::settle`]. The calls it answered are read under
     /// the same lock, so a call that begins a moment later still cuts the
@@ -846,6 +916,28 @@ async fn manager_loop(
                 Ok(stream) => {
                     tracing::info!(path = %path.display(), "connected to app socket");
                     drain_stale_inputs(&mut input_rx);
+                    // A reason a line was rejected belongs to the connection
+                    // it arrived on, and that connection is over: kept, it
+                    // would be quoted against this one, blaming a restarted
+                    // app for its previous instance's line. Only this task
+                    // writes the reason, and it does so before the link
+                    // below reads as open, so a reason seen while the link
+                    // is open is about the open connection. The one
+                    // exception is the oversized line, which an app resends
+                    // to every connection (see `rejected_rx`).
+                    forget_rejected_except_oversized(&rejected_tx);
+                    if let Some(idle) = idle.as_ref() {
+                        // For a connection the app has not accepted yet, the
+                        // process listening at the path. A pid of 0 is the
+                        // kernel saying it cannot name the peer in this pid
+                        // namespace, which is no pid at all.
+                        let peer_pid = stream
+                            .peer_cred()
+                            .ok()
+                            .and_then(|cred| cred.pid())
+                            .filter(|pid| *pid > 0);
+                        idle.note(|activity| activity.peer_pid = peer_pid);
+                    }
                     let connected_at = Instant::now();
                     // Published before the connection is served, not after it
                     // has said something: the whole point of this channel is
@@ -878,6 +970,9 @@ async fn manager_loop(
                     // connection delivered a snapshot.
                     let delivered_snapshot =
                         matches!(&*state_tx.borrow(), BridgeState::Connected(_));
+                    if let Some(idle) = idle.as_ref() {
+                        idle.note_disconnect(delivered_snapshot, &end);
+                    }
                     // Demote `Connected` to `Disconnected`, remembering which
                     // app died and its last seq. A connection that died before
                     // delivering a snapshot leaves the previous state (`Never`,
@@ -1085,11 +1180,31 @@ fn forget_oversized_if_nothing_listens(
     }
 }
 
-/// Retire [`OVERSIZED_LINE`], and only that reason: any other one stays, as it
-/// always has.
+/// Retire every reason but [`OVERSIZED_LINE`], the counterpart of
+/// [`forget_oversized`], for a connection that has just opened: what the last
+/// connection's lines failed on says nothing about this one's, while an
+/// oversized tree is resent to every connection and overflows on each.
+fn forget_rejected_except_oversized(rejected_tx: &watch::Sender<Option<String>>) {
+    rejected_tx.send_if_modified(|rejected| {
+        if rejected.is_some() && !is_oversized_reason(rejected.as_deref()) {
+            *rejected = None;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// True when `rejected` is [`OVERSIZED_LINE`].
+fn is_oversized_reason(rejected: Option<&str>) -> bool {
+    rejected == Some(OVERSIZED_LINE)
+}
+
+/// Retire [`OVERSIZED_LINE`], and only that reason: any other one stays until
+/// the next connection opens (see [`forget_rejected_except_oversized`]).
 fn forget_oversized(rejected_tx: &watch::Sender<Option<String>>) {
     rejected_tx.send_if_modified(|rejected| {
-        if rejected.as_deref() == Some(OVERSIZED_LINE) {
+        if is_oversized_reason(rejected.as_deref()) {
             *rejected = None;
             true
         } else {
@@ -1257,6 +1372,9 @@ async fn serve_connection(
     let mut reader = BufReader::new(read_half);
     let mut line_buf: Vec<u8> = Vec::new();
     let mut unacked = Unacked::default();
+    // Whether this connection has served a tree yet: the first one retires
+    // the release flag, whose departure the tree has superseded.
+    let mut served = false;
     loop {
         let awaiting_acks = unacked.any();
         tokio::select! {
@@ -1274,6 +1392,12 @@ async fn serve_connection(
                         unacked.acked(id);
                     }
                     line_buf.clear();
+                    if !served && matches!(&*state_tx.borrow(), BridgeState::Connected(_)) {
+                        served = true;
+                        if let Some(idle) = idle.as_deref() {
+                            idle.note(|activity| activity.released = false);
+                        }
+                    }
                 }
                 Ok(LineRead::Eof) => {
                     return ConnectionEnd::AppClosed {
@@ -1392,6 +1516,27 @@ fn handle_app_line(
         }
         Ok(AppToBridge::Snapshot(parsed)) => {
             tracing::debug!(seq = parsed.seq, "snapshot received");
+            // A peer that has not greeted this connection is taken at the
+            // version its snapshot states. Left unknown, it read as "no
+            // mismatch known", and the input tools sent to a peer on another
+            // version. Set before the tree is served, so no tool call can
+            // see the tree and not the version; a `Hello` replaces it.
+            let unannounced = protocol_tx.send_if_modified(|version| {
+                if version.is_none() {
+                    *version = Some(parsed.protocol_version);
+                    true
+                } else {
+                    false
+                }
+            });
+            if unannounced && parsed.protocol_version != PROTOCOL_VERSION {
+                tracing::warn!(
+                    app_protocol = parsed.protocol_version,
+                    bridge_protocol = PROTOCOL_VERSION,
+                    "the app sent a snapshot before any handshake, on another protocol version; \
+                     the app cannot receive input from this bridge"
+                );
+            }
             // A snapshot that fits retires the oversized-line reason, and only
             // that one: a tree the bridge can read has replaced the one it
             // could not. Any other reason stays, as it always has. Cleared
@@ -1544,7 +1689,7 @@ mod tests {
         line(&snapshot);
         assert_eq!(rejected_rx.borrow().as_deref(), None);
 
-        // Any other reason is kept, as it always was.
+        // Any other reason is kept: only the next connection retires it.
         rejected_tx.send_replace(Some("expected value at line 1".to_string()));
         line(&snapshot);
         assert_eq!(
@@ -1607,6 +1752,155 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// A connection that opens retires the last connection's reason for a
+    /// rejected line, so the tool layer can quote a reason seen with a
+    /// connection open as that connection's (issue #16), and spares the
+    /// oversized one, which the app resends to every connection. Nothing is
+    /// sent for a reason that is not there.
+    #[test]
+    fn a_new_connection_forgets_every_reason_but_the_oversized_one() {
+        let (rejected_tx, mut rejected_rx) =
+            watch::channel(Some("expected value at line 1".to_string()));
+        rejected_rx.borrow_and_update();
+        forget_rejected_except_oversized(&rejected_tx);
+        assert_eq!(rejected_rx.borrow_and_update().as_deref(), None);
+
+        forget_rejected_except_oversized(&rejected_tx);
+        assert!(!rejected_rx.has_changed().expect("the sender is alive"));
+
+        rejected_tx.send_replace(Some(OVERSIZED_LINE.to_string()));
+        rejected_rx.borrow_and_update();
+        forget_rejected_except_oversized(&rejected_tx);
+        assert_eq!(rejected_rx.borrow().as_deref(), Some(OVERSIZED_LINE));
+        assert!(!rejected_rx.has_changed().expect("the sender is alive"));
+    }
+
+    /// A peer that publishes before it greets is taken at the version its
+    /// snapshot states, so a peer on another version is refused input even
+    /// with no `hello`; a `hello` later replaces it, and a version the
+    /// handshake set is not overridden by a snapshot's.
+    #[test]
+    fn a_snapshot_sets_the_version_only_where_no_hello_has() {
+        let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
+        let (ack_tx, _) = broadcast::channel(1);
+        let (protocol_tx, protocol_rx) = watch::channel(None);
+        let (rejected_tx, _rejected_rx) = watch::channel(None);
+        let mut label = None;
+        let mut line = |message: &AppToBridge| {
+            let line = serde_json::to_string(message).expect("a message serializes");
+            handle_app_line(
+                line.as_bytes(),
+                &state_tx,
+                &ack_tx,
+                &protocol_tx,
+                &rejected_tx,
+                &mut label,
+            );
+        };
+        let snapshot = |version: u32| {
+            let mut snapshot = Snapshot::new(1, Node::new("app", Role::App));
+            snapshot.protocol_version = version;
+            AppToBridge::Snapshot(snapshot)
+        };
+
+        line(&snapshot(2));
+        assert_eq!(*protocol_rx.borrow(), Some(2));
+        // The first snapshot's version holds: later ones do not move it.
+        line(&snapshot(1));
+        assert_eq!(*protocol_rx.borrow(), Some(2));
+        line(&AppToBridge::hello("demo", 1));
+        assert_eq!(*protocol_rx.borrow(), Some(1), "a hello replaces it");
+        line(&snapshot(2));
+        assert_eq!(*protocol_rx.borrow(), Some(1), "and a snapshot never does");
+    }
+
+    /// The flag that says a departure was this bridge's own release follows
+    /// the `Disconnected` record it describes. Only a connection that served
+    /// a tree writes that record, so only such a connection sets the flag;
+    /// a connection the app closed clears it whether it served or not; and a
+    /// release of one that served nothing leaves it, since the record is
+    /// unchanged. The peer's pid goes with every connection.
+    #[test]
+    fn the_release_flag_follows_the_departure_it_describes() {
+        let (idle, demand) = idle_and_demand(Duration::from_secs(1));
+        let release = || {
+            ConnectionEnd::Released(Release {
+                quiet_since: TokioInstant::now(),
+                hold: Hold::None,
+            })
+        };
+        let closed = ConnectionEnd::AppClosed { unacked: 0 };
+        assert!(!demand.released(), "nothing has been let go of yet");
+
+        idle.note_disconnect(true, &release());
+        assert!(demand.released());
+        idle.note_disconnect(false, &release());
+        assert!(
+            demand.released(),
+            "a held connection let go of names nothing new"
+        );
+        idle.note_disconnect(false, &closed);
+        assert!(
+            !demand.released(),
+            "the app closed a connection after the release"
+        );
+
+        idle.note_disconnect(false, &release());
+        assert!(!demand.released(), "the record names an older departure");
+        idle.note_disconnect(true, &release());
+        idle.note_disconnect(true, &closed);
+        assert!(!demand.released(), "a served connection the app closed");
+
+        idle.note(|activity| activity.peer_pid = Some(42));
+        assert_eq!(demand.peer_pid(), Some(42));
+        idle.note_disconnect(true, &closed);
+        assert_eq!(
+            demand.peer_pid(),
+            None,
+            "the pid was the ended connection's"
+        );
+    }
+
+    /// A connection that serves a tree retires the release flag at once, so
+    /// it cannot outlive the departure it was about, whatever ends the
+    /// connection later.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_serves_a_tree_retires_the_release_flag() {
+        let (mut idle, demand) = idle_and_demand(Duration::from_secs(1));
+        let mut wiring = Wiring::new();
+        idle.note(|activity| activity.released = true);
+        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        drop(demand.begin());
+        let app = async {
+            let (read, mut write) = app_end.into_split();
+            let mut snapshot = serde_json::to_string(&AppToBridge::Snapshot(Snapshot::new(
+                1,
+                Node::new("app", Role::App),
+            )))
+            .expect("a snapshot serializes");
+            snapshot.push('\n');
+            write
+                .write_all(snapshot.as_bytes())
+                .await
+                .expect("send the snapshot");
+            // Polled: the flag changes without waking anyone. Far inside
+            // the window, which is the next thing the clock could jump to.
+            in_small_steps(async {
+                while demand.released() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            let mut rest = Vec::new();
+            BufReader::new(read)
+                .read_to_end(&mut rest)
+                .await
+                .expect("read until the bridge closes");
+        };
+        let ((end, _at), ()) = tokio::join!(wiring.serve(bridge_end, &mut idle), app);
+        released(end);
     }
 
     #[test]
@@ -2160,32 +2454,45 @@ mod tests {
             idle.activity.send_modify(|activity| activity.awake = true);
             let call = demand.begin();
             let started = Instant::now();
+            // Each side reports its own moment as it happens. Measured after
+            // both had finished, an opener that fired past the bound left a
+            // link young enough for the second case to pass on, with the
+            // call never having seen it open.
+            let settle = async {
+                call.settle(&wired.handle).await;
+                (started.elapsed(), wired.handle.link_rx.borrow().open_for())
+            };
             let opener = async {
                 tokio::time::sleep(opens_after).await;
                 wired.link_tx.send_replace(LinkState::Open {
                     since: Instant::now(),
                 });
+                started.elapsed()
             };
-            tokio::join!(call.settle(&wired.handle), opener);
-            let waited = started.elapsed();
-            let age = wired
-                .handle
-                .link_rx
-                .borrow()
-                .open_for()
-                .expect("the link is open");
+            let ((waited, age), opened) = tokio::join!(settle, opener);
+            assert!(
+                opened < FIRST_CALL_WAIT,
+                "the link opened {opened:?} in, past the call's bound, so the case tests nothing"
+            );
+            let age = age.unwrap_or_else(|| {
+                panic!("opened {opened:?} in, the call answered at {waited:?} with no link open")
+            });
             if diagnosed {
                 assert!(
                     age >= SILENT_LINK_GRACE && waited < FIRST_CALL_WAIT,
-                    "opened {opens_after:?} in, the call answered at {waited:?} about a link \
-                     {age:?} old"
+                    "opened {opened:?} in, the call answered at {waited:?} about a link {age:?} \
+                     old"
                 );
             } else {
                 assert!(
                     waited >= FIRST_CALL_WAIT && waited < FIRST_CALL_WAIT * 2,
-                    "{waited:?}"
+                    "opened {opened:?} in, the call answered at {waited:?}"
                 );
-                assert!(age < SILENT_LINK_GRACE, "{age:?}");
+                assert!(
+                    age < SILENT_LINK_GRACE,
+                    "opened {opened:?} in, the call answered at {waited:?} about a link {age:?} \
+                     old"
+                );
             }
         }
     }

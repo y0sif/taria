@@ -313,11 +313,13 @@ streams every subsequent publish.
 ### 3.5 An app that sends no hello
 
 An app **MUST** send `hello`. A bridge **SHOULD** tolerate its absence rather
-than dropping the connection: the reference bridge leaves the peer's version
-unknown, which it reads as "no mismatch known", and goes on serving snapshots
-and forwarding input. That path exists for adapters older than the handshake.
-The cost of relying on it is that version-mismatch protection (section 16.5)
-is only as good as the peer's honesty about its version.
+than dropping the connection. Until a `hello` arrives, the reference bridge
+takes the peer's version from the `protocol_version` every snapshot carries
+(section 5.2), so a snapshot declaring another version refuses input exactly
+as a mismatched `hello` does; a later `hello` replaces it. No taria adapter
+has omitted the `hello`; the path exists for hand-written peers. The cost of
+relying on it is that version-mismatch protection (section 16.5) is only as
+good as the peer's honesty about its version.
 
 ## 4. Message catalogue
 
@@ -413,13 +415,15 @@ beyond that.
 
 ### 5.2 `protocol_version` on the snapshot
 
-Every snapshot states the version, and **neither reference peer reads it**.
-Version negotiation happens on the `hello` (section 16.5). A `Snapshot` object
-carrying `"protocol_version":2` parses without complaint into this build's
-types, so a reader **MUST NOT** treat this field as a validity check.
+Every snapshot states the version, and **the reference bridge reads it only
+on a connection that sent no `hello`** (section 3.5). Version negotiation
+happens on the `hello` (section 16.5). A `Snapshot` object carrying
+`"protocol_version":2` parses without complaint into this build's types, so a
+reader **MUST NOT** treat this field as a validity check.
 
 **Not specified.** What a peer should do when a snapshot's `protocol_version`
-disagrees with the `hello`'s, or with its own.
+disagrees with the `hello`'s, or with its own. The reference bridge goes by
+the `hello` where there is one, and until there is, by the first snapshot's.
 
 ## 6. Node
 
@@ -1296,10 +1300,14 @@ beyond reporting it.
 **Reference implementation.** The reference bridge takes turns, which is its
 own policy and not a rule. It opens no connection until its first tool call,
 so a bridge that is started and never used never takes the app. A bridge
-that waits says the app is held by another bridge, and that a taria-mcp lets
-go of the app after 60 s with no tool calls, so the agent retries. Once the
-holder does (section 14.7), the waiting bridge is accepted. A waiting bridge
-that itself goes 60 s with no tool calls leaves the backlog.
+that waits says the app is held by another bridge, and when the holder lets
+go, so the agent retries: after 60 s with no tool calls on the default, or
+after the waiting bridge's own `--idle-release`, its best guess at a holder
+started the same way. Once the holder does (section 14.7), the waiting bridge
+is accepted. A waiting bridge that itself goes its window with no tool calls
+leaves the backlog. On Linux it tells a held app from a stopped one by the
+listener's state, read through the connection's peer credentials and `/proc`;
+nothing on the wire carries it.
 
 ### 14.6 Shutdown
 

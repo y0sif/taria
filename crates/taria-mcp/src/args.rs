@@ -17,9 +17,18 @@ use crate::tree_format::TreeFormat;
 ///
 /// Long enough that an agent working through a task never pays a reconnect
 /// between its calls, and short enough that a session that has gone quiet
-/// hands the app to the next one within a minute. The answer a held bridge
-/// gives names this number, as the default every other taria-mcp runs with.
+/// hands the app to the next one within a minute. A held bridge's answer
+/// names this number as the window a holder on the default lets go after,
+/// and names its own instead, as the best guess at the holder's, when it was
+/// started with another.
 pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(60);
+
+/// The longest `--idle-release` takes, in seconds: a day.
+///
+/// A bridge meant to hold the app longer than that while idle is one meant
+/// never to let go, which `0` says. Without a bound, a value past what the
+/// window's deadline can reach was taken, and silently meant "never".
+pub const MAX_IDLE_RELEASE_SECS: u64 = 86_400;
 
 /// Help text printed for `--help` and appended to argument errors.
 pub const HELP: &str = "\
@@ -50,7 +59,8 @@ Options:
                               fewer characters. It names each action as act
                               takes it, without other keys in its object.
   --idle-release <SECS>       Let go of the app after SECS seconds with no
-                              tool call (default 60, 0 never lets go).
+                              tool call (default 60, 0 never lets go),
+                              from 0 to 86400.
 
 Environment:
   TARIA_LOG    Log filter (tracing env-filter syntax), default `info`.
@@ -72,7 +82,8 @@ pub enum Cli {
         /// How the tree is shown to the agent (`--tree-format`).
         tree_format: TreeFormat,
         /// How long the bridge keeps the app with no tool calls before it
-        /// lets go (`--idle-release`, whole seconds). [`Duration::ZERO`]
+        /// lets go (`--idle-release`, whole seconds up to
+        /// [`MAX_IDLE_RELEASE_SECS`]). [`Duration::ZERO`]
         /// never lets go. See
         /// [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand).
         idle_release: Duration,
@@ -120,9 +131,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 let secs = iter.next().ok_or_else(|| {
                     "--idle-release requires a number of seconds (0 never lets go)".to_string()
                 })?;
-                idle_release = secs.parse::<u64>().map(Duration::from_secs).map_err(|_| {
-                    format!("--idle-release takes whole seconds (0 never lets go), not `{secs}`")
-                })?;
+                idle_release = parse_idle_release(&secs)?;
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -148,6 +157,28 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
         tree_format,
         idle_release,
     })
+}
+
+/// The value of `--idle-release`: whole seconds, written as ASCII digits and
+/// nothing else, from 0 to [`MAX_IDLE_RELEASE_SECS`].
+///
+/// Digits only, because `u64::from_str` also takes a leading `+`, so `+5` and
+/// `+0` were windows. Leading zeros are accepted: `0005` is still five whole
+/// seconds, and refusing it would buy nothing.
+fn parse_idle_release(secs: &str) -> Result<Duration, String> {
+    let refused = || {
+        format!(
+            "--idle-release takes whole seconds from 0 to {MAX_IDLE_RELEASE_SECS} (0 never lets \
+             go), not `{secs}`"
+        )
+    };
+    if secs.is_empty() || !secs.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(refused());
+    }
+    match secs.parse::<u64>() {
+        Ok(secs) if secs <= MAX_IDLE_RELEASE_SECS => Ok(Duration::from_secs(secs)),
+        _ => Err(refused()),
+    }
 }
 
 /// Resolve the default socket path for `app_label` from the environment.
@@ -314,8 +345,10 @@ mod tests {
     fn help_names_the_idle_release_flag() {
         assert!(HELP.contains("--idle-release <SECS>"), "{HELP}");
         assert!(
-            HELP.contains("default 60") && HELP.contains("0 never lets go"),
-            "the help must say the default and what 0 means: {HELP}"
+            HELP.contains("0 to 86400")
+                && HELP.contains("default 60")
+                && HELP.contains("0 never lets go"),
+            "the help must say the range, the default and what 0 means: {HELP}"
         );
     }
 
@@ -338,6 +371,20 @@ mod tests {
             idle(&["--idle-release", "300", "--app", "demo"]),
             Duration::from_secs(300)
         );
+        // The top of the range, and leading zeros, which are still whole
+        // seconds.
+        assert_eq!(
+            idle(&["--socket", "/x.sock", "--idle-release", "86400"]),
+            Duration::from_secs(MAX_IDLE_RELEASE_SECS)
+        );
+        assert_eq!(
+            idle(&["--socket", "/x.sock", "--idle-release", "0005"]),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            idle(&["--socket", "/x.sock", "--idle-release", "00"]),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -347,11 +394,36 @@ mod tests {
             err.contains("--idle-release") && err.contains("seconds"),
             "a missing value names the flag and its unit: {err}"
         );
-        for value in ["", "-1", "1.5", "60s", "abc", "99999999999999999999999"] {
+        // `+5` and `+0` are what `u64::from_str` takes and this used to; the
+        // last two are past the range, the second of them past a `u64` too,
+        // and 2^64 - 1 below it used to be taken as a window too far off to
+        // reach, which meant "never".
+        for value in [
+            "",
+            "-1",
+            "1.5",
+            "60s",
+            "abc",
+            "99999999999999999999999",
+            "+5",
+            "+0",
+            " 5",
+            "5 ",
+            "5s",
+            "-0",
+            "1e3",
+            "0x10",
+            "\u{0665}",
+            "86401",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
             let err = parse_strs(&["--socket", "/x.sock", "--idle-release", value]).unwrap_err();
             assert!(
-                err.contains("--idle-release") && err.contains(&format!("`{value}`")),
-                "a bad value names the flag and itself: {err}"
+                err.contains("--idle-release")
+                    && err.contains(&format!("`{value}`"))
+                    && err.contains("whole seconds from 0 to 86400"),
+                "a bad value names the flag, the range and itself: {err}"
             );
         }
     }
