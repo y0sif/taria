@@ -610,8 +610,12 @@ Bridge side (`taria-mcp`):
      at once, taking the terminal back into raw mode. The agent cannot run
      `fg`, so it is told to ask the user to. Any other stop gets `kill -CONT`
      with the pid, and a tracing stop (state `t` in `/proc/<pid>/stat`) is
-     sent to the debugger. Any failure to read the state leaves the held
-     answer, and other platforms always get it. Only a bridge started on
+     sent to the debugger. After a release, the opening's sentence says the
+     disconnect was that release and not a fault, in the held answer's words,
+     before it says the bridge has reconnected, and so do the three answers
+     above that say it: told only that the app was suspended, an agent took
+     the suspension for the cause. Any failure to read the state leaves the
+     held answer, and other platforms always get it. Only a bridge started on
      demand records the pid; one handed to `TariaMcpServer::new` gets the held
      answer, as in 0.3.2.
    - With no connection open, between two connects or because nothing is

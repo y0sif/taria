@@ -57,8 +57,10 @@ taria-ratatui 0.3.3 needs taria 0.3.3.
   `, and the app is now held by another bridge.`, then says the disconnect was
   this bridge letting go on purpose after its window with no tool calls, or
   up to 30 s later while an input awaited its ack, and that it is not a
-  fault. Once a connect finds nothing listening, or another process listening
-  than the one it let go of (when the kernel names both), it stops saying so.
+  fault. Its other answers that say it reconnected, a stopped app's among
+  them, say the same right after the opening. Once a connect finds nothing
+  listening, or another process listening than the one it let go of (when
+  the kernel names both), it stops saying so.
 - **The retry hint follows `--idle-release`.** At the default the text is as
   in 0.3.2. A bridge started with another window names it, and one started
   with `0` says it never lets go.

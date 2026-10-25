@@ -1377,12 +1377,12 @@ exited. One that reconnects to an app that greets it but has not published yet
 says that, and that a retry is served the first snapshot. One that reconnects
 and cannot read what the app sends quotes the line it could not read: a
 connect forgets every reason it held but an oversized line's (section 13.2),
-so the reason quoted is the new connection's. One that let go of the app after
-its window and finds it held says that the disconnect was its own release, not
-a fault, unless it has seen signs of a new instance since: nothing listening,
-or another pid listening than the one it let go of. On Linux, one whose
-connection is silent because the app is stopped names it as stopped, with its
-pid and how to resume it (section 14.5). None of this is a protocol rule. To
+so the reason quoted is the new connection's. On Linux, one whose connection
+is silent because the app is stopped names it as stopped, with its pid and how
+to resume it (section 14.5). One that let go of the app after its window says,
+in each of these answers, that the disconnect was its own release, not a fault,
+unless it has seen signs of a new instance since: nothing listening, or another
+pid listening than the one it let go of. None of this is a protocol rule. To
 the app, a bridge that let go is one that left.
 
 ## 15. Focus contract

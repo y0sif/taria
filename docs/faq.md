@@ -92,11 +92,11 @@ lets go, so the agent retries rather than asking you to kill a process: after
 60 s idle on the default, and after the waiting bridge's own window when it
 was started with another, since a holder started from the same `.mcp.json` has
 the same one. `--idle-release` changes the 60 s (`docs/cli.md`). A bridge that
-let go and came back to find the app taken says that its own disconnect was
-that release, not a fault, after its window or up to 30 s more if an input was
-awaiting its ack. A bridge older than 0.3.2 still holds the app until its
-session ends; until every session runs the new one, disable taria with `/mcp`
-in the Claude Code sessions that do not drive the app.
+let go and came back to find the app taken or stopped says that its own
+disconnect was that release, not a fault, after its window or up to 30 s more
+if an input was awaiting its ack. A bridge older than 0.3.2 still holds the
+app until its session ends; until every session runs the new one, disable
+taria with `/mcp` in the Claude Code sessions that do not drive the app.
 
 **Is the protocol stable?**
 

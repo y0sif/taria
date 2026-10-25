@@ -846,7 +846,7 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
                      bridge's line limit, so the bridge closed the connection. {OVERSIZED_REPEATS}"
                 )
             } else if let Some(open_for) = report.link.open_for() {
-                reconnected_reason(&gone, open_for, report)
+                reconnected_reason(&gone, open_for, report, stopped_peer)
             } else {
                 // Only with no connection open: the one state in which this
                 // bridge cannot tell an app that is gone from one between
@@ -866,8 +866,9 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
 
 /// Why a bridge that had the app, and has a connection to the socket open
 /// again, has no tree to serve: `gone` is the departure opening, `open_for`
-/// the age of the new connection, and `report` the rest of what the bridge
-/// knows about it.
+/// the age of the new connection, `report` the rest of what the bridge
+/// knows about it, and `stop_of_peer` how the peer's pid is read for a stop
+/// ([`stopped_peer`], but for tests).
 ///
 /// An open connection means something at the path accepted the connect, so
 /// "it may have exited", the answer all of these once got, was about an app
@@ -885,17 +886,34 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
 /// every other reason at each connect. A restarted app whose tree this bridge
 /// cannot read was otherwise told to retry, which no retry could fix (issue
 /// #16).
-fn reconnected_reason(gone: &str, open_for: Duration, report: LinkReport) -> String {
+///
+/// When the departure was this bridge letting go after its idle window, each
+/// answer that says this bridge reconnected says so between the opening and
+/// that phrase, in [`let_go_on_purpose`]'s words; the held answer says it in
+/// a sentence of its own, after the phrase callers match on. An agent told
+/// "disconnected" and then that the app is suspended took the suspension for
+/// the cause.
+fn reconnected_reason(
+    gone: &str,
+    open_for: Duration,
+    report: LinkReport,
+    stop_of_peer: impl FnOnce(Option<i32>) -> Option<Stopped>,
+) -> String {
+    let departed = if report.released {
+        format!("{gone} {}", let_go_on_purpose(report.idle_release))
+    } else {
+        gone.to_string()
+    };
     if let Some(err) = report.rejected {
         return format!(
-            "{gone}, and this bridge has reconnected: the app sent lines on the new connection, \
-             and this bridge could not read the last one ({err}). {}",
+            "{departed}, and this bridge has reconnected: the app sent lines on the new \
+             connection, and this bridge could not read the last one ({err}). {}",
             unreadable_line_hints()
         );
     }
     if let Some(version) = report.peer_protocol {
         return format!(
-            "{gone}, and this bridge has reconnected: the app completed the taria handshake \
+            "{departed}, and this bridge has reconnected: the app completed the taria handshake \
              (protocol version {version}) and has not published a tree on this connection yet. \
              The socket path is right and the app is running, so nothing needs restarting; \
              retry, and the first snapshot it publishes is served."
@@ -903,15 +921,15 @@ fn reconnected_reason(gone: &str, open_for: Duration, report: LinkReport) -> Str
     }
     if open_for < SILENT_LINK_GRACE {
         return format!(
-            "{gone}, and this bridge reconnected to the socket {}ms ago; no handshake has \
+            "{departed}, and this bridge reconnected to the socket {}ms ago; no handshake has \
              arrived yet. The path is right, so this is worth one retry; a connection that is \
              still silent on the next call is diagnosed rather than waited on.",
             open_for.as_millis()
         );
     }
-    if let Some(stopped) = stopped_peer(report.peer_pid) {
+    if let Some(stopped) = stop_of_peer(report.peer_pid) {
         return format!(
-            "{gone}, and this bridge has reconnected: {} {}",
+            "{departed}, and this bridge has reconnected: {} {}",
             stopped.cannot_answer(),
             stopped_evidence(open_for)
         );
@@ -924,6 +942,27 @@ fn reconnected_reason(gone: &str, open_for: Duration, report: LinkReport) -> Str
         held_by_another_bridge(open_for, report.idle_release)
     };
     format!("{gone}, and the app is now held by another bridge. {explanation}")
+}
+
+/// What a reconnected answer other than the held one says, after the
+/// departure opening, when that departure was this bridge letting go after
+/// its idle window: that it was, and that it is not a fault.
+fn let_go_on_purpose(idle_release: Option<Duration>) -> String {
+    format!(
+        "when this bridge let go of it on purpose {}, which is not a fault",
+        release_window(idle_release)
+    )
+}
+
+/// When a release came, in the words both answers that report one use: the
+/// window once, then the hold past it, since an input awaiting its ack holds
+/// the app up to [`UNACKED_HOLD`] longer.
+fn release_window(idle_release: Option<Duration>) -> String {
+    format!(
+        "after {} s with no tool calls, or up to {} s later while an input awaited its ack",
+        seconds(idle_release.unwrap_or(DEFAULT_IDLE_RELEASE)),
+        seconds(UNACKED_HOLD)
+    )
 }
 
 /// What follows a snapshot over [`MAX_LINE_BYTES`], said the same way by
@@ -1078,10 +1117,9 @@ fn held_by_another_bridge(open_for: Duration, idle_release: Option<Duration>) ->
 /// silent connection and the peer that might not be an adapter are left out:
 /// this bridge had the app before it let go, so the peer is known to be one.
 ///
-/// The window is said once: an input awaiting its ack holds the app past
-/// it, so the release came at the window or up to [`UNACKED_HOLD`] after it.
-/// The retry that follows guesses the holder was started like this bridge,
-/// as [`retry_guidance`] does.
+/// The window is said once, in [`release_window`]'s words. The retry that
+/// follows guesses the holder was started like this bridge, as
+/// [`retry_guidance`] does.
 fn held_after_release(idle_release: Option<Duration>) -> String {
     let window = idle_release.unwrap_or(DEFAULT_IDLE_RELEASE);
     let retry = if window == DEFAULT_IDLE_RELEASE {
@@ -1090,12 +1128,11 @@ fn held_after_release(idle_release: Option<Duration>) -> String {
         format!("{} s", seconds(window))
     };
     format!(
-        "That disconnect was this bridge letting go on purpose after {} s with no tool calls, or \
-         up to {} s later while an input awaited its ack, so another session could use the app; \
-         it is not a fault. A holder started like this bridge lets go the same way, and this \
-         bridge takes over as soon as it does, with no restart; retry in {retry}. {STAYS_HELD}",
-        seconds(window),
-        seconds(UNACKED_HOLD)
+        "That disconnect was this bridge letting go on purpose {}, so another session could use \
+         the app; it is not a fault. A holder started like this bridge lets go the same way, and \
+         this bridge takes over as soon as it does, with no restart; retry in {retry}. \
+         {STAYS_HELD}",
+        release_window(idle_release)
     )
 }
 
@@ -2418,11 +2455,33 @@ mod tests {
                     like this; so does an app built against a taria whose snapshot shape differs \
                     from this bridge's. Fix the tree the app publishes, or match its taria \
                     dependency to this bridge's; the bridge keeps reading and needs no restart.";
-        for (name, link, peer_protocol, released) in [
-            ("young", open_for(10), None, false),
-            ("held", open_for(4_000), None, false),
-            ("greeted", open_for(4_000), Some(PROTOCOL_VERSION), false),
-            ("held after a release", open_for(4_000), None, true),
+        // After a release the opening says the disconnect was that, and the
+        // rest is the same.
+        let after_release = want.replacen(
+            "(last snapshot seq 7), and",
+            "(last snapshot seq 7) when this bridge let go of it on purpose after 60 s with no \
+             tool calls, or up to 30 s later while an input awaited its ack, which is not a \
+             fault, and",
+            1,
+        );
+        assert_ne!(after_release, want);
+        for (name, link, peer_protocol, released, want) in [
+            ("young", open_for(10), None, false, want),
+            ("held", open_for(4_000), None, false, want),
+            (
+                "greeted",
+                open_for(4_000),
+                Some(PROTOCOL_VERSION),
+                false,
+                want,
+            ),
+            (
+                "after a release",
+                open_for(4_000),
+                None,
+                true,
+                after_release.as_str(),
+            ),
         ] {
             let err = available_snapshot(
                 gone_demo(),
@@ -2612,18 +2671,28 @@ mod tests {
         );
         assert!(!held.message.contains("on purpose"), "{}", held.message);
 
-        // And a release changes only the held answer: a young link, a
-        // greeting, a link that is down and an oversized tree answer as they
-        // did.
-        for (name, link, peer_protocol, rejected) in [
-            ("young", open_for(10), None, None),
-            ("greeted", open_for(4_000), Some(PROTOCOL_VERSION), None),
-            ("down", LinkState::Down, None, None),
+        // Every other answer that says this bridge reconnected says it in the
+        // opening's sentence instead, the same way (the unreadable line's and
+        // the stopped app's are pinned with theirs), and nothing else in it
+        // changes. A link that is down and an oversized tree answer as they
+        // did: the first is the 0.3.1 answer byte for byte, and the second's
+        // departure is the bridge closing the connection over the size.
+        for (name, link, peer_protocol, rejected, said) in [
+            ("young", open_for(10), None, None, true),
+            (
+                "greeted",
+                open_for(4_000),
+                Some(PROTOCOL_VERSION),
+                None,
+                true,
+            ),
+            ("down", LinkState::Down, None, None, false),
             (
                 "oversized",
                 open_for(4_000),
                 None,
                 Some(OVERSIZED_LINE.to_string()),
+                false,
             ),
         ] {
             let report = |released| LinkReport {
@@ -2636,18 +2705,51 @@ mod tests {
             };
             let plain = available_snapshot(gone_demo(), report(false)).expect_err("no tree");
             let released = available_snapshot(gone_demo(), report(true)).expect_err("no tree");
+            let want = if said {
+                plain.message.replacen(
+                    "(last snapshot seq 7), and",
+                    &format!(
+                        "(last snapshot seq 7) {}, and",
+                        let_go_on_purpose(Some(DEFAULT_IDLE_RELEASE))
+                    ),
+                    1,
+                )
+            } else {
+                plain.message.to_string()
+            };
             if name == "young" {
                 // The age is read off the clock between the two calls.
-                assert!(
-                    released.message.contains("worth one retry"),
-                    "{}",
-                    released.message
-                );
+                let ms = |message: &str| {
+                    let (before, rest) = message
+                        .split_once("reconnected to the socket ")
+                        .unwrap_or_else(|| panic!("{message}"));
+                    let (_, after) = rest
+                        .split_once("ms ago")
+                        .unwrap_or_else(|| panic!("{rest}"));
+                    format!("{before}{after}")
+                };
+                assert_eq!(ms(&released.message), ms(&want), "{name}");
             } else {
-                assert_eq!(released.message, plain.message, "{name}");
+                assert_eq!(released.message, want, "{name}");
             }
-            assert!(!released.message.contains("on purpose"), "{name}");
+            assert_eq!(released.message.contains("on purpose"), said, "{name}");
         }
+        assert_eq!(
+            let_go_on_purpose(Some(DEFAULT_IDLE_RELEASE)),
+            "when this bridge let go of it on purpose after 60 s with no tool calls, or up to 30 \
+             s later while an input awaited its ack, which is not a fault"
+        );
+        // A window of its own is named the same way the held answer names it.
+        assert_eq!(
+            let_go_on_purpose(Some(Duration::from_secs(2))),
+            "when this bridge let go of it on purpose after 2 s with no tool calls, or up to 30 s \
+             later while an input awaited its ack, which is not a fault"
+        );
+        assert!(
+            after_release(Duration::from_secs(2))
+                .contains(&release_window(Some(Duration::from_secs(2)))),
+            "both answers say when the release came in the same words"
+        );
     }
 
     /// What the held answers end with, for a bridge on the default window
@@ -2792,6 +2894,94 @@ mod tests {
              bridge lets go of the app (60 s with no tool calls, then 30 s more while an input \
              awaits its ack). Resume it from the debugger, then call read_tree, and resend the \
              input if its effect is missing."
+        );
+    }
+
+    /// A bridge that let go of the app after its window reconnects and finds
+    /// it stopped. The answer said "disconnected" and then that the app is
+    /// suspended, and the agent took the suspension for the cause of the
+    /// disconnect. After a release the opening's sentence says the
+    /// disconnect was that release and not a fault, by this bridge's window,
+    /// for every kind of stop; without one the answer is as it was. The
+    /// opening callers match on stays byte for byte.
+    #[test]
+    fn a_bridge_that_let_go_and_finds_the_app_stopped_says_the_disconnect_was_its_own() {
+        let gone = "app 'demo' disconnected (last snapshot seq 7)";
+        let evidence = "The socket path is right: this bridge's connection has waited 4.0s in \
+                        the app's listen queue with no handshake, because a stopped app accepts \
+                        nothing.";
+        for stop in [Stop::Signal, Stop::Job, Stop::Debugger] {
+            let stopped = Stopped { pid: 4242, stop };
+            let answer = |released, idle_release| {
+                reconnected_reason(
+                    gone,
+                    Duration::from_secs(4),
+                    LinkReport {
+                        link: open_for(4_000),
+                        released,
+                        peer_pid: Some(4242),
+                        idle_release,
+                        ..silent_link()
+                    },
+                    |pid| {
+                        assert_eq!(pid, Some(4242), "the peer's pid is the one read");
+                        Some(stopped)
+                    },
+                )
+            };
+            let resume = stopped.cannot_answer();
+            assert_eq!(
+                answer(false, Some(DEFAULT_IDLE_RELEASE)),
+                format!("{gone}, and this bridge has reconnected: {resume} {evidence}"),
+                "{stop:?}, not released"
+            );
+            for (idle_release, window) in [
+                (Some(DEFAULT_IDLE_RELEASE), "60"),
+                (None, "60"),
+                (Some(Duration::from_secs(2)), "2"),
+            ] {
+                let released = answer(true, idle_release);
+                assert_eq!(
+                    released,
+                    format!(
+                        "{gone} when this bridge let go of it on purpose after {window} s with no \
+                         tool calls, or up to 30 s later while an input awaited its ack, which is \
+                         not a fault, and this bridge has reconnected: {resume} {evidence}"
+                    ),
+                    "{stop:?}, {idle_release:?}"
+                );
+                assert_eq!(released.matches("with no tool calls").count(), 1);
+            }
+        }
+
+        // The answer the agent misread, whole.
+        let job = reconnected_reason(
+            "app 'taria-demo' disconnected (last snapshot seq 1)",
+            Duration::from_millis(500),
+            LinkReport {
+                link: open_for(4_000),
+                released: true,
+                peer_pid: Some(3_061_531),
+                idle_release: Some(DEFAULT_IDLE_RELEASE),
+                ..silent_link()
+            },
+            |_| {
+                Some(Stopped {
+                    pid: 3_061_531,
+                    stop: Stop::Job,
+                })
+            },
+        );
+        assert_eq!(
+            job,
+            "app 'taria-demo' disconnected (last snapshot seq 1) when this bridge let go of it on \
+             purpose after 60 s with no tool calls, or up to 30 s later while an input awaited \
+             its ack, which is not a fault, and this bridge has reconnected: the app (pid \
+             3061531) is suspended in its terminal, so it cannot answer; ask the user to run fg \
+             in that terminal (kill -CONT resumes it only in the background, where its next use \
+             of the terminal stops it again), then retry. The socket path is right: this \
+             bridge's connection has waited 0.5s in the app's listen queue with no handshake, \
+             because a stopped app accepts nothing."
         );
     }
 
@@ -2981,6 +3171,7 @@ mod tests {
 
         // Both held answers carry it, in place of the held explanation, and
         // a release does not outrank it: the app is not held, it is stopped.
+        // A release is said in the opening's sentence instead.
         let report = |released| LinkReport {
             link: open_for(4_000),
             peer_pid: Some(pid),
@@ -2995,14 +3186,20 @@ mod tests {
             no_snapshot_reason(report(false)),
             format!("no snapshot from the app yet: {resume} {evidence}")
         );
-        for released in [false, true] {
+        for (released, departure) in [
+            (false, String::new()),
+            (
+                true,
+                format!(" {}", let_go_on_purpose(Some(DEFAULT_IDLE_RELEASE))),
+            ),
+        ] {
             assert_eq!(
                 available_snapshot(gone_demo(), report(released))
                     .expect_err("a stopped app serves no tree")
                     .message,
                 format!(
-                    "app 'demo' disconnected (last snapshot seq 7), and this bridge has \
-                     reconnected: {resume} {evidence}"
+                    "app 'demo' disconnected (last snapshot seq 7){departure}, and this bridge \
+                     has reconnected: {resume} {evidence}"
                 ),
                 "released: {released}"
             );
