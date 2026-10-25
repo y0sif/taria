@@ -11,7 +11,7 @@ terminals and guessing at structure. taria works on the other side of the
 terminal: the app publishes what is on screen semantically, the way
 accessibility trees transformed GUI automation.
 
-> Status: pre-alpha, at version 0.3.2. The vertical slice works end to end: a
+> Status: pre-alpha, at version 0.3.3. The vertical slice works end to end: a
 > ratatui adapter, an MCP bridge, and a demo app an agent can drive today. The
 > wire format is frozen at `PROTOCOL_VERSION` 1. See `CHANGELOG.md` for what
 > this release changed and what the freeze promises, `docs/comparison.md` for
