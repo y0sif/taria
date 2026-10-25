@@ -2093,7 +2093,7 @@ async fn disconnect_reports_app_label_and_last_seq_then_recovers() {
 /// One line from an app on a later version of the format: a role and an action
 /// this build has never heard of, a node field it has no place for, and a key
 /// order and spacing no serializer here would produce. Every one of those is
-/// information the bridge is relaying, not information it owns.
+/// information the bridge is passing on, not information it owns.
 const NEWER_APP_LINE: &str = concat!(
     r#"{"seq": 2, "type": "snapshot", "protocol_version": 1, "root":"#,
     r#" {"id": "app", "role": "app", "focused": false, "children": ["#,
@@ -2124,8 +2124,8 @@ fn without_envelope(line: &str) -> serde_json::Value {
     value
 }
 
-/// The bridge relays the app's snapshot; it does not re-serialize its own
-/// parse of it, and it does not pass on the envelope the message arrived in.
+/// The bridge passes on the app's own snapshot line; it does not re-serialize
+/// its own parse of it, and it leaves out the envelope the message arrived in.
 ///
 /// Deserializing into `Snapshot` and serializing back is lossy by
 /// construction: it can only emit what this build's types can hold. An app
@@ -2160,8 +2160,8 @@ async fn read_tree_relays_the_apps_tree_without_the_transport_envelope() {
         "the transport's framing key must not reach the agent: {text}"
     );
 
-    // Spelled out, because these three are the losses the relay exists to
-    // prevent and an equality failure alone would not name them.
+    // Spelled out, because these three are the losses passing the line on
+    // exists to prevent and an equality failure alone would not name them.
     let chart = &relayed["root"]["children"][0];
     assert_eq!(
         chart["role"], "sparkline",
@@ -2174,7 +2174,7 @@ async fn read_tree_relays_the_apps_tree_without_the_transport_envelope() {
     );
     assert_eq!(
         chart["sample_hz"], 30,
-        "a field added after this build must survive the relay: {text}"
+        "a field added after this build must survive being passed on: {text}"
     );
 }
 
@@ -2204,7 +2204,7 @@ async fn the_parse_still_validates_acts_against_the_relayed_tree() {
             value: None,
         }))
         .await
-        .expect("an action the relayed tree advertises");
+        .expect("an action the tree passed on advertises");
     let (_app, input) = echo.await.expect("fake app task");
     assert_eq!(
         input,
@@ -2215,7 +2215,7 @@ async fn the_parse_still_validates_acts_against_the_relayed_tree() {
         )
     );
 
-    // And a node the relayed line does not carry is still refused, from the
+    // And a node the line passed on does not carry is still refused, from the
     // same parse.
     let err = server
         .act(Parameters(ActParams {
@@ -2232,9 +2232,9 @@ async fn the_parse_still_validates_acts_against_the_relayed_tree() {
     );
 }
 
-/// The tools that answer with a tree relay it too, not just `read_tree`.
-/// Anything that re-serialized here would put the agent back where it started
-/// one call later.
+/// The tools that answer with a tree pass the app's line on too, not just
+/// `read_tree`. Anything that re-serialized here would put the agent back
+/// where it started one call later.
 #[tokio::test]
 async fn a_tool_result_relays_the_tree_the_app_published() {
     let (_dir, listener, mut handle, server) = setup("relay-tool-result").await;
@@ -2265,7 +2265,7 @@ async fn a_tool_result_relays_the_tree_the_app_published() {
 }
 
 /// `--tree-format outline` changes the text an agent reads and nothing else:
-/// the outline is rendered from the relayed line, so the newer app's role,
+/// the outline is rendered from the line passed on, so the newer app's role,
 /// action and field reach the agent by name there too, and the tree an input
 /// tool answers with comes out in the same format as `read_tree`'s.
 #[tokio::test]
@@ -2321,7 +2321,7 @@ async fn outline_mode_renders_the_relayed_tree_for_every_tool() {
     );
 }
 
-/// A line that failed to parse is still skipped, not relayed. The raw line is
+/// A line that failed to parse is still skipped, not passed on. The raw line is
 /// the agent's view of the app, and forwarding one the bridge could not read
 /// would hand the agent something no peer has vouched for; the last good tree
 /// is the honest answer until a readable one arrives.
@@ -2335,7 +2335,7 @@ async fn a_line_that_does_not_parse_is_never_relayed() {
         .await;
     app.send_raw(r#"{"type":"snapshot","protocol_version":1,"seq":3,"root":42}"#)
         .await;
-    // Nothing to wait for, so give the manager a window to have relayed them
+    // Nothing to wait for, so give the manager a window to have passed them on
     // if it were going to.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2354,6 +2354,13 @@ async fn a_line_that_does_not_parse_is_never_relayed() {
 /// An idle window the on-demand tests can wait out: long enough that a test's
 /// own calls run inside it.
 const SHORT_IDLE: Duration = Duration::from_millis(300);
+
+/// What a held answer says of when the holder lets go, from a bridge started
+/// with a 30 s window: that a holder started the same way lets go after 30 s,
+/// and to retry then. The 60 s default is named as the other possibility.
+const HELD_ON_30_S: &str = "A taria-mcp started like this one lets go of the app after 30 s with \
+no tool calls (one on the default, after 60 s), and this bridge takes over as soon as the holder \
+does, with no restart; retry in 30 s.";
 
 fn on_demand(path: PathBuf, idle_release: Duration) -> TariaMcpServer {
     TariaMcpServer::on_demand(path, TreeFormat::Json, idle_release)
@@ -2493,10 +2500,12 @@ async fn hand_over() {
         .read_tree()
         .await
         .expect_err("the app is serving the holder");
+    // The waiting bridge's own window is the one its answer names: a holder
+    // started the same way lets go after the same.
     assert!(
         err.message
             .starts_with("no snapshot from the app yet: the app is held by another bridge. ")
-            && err.message.contains("lets go of the app after 60 s")
+            && err.message.contains(HELD_ON_30_S)
             && !err.message.contains("may have exited"),
         "{}",
         err.message
@@ -2714,7 +2723,7 @@ async fn the_first_call_to_a_held_app_says_it_is_held() {
             err.message
                 .starts_with("no snapshot from the app yet: the app is held by another bridge. ")
                 && err.message.contains("The socket path is right")
-                && err.message.contains("lets go of the app after 60 s")
+                && err.message.contains(HELD_ON_30_S)
                 && !err.message.contains("may have exited"),
             "{}",
             err.message
@@ -3246,5 +3255,474 @@ async fn a_call_cuts_the_reconnect_backoff_short() {
         gap < pause,
         "the serving connect came {gap:?} after the last dropped one, which the {pause:?} pause \
          after it could have run out to: the call did not cut it short"
+    );
+}
+
+/// Issue #16. A bridge that had the app reconnects to a restarted instance
+/// that greets it and then publishes a snapshot this bridge cannot parse (a
+/// tree past what the JSON parser recurses into, or a taria whose snapshot
+/// shape differs, after a change the adopter just made). The answer was the
+/// greeted one, "retry, and the first snapshot it publishes is served", on
+/// every call, about an app that had published and been thrown away. The
+/// reason is quoted instead, as it is for a bridge that never had a tree.
+#[tokio::test]
+async fn a_restarted_app_whose_tree_cannot_be_read_is_named_not_retried() {
+    let (_dir, path) = test_socket_path("rejected-restart");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path.clone(), Duration::from_secs(30));
+    let first = tokio::spawn(async move {
+        let app = FakeApp::accept(&listener, Snapshot::new(4, demo_root("first-life"))).await;
+        (listener, app)
+    });
+    server.read_tree().await.expect("the first instance's tree");
+    let (listener, app) = first.await.expect("fake app task");
+
+    // The new instance is listening before the old one's connection ends, so
+    // the bridge's reconnect reaches it.
+    drop(listener);
+    std::fs::remove_file(&path).expect("remove old socket file");
+    let restarted = UnixListener::bind(&path).expect("rebind fake app socket");
+    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+    let second = tokio::spawn(async move {
+        let (stream, _addr) = timeout(WAIT, restarted.accept())
+            .await
+            .expect("the bridge should reconnect")
+            .expect("accept");
+        let mut app = FakeApp::from_stream(stream);
+        app.send(&AppToBridge::hello("fake-app", PROTOCOL_VERSION))
+            .await;
+        app.send_raw(r#"{"type":"snapshot","seq":"not a number","root":{}}"#)
+            .await;
+        let _ = sent_tx.send(());
+        (restarted, app)
+    });
+    drop(app);
+    timeout(WAIT, sent_rx)
+        .await
+        .expect("the restarted app should send its line")
+        .expect("the fake app task");
+
+    let opening = "app 'fake-app' disconnected (last snapshot seq 4), and this bridge has \
+                   reconnected: the app sent lines on the new connection, and this bridge could \
+                   not read the last one (invalid type: string \"not a number\", expected u64";
+    // The manager reads the line on its own schedule; until it has, the
+    // greeting is the answer.
+    let err = timeout(WAIT, async {
+        loop {
+            let err = server.read_tree().await.expect_err("no tree can be read");
+            if err.message.starts_with(opening) {
+                return err;
+            }
+            assert_eq!(err.message, GREETED_AFTER_RESTART);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the unreadable line should be named");
+    assert!(
+        err.message.ends_with(
+            "). The socket path is right, so the line is what is wrong. A snapshot more than 32 \
+             levels deep exceeds what a JSON parser will recurse into and fails exactly like \
+             this; so does an app built against a taria whose snapshot shape differs from this \
+             bridge's. Fix the tree the app publishes, or match its taria dependency to this \
+             bridge's; the bridge keeps reading and needs no restart."
+        ),
+        "{}",
+        err.message
+    );
+    // Every call says so, the input tools included, until the app publishes
+    // something readable.
+    let again = server.read_tree().await.expect_err("still unreadable");
+    let key_err = server
+        .key(Parameters(KeyParams {
+            key: "x".to_string(),
+            repeat: None,
+        }))
+        .await
+        .expect_err("nothing to send a key against");
+    assert_eq!(again.message, err.message);
+    assert_eq!(key_err.message, err.message);
+
+    let (_restarted, mut app) = second.await.expect("fake app task");
+    app.send(&AppToBridge::Snapshot(Snapshot::new(1, demo_root("fixed"))))
+        .await;
+    let tree = timeout(WAIT, async {
+        loop {
+            if let Ok(tree) = server.read_tree().await {
+                return tree;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a readable snapshot is served as usual");
+    assert!(result_text(&tree).contains("fixed"), "{tree:?}");
+}
+
+/// The other half of the fix for issue #16. A line the bridge could not read
+/// is quoted with a connection open because it came from that connection:
+/// the bridge forgets every reason at a connect. Here the app's first
+/// instance sends a bad line partway through its session and then restarts,
+/// and the instance that greets the reconnect has sent nothing wrong. Quoting
+/// the old reason would blame it for its predecessor's line; it gets the
+/// greeted answer, word for word.
+#[tokio::test]
+async fn a_line_an_earlier_connection_sent_is_not_held_against_the_next() {
+    let (_dir, path) = test_socket_path("stale-rejected");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = on_demand(path.clone(), Duration::from_secs(30));
+    let first = tokio::spawn(async move {
+        let app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("first-life"))).await;
+        (listener, app)
+    });
+    server.read_tree().await.expect("the first instance's tree");
+    let (listener, mut app) = first.await.expect("fake app task");
+    // Mid-session, a line the bridge cannot read, then a tree it can. Lines
+    // are read in order, so once the second tree is served the bad line has
+    // been read and its reason recorded.
+    app.send_raw(r#"{"type":"snapshot","seq":"x"}"#).await;
+    app.send(&AppToBridge::Snapshot(Snapshot::new(
+        4,
+        demo_root("after-a-bad-line"),
+    )))
+    .await;
+    timeout(WAIT, async {
+        loop {
+            let tree = server.read_tree().await.expect("a tree is being served");
+            if result_text(&tree).contains("after-a-bad-line") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the tree after the bad line should be served");
+
+    drop(listener);
+    std::fs::remove_file(&path).expect("remove old socket file");
+    let restarted = UnixListener::bind(&path).expect("rebind fake app socket");
+    let (greeted_tx, greeted_rx) = tokio::sync::oneshot::channel();
+    let second = tokio::spawn(async move {
+        let (stream, _addr) = timeout(WAIT, restarted.accept())
+            .await
+            .expect("the bridge should reconnect")
+            .expect("accept");
+        let mut app = FakeApp::from_stream(stream);
+        app.send(&AppToBridge::hello("fake-app", PROTOCOL_VERSION))
+            .await;
+        let _ = greeted_tx.send(());
+        (restarted, app)
+    });
+    drop(app);
+    timeout(WAIT, greeted_rx)
+        .await
+        .expect("the restarted app should greet the bridge")
+        .expect("the fake app task");
+
+    for _ in 0..3 {
+        let err = server
+            .read_tree()
+            .await
+            .expect_err("a greeting is not a tree");
+        assert_eq!(err.message, GREETED_AFTER_RESTART);
+    }
+    drop(second.await.expect("fake app task"));
+}
+
+/// The same forgetting, for a bridge that never had a tree: an app whose
+/// line it could not read went away, and the next connection is greeted. Up
+/// to 0.3.2 the old reason outranked that greeting for good, since nothing
+/// but a parsed snapshot retired it; now the greeting is the answer, and the
+/// reason was the answer only while it was the last thing that happened.
+#[tokio::test]
+async fn a_bridge_that_never_had_a_tree_forgets_the_last_connections_line() {
+    let (_dir, listener, _handle, server) = setup("never-stale-rejected").await;
+    let (stream, _addr) = timeout(WAIT, listener.accept())
+        .await
+        .expect("bridge should connect")
+        .expect("accept");
+    let mut app = FakeApp::from_stream(stream);
+    app.send(&AppToBridge::hello("fake-app", PROTOCOL_VERSION))
+        .await;
+    app.send_raw(r#"{"type":"snapshot","seq":"x"}"#).await;
+    timeout(WAIT, async {
+        loop {
+            let err = server.read_tree().await.expect_err("nothing readable");
+            if err.message.contains("could not read the last one") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the bad line should be named while it is the last thing that happened");
+
+    // The app leaves, and the bridge's reconnect is greeted.
+    drop(app);
+    let (stream, _addr) = timeout(WAIT, listener.accept())
+        .await
+        .expect("bridge should reconnect")
+        .expect("accept");
+    let mut app = FakeApp::from_stream(stream);
+    app.send(&AppToBridge::hello("fake-app", PROTOCOL_VERSION))
+        .await;
+    let err = timeout(WAIT, async {
+        loop {
+            let err = server
+                .read_tree()
+                .await
+                .expect_err("a greeting is not a tree");
+            if err.message.contains("completed the taria handshake") {
+                return err;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the greeting should be the answer once the new connection has it");
+    assert!(
+        err.message
+            .starts_with("no snapshot from the app yet, and the socket is not what is wrong")
+            && !err.message.contains("could not read"),
+        "{}",
+        err.message
+    );
+    drop(app);
+}
+
+/// A bridge that let go of the app after its idle window comes back to find
+/// another session holding it. Its answer opens with the departure every
+/// disconnect gets, and agents read that as a fault and went looking for it;
+/// so after the phrases callers match on, it says the departure was this
+/// bridge letting go on purpose, and when to retry.
+#[tokio::test]
+async fn a_bridge_that_let_go_says_its_disconnect_was_on_purpose() {
+    let (_dir, path) = test_socket_path("released-held");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let first = on_demand(path.clone(), SHORT_IDLE);
+    let other = on_demand(path, Duration::from_secs(30));
+    let (mut closed, _inputs) = serve_generations(listener, PROTOCOL_VERSION);
+
+    let tree = first
+        .read_tree()
+        .await
+        .expect("the first bridge gets the app");
+    assert!(result_text(&tree).contains("gen-1"), "{tree:?}");
+    assert_eq!(wait_released(&mut closed).await, 1);
+    let tree = other.read_tree().await.expect("the other session takes it");
+    assert!(result_text(&tree).contains("gen-2"), "{tree:?}");
+
+    let err = first
+        .read_tree()
+        .await
+        .expect_err("the other session holds the app");
+    assert_eq!(
+        err.message,
+        "app 'fake-app' disconnected (last snapshot seq 1), and the app is now held by another \
+         bridge. That disconnect was this bridge letting go on purpose after 0.3 s with no tool \
+         calls, or up to 30 s later while an input awaited its ack, so another session could use \
+         the app; it is not a fault. A holder started like this bridge lets go the same way, \
+         and this bridge takes over as soon as it does, with no restart; retry in 0.3 s. If the \
+         app stays held, another session is using it, or the holder is a taria-mcp older than \
+         0.3.2, which holds the app until its session ends."
+    );
+}
+
+/// A bridge that let go of the app, and then found nothing listening at the
+/// path, no longer calls the disconnect its own: the app it let go of has
+/// gone since. Before, a new instance held by another session got the
+/// released answer, "it is not a fault", about a departure that by then
+/// included the app's exit. Both "it may have exited" answers in between are
+/// as they always were.
+#[tokio::test]
+async fn a_bridge_that_let_go_drops_the_claim_once_the_app_is_gone() {
+    let (_dir, path) = test_socket_path("released-gone");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let first = on_demand(path.clone(), SHORT_IDLE);
+
+    let (tree, app) = tokio::join!(
+        first.read_tree(),
+        FakeApp::accept(&listener, Snapshot::new(1, demo_root("gen-1")))
+    );
+    assert!(
+        result_text(&tree.expect("the bridge gets the app")).contains("gen-1"),
+        "the first tree"
+    );
+    // The bridge lets go after its window, and the app sees the close.
+    let mut app = app;
+    app.wait_closed().await;
+
+    // The app exits and takes its socket with it.
+    drop(app);
+    drop(listener);
+    std::fs::remove_file(&path).expect("remove the socket file");
+    for ask in 1..=2 {
+        let err = first.read_tree().await.expect_err("nothing is listening");
+        assert_eq!(
+            err.message,
+            "app 'fake-app' disconnected (last snapshot seq 1); it may have exited. The bridge \
+             reconnects automatically; retry once the app is back.",
+            "ask {ask}"
+        );
+    }
+
+    // A new instance, taken by a bridge that never lets go.
+    let listener = UnixListener::bind(&path).expect("bind the new instance's socket");
+    let (_closed, _inputs) = serve_generations(listener, PROTOCOL_VERSION);
+    let holder = on_demand(path, Duration::ZERO);
+    let tree = holder.read_tree().await.expect("the holder takes the app");
+    assert!(result_text(&tree).contains("gen-1"), "{tree:?}");
+
+    let err = timeout(WAIT, async {
+        loop {
+            let err = first.read_tree().await.expect_err("the holder has the app");
+            if !err.message.contains("worth one retry") {
+                return err;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a connection nobody accepts should be diagnosed");
+    assert!(
+        err.message.starts_with(
+            "app 'fake-app' disconnected (last snapshot seq 1), and the app is now held by \
+             another bridge. The socket path is right: this bridge has been connected for "
+        ) && !err.message.contains("on purpose"),
+        "{}",
+        err.message
+    );
+}
+
+/// Accept the bridge's connection and publish `initial` with no `hello`: a
+/// hand-written peer that skips the handshake.
+async fn accept_without_hello(listener: &UnixListener, initial: Snapshot) -> FakeApp {
+    let (stream, _addr) = timeout(WAIT, listener.accept())
+        .await
+        .expect("bridge should connect")
+        .expect("accept");
+    let mut app = FakeApp::from_stream(stream);
+    app.send(&AppToBridge::Snapshot(initial)).await;
+    app
+}
+
+/// `initial` as an app on `protocol_version` would publish it.
+fn on_version(protocol_version: u32, mut initial: Snapshot) -> Snapshot {
+    initial.protocol_version = protocol_version;
+    initial
+}
+
+/// The `act` every test below sends.
+fn activate_btn() -> Parameters<ActParams> {
+    Parameters(ActParams {
+        node: "btn".to_string(),
+        action: "activate".to_string(),
+        value: None,
+    })
+}
+
+/// A peer that never sends `hello` used to pass the version check, since
+/// only the handshake set the version and none read as "no mismatch known",
+/// so a peer on another version was sent input it cannot parse. Every
+/// snapshot states its version, and until a `hello` arrives the first
+/// snapshot's is the version the bridge goes by.
+#[tokio::test]
+async fn an_app_that_never_greets_is_held_to_the_version_its_snapshot_states() {
+    let (_dir, listener, mut handle, server) = setup("no-hello-other").await;
+    let other = PROTOCOL_VERSION + 1;
+    let mut app = accept_without_hello(
+        &listener,
+        on_version(other, Snapshot::new(1, demo_root("no-hello"))),
+    )
+    .await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+
+    let tree = server.read_tree().await.expect("the snapshot still parses");
+    assert!(result_text(&tree).contains("no-hello"), "{tree:?}");
+    let err = server
+        .act(activate_btn())
+        .await
+        .expect_err("a peer on another version cannot read input");
+    assert!(
+        err.message.starts_with(&format!(
+            "the app speaks taria protocol version {other}, this bridge speaks {PROTOCOL_VERSION}"
+        )),
+        "{}",
+        err.message
+    );
+    app.expect_no_input(Duration::from_millis(300)).await;
+}
+
+/// The same peer on this bridge's version is served input as any other.
+#[tokio::test]
+async fn an_app_that_never_greets_on_this_version_is_sent_input() {
+    let (_dir, listener, mut handle, server) = setup("no-hello-same").await;
+    let app = accept_without_hello(&listener, Snapshot::new(1, demo_root("no-hello"))).await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+    let echo = tokio::spawn(async move {
+        let mut app = app;
+        let (_id, input) = app.recv_input().await;
+        assert!(matches!(input, AgentInput::Act { .. }), "{input:?}");
+        app
+    });
+    let result = server.act(activate_btn()).await.expect("the act is sent");
+    assert!(
+        result_text(&result).contains("The app received this input"),
+        "{}",
+        result_text(&result)
+    );
+    drop(echo.await.expect("fake app task"));
+}
+
+/// A `hello` that comes after a snapshot is the peer's word on its version,
+/// and replaces the one its snapshot stated, either way round.
+#[tokio::test]
+async fn a_hello_after_a_snapshot_replaces_the_version_it_stated() {
+    let (_dir, listener, mut handle, server) = setup("late-hello").await;
+    let other = PROTOCOL_VERSION + 1;
+    let mut app = accept_without_hello(
+        &listener,
+        on_version(other, Snapshot::new(1, demo_root("late-hello"))),
+    )
+    .await;
+    wait_for_snapshot(&mut handle.state_rx, 1).await;
+    server
+        .act(activate_btn())
+        .await
+        .expect_err("the snapshot said another version");
+
+    app.send(&AppToBridge::hello("fake-app", PROTOCOL_VERSION))
+        .await;
+    let mut protocol = handle.protocol_rx.clone();
+    timeout(WAIT, protocol.wait_for(|v| *v == Some(PROTOCOL_VERSION)))
+        .await
+        .expect("the hello should be read")
+        .expect("the bridge task is alive");
+    let echo = tokio::spawn(async move {
+        let (_id, input) = app.recv_input().await;
+        assert!(matches!(input, AgentInput::Act { .. }), "{input:?}");
+        app
+    });
+    server
+        .act(activate_btn())
+        .await
+        .expect("the hello said this version");
+    let mut app = echo.await.expect("fake app task");
+
+    // And the other way round: a hello naming another version outranks a
+    // snapshot that named this one.
+    app.send(&AppToBridge::hello("fake-app", other)).await;
+    timeout(WAIT, protocol.wait_for(|v| *v == Some(other)))
+        .await
+        .expect("the hello should be read")
+        .expect("the bridge task is alive");
+    let err = server
+        .act(activate_btn())
+        .await
+        .expect_err("the hello said another version");
+    assert!(
+        err.message.contains(&format!("protocol version {other}")),
+        "{}",
+        err.message
     );
 }

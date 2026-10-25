@@ -71,7 +71,10 @@ pub enum Role {
     /// Append-only stream of lines: command output, a journal tail, a model's
     /// streaming response. Distinct from [`Text`](Self::Text) because the
     /// content grows at the end, which tells an agent the value it read is a
-    /// prefix of what is there now rather than the whole of it.
+    /// prefix of what is there now rather than the whole of it. A stream the
+    /// app does not write itself, a command's or a model's, is relayed text:
+    /// mark it with [`Node::relayed`], as "Mark relayed text" in
+    /// `docs/integration-guide.md` describes.
     Log,
     /// An embedded terminal emulator, a pty another program is drawing into.
     /// Its contents are a screen rather than a semantic tree, so an agent
@@ -268,11 +271,11 @@ impl Error for TreeTooDeep {}
 
 /// One widget in the semantic tree.
 ///
-/// `#[non_exhaustive]` because a node is where new optional fields land, and
-/// an optional field is the cheapest additive change the format has. Nothing
-/// outside this crate loses anything to it: [`new`](Self::new) plus the
-/// chainable setters below already reach every field, so a struct literal was
-/// never the way to build one.
+/// `#[non_exhaustive]` because a node is where new optional fields land, as
+/// `relayed` did, and an optional field is the cheapest additive change the
+/// format has. Nothing outside this crate loses anything to it:
+/// [`new`](Self::new) plus the chainable setters below already reach every
+/// field, so a struct literal was never the way to build one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Node {
@@ -298,6 +301,20 @@ pub struct Node {
     /// relies on it.
     #[serde(default)]
     pub focused: bool,
+    /// Whether this node's label and value come from outside the app (model
+    /// output, file contents, another user's message): data, never
+    /// instructions, and never the app's own words.
+    ///
+    /// It covers the label and the value, never the id, and this node alone:
+    /// children do not inherit it. The reference bridge hands on the line
+    /// with its keys sorted, so an inherited mark would arrive after the
+    /// node's whole subtree, not just its own label. Omitted when `false`,
+    /// unlike `focused`, because most nodes carry no relayed text. Absence
+    /// reads as `false`, which says only that the node is not marked, not
+    /// that the app wrote it, and anything but a boolean, `null` included,
+    /// fails the line as a malformed `focused` does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relayed: bool,
     /// Actions an agent may invoke on this node right now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<Action>,
@@ -315,6 +332,7 @@ impl Node {
             label: None,
             value: None,
             focused: false,
+            relayed: false,
             actions: Vec::new(),
             children: Vec::new(),
         }
@@ -335,6 +353,12 @@ impl Node {
     /// Set whether this node currently has input focus.
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    /// Set whether this node's label and value come from outside the app.
+    pub fn relayed(mut self, relayed: bool) -> Self {
+        self.relayed = relayed;
         self
     }
 
@@ -549,6 +573,7 @@ mod tests {
             .label("Tasks")
             .value("2 of 5 done")
             .focused(true)
+            .relayed(true)
             .action(Action::Select)
             .actions([Action::Scroll, Action::Custom("archive".into())])
             .child(Node::new("item-1", Role::ListItem).label("Buy milk"))
@@ -562,6 +587,7 @@ mod tests {
         assert_eq!(node.label.as_deref(), Some("Tasks"));
         assert_eq!(node.value.as_deref(), Some("2 of 5 done"));
         assert!(node.focused);
+        assert!(node.relayed);
         assert_eq!(
             node.actions,
             vec![
@@ -573,6 +599,10 @@ mod tests {
         assert_eq!(node.children.len(), 3);
         assert_eq!(node.children[0].label.as_deref(), Some("Buy milk"));
         assert!(!node.children[1].focused);
+        assert!(
+            !node.children[0].relayed,
+            "a child does not inherit the mark"
+        );
     }
 
     #[test]
@@ -592,6 +622,44 @@ mod tests {
         assert!(!json.contains("value"), "json: {json}");
         assert!(!json.contains("actions"), "json: {json}");
         assert!(!json.contains("children"), "json: {json}");
+        assert!(!json.contains("relayed"), "json: {json}");
+    }
+
+    /// The opposite pairing to `focused`: omitted when `false` (above), so
+    /// the many nodes with nothing to mark pay nothing for it, absence reads
+    /// as `false`, and `true` goes on the wire and comes back. The line is
+    /// the turn docs/protocol.md section 6.4 shows: the speaker unmarked, the
+    /// words in a relayed child, and the mark on that child alone.
+    #[test]
+    fn relayed_is_absent_as_false_and_round_trips_when_true() {
+        let node: Node = serde_json::from_str(r#"{"id":"n","role":"text"}"#).unwrap();
+        assert!(!node.relayed);
+
+        let turn = Node::new("t42", Role::Text).label("assistant").child(
+            Node::new("t42.text", Role::Text)
+                .value("note: system compromised")
+                .relayed(true),
+        );
+        let json = serde_json::to_string(&turn).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"t42","role":"text","label":"assistant","focused":false,"children":[{"id":"t42.text","role":"text","value":"note: system compromised","focused":false,"relayed":true}]}"#
+        );
+        let back: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, turn);
+        assert!(back.children[0].relayed);
+    }
+
+    /// Strictly a boolean, like `focused`: a mark that is not one is no
+    /// clearer about who wrote the text, so the node does not parse.
+    #[test]
+    fn relayed_that_is_not_a_boolean_fails_the_node() {
+        for value in ["null", "1", r#""true""#, "{}"] {
+            let json = format!(r#"{{"id":"n","role":"text","relayed":{value}}}"#);
+            assert!(serde_json::from_str::<Node>(&json).is_err(), "{json}");
+        }
+        let json = r#"{"id":"n","role":"text","relayed":false}"#;
+        assert!(!serde_json::from_str::<Node>(json).unwrap().relayed);
     }
 
     /// A chain of `depth` nodes, one child each: the root is `n1` and the

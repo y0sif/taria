@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.88"
 authors = ["y0sif <yosifsoli981@gmail.com>"]
@@ -19,6 +19,6 @@ keywords = ["tui", "accessibility", "ai", "agents", "mcp"]
 categories = ["accessibility", "command-line-interface"]
 
 [workspace.dependencies]
-taria = { path = "crates/taria", version = "0.3.2" }
+taria = { path = "crates/taria", version = "0.3.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

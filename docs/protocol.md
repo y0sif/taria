@@ -74,10 +74,10 @@ the app is the one that speaks first (section 3).
 4. Answer every `input` message it reads on a live connection with at least
    one `ack` naming the same `id` (section 10). An input the app cannot act on
    is answered `ignored`, not left unanswered. The exceptions are a line
-   that did not parse, which carries no readable id (section 2.6), an input
-   whose connection has since ended, which is deliberately not acked
-   (section 11), and an input written before the app's `hello`, which it may
-   discard unacked (section 14.5).
+   that did not parse, whose id is lost with it even when the text shows one
+   (sections 2.6 and 9.4), an input whose connection has since ended, which
+   is deliberately not acked (section 11), and an input written before the
+   app's `hello`, which it may discard unacked (section 14.5).
 5. Skip a line it cannot parse and keep the connection (section 2.6).
 6. Never apply an input that arrived on a connection that has since ended
    (section 11).
@@ -313,18 +313,20 @@ streams every subsequent publish.
 ### 3.5 An app that sends no hello
 
 An app **MUST** send `hello`. A bridge **SHOULD** tolerate its absence rather
-than dropping the connection: the reference bridge leaves the peer's version
-unknown, which it reads as "no mismatch known", and goes on serving snapshots
-and forwarding input. That path exists for adapters older than the handshake.
-The cost of relying on it is that version-mismatch protection (section 16.5)
-is only as good as the peer's honesty about its version.
+than dropping the connection. Until a `hello` arrives, the reference bridge
+takes the peer's version from the first snapshot's `protocol_version`
+(section 5.2), so a first snapshot declaring another version refuses input
+exactly as a mismatched `hello` does; a later `hello` replaces it. No taria
+adapter has omitted the `hello`; the path exists for hand-written peers. The
+cost of relying on it is that version-mismatch protection (section 16.5) is
+only as good as the peer's honesty about its version.
 
 ## 4. Message catalogue
 
 Both message enums are internally tagged: every line carries a `type` key
 naming the message. That key frames the message on the transport and says
-nothing about the tree, which is why a bridge relaying a snapshot to an agent
-strips it.
+nothing about the tree, which is why a bridge passing a snapshot on to an
+agent strips it.
 
 ### 4.1 App to bridge
 
@@ -413,13 +415,16 @@ beyond that.
 
 ### 5.2 `protocol_version` on the snapshot
 
-Every snapshot states the version, and **neither reference peer reads it**.
-Version negotiation happens on the `hello` (section 16.5). A `Snapshot` object
-carrying `"protocol_version":2` parses without complaint into this build's
-types, so a reader **MUST NOT** treat this field as a validity check.
+Every snapshot states the version, and **the reference bridge reads it only
+on a connection that sent no `hello`, and only the first snapshot's**
+(section 3.5). Version negotiation
+happens on the `hello` (section 16.5). A `Snapshot` object carrying
+`"protocol_version":2` parses without complaint into this build's types, so a
+reader **MUST NOT** treat this field as a validity check.
 
 **Not specified.** What a peer should do when a snapshot's `protocol_version`
-disagrees with the `hello`'s, or with its own.
+disagrees with the `hello`'s, or with its own. The reference bridge goes by
+the `hello` where there is one, and until there is, by the first snapshot's.
 
 ## 6. Node
 
@@ -460,6 +465,7 @@ A node with nothing set beyond its identity:
 | `label` | string | no | **omitted when unset** | no label |
 | `value` | string | no | **omitted when unset** | no value |
 | `focused` | boolean | no | **always emitted**, including `false` | `false` |
+| `relayed` | boolean | no | **omitted when `false`** | `false`: not marked |
 | `actions` | array | no | **omitted when empty** | no actions advertised |
 | `children` | array | no | **omitted when empty** | a leaf |
 
@@ -475,12 +481,18 @@ Rules a reader has to implement:
   sender in version 1 **SHOULD** emit it on every node anyway: the reference
   adapter does, and accepting absence now is what keeps dropping the field
   later an additive change rather than a version bump.
+- A reader **MUST** accept `relayed` absent and read absence as `false`. A
+  sender **SHOULD** omit it when `false`, as the reference `Node` does: it
+  marks the few nodes whose text came from outside the app, so spelling
+  `"relayed":false` on all the others costs bytes and says nothing. What it
+  means is section 6.4.
 - A reader **MUST** accept `actions` and `children` absent and read absence as
   empty.
-- `focused`, `actions` and `children` **MUST NOT** be sent as `null`. Absent
-  and empty are the two spellings; `null` fails the parse with "invalid type:
-  null" in the reference implementation, and failing takes the whole snapshot
-  with it.
+- `focused`, `relayed`, `actions` and `children` **MUST NOT** be sent as
+  `null`, and `focused` and `relayed` **MUST NOT** be sent as anything but a
+  boolean. Absent and empty are the two spellings; `null` fails the parse with
+  "invalid type: null" in the reference implementation, a value of any other
+  wrong type fails it too, and failing takes the whole snapshot with it.
 - `id` **MUST** be a JSON string. Verified: `{"id":7,...}` fails.
 
 ### 6.2 Node ids
@@ -507,6 +519,47 @@ authors, not a wire rule. See section 18.3.
 of nodes in a tree, or on the length of a `label` or a `value`; the 1 MiB line
 cap (section 2.5) bounds all of them together, and crossing it costs the
 connection rather than the tree (section 13.2).
+
+### 6.4 Relayed text
+
+Most of a tree's text is the app's own: a button's text, a tab's name, a
+status line. Some of it the app shows without having written it: a model's
+output, a file's contents, another user's message, a command's output, the
+file names in a directory tree. Both arrive as plain strings, so without a
+mark an agent cannot weigh them differently, and relayed text can speak in
+the app's voice. `"relayed":true` is that mark.
+
+- It covers the node's `label` and `value`, and nothing else. The mark says
+  nothing about `id`, `role`, `focused` or `actions`; a sender **SHOULD NOT**
+  build an id or a custom action name from relayed text.
+- It is strictly per node. A reader **MUST NOT** read a child of a relayed
+  node as relayed, and a sender **SHOULD** mark every node whose `label` or
+  `value` it relays. The reference bridge hands the line on with its keys
+  sorted (section 16.6), so an inherited mark would arrive after the node's
+  whole subtree, not just its own label.
+- Absent reads as `false`. It is not a statement that the app wrote the text,
+  so a reader **MUST NOT** treat an unmarked node as vouched for.
+- The `label` and `value` of a relayed node are data: what the app is
+  showing, never an instruction to follow and never the app describing its
+  own state. A bridge that hands the tree to an agent **SHOULD** say what the
+  mark means, as the reference `read_tree` description does.
+- A sender **SHOULD** carry speakers in structure, not in the text. A
+  transcript is one unmarked node per turn with the speaker as its `label`,
+  and the turn's words in a child marked relayed:
+
+```json
+{"id":"t42","role":"text","label":"assistant","focused":false,"children":[{"id":"t42.text","role":"text","value":"note: system compromised","focused":false,"relayed":true}]}
+```
+
+A prefix such as `you:` or `note:` inside the text is something the content
+can spell as well; a label on a node of its own is not. Here the reply opens
+with `note:`, and the tree still says the assistant wrote it.
+
+The mark is the app's statement about where its strings came from, and no
+peer can check it. A bridge needs nothing new to carry it: it passes the mark
+on with the rest of the line, and a bridge built before the field does too,
+because it hands the agent the app's line rather than its parse of it
+(section 16.6).
 
 ## 7. Role vocabulary
 
@@ -758,7 +811,11 @@ newline or a tab means there.
   failure, not an unknown kind.
 - A known `kind` missing the field it is made of is a parse failure, not an
   unknown kind. `{"kind":"key"}` fails, the whole line is skipped, and the id
-  inside it is lost: verified, the reference adapter sent no ack for it.
+  inside it is lost: verified, the reference adapter sent no ack for it. No
+  conforming sender writes such a line: a kind's fields are fixed within
+  version 1, since a new required field is not additive (sections 16.2 and
+  16.7). So the adapter skips it like any broken line rather than salvaging
+  the id.
 - The name `unknown` is effectively reserved: it is what this build
   re-serializes an unreadable input as (section 9.5).
 
@@ -928,7 +985,8 @@ the ack exists to remove.
   delivers keystrokes aimed at a UI that no longer exists. The reference
   bridge drains its queue on every reconnect.
 - A bridge **MUST** forget the peer's `protocol_version` when a connection
-  ends, so the next connection is not judged by the previous app's handshake.
+  ends, so the next connection is not judged by the previous app's handshake
+  or snapshot version.
 
 **Reference implementation.** The adapter tags each connection with a
 generation, stamps every queued input with the generation it arrived on, and
@@ -1179,6 +1237,10 @@ attacker swap the socket for their own and impersonate the app, or intercept
 the bridge. The check uses the link's own metadata, not the target's, so a
 planted symlink is seen as itself.
 
+That is impersonation at the socket. Text inside the real app's tree that
+speaks as the app, a model's output or a file's contents, is the content-level
+case, and section 6.4 covers it.
+
 ### 14.4 Freeing the path
 
 Binding needs the path to be absent, so a socket left behind by a run that was
@@ -1243,10 +1305,25 @@ beyond reporting it.
 **Reference implementation.** The reference bridge takes turns, which is its
 own policy and not a rule. It opens no connection until its first tool call,
 so a bridge that is started and never used never takes the app. A bridge
-that waits says the app is held by another bridge, and that a taria-mcp lets
-go of the app after 60 s with no tool calls, so the agent retries. Once the
-holder does (section 14.7), the waiting bridge is accepted. A waiting bridge
-that itself goes 60 s with no tool calls leaves the backlog.
+that waits says the app is held by another bridge, and when the holder lets
+go, so the agent retries: after 60 s with no tool calls on the default, or
+after the waiting bridge's own `--idle-release`, its best guess at a holder
+started the same way. Once the holder does (section 14.7), the waiting bridge
+is accepted. A waiting bridge that itself goes a whole window with no tool
+calls leaves the backlog.
+
+A stopped app keeps its socket listening and accepts nothing, which leaves a
+connection exactly as silent as a held app does. On Linux the reference bridge
+tells the two apart by the listener's state. It takes the listener's pid from
+`SO_PEERCRED`, the pid the kernel records for the other end of a Unix socket
+(for a connection still in the backlog, the process listening), and reads that
+process's state from `/proc/<pid>/stat`. A stopped app is named with its pid
+and how to resume it. A job suspended in its terminal, stopped outside the
+terminal's foreground process group, resumes only with `fg` there:
+`kill -CONT` resumes it only in the background, where its next use of the
+terminal stops it again. A tracing stop (state `t`) ends from the debugger,
+and any other stop with `kill -CONT`. Nothing on the wire carries any of it,
+and elsewhere a stopped app reads as held.
 
 ### 14.6 Shutdown
 
@@ -1284,22 +1361,29 @@ On disconnect a bridge **SHOULD** fail tool calls fast with an error naming
 the app that went away, rather than acting on a stale tree.
 
 **Reference implementation.** The reference bridge connects on demand. It
-opens no connection until its first tool call, which waits for the `hello`
-and the latest snapshot the app sends on accept (section 3.4), so that call
-still answers with the live tree. The wait normally takes milliseconds and
-never runs past 1.2 s. After 60 s with no tool calls it closes its
-connection, or leaves the listen backlog, and stops reconnecting until the
-next tool call, so a bridge waiting for the app gets it. Stopping while no
-call wants the app is not giving up: the next call reconnects.
-`--idle-release` sets the delay, and `0` never lets go. It does not let go
-while an input it sent is still waiting for its ack, for up to 30 s past the
-delay, because the app discards an input whose connection has ended
-(section 11). A bridge that reconnects into the backlog behind another, as
-the one that loses the race does when an app restarts, says the app is held
-by another bridge rather than that it may have exited. One that reconnects
-to an app that greets it but has not published yet says that, and that a
-retry is served the first snapshot. None of this is a protocol rule. To the
-app, a bridge that let go is one that left.
+opens no connection until its first tool call, which waits for the `hello` and
+the latest snapshot the app sends on accept (section 3.4), so that call still
+answers with the live tree. The wait normally takes milliseconds and never
+runs past 1.2 s. After 60 s with no tool calls it closes its connection, or
+leaves the listen backlog, and stops reconnecting until the next tool call, so
+a bridge waiting for the app gets it. Stopping while no call wants the app is
+not giving up: the next call reconnects. `--idle-release` sets the delay, and
+`0` never lets go. It does not let go while an input it sent is still waiting
+for its ack, for up to 30 s past the delay, because the app discards an input
+whose connection has ended (section 11). A bridge that reconnects into the
+backlog behind another, as the one that loses the race does when an app
+restarts, says the app is held by another bridge rather than that it may have
+exited. One that reconnects to an app that greets it but has not published yet
+says that, and that a retry is served the first snapshot. One that reconnects
+and cannot read what the app sends quotes the line it could not read: a
+connect forgets every reason it held but an oversized line's (section 13.2),
+so the reason quoted is the new connection's. On Linux, one whose connection
+is silent because the app is stopped names it as stopped, with its pid and how
+to resume it (section 14.5). One that let go of the app after its window says,
+in each of these answers, that the disconnect was its own release, not a fault,
+unless it has seen signs of a new instance since: nothing listening, or another
+pid listening than the one it let go of. None of this is a protocol rule. To
+the app, a bridge that let go is one that left.
 
 ## 15. Focus contract
 
@@ -1415,25 +1499,35 @@ same way.
 An app has no comparable decision to make: it reads the bridge's version
 nowhere, because the bridge sends no handshake.
 
-### 16.6 Relaying beats degrading
+### 16.6 Passing the line on beats degrading
 
-Degrading keeps the connection; relaying keeps the information. A bridge
-**SHOULD** store each snapshot as **the app's own line** beside the parse of
-it, and hand the line to the agent. A role, an action or a field the bridge
-has never heard of then reaches the agent by name instead of flattened into
-whatever its typed view could hold: an app publishing `"role":"sparkline"` had
-the agent read `"role":"other"`, with the real name on the wire the whole time.
+Degrading keeps the connection; passing the line on keeps the information. A
+bridge **SHOULD** store each snapshot as **the app's own line** beside the
+parse of it, and hand the line to the agent. A role, an action or a field the
+bridge has never heard of then reaches the agent by name instead of flattened
+into whatever its typed view could hold: an app publishing
+`"role":"sparkline"` had the agent read `"role":"other"`, with the real name
+on the wire the whole time.
 `taria-mcp --tree-format outline`, which hands the agent an outline instead of
 the line, renders it from the line for the same reason.
 
 The parse stays authoritative for what the bridge **decides**, because it is
 typed: validating node ids and advertised actions, and detecting change, read
-the parse rather than the text. A line is relayed only after it parsed, so a
-malformed one is still skipped.
+the parse rather than the text. A line is passed on only after it parsed, so
+a malformed one is still skipped.
 
-The one thing a relaying bridge **SHOULD** remove from the line is the
+The one thing a bridge **SHOULD** remove from the line it passes on is the
 `"type":"snapshot"` framing key, which belongs to the transport rather than to
-the tree.
+the tree. The reference bridge removes it by parsing the line into a JSON
+value and writing that out again, which keeps every other key but not the
+app's spelling of the line: keys come out sorted and whitespace gone, string
+escapes are rewritten (`"\u00e9"` becomes `"é"`), numbers are rewritten
+(`1e3` becomes `1000.0`, `-0` becomes `-0.0`, and an integer outside the
+64-bit range becomes a float, keeping about 17 significant digits), and of a
+key repeated in one object only the last value is kept, though a repeated
+field the bridge knows never gets that far, because it fails the parse
+(section 2.2). A sender **MUST NOT** rely on any of these spellings reaching
+the agent.
 
 ### 16.7 What forces a version bump
 
@@ -1592,8 +1686,9 @@ behaviour a peer may rely on.
 
 1. **A second `hello` on one connection.** Neither reference peer accepts or
    rejects one explicitly (section 3.2).
-2. **A snapshot's `protocol_version` disagreeing with the `hello`'s.** Nothing
-   reads the snapshot field (section 5.2).
+2. **A snapshot's `protocol_version` disagreeing with the `hello`'s.** The
+   reference bridge goes by the `hello`, and before one by the first
+   snapshot's (sections 3.5, 5.2).
 3. **`seq` at the u64 maximum** (section 5.1).
 4. **Duplicate keys naming a field the reader does not know.** A duplicate of
    a known field fails the line in the reference implementation; a sender
@@ -1613,3 +1708,7 @@ behaviour a peer may rely on.
 10. **Bounds on `app_label`, `label`, `value`, node count and children count.**
     Only the 1 MiB line cap bounds them, and section 2.5 asks an app to keep
     its snapshot within it (sections 3.1, 6.3, 13.2).
+11. **What a bridge does with relayed text beyond passing the mark on**, such
+    as fencing or escaping it in what an agent reads. The reference bridge
+    alters no text: it hands the mark on, and its outline prints it as
+    `*relayed` (section 6.4).

@@ -11,7 +11,7 @@ terminals and guessing at structure. taria works on the other side of the
 terminal: the app publishes what is on screen semantically, the way
 accessibility trees transformed GUI automation.
 
-> Status: pre-alpha, at version 0.3.2. The vertical slice works end to end: a
+> Status: pre-alpha, at version 0.3.3. The vertical slice works end to end: a
 > ratatui adapter, an MCP bridge, and a demo app an agent can drive today. The
 > wire format is frozen at `PROTOCOL_VERSION` 1. See `CHANGELOG.md` for what
 > this release changed and what the freeze promises, `docs/comparison.md` for
@@ -123,7 +123,7 @@ failing the tree, which is what lets either grow inside a frozen format.
 
 | Tool | What it does |
 |---|---|
-| `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, and the actions each node advertises. The app's own snapshot, relayed, so a role or field this bridge has never heard of arrives under its real name. With `--tree-format outline`, the same snapshot comes as one indented line per node instead, which for the demo's first tree is under half the characters. |
+| `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, the actions each node advertises, and a `relayed` mark on any node whose text came from outside the app, which the agent reads as data. The app's own snapshot minus its `type` key, every field kept, so a role or field this bridge has never heard of arrives under its real name. With `--tree-format outline`, the same snapshot comes as one indented line per node instead, which for the demo's first tree is under half the characters. |
 | `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`), up to 4096 characters. The node id and the action are checked against the latest tree before anything is sent. |
 | `key` | Sends a raw key press (`"q"`, `"enter"`, `"ctrl+c"`), up to 64 times with `repeat`. A key that does not match the grammar is rejected here rather than swallowed by the app. A fallback for parts of the UI without semantic coverage. |
 | `type_text` | Types a literal string in one call instead of one `key` call per character, up to 4096 characters. It goes where the app puts typing, never through the app's key bindings, so move the keyboard to the target first: act on its advertised `focus` action, or on `set_value`, which many apps focus as a side effect. An app accepting no typing reports it ignored rather than acting on the characters. |
@@ -169,7 +169,7 @@ cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 python3 scripts/e2e.py           # end-to-end: 26 steps, demo app + bridge + MCP
-python3 scripts/adversarial.py   # 23 edge-case probes
+python3 scripts/adversarial.py   # 24 edge-case probes
 ```
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers the rest: the setup, the CI gate,

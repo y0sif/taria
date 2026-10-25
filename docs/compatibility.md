@@ -14,12 +14,22 @@ value it does not know, and what bumps the version are
 later taria stays readable by an agent built against this one, at the cost of
 one degraded field rather than the whole tree.
 
-Reading through the bridge keeps more than that. It relays the app's own
+Reading through the bridge keeps more than that. It passes on the app's own
 snapshot instead of re-serializing its parse of it, so an unknown role, action
 or field reaches the agent under its real name; the degraded parse is what the
 bridge validates and compares against, not what the agent reads. The opt-in
 outline format, `--tree-format outline`, is rendered from that same line, so
 it keeps the names too.
+
+The node field `relayed`, added in 0.3.3, is that case. It marks a node whose
+label and value came from outside the app, a model's output or a file's
+contents, for the agent to read as data. A taria-mcp older than 0.3.3 passes
+it on in the JSON tree with every other field of the app's snapshot, and 0.3.0
+to 0.3.2, the releases with an outline, show it in one as `relayed=true` among
+the fields at the end of the line rather than as `*relayed` after the role,
+but no `read_tree` description before 0.3.3 says what the mark means. An app
+built before 0.3.3 never sends it, so nothing in its tree is marked, whoever
+wrote it.
 
 In Rust the same promise is `#[non_exhaustive]` on the eleven types a version-1
 addition can reach, from `Role` and `Action` to the two wire message enums,

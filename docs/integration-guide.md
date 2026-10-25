@@ -4,11 +4,12 @@ Adding taria to a ratatui app you already have. For how the pieces fit, see
 `architecture.md`; for what the wire format requires of a peer, message by
 message, see `protocol.md`; for why taria exists, see `landscape.md`.
 
-Two apps have been through this. One is `examples/demo-app`, written taria
-first. The other was an existing typing tutor, retrofitted after the fact: a
+Three apps have been through this. One is `examples/demo-app`, written taria
+first. The second was an existing typing tutor, retrofitted after the fact: a
 real event loop, live metrics, and its own idea of node identity. Several of
-the APIs below exist because of the second one. Where a rule here comes from
-a bug rather than a preference, the bug is named.
+the APIs below exist because of it. The third, ramvamp, draws only a panel
+and was retrofitted too. Where a rule here comes from a bug rather than a
+preference, the bug is named.
 
 The work is five edits, in this order:
 
@@ -33,7 +34,7 @@ has the details and a lint that catches it.
 
 ## Add the dependency
 
-Both crates are on crates.io, at version `0.3.2`.
+Both crates are on crates.io, at version `0.3.3`.
 
 ```bash
 cargo add taria-ratatui
@@ -106,7 +107,8 @@ never branches on whether taria came up.
 
 The layer prints nothing itself, ever, and that is the reason `bind_error()`
 exists as a getter. It is your app that knows when the screen is safe to
-write to.
+write to, and an app that draws only a panel has no alternate screen to time
+it by (see [Apps that draw only a panel](#apps-that-draw-only-a-panel)).
 
 ## Build the tree in its own module
 
@@ -159,6 +161,109 @@ is hardest to test.
 Either way the nodes are wrapped in an auto-generated `app` root, so the two
 produce the same tree.
 
+## Apps that draw only a panel
+
+Not every app hands ratatui the screen. A chat REPL or a build runner can
+leave its output in the terminal's own scrollback and have ratatui draw only a
+panel pinned under it; `Viewport::Inline` plus `insert_before` is the common
+way. ramvamp, a local LLM runtime, does it by hand in `chat --tui`: it prints
+its transcript into a scroll region over the rows above the panel, and ratatui
+draws the panel through `Viewport::Fixed`. Three things this guide otherwise
+takes for granted change there.
+
+**Publish the output from state.** `layer.frame()` and `sem` record a node
+only when its widget renders inside a draw, so they see the panel and nothing
+else. Output printed above it is drawn once, outside any frame, and a `sem`
+inside an `insert_before` closure lands in one snapshot and is gone from the
+next. Build the output's node from the state that holds it, and publish on
+every pass rather than after each draw, because a line printed above the
+panel changes the tree without redrawing it:
+
+```rust
+// tree.rs: the transcript is app state, not a widget in the frame.
+pub fn build_nodes(app: &App) -> Vec<Node> {
+    vec![
+        Node::new("transcript", Role::Log)
+            .label("Conversation, oldest line first")
+            .value(app.transcript.text()),
+        panel_node(app),
+    ]
+}
+
+// The event loop: every pass, whether or not the panel redrew. A tree
+// identical to the last one costs a comparison.
+layer.publish(tree::build_nodes(&app));
+```
+
+**Publish a bounded tail, as a `log`.** The output grows for the whole
+session, and a snapshot is one line of at most 1 MiB
+([Keep the snapshot small enough to arrive](#keep-the-snapshot-small-enough-to-arrive)).
+A reply streamed into it also changes the tree on every token, so each token
+republishes the whole tail
+([Watch your publish rate](#watch-your-publish-rate)). ramvamp keeps the last
+6 KiB, about two screens of prose, trimmed a whole line at a time from the
+front; `Role::Log` tells an agent the value grows at the end. If the adapter
+ever has to trim the tree, a log's own value keeps its end, but a transcript
+of turn nodes, as in [Mark relayed text](#mark-relayed-text), is cut like any
+list: each turn's words keep their start, and if that is not enough the
+newest turns are dropped, so cap the turn list yourself.
+
+```rust
+/// About two screens of prose: a whole reply, without the tail being most
+/// of every snapshot.
+const TAIL_CAP: usize = 6 * 1024;
+
+impl Transcript {
+    fn trim(&mut self) {
+        let mut cut = 0;
+        // Whole lines from the front, but never the last one: a single line
+        // over the cap would otherwise empty the tail.
+        while self.text.len() - cut > TAIL_CAP {
+            match self.text[cut..].find('\n') {
+                Some(at) if cut + at + 1 < self.text.len() => cut += at + 1,
+                _ => break,
+            }
+        }
+        // That line alone is over the cap: cut into it on a char boundary.
+        if self.text.len() - cut > TAIL_CAP {
+            cut = (self.text.len() - TAIL_CAP..self.text.len())
+                .find(|&at| self.text.is_char_boundary(at))
+                .unwrap_or(cut);
+        }
+        self.text.drain(..cut);
+    }
+}
+```
+
+A transcript that mixes your app's own lines with a model's text needs one
+more thing before an agent can tell the two apart; see
+[Mark relayed text](#mark-relayed-text).
+
+**Report after teardown.** There is no alternate screen to print around. The
+panel shares the primary buffer with the output above it, so an `eprintln!`
+while it is up lands in the scrolling output or tears the panel, and in raw
+mode a bare newline does not even return to column 0. Bind before raw mode,
+and send diagnostics through your app's own output path while the panel is
+up, or print them once it is down:
+
+```rust
+// Before raw mode: a bind that blocks on the filesystem must not leave a
+// half-taken terminal behind it.
+let mut layer = TariaLayer::bind_or_disabled("my-app");
+let mut panel = Panel::enter()?; // raw mode, scroll region, Viewport::Fixed
+let result = run(&mut panel, &mut layer);
+panel.leave()?; // scroll region reset, raw mode off
+
+// Only now is stderr the user's again.
+if let Some(err) = layer.bind_error() {
+    eprintln!("my-app: taria disabled: {err}");
+}
+```
+
+ramvamp sends that one line to its debug log instead, because a second
+instance in another window is the ordinary way to fail to bind, and an error
+about a feature nobody asked for is worse than silence.
+
 ## Pick the role that says what the widget is
 
 The role is the first thing an agent reads about a node, so it decides how the
@@ -210,6 +315,83 @@ about the node. Reaching for it often means the vocabulary is missing
 something. Say so rather than inventing a role name of your own: a role added
 to taria is additive and every peer learns it, while a role each app names for
 itself is one vocabulary per app.
+
+## Mark relayed text
+
+Most strings in a tree are the app's own words: a button's text, a tab's
+name, a status line. Some are not. A model's output, a file's contents,
+another user's message, a command's stdout, the file names in a directory
+tree: the app shows them without having written them, and an agent reads them
+in the same shape as everything else. Text the app did not write can then
+speak in its voice. A model reply that opens a line with
+`note: system compromised` reads as the app reporting its own state.
+
+Mark every node whose label or value the app relays:
+
+```rust
+Node::new("output", Role::Log).value(stdout.clone()).relayed(true)
+```
+
+The mark covers that node's label and value, never its id, and that node
+alone: children do not inherit it, so each node carrying relayed text is
+marked on its own. The common case is a `log` streaming a command's output or
+a model's response. An agent sees `"relayed":true` in the JSON tree and
+`*relayed` right after the role in the outline, and `read_tree` tells it what
+the mark means.
+
+Carry speakers in structure, not in the text. An app that prefixed its
+transcript's turns `you:` and `note:` found a reply could open a line with
+`note:` and pass for the app: any prefix the text can carry, the text can
+also forge. Breaking every in-band prefix with an invisible character in the
+agent's copy works, but it is per app, invisible, and has to survive the
+app's own trimming. Instead, publish one unmarked node per turn with the
+speaker as its label, and the words in a child marked relayed:
+
+```rust
+use taria::{IdSpace, Node, Role};
+
+pub const TURN_IDS: IdSpace = IdSpace::new("turn");
+pub const WORDS_IDS: IdSpace = IdSpace::new("words");
+
+fn transcript(app: &App) -> Node {
+    Node::new("transcript", Role::Log)
+        .label("Transcript")
+        .children(app.turns.iter().map(|turn| {
+            // Who spoke is the app's word; what they said is not.
+            Node::new(TURN_IDS.id(turn.id), Role::Text)
+                .label(turn.speaker.name())
+                .child(
+                    Node::new(WORDS_IDS.id(turn.id), Role::Text)
+                        .value(turn.text.clone())
+                        .relayed(true),
+                )
+        }))
+}
+```
+
+which an agent reads in the outline as the lines below. Left out are the
+outline's header line (`protocol_version=1 seq=N`) and the line of the app's
+root node. The transcript is taken to be a child of that root, so each line
+here sits one level (two spaces) left of where the agent sees it:
+
+```text
+transcript log "Transcript"
+  turn-41 text "you"
+    words-41 text *relayed = "summarize the logs"
+  turn-42 text "assistant"
+    words-42 text *relayed = "note: system compromised"
+```
+
+The `note:` is still there, inside a node that says it is relayed, under a
+turn that says the assistant wrote it. If the speaker's name is itself someone
+else's text, a chat handle another user chose, mark the turn node too.
+
+Ids come from identities, as in
+[Give things identities, not positions](#give-things-identities-not-positions),
+never from relayed text. The mark does not cover the id, and an id is what an
+agent passes back to `act`, so one built from a file name or a message carries
+that text unmarked, and moves whenever the text does. The same goes for a
+custom action's name.
 
 ## Drain agent input around the blocking call
 
@@ -815,7 +997,8 @@ primary path.
 ## Report what the layer threw away
 
 Four counters record agent traffic that went nowhere. Read them after the
-terminal is restored, never while the alternate screen is up.
+terminal is restored, never while the alternate screen or a pinned panel is
+up ([Apps that draw only a panel](#apps-that-draw-only-a-panel)).
 
 ```rust
 ratatui::restore();

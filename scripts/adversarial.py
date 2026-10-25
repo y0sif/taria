@@ -13,20 +13,28 @@ app that drops half a burst, an app that stops reading its socket, a tree
 past the bridge's 1 MiB line cap, an app slower to ack than a bridge's idle
 window. Those are
 probed against [`FakeApp`], which speaks the ndjson wire directly, so the
-bridge under test is the real one and only the app is a stand-in.
+bridge under test is the real one and only the app is a stand-in. An app
+stopped by a signal is a stand-in process of its own, or the demo run as a
+job of a shell on a pty of its own, so that stopping it stops nothing else.
 
 Usage:  python3 scripts/adversarial.py [--no-build]
 """
 
 import contextlib
+import fcntl
 import json
 import os
 import re
+import select
+import shlex
 import shutil
+import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 import traceback
@@ -34,6 +42,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from e2e import (  # noqa: E402
     CLOSED_LOG,
+    DEMO_BIN,
     EXITED_MARKER,
     EXPECT_ACK,
     HELD_NEVER_RE,
@@ -58,6 +67,7 @@ from e2e import (  # noqa: E402
     response_text,
     task_items,
     type_text,
+    wait_log,
 )
 
 READ_TIMEOUT = 5.0
@@ -1232,12 +1242,12 @@ def probe_unknown_vocabulary(client, ctx):
     The second is what the bridge then did with the tree it had kept. It
     deserialized the app's line into its own `Snapshot` and serialized that
     back out, so an app publishing `"role":"sparkline"` had the agent read
-    `"role":"other"`: the name was on the wire and the relay threw it away.
+    `"role":"other"`: the name was on the wire and the bridge threw it away.
     The bridge now forwards the app's line as sent, so the name survives, and
     so does every field a newer app adds. The principle is the one the project
     already applies to `Action::Custom` below, which keeps an unknown action's
-    name for exactly this reason; the relay extends it to everything else in
-    the line.
+    name for exactly this reason; passing the line on extends it to
+    everything else in it.
     """
     with fake_session() as (mcp, app):
         app.snapshot(9, UNKNOWN_VOCAB_ROOT)
@@ -1256,7 +1266,7 @@ def probe_unknown_vocabulary(client, ctx):
             f"the role reached the agent as {chart['role']!r}, expected the "
             "'sparkline' the app published",
         )
-        require(chart["label"] == "cpu", f"the relayed node lost its label: {chart}")
+        require(chart["label"] == "cpu", f"the node passed on lost its label: {chart}")
         require(
             chart["actions"] == ["zoom", {"set_range": {"from": 1, "to": 9}}],
             f"unknown actions came back as {chart['actions']}, expected them "
@@ -1272,10 +1282,10 @@ def probe_unknown_vocabulary(client, ctx):
                 "focused": True,
                 "actions": ["activate"],
             },
-            f"the sibling of the relayed node came back as {button}",
+            f"the sibling of the node passed on came back as {button}",
         )
 
-        # The relayed line is untyped, so `act` validates against the bridge's
+        # The line passed on is untyped, so `act` validates against the bridge's
         # parse of it, where the unknown action is a custom one keeping its
         # name. That is what keeps it usable: an agent reads `zoom` out of the
         # tree and invokes it, all the way back to the app.
@@ -1287,7 +1297,7 @@ def probe_unknown_vocabulary(client, ctx):
             f"the bridge forwarded {sent}, expected the custom action by name",
         )
     return (
-        "unknown role and actions relayed verbatim, siblings intact, "
+        "unknown role and actions passed on verbatim, siblings intact, "
         "the unknown action still invocable"
     )
 
@@ -1626,6 +1636,471 @@ def probe_socket_held_by_another_bridge(client, ctx):
     return (
         f"connect succeeded and the peer never spoke; read_tree call {calls} named the "
         f"held socket after {matched.group('open')}s open, and key said the same"
+    )
+
+
+# What a bridge says, on Linux, when the process listening at the socket is
+# stopped: the pid, and how to resume it. A stopped job in the background of
+# its terminal is a suspended TUI, which only `fg` there brings back, so that
+# one is sent to the user; any other stop, `kill -CONT`. The age of the silent
+# connection is captured; every other word is verbatim.
+STOPPED_EVIDENCE = (
+    r" The socket path is right: this bridge's connection has waited "
+    r"(?P<open>\d+\.\d)s in the app's listen queue with no handshake, because a "
+    r"stopped app accepts nothing\.$"
+)
+STOPPED_RE = re.compile(
+    r"^no snapshot from the app yet: the app \(pid (?P<pid>\d+)\) is stopped, so it "
+    r"cannot answer; resume it \(kill -CONT (?P=pid)\) and retry\." + STOPPED_EVIDENCE
+)
+SUSPENDED = (
+    r"the app \(pid (?P<pid>\d+)\) is suspended in its terminal, so it cannot answer; "
+    r"ask the user to run fg in that terminal \(kill -CONT resumes it only in the "
+    r"background, where its next use of the terminal stops it again\), then retry\."
+)
+SUSPENDED_RE = re.compile(r"^no snapshot from the app yet: " + SUSPENDED + STOPPED_EVIDENCE)
+# The same, from a bridge that had the app and let go of it after its window
+# (2 s here) before the app was suspended: the opening says the disconnect
+# was that release, and not a fault, before the diagnosis.
+RELEASED_WINDOW = 2
+RELEASED_SUSPENDED_RE = re.compile(
+    r"^app 'taria-demo' disconnected \(last snapshot seq (?P<seq>\d+)\) when this bridge "
+    rf"let go of it on purpose, not as a fault, after {RELEASED_WINDOW} s with no tool "
+    r"calls, or up to 30 s later while an input awaited its ack, and this bridge has "
+    r"reconnected: " + SUSPENDED + STOPPED_EVIDENCE
+)
+# And what an input tool says when the app it was talking to stops: nothing
+# acked and nothing changed, because nothing has read the input yet. The
+# bridge runs on the default window, so the input is applied only if the app
+# resumes within 90 s of the last tool call: 60 s, then the 30 s an input
+# awaiting its ack holds the app.
+STOPPED_INPUT_RE = re.compile(
+    r"^The app \(pid (?P<pid>\d+)\) is stopped, so it has not read this input yet\. It "
+    r"applies the input if it resumes within 90 s of your last tool call, before this "
+    r"bridge lets go of the app \(60 s with no tool calls, then 30 s more while an input "
+    r"awaits its ack\)\. Resume it \(kill -CONT (?P=pid)\), then call read_tree, and "
+    r"resend the input if its effect is missing\.$"
+)
+
+# A stand-in app: binds and listens at the path given it and prints its pid.
+# `silent` then accepts nothing, which is an app's socket with nobody to
+# answer on it once the process is stopped. `job` does the same from a
+# background job of the pty named third: it runs as a session leader with no
+# terminal (the probe starts it in a new session), opening the pty makes that
+# its controlling terminal with its own group in the foreground, and the
+# child that listens takes a group of its own, the way a shell keeps a
+# suspended job. `serve` accepts one bridge, greets it, publishes a tree, and
+# prints every line the bridge writes, acking none.
+STAND_IN = """
+import json, os, socket, sys, time
+path, mode = sys.argv[1], sys.argv[2]
+if mode == "job":
+    os.open(sys.argv[3], os.O_RDWR)
+    if os.fork() != 0:
+        while True:
+            time.sleep(1)
+    os.setpgid(0, 0)
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(path)
+listener.listen(8)
+print(os.getpid(), flush=True)
+if mode != "serve":
+    while True:
+        time.sleep(1)
+conn, _ = listener.accept()
+root = {"id": "app", "role": "app", "label": "stand-in", "focused": True}
+for msg in (
+    {"type": "hello", "app_label": "stand-in", "protocol_version": 1},
+    {"type": "snapshot", "protocol_version": 1, "seq": 1, "root": root},
+):
+    conn.sendall((json.dumps(msg) + "\\n").encode())
+for line in conn.makefile():
+    print(line.strip(), flush=True)
+"""
+
+
+def process_state(pid):
+    """The state code in /proc/<pid>/stat, read after the last `)`, since the
+    command name before it may hold spaces and parentheses; None if unread."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
+
+
+def signal_and_wait(pid, sig, stopped):
+    """Send `sig` to `pid`, then wait until it reads as stopped or not."""
+    os.kill(pid, sig)
+    deadline = time.monotonic() + READ_TIMEOUT
+    while (process_state(pid) == "T") != stopped:
+        require(
+            time.monotonic() < deadline,
+            f"pid {pid} never read as {'stopped' if stopped else 'resumed'}: "
+            f"{process_state(pid)!r}",
+        )
+        time.sleep(0.02)
+
+
+class StandIn:
+    """One STAND_IN process, its pid (the listener's, which in `job` mode is
+    not the process this starts), and its stdout lines."""
+
+    def __init__(self, path, mode, tty=None):
+        args = [sys.executable, "-I", "-c", STAND_IN, path, mode]
+        if tty is not None:
+            args.append(tty)
+        # A session of its own, so it has no controlling terminal, whatever
+        # terminal this script runs in: a `silent` or `serve` stand-in is
+        # then a plain stop, and a `job` one is a job of the pty only.
+        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, start_new_session=True)
+        self.pid = None
+        line = self.readline()
+        require(line is not None and line.isdigit(), f"the {mode} stand-in never listened")
+        self.pid = int(line)
+
+    def readline(self):
+        """The next stdout line, or None after READ_TIMEOUT."""
+        ready, _, _ = select.select([self.proc.stdout], [], [], READ_TIMEOUT)
+        if not ready:
+            return None
+        return self.proc.stdout.readline().decode().strip()
+
+    def close(self):
+        # Only the pids this started: the listener, resumed first so the kill
+        # is not left pending on a stopped process, and the process itself.
+        for pid in {self.pid, self.proc.pid} - {None}:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGCONT)
+                os.kill(pid, signal.SIGKILL)
+        self.proc.wait(timeout=READ_TIMEOUT)
+        self.proc.stdout.close()
+
+
+# A shell for the demo to be a job of. Started in a session of its own, it
+# opens the pty named to it, which makes that its controlling terminal, and
+# becomes an interactive bash there, so the demo is suspended and resumed by
+# the shell's own job control, as in a user's terminal.
+SHELL_ON_PTY = """
+import os, sys
+tty = os.open(sys.argv[1], os.O_RDWR)
+for fd in (0, 1, 2):
+    os.dup2(tty, fd)
+os.close(tty)
+os.execvp("bash", ["bash", "--norc", "--noprofile", "-i"])
+"""
+
+
+def job_fields(pid):
+    """(state, pgrp, tty_nr, tpgid) from /proc/<pid>/stat, or None if unread."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            fields = stat.read().rsplit(")", 1)[1].split()
+        return fields[0], int(fields[2]), int(fields[4]), int(fields[5])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def child_named(ppid, name):
+    """The pid of a child of `ppid` whose command is `name`, or None."""
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as stat:
+                line = stat.read()
+        except OSError:
+            continue
+        comm = line[line.find("(") + 1 : line.rfind(")")]
+        if comm == name and int(line.rsplit(")", 1)[1].split()[1]) == ppid:
+            return int(entry)
+    return None
+
+
+class DemoJob:
+    """taria-demo run as a job of an interactive bash on a pty of its own:
+    the shell, the demo's pid (a child of the shell), and the pty's master,
+    drained so the demo never blocks drawing."""
+
+    def __init__(self, sock_path):
+        self.master, self.slave = os.openpty()
+        self.shell = None
+        self.demo_pid = None
+        self.screen = bytearray()
+        self._done = threading.Event()
+        self._drainer = threading.Thread(target=self._drain, daemon=True)
+        try:
+            # A sane size, so ratatui has an area to draw into.
+            fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+            # No history file: an interactive shell writes one on exit.
+            env = dict(os.environ, TARIA_SOCK=sock_path, PS1="$ ", HISTFILE="")
+            env.setdefault("TERM", "xterm-256color")
+            self.shell = subprocess.Popen(
+                [sys.executable, "-I", "-c", SHELL_ON_PTY, os.ttyname(self.slave)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,
+            )
+            self._drainer.start()
+            self._wait(lambda: b"$ " in self.screen, "the shell never prompted")
+            os.write(self.master, (shlex.quote(DEMO_BIN) + "\n").encode())
+            self._wait(
+                lambda: self._found_demo() and os.path.exists(sock_path),
+                "the demo never listened as a job of the shell",
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def _drain(self):
+        while not self._done.is_set():
+            try:
+                ready, _, _ = select.select([self.master], [], [], 0.1)
+                chunk = os.read(self.master, 65536) if ready else b""
+            except OSError:
+                return
+            self.screen += chunk
+            del self.screen[:-8192]
+
+    def _found_demo(self):
+        if self.demo_pid is None:
+            self.demo_pid = child_named(self.shell.pid, "taria-demo")
+        return self.demo_pid is not None
+
+    def _wait(self, cond, failure):
+        deadline = time.monotonic() + READ_TIMEOUT
+        while not cond():
+            require(time.monotonic() < deadline, f"{failure}: {bytes(self.screen[-300:])!r}")
+            time.sleep(0.02)
+
+    def is_suspended_job(self):
+        """Stopped, with the terminal's foreground group no longer its own: the
+        shell has taken the terminal back, which is what makes it a job."""
+        fields = job_fields(self.demo_pid)
+        if fields is None:
+            return False
+        state, pgrp, tty_nr, tpgid = fields
+        return state == "T" and tty_nr != 0 and tpgid != pgrp
+
+    def suspend(self):
+        """SIGTSTP to the demo's pid only, as a ratatui app raises on Ctrl-Z."""
+        os.kill(self.demo_pid, signal.SIGTSTP)
+        self._wait(self.is_suspended_job, "the demo never read as a suspended job")
+
+    def fg(self):
+        """The user's `fg`, typed at the shell's prompt."""
+        os.write(self.master, b"fg\n")
+        self._wait(
+            lambda: (job_fields(self.demo_pid) or ("T",))[0] != "T",
+            "fg never resumed the demo",
+        )
+
+    def close(self):
+        # Only the pids this started: the demo, resumed first so the kill is
+        # not left pending on a stopped process, and then its shell.
+        for pid in (self.demo_pid, self.shell.pid if self.shell else None):
+            if pid is None:
+                continue
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGCONT)
+                os.kill(pid, signal.SIGKILL)
+        if self.shell is not None:
+            self.shell.wait(timeout=READ_TIMEOUT)
+        self._done.set()
+        if self._drainer.is_alive():
+            self._drainer.join(READ_TIMEOUT)
+        for fd in (self.master, self.slave):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def held_answer(bridge, tool, arguments=None):
+    """`tool`'s refusal on a silent connection, asked again only while the
+    connection is too young to diagnose."""
+    message = ""
+    for _ in range(3):
+        try:
+            text = bridge.call_raw(tool, arguments)
+            raise StepFailure(f"{tool} was answered by a silent app: {text[:200]}")
+        except ToolError as err:
+            message = err.message
+        if YOUNG_LINK_MARKER not in message:
+            break
+    return message
+
+
+def probe_stopped_app(client, ctx):
+    """An app stopped by a signal is named as stopped, not held.
+
+    A stopped app (SIGSTOP, a shell's Ctrl-Z) keeps its socket listening, so
+    a bridge's connect succeeds into the listen backlog and nothing is said
+    on it: exactly the silence of an app another bridge holds, and the held
+    answer sent the agent to wait for a release that a stopped app never
+    makes. The bridge reads the listener's pid from the connection's peer
+    credentials and its state from /proc, and a stopped one is named with its
+    pid and the way to resume it: `kill -CONT` for a plain stop, and the
+    user's `fg` for a job suspended in its terminal, which SIGCONT alone
+    resumes only in the background, where its next use of the terminal stops
+    it again. Once it is resumed and still accepts nothing, the same
+    connection reads as held again.
+
+    An app that stops while a bridge is driving it answers no input, and that
+    silence is named too, after the input tool's wait: the input has not been
+    read, and is read if the app resumes before the bridge lets go of it,
+    which the stand-in shows by printing it.
+
+    A bridge that let go of the app after its window, and reconnects to find
+    it suspended, says first that the disconnect was its own release and not
+    a fault, then that the app is suspended: told only the second, an agent
+    took the suspension for the cause of the disconnect. That runs on the
+    demo itself, a job of an interactive bash on a pty of its own, suspended
+    by SIGTSTP to its pid (what a ratatui app raises on Ctrl-Z), and served
+    again once `fg` is typed at the shell.
+
+    The stand-ins, the shell and the demo are separate processes, since
+    stopping this script would stop the probe. Only their pids are ever
+    signalled, and they are killed at the end. `client` goes unused.
+    """
+    if not sys.platform.startswith("linux"):
+        return "skipped: the bridge reads a process's state from /proc, on Linux only"
+    tmpdir = tempfile.mkdtemp(prefix="taria-stopped-")
+    stand_ins = []
+    bridges = []
+    demo = None
+    master, slave = os.openpty()
+
+    def bridge_to(path, extra_args=()):
+        bridge = McpClient(path, extra_args)
+        LIVE_CLIENTS.add(bridge)
+        bridges.append(bridge)
+        bridge.initialize()
+        return bridge
+
+    try:
+        # A plain stop, before any bridge connected.
+        path = os.path.join(tmpdir, "stopped.sock")
+        listener = StandIn(path, "silent")
+        stand_ins.append(listener)
+        signal_and_wait(listener.pid, signal.SIGSTOP, stopped=True)
+        bridge = bridge_to(path)
+        message = held_answer(bridge, "read_tree")
+        stopped = STOPPED_RE.match(message)
+        require(stopped is not None, f"read_tree did not name a stopped app: {message[:400]}")
+        require(
+            int(stopped["pid"]) == listener.pid,
+            f"the answer names pid {stopped['pid']}, the stopped listener is {listener.pid}",
+        )
+        require(
+            "held by another bridge" not in message,
+            f"a stopped app was called held: {message[:300]}",
+        )
+        message = held_answer(bridge, "key", {"key": "down"})
+        require(
+            STOPPED_RE.match(message) is not None,
+            f"an input tool answered a stopped app differently: {message[:400]}",
+        )
+        signal_and_wait(listener.pid, signal.SIGCONT, stopped=False)
+        message = held_answer(bridge, "read_tree")
+        require(
+            SILENT_PEER_RE.match(message) is not None,
+            f"once resumed, a listener that accepts nothing was not called held: "
+            f"{message[:400]}",
+        )
+
+        # A job suspended in the background of its terminal.
+        path = os.path.join(tmpdir, "job.sock")
+        job = StandIn(path, "job", tty=os.ttyname(slave))
+        stand_ins.append(job)
+        signal_and_wait(job.pid, signal.SIGSTOP, stopped=True)
+        message = held_answer(bridge_to(path), "read_tree")
+        suspended = SUSPENDED_RE.match(message)
+        require(
+            suspended is not None,
+            f"read_tree did not name a suspended job: {message[:400]}",
+        )
+        require(
+            int(suspended["pid"]) == job.pid,
+            f"the answer names pid {suspended['pid']}, the suspended job is {job.pid}",
+        )
+
+        # An app that stops while a bridge is driving it.
+        path = os.path.join(tmpdir, "serving.sock")
+        app = StandIn(path, "serve")
+        stand_ins.append(app)
+        bridge = bridge_to(path)
+        bridge.read_tree()
+        signal_and_wait(app.pid, signal.SIGSTOP, stopped=True)
+        text = bridge.call_raw("key", {"key": "down"})
+        unread = STOPPED_INPUT_RE.match(text)
+        require(unread is not None, f"an input a stopped app never read: {text[:400]}")
+        require(
+            int(unread["pid"]) == app.pid,
+            f"the answer names pid {unread['pid']}, the stopped app is {app.pid}",
+        )
+        signal_and_wait(app.pid, signal.SIGCONT, stopped=False)
+        line = app.readline()
+        require(line is not None, "the resumed app never read the input it was sent")
+        sent = json.loads(line)
+        require(
+            sent.get("type") == "input" and sent.get("input", {}).get("kind") == "key",
+            f"the resumed app read {line[:200]}, not the key it was sent",
+        )
+
+        # The demo, suspended as a job of its shell after a bridge that had
+        # its tree let go of it. Told only "disconnected" and then that the
+        # app was suspended, an agent took the suspension for the cause; the
+        # opening has to say the disconnect was the release, and not a fault.
+        path = os.path.join(tmpdir, "demo.sock")
+        demo = DemoJob(path)
+        bridge = bridge_to(path, ("--idle-release", str(RELEASED_WINDOW)))
+        tree = bridge.read_tree()
+        require(find(tree, "quit") is not None, f"not the demo's tree: {json.dumps(tree)[:200]}")
+        require(
+            wait_log(bridge, CLOSED_LOG, RELEASED_WINDOW + READ_TIMEOUT),
+            f"the bridge never let go of the demo:\n{bridge.stderr_tail()}",
+        )
+        demo.suspend()
+        message = held_answer(bridge, "read_tree")
+        released = RELEASED_SUSPENDED_RE.match(message)
+        require(
+            released is not None,
+            f"read_tree after a release did not say so and name a suspended job: {message[:600]}",
+        )
+        require(
+            int(released["pid"]) == demo.demo_pid,
+            f"the answer names pid {released['pid']}, the suspended demo is {demo.demo_pid}",
+        )
+        require(
+            int(released["seq"]) == tree["seq"],
+            f"the answer names seq {released['seq']}, the last tree served was {tree['seq']}",
+        )
+        demo.fg()
+        tree = bridge.read_tree()
+        require(
+            find(tree, "quit") is not None,
+            f"the bridge was not served the demo after fg: {json.dumps(tree)[:200]}",
+        )
+    finally:
+        for bridge in bridges:
+            LIVE_CLIENTS.discard(bridge)
+            bridge.close()
+            if bridge.proc.poll() is None:
+                bridge.proc.kill()
+        if demo is not None:
+            demo.close()
+        for stand_in in stand_ins:
+            stand_in.close()
+        os.close(master)
+        os.close(slave)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return (
+        f"SIGSTOPped listener pid {listener.pid} named stopped with kill -CONT after "
+        f"{stopped['open']}s, held once resumed; a suspended job, pid {job.pid}, sent to "
+        f"fg; a key to a stopped app, pid {app.pid}, named unread, and read once resumed; "
+        f"the demo, pid {demo.demo_pid}, suspended after a {RELEASED_WINDOW} s release, "
+        f"named as both, and served after fg"
     )
 
 
@@ -2030,6 +2505,7 @@ def main():
         ("app stops reading its socket", probe_input_queue_full),
         ("acks lost to the bridge's channel", probe_lost_acks),
         ("socket held by another bridge", probe_socket_held_by_another_bridge),
+        ("app stopped by a signal", probe_stopped_app),
         ("tree over the line cap after one was served", probe_oversized_after_tree),
         ("first tree over the line cap", probe_oversized_first_tree),
         ("release waits for a pending ack", probe_release_waits_for_ack),

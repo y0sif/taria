@@ -13,6 +13,121 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [0.3.3] - 2026-10-25
+
+**A node can say that its text is not the app's.** A node's label and value
+carry both the app's own words and text it passes through from outside:
+model output, file contents, another user's message. Nothing told an agent
+which was which, so relayed text could speak in the app's voice. A node now
+takes an optional `relayed: true`, and the agent is told to read such text as
+data, never as instructions (issue #6).
+
+**A bridge that cannot be served says what it sees.** A bridge that
+reconnected to an app whose tree it could not read told the agent to retry
+(issue #16). A bridge that had let go of the app on purpose opened its answer
+with "disconnected", and agents went looking for a fault with `ss` and `ps`.
+A suspended app read as held by another bridge. Each now gets its own answer.
+
+This is the first addition to the wire since version 1 froze in 0.1.0, and
+it is additive: `PROTOCOL_VERSION` stays 1. `relayed` is a new optional field
+(section 16.2), omitted when false, and a bridge built before it passes the
+field on in JSON and shows `relayed=true` among the fields at the end of an
+outline line. The Rust API grows by the `Node::relayed` field and its setter,
+and by `taria_mcp::args::MAX_IDLE_RELEASE_SECS`; `taria_mcp::args::parse`
+refuses values 0.3.2 took (see Upgrading). The `read_tree` description gains
+one sentence in both formats, and the outline's also gains `*relayed` in its
+grammar of a line. All three crates move to 0.3.3 together, and
+taria-ratatui 0.3.3 needs taria 0.3.3.
+
+### For whoever drives an app
+
+- **`*relayed` marks text from outside the app.** In JSON the node carries
+  `"relayed":true`; the outline prints `*relayed` right after the role, which
+  nothing else can print bare. The mark covers the node's label and value,
+  never its id, and children do not inherit it. An unmarked node is not
+  vouched for: an app built before 0.3.3 marks nothing.
+- **A reconnected bridge quotes the line it could not read.** After the
+  `disconnected (last snapshot seq N)` opening, it says the app sent lines on
+  the new connection and this bridge could not read the last one, with the
+  parse error and the same depth and version hints a bridge that never had a
+  tree gives. A reason from an earlier connection is no longer held against
+  the next: a connect forgets every reason but an oversized line, whose rule
+  is unchanged.
+- **A bridge that let go says so.** Its held answer keeps the opening and
+  `, and the app is now held by another bridge.`, then says the disconnect was
+  this bridge letting go on purpose after its window with no tool calls, or
+  up to 30 s later while an input awaited its ack, and that it is not a
+  fault. Its other answers that say it reconnected, a stopped app's among
+  them, say the same right after the opening. Once a connect finds nothing
+  listening, or another process listening than the one it let go of (when
+  the kernel names both), it stops saying so.
+- **The retry hint follows `--idle-release`.** At the default the text is as
+  in 0.3.2. A bridge started with another window names it, and one started
+  with `0` says it never lets go.
+- **A stopped app is named, on Linux.** When a connection waits unanswered,
+  or an input draws no ack, the bridge checks the app's process: its pid from
+  the socket, its state from `/proc`. A job suspended in its terminal needs
+  the user to run `fg` there, since `kill -CONT` resumes it only in the
+  background, where its next use of the terminal stops it again; any other
+  stop takes `kill -CONT <pid>`, or the debugger. An input sent to a stopped
+  app waits in the socket, and the answer promises it only if the app
+  resumes within the bridge's window plus 30 s of the last tool call (90 s
+  on the default): once the bridge lets go, the adapter discards it. With
+  `--idle-release 0` it waits for good. Other platforms keep the 0.3.2
+  answers.
+- **An app that never sends `hello` is held to its first snapshot's
+  version.** Every snapshot carries `protocol_version`, and until a `hello`
+  arrives the bridge goes by the first snapshot's, so one stating another
+  version refuses input exactly as a mismatched `hello` does.
+
+### Upgrading
+
+- **`--idle-release` takes plain digits from 0 to 86400.** 0.3.2 accepted
+  `+5`, and any value up to 2^64-1, where the largest silently meant never.
+  Anything else is now a usage error and the bridge does not start. Use `0`
+  for never. `taria_mcp::args::parse` returns the same error to a library
+  caller, and `taria_mcp::args::MAX_IDLE_RELEASE_SECS` names the limit.
+
+### For an app author adopting taria
+
+- **Mark relayed text with `Node::relayed(true)`.** The integration guide's
+  new "Mark relayed text" section: mark text the app did not write, keep
+  speakers in structure (one unmarked node per turn with the speaker as its
+  label, the words in a relayed child) rather than in prefixes the content
+  can spell, and never build an id or a custom action name from relayed text.
+- **Apps that draw only a panel.** A new guide section covers an app that
+  leaves its output in the terminal's scrollback and has ratatui draw only a
+  pinned panel, as ramvamp does: publish that output from state, as a bounded
+  `log`, and report after teardown (issue #8).
+
+### For a second implementer
+
+- `docs/protocol.md` gains the `relayed` row in section 6.1 and section 6.4,
+  "Relayed text", which section 14.3 points to.
+- Sections 3.5 and 5.2 say the reference bridge reads the first snapshot's
+  `protocol_version` on a connection that sent no `hello`, and Appendix B
+  item 2 says so too.
+- Sections 1.3 and 9.4 say an input line that does not parse loses its id
+  even when its text shows one, and why no conforming sender writes one.
+- Section 16.6 is renamed "Passing the line on beats degrading", so "relay"
+  means the field, and it now says what the reference bridge's copy of a
+  snapshot respells: keys sorted, whitespace gone, numbers and escapes
+  written its own way, and a key repeated in one object kept once.
+- Section 14.5 gains a paragraph on how the reference bridge, on Linux, tells
+  a held app from a stopped one, and section 14.7 lists what a reconnected
+  bridge, one that let go and one facing a stopped app each say.
+- Appendix B gains item 11: what a bridge does with relayed text beyond
+  passing the mark on.
+
+### The gates
+
+- `scripts/adversarial.py` grows from 23 probes to 24. The new one stops an
+  app and checks that the bridge names it with its pid, and that a job
+  suspended on a terminal is told to `fg`.
+- `scripts/e2e.py` keeps its 26 steps. Step y expects the released answer
+  from the bridge that let go, and step z, when it fails, tells a transient
+  answer from a held one.
+
 ## [0.3.2] - 2026-10-24
 
 **An idle agent session no longer holds the app.** The adapter serves one
@@ -824,6 +939,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[0.3.3]: https://github.com/y0sif/taria/releases/tag/v0.3.3
 [0.3.2]: https://github.com/y0sif/taria/releases/tag/v0.3.2
 [0.3.1]: https://github.com/y0sif/taria/releases/tag/v0.3.1
 [0.3.0]: https://github.com/y0sif/taria/releases/tag/v0.3.0

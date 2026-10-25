@@ -253,3 +253,117 @@ fn the_binary_connects_on_the_first_tool_call_and_lets_go_when_idle() {
         "{release}"
     );
 }
+
+/// The app leaving while the bridge holds it past its window for an ack. The
+/// window has closed, so the manager lets go rather than reconnect (a
+/// reconnect would take the app again for a session that is not using it),
+/// and its log says the app's leaving ended the hold, with how many inputs
+/// were still unacked. That branch of the manager is otherwise untested: the
+/// library tests see the connection end and the reconnect that does not
+/// come, and only the binary's log says which release it was.
+#[test]
+fn the_app_leaving_during_the_ack_hold_is_logged_and_not_reconnected_to() {
+    let dir = tempfile::Builder::new()
+        .prefix("taria-mcp-bin-")
+        .tempdir()
+        .expect("create test socket dir");
+    let path = dir.path().join("hold.sock");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    listener
+        .set_nonblocking(true)
+        .expect("non-blocking listener");
+    let mut bridge = Bridge::start(&path, "1");
+    let init = bridge.call(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "on-demand-test", "version": "0"},
+        }),
+    );
+    assert!(init.get("result").is_some(), "{init}");
+    bridge.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    // The app's side: greet, publish, read the key and never ack it, then
+    // leave once told to, and report whether the bridge came back within a
+    // second of that.
+    let (leave_tx, leave_rx) = mpsc::channel::<()>();
+    let app = thread::spawn(move || {
+        let mut stream = accept_within(&listener, WAIT).expect("the tool call should connect");
+        write_message(
+            &mut stream,
+            &AppToBridge::hello("bin-app", PROTOCOL_VERSION),
+        );
+        let root = Node::new("app", Role::App).label("bin-tree");
+        write_message(&mut stream, &AppToBridge::Snapshot(Snapshot::new(1, root)));
+        let mut input = String::new();
+        BufReader::new(&stream)
+            .read_line(&mut input)
+            .expect("read the bridge's input");
+        leave_rx.recv_timeout(WAIT).expect("told to leave");
+        // Shut down, not only dropped: a bridge the other test is spawning
+        // holds a copy of this descriptor until its exec, and a close alone
+        // sends no EOF while it does.
+        stream
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut the app's end down");
+        drop(stream);
+        let reconnected = accept_within(&listener, Duration::from_secs(1)).is_some();
+        (input, reconnected)
+    });
+
+    let result = bridge.call(
+        2,
+        "tools/call",
+        json!({"name": "key", "arguments": {"key": "x"}}),
+    );
+    let text = result["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a text result: {result}"));
+    assert!(
+        text.contains("neither acknowledged"),
+        "an input the app never acked: {text}"
+    );
+    // Two seconds after the answer, so past the 1 s window that starts when
+    // the call ends, however late the answer reached this process, and far
+    // inside the 30 s an unacked input holds the app for.
+    thread::sleep(Duration::from_secs(2));
+    leave_tx.send(()).expect("the fake app is waiting");
+    let (input, reconnected) = app.join().expect("fake app thread");
+    assert!(input.contains(r#""type":"input""#), "{input}");
+    assert!(
+        !reconnected,
+        "the bridge reconnected to an app it had no tool call for"
+    );
+
+    let wanted = "the app closed the connection during the ack hold; not reconnecting";
+    let deadline = Instant::now() + WAIT;
+    let mut log = Vec::new();
+    while !log.iter().any(|line: &String| line.contains(wanted)) {
+        assert!(
+            Instant::now() < deadline,
+            "no ack-hold release in the log:\n{}",
+            log.join("\n")
+        );
+        log.extend(bridge.log());
+        thread::sleep(Duration::from_millis(20));
+    }
+    let release = log
+        .iter()
+        .find(|line| line.contains(wanted))
+        .expect("found above");
+    assert!(
+        release.contains("INFO")
+            && release.contains("s past the 1 s idle window")
+            && release.contains("held there while 1 input(s) awaited the app's ack")
+            && release.contains(&format!("released the app ({wanted})")),
+        "{release}"
+    );
+    assert!(
+        !log.iter()
+            .any(|line| line.contains("reconnecting") && !line.contains("not reconnecting")),
+        "the log has a reconnect:\n{}",
+        log.join("\n")
+    );
+}

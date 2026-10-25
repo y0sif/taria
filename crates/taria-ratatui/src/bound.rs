@@ -1165,6 +1165,7 @@ mod tests {
         for (index, role) in ROLES.into_iter().enumerate() {
             let mut node = Node::new(format!("node-{index}-{ESCAPE_HEAVY}"), role)
                 .focused(index == 3)
+                .relayed(index % 4 == 1)
                 .label(ESCAPE_HEAVY.repeat(index % 4))
                 .value(format!("{index}:{}", ESCAPE_HEAVY.repeat(index % 3)));
             if index % 2 == 0 {
@@ -1452,6 +1453,36 @@ mod tests {
             escaped_len(&value) > STRING_FLOOR,
             "the shared level sits above the floor"
         );
+    }
+
+    /// A cut shortens the text a node relays and says nothing new about who
+    /// wrote it: a relayed log cut in both its value and its label still goes
+    /// out marked, and the nodes around it stay unmarked.
+    #[test]
+    fn a_relayed_node_cut_to_fit_keeps_its_mark() {
+        let root = Node::new("app", Role::App).label("relayed").children([
+            Node::new("reply", Role::Log)
+                .label("l".repeat(3000))
+                .value("v".repeat(3000))
+                .relayed(true),
+            Node::new("status", Role::Status).value("streaming"),
+        ]);
+        let mut cut = root.clone();
+        let budget = json_len(&root) - 4000;
+        let bounded = bound_root(&mut cut, budget).expect("over budget");
+        assert_eq!(bounded.strings_trimmed, 2);
+        assert!(json_len(&cut) <= budget);
+
+        let reply = &cut.children[0];
+        assert!(
+            value_of(&cut, 0).starts_with(MARKER),
+            "a log keeps its tail"
+        );
+        assert!(reply.label.as_deref().is_some_and(|l| l.ends_with(MARKER)));
+        assert!(reply.relayed, "cut or not, it is still relayed text");
+        let json = serde_json::to_string(reply).unwrap();
+        assert!(json.contains(r#""relayed":true"#), "{json}");
+        assert!(!cut.relayed && !cut.children[1].relayed);
     }
 
     #[test]
