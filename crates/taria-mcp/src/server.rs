@@ -947,9 +947,13 @@ fn reconnected_reason(
 /// What a reconnected answer other than the held one says, after the
 /// departure opening, when that departure was this bridge letting go after
 /// its idle window: that it was, and that it is not a fault.
+///
+/// "Not a fault" comes straight after "on purpose", ahead of the window, so
+/// it qualifies the disconnect. Trailing the window, it read as said of the
+/// input that awaited its ack.
 fn let_go_on_purpose(idle_release: Option<Duration>) -> String {
     format!(
-        "when this bridge let go of it on purpose {}, which is not a fault",
+        "when this bridge let go of it on purpose, not as a fault, {}",
         release_window(idle_release)
     )
 }
@@ -2459,9 +2463,9 @@ mod tests {
         // rest is the same.
         let after_release = want.replacen(
             "(last snapshot seq 7), and",
-            "(last snapshot seq 7) when this bridge let go of it on purpose after 60 s with no \
-             tool calls, or up to 30 s later while an input awaited its ack, which is not a \
-             fault, and",
+            "(last snapshot seq 7) when this bridge let go of it on purpose, not as a fault, \
+             after 60 s with no tool calls, or up to 30 s later while an input awaited its ack, \
+             and",
             1,
         );
         assert_ne!(after_release, want);
@@ -2736,14 +2740,14 @@ mod tests {
         }
         assert_eq!(
             let_go_on_purpose(Some(DEFAULT_IDLE_RELEASE)),
-            "when this bridge let go of it on purpose after 60 s with no tool calls, or up to 30 \
-             s later while an input awaited its ack, which is not a fault"
+            "when this bridge let go of it on purpose, not as a fault, after 60 s with no tool \
+             calls, or up to 30 s later while an input awaited its ack"
         );
         // A window of its own is named the same way the held answer names it.
         assert_eq!(
             let_go_on_purpose(Some(Duration::from_secs(2))),
-            "when this bridge let go of it on purpose after 2 s with no tool calls, or up to 30 s \
-             later while an input awaited its ack, which is not a fault"
+            "when this bridge let go of it on purpose, not as a fault, after 2 s with no tool \
+             calls, or up to 30 s later while an input awaited its ack"
         );
         assert!(
             after_release(Duration::from_secs(2))
@@ -2944,9 +2948,9 @@ mod tests {
                 assert_eq!(
                     released,
                     format!(
-                        "{gone} when this bridge let go of it on purpose after {window} s with no \
-                         tool calls, or up to 30 s later while an input awaited its ack, which is \
-                         not a fault, and this bridge has reconnected: {resume} {evidence}"
+                        "{gone} when this bridge let go of it on purpose, not as a fault, after \
+                         {window} s with no tool calls, or up to 30 s later while an input \
+                         awaited its ack, and this bridge has reconnected: {resume} {evidence}"
                     ),
                     "{stop:?}, {idle_release:?}"
                 );
@@ -2975,13 +2979,13 @@ mod tests {
         assert_eq!(
             job,
             "app 'taria-demo' disconnected (last snapshot seq 1) when this bridge let go of it on \
-             purpose after 60 s with no tool calls, or up to 30 s later while an input awaited \
-             its ack, which is not a fault, and this bridge has reconnected: the app (pid \
-             3061531) is suspended in its terminal, so it cannot answer; ask the user to run fg \
-             in that terminal (kill -CONT resumes it only in the background, where its next use \
-             of the terminal stops it again), then retry. The socket path is right: this \
-             bridge's connection has waited 0.5s in the app's listen queue with no handshake, \
-             because a stopped app accepts nothing."
+             purpose, not as a fault, after 60 s with no tool calls, or up to 30 s later while an \
+             input awaited its ack, and this bridge has reconnected: the app (pid 3061531) is \
+             suspended in its terminal, so it cannot answer; ask the user to run fg in that \
+             terminal (kill -CONT resumes it only in the background, where its next use of the \
+             terminal stops it again), then retry. The socket path is right: this bridge's \
+             connection has waited 0.5s in the app's listen queue with no handshake, because a \
+             stopped app accepts nothing."
         );
     }
 

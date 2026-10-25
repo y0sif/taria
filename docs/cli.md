@@ -27,18 +27,20 @@ is held by another bridge, and when the holder lets go, so a retry is the way
 in. It names its own `--idle-release` as the holder's, which is right for a
 holder started the same way: "retry in a minute" on the default, "retry in N
 s" for a window of N, and for `0` that such a holder keeps the app until its
-session ends. A bridge that let go of the app itself, and came back to find it
-taken or stopped, adds that its own disconnect was that release and not a
-fault: after its window with no tool calls, or up to 30 s later while an input
-awaited its ack. On Linux, an app stopped by a signal or a debugger is named
-as stopped, with its pid, rather than as held, and with how to resume it: from
-the debugger, with `kill -CONT`, or, for a TUI suspended as a job in its
-terminal (which `kill -CONT` resumes only in the background, where its next
-use of the terminal stops it again), with the user's `fg` there. An input sent
-to an app that stops while the bridge is driving it gets the same diagnosis in
-place of "neither acknowledged", and the app applies it only if it resumes
-before the bridge lets go: within the window plus 30 s of the last tool call
-(90 s on the default), or at any time with `0`.
+session ends. A bridge that let go of the app itself adds, to every answer it
+gives once it has reconnected (the app held by another bridge, stopped,
+greeted but with no tree yet, not greeted yet, or sending a line it cannot
+read), that its own disconnect was that release and not a fault: after its
+window with no tool calls, or up to 30 s later while an input awaited its ack.
+On Linux, an app stopped by a signal or a debugger is named as stopped, with
+its pid, rather than as held, and with how to resume it: from the debugger,
+with `kill -CONT`, or, for a TUI suspended as a job in its terminal (which
+`kill -CONT` resumes only in the background, where its next use of the
+terminal stops it again), with the user's `fg` there. An input sent to an app
+that stops while the bridge is driving it gets the same diagnosis in place of
+"neither acknowledged", and the app applies it only if it resumes before the
+bridge lets go: within the window plus 30 s of the last tool call (90 s on the
+default), or at any time with `0`.
 
 Environment variables:
 
