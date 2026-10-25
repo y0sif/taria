@@ -72,8 +72,9 @@ and an input the app deliberately dropped looks like a slow one.
 - `relayed`: an optional boolean, omitted when `false`, saying a node's label
   and value come from outside the app (a model's output, a file's contents,
   another user's message), so an agent reads them as data rather than as the
-  app's own words. Per node, never inherited, and never covering the id. An
-  additive field that reaches an agent through any bridge, since a bridge
+  app's own words. Absent says only that the node is not marked, not that the
+  app wrote it. Per node, never inherited, and never covering the id. An
+  additive field that reaches an agent through any taria-mcp, since taria-mcp
   hands on the app's own line and one built before the field passes it on
   too. What it means is said once, in `read_tree`'s description in both
   formats, and not again in the instructions, which are resent with every
@@ -282,17 +283,17 @@ ack and the reader skips that line, which leaves the input reading as
 unacknowledged. That is the safe reading, and the loss is one ack rather
 than a tree.
 
-Degrading keeps the connection; relaying keeps the information. The bridge
-stores each snapshot as the app's own line beside the parse of it, and it is
-the line an agent reads. So a role, an action or a field this build has never
-heard of reaches the agent by name instead of flattened into whatever the
-typed struct could hold: an app publishing `"role":"sparkline"` had the agent
-read `"role":"other"`, with the real name on the wire the whole time. The
-parse stays authoritative for what the bridge decides, because it is typed:
-`act` validates node ids and advertised actions against it, and change
-detection compares parses rather than text. A line is relayed only after it
-parsed, so a malformed one is still skipped. `taria-mcp --tree-format outline`
-hands the agent an indented outline instead of the line, and renders it from
+Degrading keeps the connection; passing the line on keeps the information.
+The bridge stores each snapshot as the app's own line beside the parse of it,
+and it is the line an agent reads. So a role, an action or a field this build
+has never heard of reaches the agent by name instead of flattened into
+whatever the typed struct could hold: an app publishing `"role":"sparkline"`
+had the agent read `"role":"other"`, with the real name on the wire the whole
+time. The parse stays authoritative for what the bridge decides, because it
+is typed: `act` validates node ids and advertised actions against it, and
+change detection compares parses rather than text. A line is passed on only
+after it parsed, so a malformed one is still skipped.
+`taria-mcp --tree-format outline` hands the agent an indented outline instead of the line, and renders it from
 the line for the same reason, so the outline keeps every role, action and
 field name the JSON would have shown. It drops only the extra keys inside an
 action object, since `act` takes the action's name alone.

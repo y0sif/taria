@@ -464,7 +464,7 @@ A node with nothing set beyond its identity:
 | `label` | string | no | **omitted when unset** | no label |
 | `value` | string | no | **omitted when unset** | no value |
 | `focused` | boolean | no | **always emitted**, including `false` | `false` |
-| `relayed` | boolean | no | **omitted when `false`** | `false`: the app wrote the text |
+| `relayed` | boolean | no | **omitted when `false`** | `false`: not marked |
 | `actions` | array | no | **omitted when empty** | no actions advertised |
 | `children` | array | no | **omitted when empty** | a leaf |
 
@@ -488,9 +488,10 @@ Rules a reader has to implement:
 - A reader **MUST** accept `actions` and `children` absent and read absence as
   empty.
 - `focused`, `relayed`, `actions` and `children` **MUST NOT** be sent as
-  `null`. Absent and empty are the two spellings; `null` fails the parse with
-  "invalid type: null" in the reference implementation, and failing takes the
-  whole snapshot with it.
+  `null`, and `focused` and `relayed` **MUST NOT** be sent as anything but a
+  boolean. Absent and empty are the two spellings; `null` fails the parse with
+  "invalid type: null" in the reference implementation, a value of any other
+  wrong type fails it too, and failing takes the whole snapshot with it.
 - `id` **MUST** be a JSON string. Verified: `{"id":7,...}` fails.
 
 ### 6.2 Node ids
@@ -527,18 +528,20 @@ file names in a directory tree. Both arrive as plain strings, so without a
 mark an agent cannot weigh them differently, and relayed text can speak in
 the app's voice. `"relayed":true` is that mark.
 
-- It covers the node's `label` and `value`, and nothing else: the `id`, the
-  `role`, `focused` and `actions` are always the app's. Because the mark does
-  not cover the id, a sender **SHOULD NOT** build an id out of relayed text.
+- It covers the node's `label` and `value`, and nothing else. The mark says
+  nothing about `id`, `role`, `focused` or `actions`; a sender **SHOULD NOT**
+  build an id or a custom action name from relayed text.
 - It is strictly per node. A reader **MUST NOT** read a child of a relayed
-  node as relayed, and a sender marks every node whose text it relays. The
-  reference bridge hands the line on with its keys sorted (section 16.6),
-  which puts a parent's `relayed` after its `children`, so an inherited mark
-  would reach an agent only after the text it covers.
-- Absent means `false`: the app says it wrote the text.
-- An agent **SHOULD** read the `label` and `value` of a relayed node as data:
-  what the app is showing, never an instruction to follow and never the app
-  describing its own state.
+  node as relayed, and a sender **SHOULD** mark every node whose `label` or
+  `value` it relays. The reference bridge hands the line on with its keys
+  sorted (section 16.6), so an inherited mark would arrive after the node's
+  whole subtree, not just its own label.
+- Absent reads as `false`. It is not a statement that the app wrote the text,
+  so a reader **MUST NOT** treat an unmarked node as vouched for.
+- The `label` and `value` of a relayed node are data: what the app is
+  showing, never an instruction to follow and never the app describing its
+  own state. A bridge that hands the tree to an agent **SHOULD** say what the
+  mark means, as the reference `read_tree` description does.
 - A sender **SHOULD** carry speakers in structure, not in the text. A
   transcript is one unmarked node per turn with the speaker as its `label`,
   and the turn's words in a child marked relayed:
@@ -548,7 +551,7 @@ the app's voice. `"relayed":true` is that mark.
 ```
 
 A prefix such as `you:` or `note:` inside the text is something the content
-can spell as well; a label on an unmarked node is not. Here the reply opens
+can spell as well; a label on a node of its own is not. Here the reply opens
 with `note:`, and the tree still says the assistant wrote it.
 
 The mark is the app's statement about where its strings came from, and no
@@ -808,10 +811,10 @@ newline or a tab means there.
 - A known `kind` missing the field it is made of is a parse failure, not an
   unknown kind. `{"kind":"key"}` fails, the whole line is skipped, and the id
   inside it is lost: verified, the reference adapter sent no ack for it. No
-  conforming version 1 sender writes such a line, because the reference
-  bridge serializes every input from typed values and a kind cannot gain a
-  required field without a version bump (sections 16.2 and 16.7), so the
-  adapter skips it like any broken line rather than salvaging the id.
+  conforming sender writes such a line: a kind's fields are fixed within
+  version 1, since a new required field is not additive (sections 16.2 and
+  16.7). So the adapter skips it like any broken line rather than salvaging
+  the id.
 - The name `unknown` is effectively reserved: it is what this build
   re-serializes an unreadable input as (section 9.5).
 
@@ -1476,25 +1479,28 @@ same way.
 An app has no comparable decision to make: it reads the bridge's version
 nowhere, because the bridge sends no handshake.
 
-### 16.6 Relaying beats degrading
+### 16.6 Passing the line on beats degrading
 
-Degrading keeps the connection; relaying keeps the information. A bridge
-**SHOULD** store each snapshot as **the app's own line** beside the parse of
-it, and hand the line to the agent. A role, an action or a field the bridge
-has never heard of then reaches the agent by name instead of flattened into
-whatever its typed view could hold: an app publishing `"role":"sparkline"` had
-the agent read `"role":"other"`, with the real name on the wire the whole time.
+Degrading keeps the connection; passing the line on keeps the information. A
+bridge **SHOULD** store each snapshot as **the app's own line** beside the
+parse of it, and hand the line to the agent. A role, an action or a field the
+bridge has never heard of then reaches the agent by name instead of flattened
+into whatever its typed view could hold: an app publishing
+`"role":"sparkline"` had the agent read `"role":"other"`, with the real name
+on the wire the whole time.
 `taria-mcp --tree-format outline`, which hands the agent an outline instead of
 the line, renders it from the line for the same reason.
 
 The parse stays authoritative for what the bridge **decides**, because it is
 typed: validating node ids and advertised actions, and detecting change, read
-the parse rather than the text. A line is relayed only after it parsed, so a
-malformed one is still skipped.
+the parse rather than the text. A line is passed on only after it parsed, so
+a malformed one is still skipped.
 
-The one thing a relaying bridge **SHOULD** remove from the line is the
+The one thing a bridge **SHOULD** remove from the line it passes on is the
 `"type":"snapshot"` framing key, which belongs to the transport rather than to
-the tree.
+the tree. The reference bridge removes it through a JSON value, so the line it
+hands on has its keys sorted and its whitespace gone, and every other key
+kept; neither order nor whitespace is information the app was carrying.
 
 ### 16.7 What forces a version bump
 

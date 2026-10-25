@@ -229,7 +229,7 @@ impl AgentInput {
     /// [`Action::SetValue`] or the row for a select, and `None` for the
     /// actions that do not. It is one constructor taking an option rather than
     /// a pair of constructors because the only thing that builds an act is a
-    /// bridge relaying what an agent asked for, and an optional argument is
+    /// bridge passing on what an agent asked for, and an optional argument is
     /// already what it holds: splitting this in two would make that caller
     /// match on the option to rebuild the same value. It also keeps every
     /// field of the variant reachable through one entry point, so a peer

@@ -3,7 +3,8 @@
 //!
 //! The wire format is not involved. An app sends the same version 1 JSON
 //! either way; this only decides the text an agent reads. The JSON is the
-//! default and is passed on untouched. The outline carries every node, id,
+//! default and is passed on with every field kept, minus its `type` key and
+//! with its keys sorted. The outline carries every node, id,
 //! role, relayed mark, label, value, focus state and other field, and the
 //! name of every action as `act` takes it, in fewer characters: most of a
 //! snapshot line is repeated field names, `"focused":false` on nearly every
