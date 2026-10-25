@@ -1236,12 +1236,12 @@ def probe_unknown_vocabulary(client, ctx):
     The second is what the bridge then did with the tree it had kept. It
     deserialized the app's line into its own `Snapshot` and serialized that
     back out, so an app publishing `"role":"sparkline"` had the agent read
-    `"role":"other"`: the name was on the wire and the relay threw it away.
+    `"role":"other"`: the name was on the wire and the bridge threw it away.
     The bridge now forwards the app's line as sent, so the name survives, and
     so does every field a newer app adds. The principle is the one the project
     already applies to `Action::Custom` below, which keeps an unknown action's
-    name for exactly this reason; the relay extends it to everything else in
-    the line.
+    name for exactly this reason; passing the line on extends it to
+    everything else in it.
     """
     with fake_session() as (mcp, app):
         app.snapshot(9, UNKNOWN_VOCAB_ROOT)
@@ -1260,7 +1260,7 @@ def probe_unknown_vocabulary(client, ctx):
             f"the role reached the agent as {chart['role']!r}, expected the "
             "'sparkline' the app published",
         )
-        require(chart["label"] == "cpu", f"the relayed node lost its label: {chart}")
+        require(chart["label"] == "cpu", f"the node passed on lost its label: {chart}")
         require(
             chart["actions"] == ["zoom", {"set_range": {"from": 1, "to": 9}}],
             f"unknown actions came back as {chart['actions']}, expected them "
@@ -1276,10 +1276,10 @@ def probe_unknown_vocabulary(client, ctx):
                 "focused": True,
                 "actions": ["activate"],
             },
-            f"the sibling of the relayed node came back as {button}",
+            f"the sibling of the node passed on came back as {button}",
         )
 
-        # The relayed line is untyped, so `act` validates against the bridge's
+        # The line passed on is untyped, so `act` validates against the bridge's
         # parse of it, where the unknown action is a custom one keeping its
         # name. That is what keeps it usable: an agent reads `zoom` out of the
         # tree and invokes it, all the way back to the app.
@@ -1291,7 +1291,7 @@ def probe_unknown_vocabulary(client, ctx):
             f"the bridge forwarded {sent}, expected the custom action by name",
         )
     return (
-        "unknown role and actions relayed verbatim, siblings intact, "
+        "unknown role and actions passed on verbatim, siblings intact, "
         "the unknown action still invocable"
     )
 
@@ -1634,26 +1634,67 @@ def probe_socket_held_by_another_bridge(client, ctx):
 
 
 # What a bridge says, on Linux, when the process listening at the socket is
-# stopped by a signal: the pid, and how to resume it. The age of the silent
+# stopped: the pid, and how to resume it. A stopped job in the background of
+# its terminal is a suspended TUI, which only `fg` there brings back, so that
+# one is sent to the user; any other stop, `kill -CONT`. The age of the silent
 # connection is captured; every other word is verbatim.
+STOPPED_EVIDENCE = (
+    r" The socket path is right: this bridge's connection has waited "
+    r"(?P<open>\d+\.\d)s in the app's listen queue with no handshake, because a "
+    r"stopped app accepts nothing\.$"
+)
 STOPPED_RE = re.compile(
     r"^no snapshot from the app yet: the app \(pid (?P<pid>\d+)\) is stopped, so it "
-    r"cannot answer; resume it \(kill -CONT (?P=pid), or fg in its terminal\) and "
-    r"retry\. The socket path is right: this bridge has been connected for "
-    r"(?P<open>\d+\.\d)s with no handshake, and a stopped app accepts no connection\.$"
+    r"cannot answer; resume it \(kill -CONT (?P=pid)\) and retry\." + STOPPED_EVIDENCE
+)
+SUSPENDED_RE = re.compile(
+    r"^no snapshot from the app yet: the app \(pid (?P<pid>\d+)\) is suspended in its "
+    r"terminal, so it cannot answer; ask the user to run fg in that terminal "
+    r"\(kill -CONT only stops it again\), then retry\." + STOPPED_EVIDENCE
+)
+# And what an input tool says when the app it was talking to stops: nothing
+# acked and nothing changed, because nothing has read the input yet.
+STOPPED_INPUT_RE = re.compile(
+    r"^The app \(pid (?P<pid>\d+)\) is stopped, so it has not read this input yet; the "
+    r"input waits in the socket, and the app reads it once resumed\. Resume it "
+    r"\(kill -CONT (?P=pid)\), then call read_tree, and resend the input if its effect "
+    r"is missing\.$"
 )
 
-# A process that binds and listens at the path given it, says so on stdout,
-# and accepts nothing: an app's socket, with nobody to answer on it once the
-# process is stopped.
-SILENT_LISTENER = """
-import socket, sys, time
+# A stand-in app: binds and listens at the path given it and prints its pid.
+# `silent` then accepts nothing, which is an app's socket with nobody to
+# answer on it once the process is stopped. `job` does the same from a
+# background job of the pty named third: it runs as a session leader with no
+# terminal (the probe starts it in a new session), opening the pty makes that
+# its controlling terminal with its own group in the foreground, and the
+# child that listens takes a group of its own, the way a shell keeps a
+# suspended job. `serve` accepts one bridge, greets it, publishes a tree, and
+# prints every line the bridge writes, acking none.
+STAND_IN = """
+import json, os, socket, sys, time
+path, mode = sys.argv[1], sys.argv[2]
+if mode == "job":
+    os.open(sys.argv[3], os.O_RDWR)
+    if os.fork() != 0:
+        while True:
+            time.sleep(1)
+    os.setpgid(0, 0)
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-listener.bind(sys.argv[1])
+listener.bind(path)
 listener.listen(8)
-print("listening", flush=True)
-while True:
-    time.sleep(1)
+print(os.getpid(), flush=True)
+if mode != "serve":
+    while True:
+        time.sleep(1)
+conn, _ = listener.accept()
+root = {"id": "app", "role": "app", "label": "stand-in", "focused": True}
+for msg in (
+    {"type": "hello", "app_label": "stand-in", "protocol_version": 1},
+    {"type": "snapshot", "protocol_version": 1, "seq": 1, "root": root},
+):
+    conn.sendall((json.dumps(msg) + "\\n").encode())
+for line in conn.makefile():
+    print(line.strip(), flush=True)
 """
 
 
@@ -1667,6 +1708,69 @@ def process_state(pid):
         return None
 
 
+def signal_and_wait(pid, sig, stopped):
+    """Send `sig` to `pid`, then wait until it reads as stopped or not."""
+    os.kill(pid, sig)
+    deadline = time.monotonic() + READ_TIMEOUT
+    while (process_state(pid) == "T") != stopped:
+        require(
+            time.monotonic() < deadline,
+            f"pid {pid} never read as {'stopped' if stopped else 'resumed'}: "
+            f"{process_state(pid)!r}",
+        )
+        time.sleep(0.02)
+
+
+class StandIn:
+    """One STAND_IN process, its pid (the listener's, which in `job` mode is
+    not the process this starts), and its stdout lines."""
+
+    def __init__(self, path, mode, tty=None):
+        args = [sys.executable, "-I", "-c", STAND_IN, path, mode]
+        if tty is not None:
+            args.append(tty)
+        # A session of its own, so it has no controlling terminal, whatever
+        # terminal this script runs in: a `silent` or `serve` stand-in is
+        # then a plain stop, and a `job` one is a job of the pty only.
+        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, start_new_session=True)
+        self.pid = None
+        line = self.readline()
+        require(line is not None and line.isdigit(), f"the {mode} stand-in never listened")
+        self.pid = int(line)
+
+    def readline(self):
+        """The next stdout line, or None after READ_TIMEOUT."""
+        ready, _, _ = select.select([self.proc.stdout], [], [], READ_TIMEOUT)
+        if not ready:
+            return None
+        return self.proc.stdout.readline().decode().strip()
+
+    def close(self):
+        # Only the pids this started: the listener, resumed first so the kill
+        # is not left pending on a stopped process, and the process itself.
+        for pid in {self.pid, self.proc.pid} - {None}:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGCONT)
+                os.kill(pid, signal.SIGKILL)
+        self.proc.wait(timeout=READ_TIMEOUT)
+        self.proc.stdout.close()
+
+
+def held_answer(bridge, tool, arguments=None):
+    """`tool`'s refusal on a silent connection, asked again only while the
+    connection is too young to diagnose."""
+    message = ""
+    for _ in range(3):
+        try:
+            text = bridge.call_raw(tool, arguments)
+            raise StepFailure(f"{tool} was answered by a silent app: {text[:200]}")
+        except ToolError as err:
+            message = err.message
+        if YOUNG_LINK_MARKER not in message:
+            break
+    return message
+
+
 def probe_stopped_app(client, ctx):
     """An app stopped by a signal is named as stopped, not held.
 
@@ -1676,52 +1780,42 @@ def probe_stopped_app(client, ctx):
     answer sent the agent to wait for a release that a stopped app never
     makes. The bridge reads the listener's pid from the connection's peer
     credentials and its state from /proc, and a stopped one is named with its
-    pid and the way to resume it. Once it is resumed and still accepts
-    nothing, the same connection reads as held again.
+    pid and the way to resume it: `kill -CONT` for a plain stop, and the
+    user's `fg` for a job suspended in its terminal, where SIGCONT alone only
+    stops it again. Once it is resumed and still accepts nothing, the same
+    connection reads as held again.
 
-    The stand-in is a separate process, since stopping this script would stop
-    the probe. Only its pid is ever signalled, and it is killed at the end.
-    `client` goes unused.
+    An app that stops while a bridge is driving it answers no input, and that
+    silence is named too, after the input tool's wait: the input has not been
+    read, and is read once the app resumes, which the stand-in shows by
+    printing it.
+
+    The stand-ins are separate processes, since stopping this script would
+    stop the probe. Only their pids are ever signalled, and they are killed
+    at the end. `client` goes unused.
     """
     if not sys.platform.startswith("linux"):
         return "skipped: the bridge reads a process's state from /proc, on Linux only"
     tmpdir = tempfile.mkdtemp(prefix="taria-stopped-")
-    path = os.path.join(tmpdir, "stopped.sock")
-    listener = subprocess.Popen(
-        [sys.executable, "-I", "-c", SILENT_LISTENER, path],
-        stdout=subprocess.PIPE,
-    )
-    bridge = None
-    try:
-        ready, _, _ = select.select([listener.stdout], [], [], READ_TIMEOUT)
-        require(
-            ready and listener.stdout.readline().strip() == b"listening",
-            "the stand-in listener never bound its socket",
-        )
-        os.kill(listener.pid, signal.SIGSTOP)
-        deadline = time.monotonic() + READ_TIMEOUT
-        while process_state(listener.pid) != "T":
-            require(
-                time.monotonic() < deadline,
-                f"pid {listener.pid} never read as stopped: {process_state(listener.pid)!r}",
-            )
-            time.sleep(0.02)
+    stand_ins = []
+    bridges = []
+    master, slave = os.openpty()
 
+    def bridge_to(path):
         bridge = McpClient(path)
         LIVE_CLIENTS.add(bridge)
+        bridges.append(bridge)
         bridge.initialize()
-        # The call that connects waits out the grace, so its answer is the
-        # diagnosis; a connect that ran late gets the young answer first, and
-        # only that one is asked again.
-        message = ""
-        for _ in range(3):
-            try:
-                text = bridge.call_raw("read_tree")
-                raise StepFailure(f"a stopped app served a tree: {text[:200]}")
-            except ToolError as err:
-                message = err.message
-            if YOUNG_LINK_MARKER not in message:
-                break
+        return bridge
+
+    try:
+        # A plain stop, before any bridge connected.
+        path = os.path.join(tmpdir, "stopped.sock")
+        listener = StandIn(path, "silent")
+        stand_ins.append(listener)
+        signal_and_wait(listener.pid, signal.SIGSTOP, stopped=True)
+        bridge = bridge_to(path)
+        message = held_answer(bridge, "read_tree")
         stopped = STOPPED_RE.match(message)
         require(stopped is not None, f"read_tree did not name a stopped app: {message[:400]}")
         require(
@@ -1732,46 +1826,72 @@ def probe_stopped_app(client, ctx):
             "held by another bridge" not in message,
             f"a stopped app was called held: {message[:300]}",
         )
-        try:
-            text = bridge.call_raw("key", {"key": "down"})
-            raise StepFailure(f"key was answered by a stopped app: {text[:200]}")
-        except ToolError as err:
-            require(
-                STOPPED_RE.match(err.message) is not None,
-                f"an input tool answered a stopped app differently: {err.message[:400]}",
-            )
-
-        os.kill(listener.pid, signal.SIGCONT)
-        deadline = time.monotonic() + READ_TIMEOUT
-        while process_state(listener.pid) == "T":
-            require(time.monotonic() < deadline, f"pid {listener.pid} never resumed")
-            time.sleep(0.02)
-        try:
-            text = bridge.call_raw("read_tree")
-            raise StepFailure(f"a listener that accepts nothing served a tree: {text[:200]}")
-        except ToolError as err:
-            message = err.message
+        message = held_answer(bridge, "key", {"key": "down"})
+        require(
+            STOPPED_RE.match(message) is not None,
+            f"an input tool answered a stopped app differently: {message[:400]}",
+        )
+        signal_and_wait(listener.pid, signal.SIGCONT, stopped=False)
+        message = held_answer(bridge, "read_tree")
         require(
             SILENT_PEER_RE.match(message) is not None,
             f"once resumed, a listener that accepts nothing was not called held: "
             f"{message[:400]}",
         )
+
+        # A job suspended in the background of its terminal.
+        path = os.path.join(tmpdir, "job.sock")
+        job = StandIn(path, "job", tty=os.ttyname(slave))
+        stand_ins.append(job)
+        signal_and_wait(job.pid, signal.SIGSTOP, stopped=True)
+        message = held_answer(bridge_to(path), "read_tree")
+        suspended = SUSPENDED_RE.match(message)
+        require(
+            suspended is not None,
+            f"read_tree did not name a suspended job: {message[:400]}",
+        )
+        require(
+            int(suspended["pid"]) == job.pid,
+            f"the answer names pid {suspended['pid']}, the suspended job is {job.pid}",
+        )
+
+        # An app that stops while a bridge is driving it.
+        path = os.path.join(tmpdir, "serving.sock")
+        app = StandIn(path, "serve")
+        stand_ins.append(app)
+        bridge = bridge_to(path)
+        bridge.read_tree()
+        signal_and_wait(app.pid, signal.SIGSTOP, stopped=True)
+        text = bridge.call_raw("key", {"key": "down"})
+        unread = STOPPED_INPUT_RE.match(text)
+        require(unread is not None, f"an input a stopped app never read: {text[:400]}")
+        require(
+            int(unread["pid"]) == app.pid,
+            f"the answer names pid {unread['pid']}, the stopped app is {app.pid}",
+        )
+        signal_and_wait(app.pid, signal.SIGCONT, stopped=False)
+        line = app.readline()
+        require(line is not None, "the resumed app never read the input it was sent")
+        sent = json.loads(line)
+        require(
+            sent.get("type") == "input" and sent.get("input", {}).get("kind") == "key",
+            f"the resumed app read {line[:200]}, not the key it was sent",
+        )
     finally:
-        if bridge is not None:
+        for bridge in bridges:
             LIVE_CLIENTS.discard(bridge)
             bridge.close()
             if bridge.proc.poll() is None:
                 bridge.proc.kill()
-        if listener.poll() is None:
-            os.kill(listener.pid, signal.SIGCONT)
-            listener.kill()
-        listener.wait(timeout=READ_TIMEOUT)
-        if listener.stdout is not None:
-            listener.stdout.close()
+        for stand_in in stand_ins:
+            stand_in.close()
+        os.close(master)
+        os.close(slave)
         shutil.rmtree(tmpdir, ignore_errors=True)
     return (
-        f"SIGSTOPped listener pid {listener.pid}: read_tree and key named it stopped, "
-        f"with its pid and kill -CONT, after {stopped['open']}s; resumed, it read as held"
+        f"SIGSTOPped listener pid {listener.pid} named stopped with kill -CONT after "
+        f"{stopped['open']}s, held once resumed; a suspended job, pid {job.pid}, sent to "
+        f"fg; a key to a stopped app, pid {app.pid}, named unread, and read once resumed"
     )
 
 

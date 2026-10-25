@@ -302,6 +302,12 @@ fn the_app_leaving_during_the_ack_hold_is_logged_and_not_reconnected_to() {
             .read_line(&mut input)
             .expect("read the bridge's input");
         leave_rx.recv_timeout(WAIT).expect("told to leave");
+        // Shut down, not only dropped: a bridge the other test is spawning
+        // holds a copy of this descriptor until its exec, and a close alone
+        // sends no EOF while it does.
+        stream
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut the app's end down");
         drop(stream);
         let reconnected = accept_within(&listener, Duration::from_secs(1)).is_some();
         (input, reconnected)

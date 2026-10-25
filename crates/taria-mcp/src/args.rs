@@ -53,8 +53,8 @@ Exactly one of --socket or --app is required.
 Options:
   --tree-format <json|outline>
                               How read_tree and the input tools show the
-                              tree: json (the default) relays the app's own
-                              snapshot line; outline renders the same
+                              tree: json (the default) passes on the app's
+                              own snapshot line; outline renders the same
                               snapshot as one indented line per node, in
                               fewer characters. It names each action as act
                               takes it, without other keys in its object.
@@ -129,7 +129,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             }
             "--idle-release" => {
                 let secs = iter.next().ok_or_else(|| {
-                    "--idle-release requires a number of seconds (0 never lets go)".to_string()
+                    format!(
+                        "--idle-release requires whole seconds from 0 to {MAX_IDLE_RELEASE_SECS} \
+                         (0 never lets go)"
+                    )
                 })?;
                 idle_release = parse_idle_release(&secs)?;
             }
@@ -391,8 +394,8 @@ mod tests {
     fn idle_release_without_whole_seconds_is_an_error() {
         let err = parse_strs(&["--socket", "/x.sock", "--idle-release"]).unwrap_err();
         assert!(
-            err.contains("--idle-release") && err.contains("seconds"),
-            "a missing value names the flag and its unit: {err}"
+            err.contains("--idle-release") && err.contains("whole seconds from 0 to 86400"),
+            "a missing value names the flag and the range: {err}"
         );
         // `+5` and `+0` are what `u64::from_str` takes and this used to; the
         // last two are past the range, the second of them past a `u64` too,

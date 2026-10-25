@@ -325,8 +325,8 @@ good as the peer's honesty about its version.
 
 Both message enums are internally tagged: every line carries a `type` key
 naming the message. That key frames the message on the transport and says
-nothing about the tree, which is why a bridge relaying a snapshot to an agent
-strips it.
+nothing about the tree, which is why a bridge passing a snapshot on to an
+agent strips it.
 
 ### 4.1 App to bridge
 
@@ -1309,8 +1309,9 @@ after the waiting bridge's own `--idle-release`, its best guess at a holder
 started the same way. Once the holder does (section 14.7), the waiting bridge
 is accepted. A waiting bridge that itself goes its window with no tool calls
 leaves the backlog. On Linux it tells a held app from a stopped one by the
-listener's state, read through the connection's peer credentials and `/proc`;
-nothing on the wire carries it.
+listener's state, read through the connection's peer credentials and `/proc`,
+and a job suspended in its terminal, which only `fg` there resumes, from a
+stop `kill -CONT` ends; nothing on the wire carries it.
 
 ### 14.6 Shutdown
 

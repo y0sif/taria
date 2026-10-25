@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, watch};
 use crate::args::DEFAULT_IDLE_RELEASE;
 use crate::bridge::{
     self, AppSnapshot, BridgeHandle, BridgeState, Call, Demand, LinkState, OVERSIZED_LINE,
+    UNACKED_HOLD,
 };
 use crate::tree_format::TreeFormat;
 
@@ -382,6 +383,11 @@ impl TariaMcpServer {
         let mut seen = observe(acks, rx, &pre, &ids).await;
         if rejected.has_changed().unwrap_or(false) {
             seen.rejected = rejected.borrow_and_update().clone();
+        }
+        // Only silence is worth the read: an ack, a tree or a rejected line
+        // inside the window is the app running.
+        if seen.status.is_none() && seen.changed.is_none() && seen.rejected.is_none() {
+            seen.stopped = stopped_peer(self.demand.as_ref().and_then(Demand::peer_pid));
         }
         if cut_short {
             return Err(partial_send_error(&seen, ids.len(), wanted));
@@ -904,7 +910,8 @@ fn reconnected_reason(gone: &str, open_for: Duration, report: LinkReport) -> Str
     }
     if let Some(stopped) = stopped_peer(report.peer_pid) {
         return format!(
-            "{gone}, and this bridge has reconnected: {stopped} {}",
+            "{gone}, and this bridge has reconnected: {} {}",
+            stopped.cannot_answer(),
             stopped_evidence(open_for)
         );
     }
@@ -1030,7 +1037,8 @@ fn no_snapshot_reason(report: LinkReport) -> String {
     }
     if let Some(stopped) = stopped_peer(report.peer_pid) {
         return format!(
-            "no snapshot from the app yet: {stopped} {}",
+            "no snapshot from the app yet: {} {}",
+            stopped.cannot_answer(),
             stopped_evidence(open_for)
         );
     }
@@ -1068,13 +1076,25 @@ fn held_by_another_bridge(open_for: Duration, idle_release: Option<Duration>) ->
 /// `ss`, `ps` and `pgrep`, about a bridge doing what it is for. The age of the
 /// silent connection and the peer that might not be an adapter are left out:
 /// this bridge had the app before it let go, so the peer is known to be one.
+///
+/// The window is said once, as a floor: an input awaiting its ack holds the
+/// app past it, so the release came at the window or up to [`UNACKED_HOLD`]
+/// after it. The retry that follows guesses the holder was started like this
+/// bridge, as [`retry_guidance`] does, without naming the window again.
 fn held_after_release(idle_release: Option<Duration>) -> String {
+    let window = idle_release.unwrap_or(DEFAULT_IDLE_RELEASE);
+    let retry = if window == DEFAULT_IDLE_RELEASE {
+        "a minute".to_string()
+    } else {
+        format!("{} s", seconds(window))
+    };
     format!(
-        "That disconnect was this bridge letting go on purpose after {} s with no tool calls, so \
-         another session could use the app; it is not a fault and needs no investigating. {} \
-         {STAYS_HELD}",
-        seconds(idle_release.unwrap_or(DEFAULT_IDLE_RELEASE)),
-        retry_guidance(idle_release)
+        "That disconnect was this bridge letting go on purpose after {} s or more with no tool \
+         calls (up to {} s more while an input awaited its ack), so another session could use the \
+         app; it is not a fault. A holder started like this bridge lets go the same way, and this \
+         bridge takes over as soon as it does, with no restart; retry in {retry}. {STAYS_HELD}",
+        seconds(window),
+        seconds(UNACKED_HOLD)
     )
 }
 
@@ -1122,16 +1142,98 @@ fn seconds(window: Duration) -> String {
 
 /// The evidence a stopped app's answer gives, after saying what to do: the
 /// path is right, and why the connection is silent.
+///
+/// The connection is in the listen backlog, not served: the kernel completed
+/// it, and the app, stopped, has not accepted it.
 fn stopped_evidence(open_for: Duration) -> String {
     format!(
-        "The socket path is right: this bridge has been connected for {:.1}s with no handshake, \
-         and a stopped app accepts no connection.",
+        "The socket path is right: this bridge's connection has waited {:.1}s in the app's \
+         listen queue with no handshake, because a stopped app accepts nothing.",
         open_for.as_secs_f64()
     )
 }
 
-/// What to tell an agent about a silent connection whose peer is a stopped
-/// process, or `None` when it is not stopped or this cannot tell.
+/// How a stopped app is stopped, which decides what resumes it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// Stopped by a signal in its terminal's foreground, or with no terminal
+    /// at all: `SIGCONT` resumes it.
+    Signal,
+    /// Stopped in the background of its terminal: a suspended job, which only
+    /// the shell's `fg` resumes. A ratatui app turns Ctrl-Z off with raw mode,
+    /// so one that suspends raises `SIGTSTP` itself, and the shell keeps it as
+    /// a stopped job. `SIGCONT` resumes it in the background, where it is
+    /// stopped again at once (`SIGTTOU`) as it takes the terminal back into
+    /// raw mode. The agent cannot run `fg`; the user can.
+    Job,
+    /// A tracing stop: `SIGCONT` does not end it, the debugger does.
+    Debugger,
+}
+
+/// A stopped app, as [`stopped_peer`] found it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stopped {
+    pid: i32,
+    stop: Stop,
+}
+
+impl Stopped {
+    /// What the app is and how to resume it, for an answer with no tree:
+    /// the first words after the answer's opening.
+    fn cannot_answer(self) -> String {
+        let pid = self.pid;
+        match self.stop {
+            Stop::Signal => format!(
+                "the app (pid {pid}) is stopped, so it cannot answer; resume it (kill -CONT {pid}) \
+                 and retry."
+            ),
+            Stop::Job => format!(
+                "the app (pid {pid}) is suspended in its terminal, so it cannot answer; ask the \
+                 user to run fg in that terminal (kill -CONT only stops it again), then retry."
+            ),
+            Stop::Debugger => format!(
+                "the app (pid {pid}) is stopped in a debugger, so it cannot answer; resume it \
+                 from the debugger and retry."
+            ),
+        }
+    }
+
+    /// The whole answer to an input the app neither acknowledged nor changed
+    /// its tree for, because it is stopped.
+    ///
+    /// The input is not lost yet. The bridge wrote it to the socket, where it
+    /// waits in the app's receive buffer, and the adapter reads it on
+    /// resuming, but only while this bridge still has the connection: an
+    /// input awaiting its ack holds the app [`UNACKED_HOLD`] past the idle
+    /// window, and once the bridge lets go anyway, the adapter discards what
+    /// arrived on the connection that ended. So the agent is sent to check,
+    /// not told the input landed.
+    fn has_not_read(self) -> String {
+        let pid = self.pid;
+        let (what, resume) = match self.stop {
+            Stop::Signal => ("is stopped", format!("Resume it (kill -CONT {pid})")),
+            Stop::Job => (
+                "is suspended in its terminal",
+                "Ask the user to run fg in that terminal (kill -CONT only stops it again)"
+                    .to_string(),
+            ),
+            Stop::Debugger => (
+                "is stopped in a debugger",
+                "Resume it from the debugger".to_string(),
+            ),
+        };
+        format!(
+            "The app (pid {pid}) {what}, so it has not read this input yet; the input waits in \
+             the socket, and the app reads it once resumed. {resume}, then call read_tree, and \
+             resend the input if its effect is missing."
+        )
+    }
+}
+
+/// The peer `pid`, if it is a stopped process, or `None` when it is not
+/// stopped or this cannot tell.
 ///
 /// A stopped app (`SIGSTOP`, a shell's Ctrl-Z, a breakpoint) still has its
 /// socket listening, so the kernel completes the connect into the backlog and
@@ -1139,29 +1241,49 @@ fn stopped_evidence(open_for: Duration) -> String {
 /// bridge, and the held answer sent an agent to wait for a release that a
 /// stopped app never makes. The pid is the listener's, from the connection's
 /// peer credentials; its state is read from `/proc`, so this is Linux only,
-/// and any failure to read it leaves the held answer as it was.
+/// and any failure to read it leaves the answer it would otherwise get.
 #[cfg(target_os = "linux")]
-fn stopped_peer(pid: Option<i32>) -> Option<String> {
+fn stopped_peer(pid: Option<i32>) -> Option<Stopped> {
     let pid = pid?;
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    match stat_state(&stat)? {
-        'T' => Some(format!(
-            "the app (pid {pid}) is stopped, so it cannot answer; resume it (kill -CONT {pid}, or \
-             fg in its terminal) and retry."
-        )),
-        // A tracing stop: `SIGCONT` does not end it, the debugger does.
-        't' => Some(format!(
-            "the app (pid {pid}) is stopped in a debugger, so it cannot answer; resume it from the \
-             debugger and retry."
-        )),
-        _ => None,
-    }
+    let stop = stop_of(&stat)?;
+    Some(Stopped { pid, stop })
 }
 
 /// Elsewhere there is no `/proc` to ask, and a stopped app reads as held.
 #[cfg(not(target_os = "linux"))]
-fn stopped_peer(_pid: Option<i32>) -> Option<String> {
+fn stopped_peer(_pid: Option<i32>) -> Option<Stopped> {
     None
+}
+
+/// How the process a `/proc/<pid>/stat` line describes is stopped, or `None`
+/// when it is not stopped or the line is not shaped like one.
+///
+/// After the last `)` (see [`stat_state`]) come the state (field 3 of the
+/// line), the parent's pid, the process group (5), the session, the
+/// controlling terminal (7, 0 for none) and the terminal's foreground
+/// process group (8). A stopped process with a terminal, outside that
+/// terminal's foreground group, is a suspended job.
+#[cfg(target_os = "linux")]
+fn stop_of(stat: &str) -> Option<Stop> {
+    match stat_state(stat)? {
+        'T' => {
+            let (_, rest) = stat.rsplit_once(')')?;
+            // Past the state and the parent's pid.
+            let mut fields = rest.split_whitespace().skip(2);
+            let pgrp: i64 = fields.next()?.parse().ok()?;
+            // Past the session.
+            let tty_nr: i64 = fields.nth(1)?.parse().ok()?;
+            let tpgid: i64 = fields.next()?.parse().ok()?;
+            if tty_nr != 0 && pgrp != tpgid {
+                Some(Stop::Job)
+            } else {
+                Some(Stop::Signal)
+            }
+        }
+        't' => Some(Stop::Debugger),
+        _ => None,
+    }
 }
 
 /// The state code of a `/proc/<pid>/stat` line (`S`, `T`, `t`, ...), or `None`
@@ -1192,7 +1314,7 @@ fn text_result(text: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
-/// The text agents read the tree from: the app's own snapshot, relayed as
+/// The text agents read the tree from: the app's own snapshot, passed on as
 /// JSON or rendered as an outline from that same JSON. Every tree an agent
 /// receives, from `read_tree` and inside every input tool's answer, comes
 /// through here.
@@ -1200,20 +1322,20 @@ fn text_result(text: String) -> CallToolResult {
 /// Not `serde_json::to_string(&snapshot.parsed)`. Round-tripping through this
 /// build's types is what turned an app's `"role":"sparkline"` into
 /// `"role":"other"` on the way to the agent, and would do the same to every
-/// field a newer app adds. Two things follow from relaying instead. The
-/// vocabulary is no longer this bridge's, so a role, an action or a field it
-/// has never heard of reaches the agent by name. And there is nothing left to
-/// fail, so the result no longer carries a serialization error no peer could
-/// have provoked.
+/// field a newer app adds. Two things follow from passing the line on
+/// instead. The vocabulary is no longer this bridge's, so a role, an action or
+/// a field it has never heard of reaches the agent by name. And there is
+/// nothing left to fail, so the result no longer carries a serialization error
+/// no peer could have provoked.
 ///
 /// What the agent gets is the tree, not the message carrying it: the
 /// `"type":"snapshot"` key that frames the line on the wire is dropped where
 /// the snapshot is stored (see [`AppSnapshot::from_line`]), because this tool
 /// promises the app's tree and that key was never part of one.
 ///
-/// The outline is rendered from that relayed text too, for the same reason,
-/// and takes only its action names from the parse, because the parse is what
-/// `act` checks a name against (see [`crate::tree_format`]).
+/// The outline is rendered from the bridge's copy of the line too, for the
+/// same reason, and takes only its action names from the parse, because the
+/// parse is what `act` checks a name against (see [`crate::tree_format`]).
 fn snapshot_text(snapshot: &AppSnapshot, format: TreeFormat) -> String {
     format.render(snapshot)
 }
@@ -1261,6 +1383,14 @@ struct Observed {
     /// bridge closed the connection on because its next tree was over
     /// [`MAX_LINE_BYTES`] (see [`OVERSIZED_LINE`]).
     rejected: Option<String>,
+    /// The app, if it is stopped. Not filled in by [`observe`] either: read
+    /// from `/proc` after the window, and only for a burst that met silence,
+    /// which is what a stopped app gives every input.
+    ///
+    /// Silence otherwise reads as an app that does not ack or has not reacted
+    /// yet, and the agent waits or resends for an app that cannot read
+    /// anything until someone resumes it.
+    stopped: Option<Stopped>,
 }
 
 /// Watch the app's acks and snapshots for up to [`UPDATE_WAIT`], and report
@@ -1571,12 +1701,18 @@ fn report(
                  makes it readable; call read_tree for the current tree either way.",
                 UPDATE_WAIT.as_millis()
             ),
-            None => format!(
-                "The app neither acknowledged this input nor changed its tree within {}ms. It \
-                 may not report acknowledgements, or it may not have reacted yet; call \
-                 read_tree to re-check.",
-                UPDATE_WAIT.as_millis()
-            ),
+            // A stopped app is silent to every input, and is the one silent
+            // app whose reason this bridge can name. Only on Linux, and only
+            // for an on-demand bridge, which records the peer's pid.
+            None => match seen.stopped {
+                Some(stopped) => stopped.has_not_read(),
+                None => format!(
+                    "The app neither acknowledged this input nor changed its tree within {}ms. \
+                     It may not report acknowledgements, or it may not have reacted yet; call \
+                     read_tree to re-check.",
+                    UPDATE_WAIT.as_millis()
+                ),
+            },
         })),
         // A status this build can decode but has no case for above.
         //
@@ -2378,27 +2514,38 @@ mod tests {
             .expect_err("a held app serves this bridge no tree")
             .message
         };
+        // The window is said once, as the floor it is: an input awaiting its
+        // ack holds the app past it.
         assert_eq!(
             after_release(DEFAULT_IDLE_RELEASE),
             "app 'demo' disconnected (last snapshot seq 7), and the app is now held by another \
-             bridge. That disconnect was this bridge letting go on purpose after 60 s with no tool \
-             calls, so another session could use the app; it is not a fault and needs no \
-             investigating. A taria-mcp lets go of the app after 60 s with no tool calls (its \
-             default), and this bridge takes over as soon as it does, with no restart; retry in a \
+             bridge. That disconnect was this bridge letting go on purpose after 60 s or more with \
+             no tool calls (up to 30 s more while an input awaited its ack), so another session \
+             could use the app; it is not a fault. A holder started like this bridge lets go the \
+             same way, and this bridge takes over as soon as it does, with no restart; retry in a \
              minute. If the app stays held, another session is using it, or the holder is a \
              taria-mcp older than 0.3.2, which holds the app until its session ends."
         );
         assert_eq!(
             after_release(Duration::from_secs(30)),
             "app 'demo' disconnected (last snapshot seq 7), and the app is now held by another \
-             bridge. That disconnect was this bridge letting go on purpose after 30 s with no tool \
-             calls, so another session could use the app; it is not a fault and needs no \
-             investigating. A taria-mcp started like this one lets go of the app after 30 s with \
-             no tool calls (one on the default, after 60 s), and this bridge takes over as soon \
-             as the holder does, with no restart; retry in 30 s. If the app stays held, another \
-             session is using it, or the holder is a taria-mcp older than 0.3.2, which holds the \
-             app until its session ends."
+             bridge. That disconnect was this bridge letting go on purpose after 30 s or more with \
+             no tool calls (up to 30 s more while an input awaited its ack), so another session \
+             could use the app; it is not a fault. A holder started like this bridge lets go the \
+             same way, and this bridge takes over as soon as it does, with no restart; retry in 30 \
+             s. If the app stays held, another session is using it, or the holder is a taria-mcp \
+             older than 0.3.2, which holds the app until its session ends."
         );
+        for answer in [
+            after_release(DEFAULT_IDLE_RELEASE),
+            after_release(Duration::from_secs(30)),
+        ] {
+            assert_eq!(
+                answer.matches("with no tool calls").count(),
+                1,
+                "the window once: {answer}"
+            );
+        }
 
         // Not after a release, the held answer is the one it always was.
         let held = available_snapshot(
@@ -2497,12 +2644,193 @@ mod tests {
         }
     }
 
+    /// After the state, a stopped process's process group, controlling
+    /// terminal and that terminal's foreground group say what resumes it: a
+    /// stopped job in the background of its terminal is a suspended TUI,
+    /// which only `fg` brings back, and anything else `SIGCONT` resumes. The
+    /// command name may hold a `)` followed by fields shaped like the real
+    /// ones, which must not be read in their place.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_process_is_told_apart_by_its_terminal() {
+        for (stat, stop) in [
+            // A suspended job: a terminal, and another group in its foreground.
+            (
+                "4242 (my app) T 4100 4242 4100 34817 4100 0",
+                Some(Stop::Job),
+            ),
+            // The terminal's foreground group: SIGCONT resumes it.
+            (
+                "4242 (a) b) T 4100 4242 4100 34817 4242 0",
+                Some(Stop::Signal),
+            ),
+            // No terminal at all: likewise.
+            ("4242 (x y) T 1 4242 4242 0 -1 0", Some(Stop::Signal)),
+            // A decoy in the name, a foreground stop with no terminal, before
+            // the real fields, which say a suspended job.
+            (
+                "4242 (a) T 1 9 9 0 9 (b) T 4100 4242 4100 34817 4100",
+                Some(Stop::Job),
+            ),
+            (
+                "4242 (gdb) me) t 4100 4242 4100 34817 4100",
+                Some(Stop::Debugger),
+            ),
+            // Not stopped, in the background of a terminal or not.
+            ("4242 (my app) S 4100 4242 4100 34817 4100 0", None),
+            ("4242 (my app) R 1 4242 4242 0 -1 0", None),
+            // Stopped, but with the fields that say how missing or not
+            // numbers: no claim, rather than a guess at the way out.
+            ("4242 (x) T 1", None),
+            ("4242 (x) T 1 4242 4242", None),
+            ("4242 (x) T 1 4242 4242 0", None),
+            ("4242 (x) T 1 a 4242 0 -1", None),
+            ("4242 (x) T 1 4242 4242 tty -1", None),
+        ] {
+            assert_eq!(stop_of(stat), stop, "{stat}");
+        }
+    }
+
+    /// What each kind of stop tells the agent to do, in both places it is
+    /// said: an answer with no tree, and the answer to an input the app has
+    /// not read. A suspended job is sent to the user, because only `fg` in its
+    /// terminal resumes it, and the agent cannot run that.
+    #[test]
+    fn a_stopped_app_says_how_to_resume_it_by_how_it_is_stopped() {
+        let stopped = |stop| Stopped { pid: 4242, stop };
+        assert_eq!(
+            stopped(Stop::Signal).cannot_answer(),
+            "the app (pid 4242) is stopped, so it cannot answer; resume it (kill -CONT 4242) and \
+             retry."
+        );
+        assert_eq!(
+            stopped(Stop::Job).cannot_answer(),
+            "the app (pid 4242) is suspended in its terminal, so it cannot answer; ask the user to \
+             run fg in that terminal (kill -CONT only stops it again), then retry."
+        );
+        assert_eq!(
+            stopped(Stop::Debugger).cannot_answer(),
+            "the app (pid 4242) is stopped in a debugger, so it cannot answer; resume it from the \
+             debugger and retry."
+        );
+        assert_eq!(
+            stopped_evidence(Duration::from_millis(4_000)),
+            "The socket path is right: this bridge's connection has waited 4.0s in the app's \
+             listen queue with no handshake, because a stopped app accepts nothing."
+        );
+        assert_eq!(
+            stopped(Stop::Signal).has_not_read(),
+            "The app (pid 4242) is stopped, so it has not read this input yet; the input waits in \
+             the socket, and the app reads it once resumed. Resume it (kill -CONT 4242), then \
+             call read_tree, and resend the input if its effect is missing."
+        );
+        assert_eq!(
+            stopped(Stop::Job).has_not_read(),
+            "The app (pid 4242) is suspended in its terminal, so it has not read this input yet; \
+             the input waits in the socket, and the app reads it once resumed. Ask the user to \
+             run fg in that terminal (kill -CONT only stops it again), then call read_tree, and \
+             resend the input if its effect is missing."
+        );
+        assert_eq!(
+            stopped(Stop::Debugger).has_not_read(),
+            "The app (pid 4242) is stopped in a debugger, so it has not read this input yet; the \
+             input waits in the socket, and the app reads it once resumed. Resume it from the \
+             debugger, then call read_tree, and resend the input if its effect is missing."
+        );
+    }
+
+    /// An input met with silence from a stopped app is answered with the
+    /// stop, not with "it may not have reacted yet", and only then: an ack, a
+    /// tree or a rejected line inside the window is the app running, and
+    /// keeps its own answer.
+    #[test]
+    fn silence_from_a_stopped_app_says_it_is_stopped() {
+        let stopped = Stopped {
+            pid: 4242,
+            stop: Stop::Job,
+        };
+        let text = |seen: Observed| {
+            let result = report(seen, snapshot("after"), 1, TreeFormat::Json).expect("a result");
+            result_text(&result).to_string()
+        };
+        let silent = || Observed {
+            stopped: Some(stopped),
+            ..Observed::default()
+        };
+        assert_eq!(text(silent()), stopped.has_not_read());
+        assert!(
+            text(Observed::default()).starts_with(
+                "The app neither acknowledged this input nor changed its tree within 500ms. It may \
+                 not report acknowledgements"
+            ),
+            "no stop read, the answer it always was"
+        );
+        let rejected = text(Observed {
+            rejected: Some("unknown variant `later`".to_string()),
+            ..silent()
+        });
+        assert!(rejected.contains("unknown variant `later`"), "{rejected}");
+        let delivered = text(Observed {
+            status: Some(InputStatus::Delivered),
+            ..silent()
+        });
+        assert!(
+            delivered.starts_with("The app received this input"),
+            "{delivered}"
+        );
+    }
+
+    /// A `sleep` a test stops, resumed and killed when dropped, so a failing
+    /// assertion never leaves a stopped process behind.
+    #[cfg(target_os = "linux")]
+    struct StoppableSleep {
+        child: std::process::Child,
+        pid: i32,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl StoppableSleep {
+        fn start() -> Self {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("start sleep");
+            let pid = i32::try_from(child.id()).expect("a pid fits an i32");
+            Self { child, pid }
+        }
+
+        fn signal(&self, name: &str) {
+            let status = std::process::Command::new("kill")
+                .args([name, &self.pid.to_string()])
+                .status()
+                .expect("run kill");
+            assert!(status.success(), "kill {name} {}", self.pid);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for StoppableSleep {
+        fn drop(&mut self) {
+            // Before the kill, while the child is unreaped and the pid still
+            // its own.
+            let _ = std::process::Command::new("kill")
+                .args(["-CONT", &self.pid.to_string()])
+                .status();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
     /// A stopped app keeps its socket listening, so a bridge's connect lands
     /// in the backlog and nothing answers: the silence of an app held by
     /// another bridge, which sent the agent to wait for a release that never
     /// comes. On Linux the peer's state is read, and a stopped one is named
     /// with its pid and how to resume it; a process that is not stopped, or
     /// one that cannot be read, leaves the held answer as it was.
+    ///
+    /// Whether the stopped `sleep` is a suspended job depends on the terminal
+    /// the tests run in, if any, so either kind passes here; what each says
+    /// is pinned above.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_stopped_app_is_named_with_its_pid_and_the_way_to_resume_it() {
@@ -2512,20 +2840,9 @@ mod tests {
         let running = i32::try_from(std::process::id()).expect("a pid fits an i32");
         assert_eq!(stopped_peer(Some(running)), None, "this test is running");
 
-        // A process this test starts and stops, and kills at the end.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("start sleep");
-        let pid = i32::try_from(child.id()).expect("a pid fits an i32");
-        let signal = |name: &str| {
-            let status = std::process::Command::new("kill")
-                .args([name, &pid.to_string()])
-                .status()
-                .expect("run kill");
-            assert!(status.success(), "kill {name} {pid}");
-        };
-        signal("-STOP");
+        let sleep = StoppableSleep::start();
+        let pid = sleep.pid;
+        sleep.signal("-STOP");
         // The stop is delivered asynchronously.
         let deadline = Instant::now() + Duration::from_secs(2);
         let stopped = loop {
@@ -2535,13 +2852,12 @@ mod tests {
             assert!(Instant::now() < deadline, "pid {pid} never read as stopped");
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(
-            stopped,
-            format!(
-                "the app (pid {pid}) is stopped, so it cannot answer; resume it (kill -CONT {pid}, \
-                 or fg in its terminal) and retry."
-            )
+        assert_eq!(stopped.pid, pid);
+        assert!(
+            matches!(stopped.stop, Stop::Signal | Stop::Job),
+            "a signal stopped it: {stopped:?}"
         );
+        let resume = stopped.cannot_answer();
 
         // Both held answers carry it, in place of the held explanation, and
         // a release does not outrank it: the app is not held, it is stopped.
@@ -2552,11 +2868,12 @@ mod tests {
             idle_release: Some(DEFAULT_IDLE_RELEASE),
             ..silent_link()
         };
-        let evidence = "The socket path is right: this bridge has been connected for 4.0s with no \
-                        handshake, and a stopped app accepts no connection.";
+        let evidence = "The socket path is right: this bridge's connection has waited 4.0s in \
+                        the app's listen queue with no handshake, because a stopped app accepts \
+                        nothing.";
         assert_eq!(
             no_snapshot_reason(report(false)),
-            format!("no snapshot from the app yet: {stopped} {evidence}")
+            format!("no snapshot from the app yet: {resume} {evidence}")
         );
         for released in [false, true] {
             assert_eq!(
@@ -2565,7 +2882,7 @@ mod tests {
                     .message,
                 format!(
                     "app 'demo' disconnected (last snapshot seq 7), and this bridge has \
-                     reconnected: {stopped} {evidence}"
+                     reconnected: {resume} {evidence}"
                 ),
                 "released: {released}"
             );
@@ -2577,7 +2894,7 @@ mod tests {
         });
         assert!(young.contains("worth one retry"), "{young}");
 
-        signal("-CONT");
+        sleep.signal("-CONT");
         let deadline = Instant::now() + Duration::from_secs(2);
         while stopped_peer(Some(pid)).is_some() {
             assert!(
@@ -2590,13 +2907,11 @@ mod tests {
             no_snapshot_reason(report(false)).contains("held by another bridge"),
             "a resumed app that still says nothing reads as held again"
         );
-        child.kill().expect("kill the sleep this test started");
-        child.wait().expect("reap it");
     }
 
     /// A published snapshot in both forms, built from a line the way an app
     /// would send it: the tests below compare parses, and the results they
-    /// read back are what the relay makes of that line.
+    /// read back are what the bridge makes of that line in passing it on.
     fn snapshot(marker: &str) -> AppSnapshot {
         let parsed = Snapshot::new(1, Node::new("app", Role::App).label(marker));
         let line = serde_json::to_string(&taria::wire::AppToBridge::Snapshot(parsed.clone()))
@@ -2652,6 +2967,7 @@ mod tests {
             changed: None,
             gone: None,
             rejected: None,
+            stopped: None,
         };
         let err = report(seen, snapshot("after"), 5, TreeFormat::Json)
             .expect_err("lost acks are not a success");
@@ -2674,6 +2990,7 @@ mod tests {
             changed: None,
             gone: None,
             rejected: None,
+            stopped: None,
         };
         let err = report(seen, snapshot("after"), 1, TreeFormat::Json)
             .expect_err("lost acks are not a success");
@@ -3269,7 +3586,7 @@ mod tests {
     /// shapes here are the ones a plain envelope rule got wrong: a longer
     /// envelope, an object a newer app might send, an envelope naming a
     /// built-in, an object whose first key on the wire is not the first in the
-    /// relayed, key-sorted text, and names that need quoting, one of them
+    /// key-sorted text the bridge passes on, and names that need quoting, one of them
     /// carrying the `|` that joins the list and one a quote, which prints
     /// escaped: stripping the quotes alone would pass `a\"b` for `a"b`.
     #[tokio::test]

@@ -134,13 +134,17 @@ HELD_GONE_RE = re.compile(HELD_GONE_OPENING + HELD_EXPLANATION)
 # The same, from a bridge whose own departure was letting go after its idle
 # window (`released_after`, its `--idle-release`): it says so, so that the
 # "disconnected" it opens with is not chased as a fault, then when to retry.
+# The window is said once, as a floor, and the retry names only when:
+# `window` is captured from "retry in N s" so a step can hold it to the
+# bridge's window as it does the held answer's, and is None for "a minute".
 HELD_RELEASED_RE = re.compile(
     HELD_GONE_OPENING
     + r"That disconnect was this bridge letting go on purpose after "
-    r"(?P<released_after>\d+(?:\.\d+)?) s with no tool calls, so another session could "
-    r"use the app; it is not a fault and needs no investigating\. "
-    + HELD_RETRY
-    + " "
+    r"(?P<released_after>\d+(?:\.\d+)?) s or more with no tool calls \(up to 30 s more "
+    r"while an input awaited its ack\), so another session could use the app; it is not a "
+    r"fault\. A holder started like this bridge lets go the same way, and this bridge takes "
+    r"over as soon as it does, with no restart; retry in "
+    r"(?:a minute|(?P<window>\d+(?:\.\d+)?) s)\. "
     + HELD_STAYS
     + "$"
 )
@@ -2676,6 +2680,14 @@ def step_z_restart_race_loser_is_held(ctx):
                     f"{when}: {name}'s held answer names a {match['window']} s window, not "
                     f"its own {window} s",
                 )
+                # The released form also says how long the bridge went with
+                # no tool calls before it let go, which is its own window.
+                if match.re is HELD_RELEASED_RE:
+                    require(
+                        match["released_after"] == str(window),
+                        f"{when}: {name} says it let go after {match['released_after']} s, "
+                        f"not its own {window} s",
+                    )
             if transient:
                 return retry
             return winners[0] if winners else None
@@ -2706,25 +2718,36 @@ def step_z_restart_race_loser_is_held(ctx):
             demo.start_app()
             winner = None
             asks = 8
+            # How each ask that found no winner went: a transient answer, or
+            # both bridges held. Asks can mix, so the failure is worded from
+            # the counts rather than from the last ask alone.
+            transient_asks = 0
             for _ in range(asks):
                 answers = ask_both()
                 verdict = judge(answers, when)
                 if verdict is not None and verdict is not retry:
                     winner = verdict
                     break
+                if verdict is retry:
+                    transient_asks += 1
             if winner is None:
                 # The last ask's answers, either way: they are the evidence.
                 quoted = "; ".join(
                     f"{name}: {'a tree' if err is None else err[:300]}"
                     for name, (_, err) in answers.items()
                 )
-                if verdict is retry:
-                    raise StepFailure(
-                        f"{when}: {asks} asks in a row met a transient answer; {quoted}"
+                if transient_asks == asks:
+                    tally = f"all {asks} asks met a transient answer"
+                elif transient_asks == 0:
+                    tally = f"all {asks} asks found both bridges held"
+                else:
+                    tally = (
+                        f"of {asks} asks, {transient_asks} met a transient answer and the "
+                        f"rest found both bridges held"
                     )
                 raise StepFailure(
-                    f"{when}: neither bridge was served the restarted app; both were "
-                    f"held; {quoted}"
+                    f"{when}: {tally}; neither was served the restarted app; last answers: "
+                    f"{quoted}"
                 )
             # And again, with the race settled: the loser stays held.
             require(

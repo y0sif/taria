@@ -12,7 +12,7 @@
 //! latest [`BridgeState`], and writes queued [`AgentInput`]s out as
 //! `BridgeToApp::Input` lines. A snapshot is stored as an [`AppSnapshot`],
 //! which keeps the app's line (minus the message framing) alongside the parse
-//! of it, so the tool layer relays what the app wrote instead of
+//! of it, so the tool layer passes on what the app wrote instead of
 //! re-serializing what this build could decode. On disconnect the watch flips
 //! to
 //! [`BridgeState::Disconnected`] so tool calls fail fast (instead of acting
@@ -121,7 +121,7 @@ const FIRST_CALL_WAIT: Duration = Duration::from_millis(1_200);
 /// Thirty seconds is far past any ack a live app sends, and it is counted from
 /// the end of the window, so from at least the idle window plus this after the
 /// input was sent: every input is sent while a tool call is in flight.
-const UNACKED_HOLD: Duration = Duration::from_secs(30);
+pub(crate) const UNACKED_HOLD: Duration = Duration::from_secs(30);
 
 /// Most unacked input ids one connection remembers.
 ///
@@ -160,8 +160,8 @@ pub(crate) const OVERSIZED_LINE: &str =
 /// The **parsed form is authoritative for what the bridge decides**: `act`
 /// validates node ids and advertised actions against it, and the tool layer
 /// compares it to tell a tree that changed from one that did not. Neither of
-/// those may read the relayed text, which is untyped and, across a version
-/// mismatch, not even shaped like this build's [`Snapshot`].
+/// those may read the bridge's copy of the line, which is untyped and, across
+/// a version mismatch, not even shaped like this build's [`Snapshot`].
 ///
 /// A line reaches here only after it parsed, so a malformed line is still
 /// skipped rather than forwarded.
@@ -204,8 +204,8 @@ impl AppSnapshot {
 ///
 /// Both fallbacks return the line untouched, and neither is reachable from a
 /// line that got here: it parsed as an `AppToBridge::Snapshot`, so it is a
-/// JSON object, and a `Value` built from JSON serializes back. Relaying the
-/// envelope is the wrong answer for both, but it is the one that keeps the
+/// JSON object, and a `Value` built from JSON serializes back. Passing the
+/// envelope on is the wrong answer for both, but it is the one that keeps the
 /// tree, which is what an agent came for.
 fn strip_envelope(line: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -491,7 +491,9 @@ struct Activity {
     /// disconnected" as a fault, and went after it with `ss`, `ps` and
     /// `pgrep`. Written where that record is (see [`Idle::note_disconnect`]), so
     /// it describes the same departure, and cleared once a connection serves
-    /// a tree, so it can never outlive the record it is about.
+    /// a tree, so it can never outlive the record it is about. Cleared too
+    /// when a connect finds nothing listening: the app has gone since, so
+    /// the departure is no longer only this bridge's doing.
     pub(crate) released: bool,
     /// The process at the other end of the open connection, as the kernel
     /// reported it at `connect`, or `None` with no connection open or no pid
@@ -1008,23 +1010,7 @@ async fn manager_loop(
                                 // reason, a healthy connection's included.
                                 if let Some(quiet_since) = idle.try_release(false) {
                                     tracing::info!(path = %path.display(), "app disconnected");
-                                    // With the window closed, an input still
-                                    // awaiting its ack is what the connection
-                                    // was being held for, and the log says
-                                    // the app's leaving ended that hold
-                                    // rather than calling it a plain release.
-                                    let (hold, what) = if unacked > 0 {
-                                        (
-                                            Hold::AppClosed { unacked },
-                                            "the app closed the connection during the ack \
-                                             hold; not reconnecting",
-                                        )
-                                    } else {
-                                        (
-                                            Hold::None,
-                                            "the app closed the connection; not reconnecting",
-                                        )
-                                    };
+                                    let (hold, what) = app_closed_release(unacked);
                                     log_release(
                                         &path,
                                         idle.release_after,
@@ -1086,6 +1072,16 @@ async fn manager_loop(
                     // one connect failure that says the app is gone.
                     forget_oversized_if_nothing_listens(&err, &rejected_tx);
                     if let Some(idle) = idle.as_mut() {
+                        // The release flag goes the same way, and for the
+                        // same reason: the app this bridge let go of has
+                        // since gone, so "it is not a fault" no longer
+                        // describes what happened to it, and a held answer
+                        // about the next instance must not say it. Cleared
+                        // before the outcome is counted, which is what a
+                        // waiting call reads it after.
+                        if nothing_listens(&err) {
+                            idle.note(|activity| activity.released = false);
+                        }
                         idle.settled();
                     }
                     if let Pause::Released(quiet_since) = pause(idle.as_mut(), backoff).await {
@@ -1110,44 +1106,81 @@ async fn manager_loop(
 /// the missing 15.
 fn log_release(path: &std::path::Path, release_after: Duration, release: Release, what: &str) {
     let idle = release.quiet_since.elapsed();
+    let line = release_line(idle, release_after, release.hold, what);
     let idle_s = idle.as_secs_f64();
     let idle_release_s = release_after.as_secs_f64();
-    let past_s = idle.saturating_sub(release_after).as_secs_f64();
     match release.hold {
-        Hold::None => tracing::info!(
+        Hold::None | Hold::UntilAcked => tracing::info!(
             path = %path.display(),
             idle_s,
             idle_release_s,
-            "no tool call for {idle_s:.1} s: released the app ({what}); the next tool call \
-             reconnects"
-        ),
-        Hold::UntilAcked => tracing::info!(
-            path = %path.display(),
-            idle_s,
-            idle_release_s,
-            "no tool call for {idle_s:.1} s, {past_s:.1} s past the {idle_release_s} s idle \
-             window, held there until the app acked every input it was sent: released the app \
-             ({what}); the next tool call reconnects"
+            "{line}"
         ),
         Hold::Expired { unacked } => tracing::warn!(
             path = %path.display(),
             idle_s,
             idle_release_s,
             unacked,
-            "no tool call for {idle_s:.1} s, {past_s:.1} s past the {idle_release_s} s idle \
-             window, the longest an input awaiting its ack holds the app: released the app \
-             ({what}) with {unacked} input(s) never acked, which the app may discard; the next \
-             tool call reconnects"
+            "{line}"
         ),
         Hold::AppClosed { unacked } => tracing::info!(
             path = %path.display(),
             idle_s,
             idle_release_s,
             unacked,
+            "{line}"
+        ),
+    }
+}
+
+/// The words [`log_release`] says a release in, after `idle` with no tool
+/// call against the window `release_after`.
+fn release_line(idle: Duration, release_after: Duration, hold: Hold, what: &str) -> String {
+    let idle_s = idle.as_secs_f64();
+    let idle_release_s = release_after.as_secs_f64();
+    let past_s = idle.saturating_sub(release_after).as_secs_f64();
+    match hold {
+        Hold::None => format!(
+            "no tool call for {idle_s:.1} s: released the app ({what}); the next tool call \
+             reconnects"
+        ),
+        Hold::UntilAcked => format!(
+            "no tool call for {idle_s:.1} s, {past_s:.1} s past the {idle_release_s} s idle \
+             window, held there until the app acked every input it was sent: released the app \
+             ({what}); the next tool call reconnects"
+        ),
+        Hold::Expired { unacked } => format!(
+            "no tool call for {idle_s:.1} s, {past_s:.1} s past the {idle_release_s} s idle \
+             window, the longest an input awaiting its ack holds the app: released the app \
+             ({what}) with {unacked} input(s) never acked, which the app may discard; the next \
+             tool call reconnects"
+        ),
+        Hold::AppClosed { unacked } => format!(
             "no tool call for {idle_s:.1} s, {past_s:.1} s past the {idle_release_s} s idle \
              window, held there while {unacked} input(s) awaited the app's ack: released the \
              app ({what}); the next tool call reconnects"
         ),
+    }
+}
+
+/// What held a release that came because the app closed the connection with
+/// the idle window already closed, and what the log says ended it.
+///
+/// With the window closed, an input still awaiting its ack is what the
+/// connection was being held for, and the log says the app's leaving ended
+/// that hold rather than calling it a plain release. With none, nothing held
+/// it: the app left at about the moment the window closed.
+fn app_closed_release(unacked: usize) -> (Hold, &'static str) {
+    if unacked > 0 {
+        (
+            Hold::AppClosed { unacked },
+            "the app closed the connection during the ack hold; not reconnecting",
+        )
+    } else {
+        (
+            Hold::None,
+            "the app closed the connection; not reconnecting",
+        )
     }
 }
 
@@ -1172,12 +1205,18 @@ fn forget_oversized_if_nothing_listens(
     err: &io::Error,
     rejected_tx: &watch::Sender<Option<String>>,
 ) {
-    if matches!(
-        err.kind(),
-        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-    ) {
+    if nothing_listens(err) {
         forget_oversized(rejected_tx);
     }
+}
+
+/// True when a failed `connect` means nothing is listening at the path: the
+/// app has gone. See [`forget_oversized_if_nothing_listens`].
+fn nothing_listens(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
 }
 
 /// Retire every reason but [`OVERSIZED_LINE`], the counterpart of
@@ -1539,9 +1578,10 @@ fn handle_app_line(
             }
             // A snapshot that fits retires the oversized-line reason, and only
             // that one: a tree the bridge can read has replaced the one it
-            // could not. Any other reason stays, as it always has. Cleared
-            // before the state is promoted, so a tool call that sees this tree
-            // can never pair the next disconnect with the old size.
+            // could not. Any other reason stays until the next connection
+            // opens (see `forget_rejected_except_oversized`). Cleared before
+            // the state is promoted, so a tool call that sees this tree can
+            // never pair the next disconnect with the old size.
             forget_oversized(rejected_tx);
             // The line is kept beside the parsed form, not instead of it: the
             // agent reads the line and the bridge reasons about the parse.
@@ -2259,7 +2299,16 @@ mod tests {
             let mut reader = BufReader::new(app_end);
             assert_eq!(next_input_id(&mut reader).await, 11);
             tokio::time::sleep_until(t0 + leaves_after).await;
-            // Gone with the input unacked, five seconds into the hold.
+            // Gone with the input unacked, five seconds into the hold. Shut
+            // down before the drop: a child process another test spawns holds
+            // a copy of every open descriptor between its fork and its exec,
+            // and while it does, closing this one sends no EOF, and the paused
+            // clock jumps to the end of the hold before the bridge sees one.
+            reader
+                .get_mut()
+                .shutdown()
+                .await
+                .expect("shut the app's end down");
             drop(reader);
             // Until the bridge has seen the end: the next timer is the end
             // of the hold, and the clock must not jump there first.
@@ -2280,6 +2329,37 @@ mod tests {
             "{:?}",
             wall.elapsed()
         );
+    }
+
+    /// An app that closes the connection once the window has closed is let
+    /// go of rather than reconnected to, and the log says what that ended:
+    /// the hold, with the inputs it was for, or nothing at all when none was
+    /// awaiting its ack, which is a plain release that the app's leaving
+    /// timed.
+    #[test]
+    fn an_app_leaving_past_the_window_is_logged_by_what_it_held() {
+        let window = Duration::from_secs(60);
+        let idle = Duration::from_millis(75_500);
+        for (unacked, hold, line) in [
+            (
+                0,
+                Hold::None,
+                "no tool call for 75.5 s: released the app (the app closed the connection; not \
+                 reconnecting); the next tool call reconnects",
+            ),
+            (
+                2,
+                Hold::AppClosed { unacked: 2 },
+                "no tool call for 75.5 s, 15.5 s past the 60 s idle window, held there while 2 \
+                 input(s) awaited the app's ack: released the app (the app closed the \
+                 connection during the ack hold; not reconnecting); the next tool call \
+                 reconnects",
+            ),
+        ] {
+            let (chosen, what) = app_closed_release(unacked);
+            assert_eq!(chosen, hold, "{unacked} unacked");
+            assert_eq!(release_line(idle, window, chosen, what), line);
+        }
     }
 
     /// The set of unacked inputs is bounded, forgetting the oldest, so an app

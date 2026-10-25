@@ -15,7 +15,7 @@ Options:
 
 | Flag | Effect |
 |---|---|
-| `--tree-format <json\|outline>` | How `read_tree`, and every input tool that answers with a tree, show the tree to the agent. `json`, the default, relays the app's own snapshot line minus its `type` framing key. `outline` renders that same line as one indented line per node (see [The outline](#the-outline)). The wire format is the same either way. A missing or unknown value is a usage error. |
+| `--tree-format <json\|outline>` | How `read_tree`, and every input tool that answers with a tree, show the tree to the agent. `json`, the default, passes on the app's own snapshot line minus its `type` framing key. `outline` renders that same line as one indented line per node (see [The outline](#the-outline)). The wire format is the same either way. A missing or unknown value is a usage error. |
 | `--idle-release <SECS>` | How long, in whole seconds from 0 to 86400 (a day), the bridge keeps the app with no tool calls before it lets go. The default is 60, and `0` never lets go. Once that long has passed, the bridge closes its connection, or leaves the listen backlog (the kernel's queue of connections the app has not accepted yet) if it was waiting behind another bridge, and stops reconnecting until the next tool call. It does not let go while an input it sent is still waiting for the app's ack, for up to 30 s past the window. A missing value, one that is not plain digits (`+5`, `5s` and `1e3` are refused; leading zeros are fine), or one past 86400 is a usage error. |
 
 The bridge opens no connection to the app until its first tool call, whatever
@@ -28,9 +28,15 @@ in. It names its own `--idle-release` as the holder's, which is right for a
 holder started the same way: "retry in a minute" on the default, "retry in N
 s" for a window of N, and for `0` that such a holder keeps the app until its
 session ends. A bridge that let go of the app itself, and came back to find it
-taken, adds that its own disconnect was that release and not a fault. On
-Linux, an app stopped by a signal or a debugger is named as stopped, with its
-pid, rather than as held.
+taken, adds that its own disconnect was that release and not a fault, and
+that it let go after its window or more, since an input awaiting its ack holds
+the app up to 30 s past it. On Linux, an app stopped by a signal or a debugger
+is named as stopped, with its pid, rather than as held, and with how to resume
+it: from the debugger, with `kill -CONT`, or, for a TUI suspended as a job in
+its terminal (where `kill -CONT` only stops it again), with the user's `fg`
+there. An input sent to an app that stops while the bridge is driving it gets
+the same diagnosis in place of "neither acknowledged", and is read once the
+app resumes.
 
 Environment variables:
 
