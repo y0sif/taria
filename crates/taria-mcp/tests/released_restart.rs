@@ -6,13 +6,14 @@
 //! from another by the pid the kernel names for the process listening at the
 //! socket, and every listener a test opens in its own process has the test's
 //! pid. Each is this test binary run again with [`APP_PROCESS_ENV`] set, which
-//! turns [`fake_app_process`] from a test that does nothing into the app.
+//! turns [`fake_app_process`], an ignored test that otherwise does nothing,
+//! into the app.
 //! Linux only: the kernel names the listener's pid there (`SO_PEERCRED`).
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
 use taria::wire::AppToBridge;
@@ -35,14 +36,23 @@ const CLOSED: &str = "fake app: connection closed";
 
 /// Not a test of its own: run by [`AppProcess::start`] with
 /// [`APP_PROCESS_ENV`] set, it is an app that serves one bridge at a time, the
-/// way the adapter does, until it is killed. Each bridge gets `hello` and one
-/// snapshot whose root names this process's pid, and is held until it closes
-/// the connection. Without the variable it returns at once.
+/// way the adapter does, until it is killed or its parent goes away. Each
+/// bridge gets `hello` and one snapshot whose root names this process's pid,
+/// and is held until it closes the connection. Without the variable it
+/// returns at once.
 #[test]
+#[ignore = "helper: the restart test runs it as a child process"]
 fn fake_app_process() {
     let Some(path) = std::env::var_os(APP_PROCESS_ENV) else {
         return;
     };
+    // The parent holds this process's stdin open and never writes to it, so
+    // end of file means the parent is gone, even SIGKILLed, with no drop to
+    // kill this one; without this it would wait for a bridge forever.
+    std::thread::spawn(|| {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        std::process::exit(0);
+    });
     let path = PathBuf::from(path);
     // A killed predecessor leaves its socket file behind.
     let _ = std::fs::remove_file(&path);
@@ -68,6 +78,9 @@ fn fake_app_process() {
 struct AppProcess {
     child: Child,
     pid: u32,
+    /// The write end of the process's stdin, its lifeline: the process exits
+    /// once this closes, which the kernel does when this process dies.
+    _lifeline: ChildStdin,
     /// The lines the process prints, read on a thread of their own so a
     /// wait for one never blocks the runtime the bridges run on.
     lines: mpsc::UnboundedReceiver<String>,
@@ -80,14 +93,17 @@ impl AppProcess {
             .args([
                 "--exact",
                 "fake_app_process",
+                "--ignored",
                 "--nocapture",
                 "--test-threads=1",
             ])
             .env(APP_PROCESS_ENV, path)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("start the app process");
+        let lifeline = child.stdin.take().expect("the app's stdin is piped");
         let stdout = child.stdout.take().expect("the app's stdout is piped");
         let (tx, lines) = mpsc::unbounded_channel();
         std::thread::spawn(move || {
@@ -99,7 +115,12 @@ impl AppProcess {
             }
         });
         let pid = child.id();
-        let mut app = Self { child, pid, lines };
+        let mut app = Self {
+            child,
+            pid,
+            _lifeline: lifeline,
+            lines,
+        };
         app.wait_for(LISTENING).await;
         app
     }

@@ -1214,8 +1214,8 @@ impl Stopped {
     /// [`UNACKED_HOLD`] past the idle window, and an input a stopped app has
     /// not read awaits its ack, so the deadline is the window and the hold
     /// together, from the agent's last tool call. A bridge that never lets
-    /// go (a zero window, or one handed in already spawned) has none. Past
-    /// it the agent is sent to check, not told the input landed.
+    /// go (a zero window) has none, and neither does an unset one. Past it
+    /// the agent is sent to check, not told the input landed.
     fn has_not_read(self, sent: usize, idle_release: Option<Duration>) -> String {
         let pid = self.pid;
         let (what, resume) = match self.stop {
@@ -1433,7 +1433,11 @@ struct Observed {
     stopped: Option<Stopped>,
     /// This bridge's idle window, filled in with [`stopped`](Self::stopped):
     /// how long an input a stopped app has not read can still be applied.
-    /// `None` for a bridge that never lets go.
+    /// `Some(ZERO)` for an on-demand bridge that never lets go once connected
+    /// (`--idle-release 0`). `None` when not filled in, and for a bridge
+    /// handed in already spawned, which records no peer pid and so never has
+    /// a stop to go with it; [`Stopped::has_not_read`] reads `None` as no
+    /// deadline, like `Some(ZERO)`.
     window: Option<Duration>,
 }
 
@@ -2822,7 +2826,9 @@ mod tests {
                      never lets go of the app. Resume it (kill -CONT 4242), then call read_tree, \
                      and resend the input if its effect is missing.";
         assert_eq!(stopped.has_not_read(1, Some(Duration::ZERO)), never);
-        assert_eq!(stopped.has_not_read(1, None), never, "an eager bridge");
+        // No window filled in reads the same; an eager bridge records no pid,
+        // so it never gets here.
+        assert_eq!(stopped.has_not_read(1, None), never, "an unset window");
         assert_eq!(
             stopped.has_not_read(2, None),
             "The app (pid 4242) is stopped, so it has not read these 2 inputs yet; the inputs \
