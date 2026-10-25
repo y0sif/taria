@@ -1650,15 +1650,20 @@ STOPPED_RE = re.compile(
 SUSPENDED_RE = re.compile(
     r"^no snapshot from the app yet: the app \(pid (?P<pid>\d+)\) is suspended in its "
     r"terminal, so it cannot answer; ask the user to run fg in that terminal "
-    r"\(kill -CONT only stops it again\), then retry\." + STOPPED_EVIDENCE
+    r"\(kill -CONT resumes it only in the background, where its next use of the terminal "
+    r"stops it again\), then retry\." + STOPPED_EVIDENCE
 )
 # And what an input tool says when the app it was talking to stops: nothing
-# acked and nothing changed, because nothing has read the input yet.
+# acked and nothing changed, because nothing has read the input yet. The
+# bridge runs on the default window, so the input is applied only if the app
+# resumes within 90 s of the last tool call: 60 s, then the 30 s an input
+# awaiting its ack holds the app.
 STOPPED_INPUT_RE = re.compile(
-    r"^The app \(pid (?P<pid>\d+)\) is stopped, so it has not read this input yet; the "
-    r"input waits in the socket, and the app reads it once resumed\. Resume it "
-    r"\(kill -CONT (?P=pid)\), then call read_tree, and resend the input if its effect "
-    r"is missing\.$"
+    r"^The app \(pid (?P<pid>\d+)\) is stopped, so it has not read this input yet\. It "
+    r"applies the input if it resumes within 90 s of your last tool call, before this "
+    r"bridge lets go of the app \(60 s with no tool calls, then 30 s more while an input "
+    r"awaits its ack\)\. Resume it \(kill -CONT (?P=pid)\), then call read_tree, and "
+    r"resend the input if its effect is missing\.$"
 )
 
 # A stand-in app: binds and listens at the path given it and prints its pid.
@@ -1781,14 +1786,15 @@ def probe_stopped_app(client, ctx):
     makes. The bridge reads the listener's pid from the connection's peer
     credentials and its state from /proc, and a stopped one is named with its
     pid and the way to resume it: `kill -CONT` for a plain stop, and the
-    user's `fg` for a job suspended in its terminal, where SIGCONT alone only
-    stops it again. Once it is resumed and still accepts nothing, the same
+    user's `fg` for a job suspended in its terminal, which SIGCONT alone
+    resumes only in the background, where its next use of the terminal stops
+    it again. Once it is resumed and still accepts nothing, the same
     connection reads as held again.
 
     An app that stops while a bridge is driving it answers no input, and that
     silence is named too, after the input tool's wait: the input has not been
-    read, and is read once the app resumes, which the stand-in shows by
-    printing it.
+    read, and is read if the app resumes before the bridge lets go of it,
+    which the stand-in shows by printing it.
 
     The stand-ins are separate processes, since stopping this script would
     stop the probe. Only their pids are ever signalled, and they are killed

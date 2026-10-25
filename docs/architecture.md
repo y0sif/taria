@@ -293,10 +293,11 @@ time. The parse stays authoritative for what the bridge decides, because it
 is typed: `act` validates node ids and advertised actions against it, and
 change detection compares parses rather than text. A line is passed on only
 after it parsed, so a malformed one is still skipped.
-`taria-mcp --tree-format outline` hands the agent an indented outline instead of the line, and renders it from
-the line for the same reason, so the outline keeps every role, action and
-field name the JSON would have shown. It drops only the extra keys inside an
-action object, since `act` takes the action's name alone.
+`taria-mcp --tree-format outline` hands the agent an indented outline instead
+of the line, and renders it from the line for the same reason, so the outline
+keeps every role, action and field name the JSON would have shown. It drops
+only the extra keys inside an action object, since `act` takes the action's
+name alone.
 
 Additive on the wire is not automatically additive in Rust. A peer skips a
 message variant it cannot parse, but a peer rebuilt against the version that
@@ -398,7 +399,7 @@ all.
 | `delivered`, tree changed | The new tree. |
 | `delivered`, tree unchanged | Text: received, no change within 500 ms. |
 | No ack, tree changed | The new tree. |
-| No ack, no change | Text: neither acknowledged nor changed; it may be an adapter that sends no acks. If a line was rejected inside the window, that line is quoted instead, because it may have been this input's ack. On Linux, if the app is stopped, the text says so instead, with its pid: the input waits in the socket and is read once the app resumes, so the agent is told how to resume it (as for a stopped app below), then to call `read_tree` and resend the input if its effect is missing, because a bridge that lets go first leaves the adapter to discard it. |
+| No ack, no change | Text: neither acknowledged nor changed; it may be an adapter that sends no acks. If a line was rejected inside the window, that line is quoted instead, because it may have been this input's ack. Otherwise, on Linux, if the app is stopped, the text says so instead, with its pid. The input waits in the socket, and the app applies it only if it resumes while the bridge still holds the connection: the window plus 30 s from the last tool call, since the input awaits its ack, and for good with `--idle-release 0`. A bridge that lets go first leaves the adapter to discard it. So the agent is told that deadline and how to resume the app (as for a stopped app below), then to call `read_tree` and resend the input if its effect is missing. A burst is spoken of as one: "these 3 inputs". |
 
 The order matters. The two send failures come first: an input that never left
 the bridge has no ack to wait for, and a burst cut short still waits out the
@@ -584,31 +585,35 @@ Bridge side (`taria-mcp`):
      phrase: the disconnect was on purpose, so another session could use the
      app, and is not a fault. Agents read the bare "disconnected" as one,
      and went after it with `ss`, `ps` and `pgrep`. It names its window once,
-     as a floor ("after 60 s or more with no tool calls"), because an input
-     awaiting its ack holds the app up to 30 s past it, and says when to
-     retry without naming the window again.
-     The bridge records that its last departure was a release beside the
-     record itself, and clears it once a connection serves a tree, the app
-     closes one, or a connect finds nothing listening (the app has gone
-     since), so it cannot outlive the departure it describes.
+     then the hold past it ("after 60 s with no tool calls, or up to 30 s
+     later while an input awaited its ack"), and says when to retry. The
+     bridge records that its last departure was a release beside the record
+     itself, with the pid of the app it let go of (`SO_PEERCRED`, below),
+     and clears it once a connection serves a tree, the app closes one, or a
+     connect finds nothing listening, or a pid listening other than that one
+     (the app has gone since), so it cannot outlive the departure it
+     describes. A pid the kernel did not name, on either side, is no change.
    - On Linux, with the same silence, the bridge first reads the state of the
-     process at the other end, the listener named by the connection's peer
-     credentials, from `/proc/<pid>/stat`. A stopped app (`SIGSTOP`, a
-     shell's Ctrl-Z, a debugger) keeps its socket listening and accepts
-     nothing, which is exactly a held app's silence, and waiting for a
-     release does not help it. Such an app is named with its pid and how to
-     resume it, which the same `stat` line decides. A process with a
-     controlling terminal, stopped outside that terminal's foreground process
-     group, is a job suspended in its shell, and only `fg` there resumes it:
-     a ratatui app turns Ctrl-Z off with raw mode, so one that suspends
-     raises `SIGTSTP` itself, and `kill -CONT` resumes it in the background,
-     where it is stopped again at once as it takes the terminal back. The
-     agent cannot run `fg`, so it is told to ask the user to. Any other stop
-     gets `kill -CONT` with the pid, and a debugger's stop (`t`) is sent to
-     the debugger. Any failure to read the state leaves the held answer, and
-     other platforms always get it. Only a bridge started on demand records
-     the pid; one handed to `TariaMcpServer::new` gets the held answer, as in
-     0.3.2.
+     process at the other end from `/proc/<pid>/stat`. The pid comes from
+     `SO_PEERCRED`, the pid the kernel records for the other end of a Unix
+     socket, which for a connection still in the backlog is the listener's. A
+     stopped app (`SIGSTOP`, a shell's Ctrl-Z, a debugger) keeps its socket
+     listening and accepts nothing, which is exactly a held app's silence, and
+     waiting for a release does not help it. Such an app is named with its pid
+     and how to resume it, which the same `stat` line decides. A process with
+     a controlling terminal, stopped outside that terminal's foreground
+     process group, is a job suspended in its shell, and only `fg` there
+     resumes it: a ratatui app turns Ctrl-Z off with raw mode, so one that
+     suspends raises `SIGTSTP` itself. `kill -CONT` resumes it only in the
+     background, where it runs, drawing over the shell, until its next use of
+     the terminal stops it again, and one that suspended itself makes that use
+     at once, taking the terminal back into raw mode. The agent cannot run
+     `fg`, so it is told to ask the user to. Any other stop gets `kill -CONT`
+     with the pid, and a tracing stop (state `t` in `/proc/<pid>/stat`) is
+     sent to the debugger. Any failure to read the state leaves the held
+     answer, and other platforms always get it. Only a bridge started on
+     demand records the pid; one handed to `TariaMcpServer::new` gets the held
+     answer, as in 0.3.2.
    - With no connection open, between two connects or because nothing is
      listening, the error says "it may have exited", in the words 0.3.1 used.
      This is the one state in which the bridge cannot tell an app that is

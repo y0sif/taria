@@ -58,9 +58,9 @@ Options:
                               snapshot as one indented line per node, in
                               fewer characters. It names each action as act
                               takes it, without other keys in its object.
-  --idle-release <SECS>       Let go of the app after SECS seconds with no
-                              tool call (default 60, 0 never lets go),
-                              from 0 to 86400.
+  --idle-release <SECS>       Let go of the app after SECS seconds
+                              (0 to 86400) with no tool call
+                              (default 60, 0 never lets go).
 
 Environment:
   TARIA_LOG    Log filter (tracing env-filter syntax), default `info`.

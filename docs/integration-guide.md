@@ -369,8 +369,10 @@ fn transcript(app: &App) -> Node {
 }
 ```
 
-which an agent reads in the outline as these lines, shown without the root
-line:
+which an agent reads in the outline as the lines below. Left out are the
+outline's header line (`protocol_version=1 seq=N`) and the line of the app's
+root node. The transcript is taken to be a child of that root, so each line
+here sits one level (two spaces) left of where the agent sees it:
 
 ```text
 transcript log "Transcript"

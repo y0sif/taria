@@ -388,6 +388,7 @@ impl TariaMcpServer {
         // inside the window is the app running.
         if seen.status.is_none() && seen.changed.is_none() && seen.rejected.is_none() {
             seen.stopped = stopped_peer(self.demand.as_ref().and_then(Demand::peer_pid));
+            seen.window = self.idle_release;
         }
         if cut_short {
             return Err(partial_send_error(&seen, ids.len(), wanted));
@@ -1077,10 +1078,10 @@ fn held_by_another_bridge(open_for: Duration, idle_release: Option<Duration>) ->
 /// silent connection and the peer that might not be an adapter are left out:
 /// this bridge had the app before it let go, so the peer is known to be one.
 ///
-/// The window is said once, as a floor: an input awaiting its ack holds the
-/// app past it, so the release came at the window or up to [`UNACKED_HOLD`]
-/// after it. The retry that follows guesses the holder was started like this
-/// bridge, as [`retry_guidance`] does, without naming the window again.
+/// The window is said once: an input awaiting its ack holds the app past
+/// it, so the release came at the window or up to [`UNACKED_HOLD`] after it.
+/// The retry that follows guesses the holder was started like this bridge,
+/// as [`retry_guidance`] does.
 fn held_after_release(idle_release: Option<Duration>) -> String {
     let window = idle_release.unwrap_or(DEFAULT_IDLE_RELEASE);
     let retry = if window == DEFAULT_IDLE_RELEASE {
@@ -1089,9 +1090,9 @@ fn held_after_release(idle_release: Option<Duration>) -> String {
         format!("{} s", seconds(window))
     };
     format!(
-        "That disconnect was this bridge letting go on purpose after {} s or more with no tool \
-         calls (up to {} s more while an input awaited its ack), so another session could use the \
-         app; it is not a fault. A holder started like this bridge lets go the same way, and this \
+        "That disconnect was this bridge letting go on purpose after {} s with no tool calls, or \
+         up to {} s later while an input awaited its ack, so another session could use the app; \
+         it is not a fault. A holder started like this bridge lets go the same way, and this \
          bridge takes over as soon as it does, with no restart; retry in {retry}. {STAYS_HELD}",
         seconds(window),
         seconds(UNACKED_HOLD)
@@ -1163,9 +1164,11 @@ enum Stop {
     /// Stopped in the background of its terminal: a suspended job, which only
     /// the shell's `fg` resumes. A ratatui app turns Ctrl-Z off with raw mode,
     /// so one that suspends raises `SIGTSTP` itself, and the shell keeps it as
-    /// a stopped job. `SIGCONT` resumes it in the background, where it is
-    /// stopped again at once (`SIGTTOU`) as it takes the terminal back into
-    /// raw mode. The agent cannot run `fg`; the user can.
+    /// a stopped job. `SIGCONT` resumes it in the background, where it runs,
+    /// drawing over the shell, until its next read of the terminal or change
+    /// to its modes stops it again (`SIGTTIN`, `SIGTTOU`); one that suspended
+    /// itself makes that change at once, taking the terminal back into raw
+    /// mode. The agent cannot run `fg`; the user can.
     Job,
     /// A tracing stop: `SIGCONT` does not end it, the debugger does.
     Debugger,
@@ -1191,7 +1194,7 @@ impl Stopped {
             ),
             Stop::Job => format!(
                 "the app (pid {pid}) is suspended in its terminal, so it cannot answer; ask the \
-                 user to run fg in that terminal (kill -CONT only stops it again), then retry."
+                 user to run fg in that terminal ({CONT_IN_BACKGROUND}), then retry."
             ),
             Stop::Debugger => format!(
                 "the app (pid {pid}) is stopped in a debugger, so it cannot answer; resume it \
@@ -1200,37 +1203,74 @@ impl Stopped {
         }
     }
 
-    /// The whole answer to an input the app neither acknowledged nor changed
-    /// its tree for, because it is stopped.
+    /// The whole answer to a burst of `sent` inputs the app neither
+    /// acknowledged nor changed its tree for, because it is stopped.
     ///
     /// The input is not lost yet. The bridge wrote it to the socket, where it
     /// waits in the app's receive buffer, and the adapter reads it on
-    /// resuming, but only while this bridge still has the connection: an
-    /// input awaiting its ack holds the app [`UNACKED_HOLD`] past the idle
-    /// window, and once the bridge lets go anyway, the adapter discards what
-    /// arrived on the connection that ended. So the agent is sent to check,
-    /// not told the input landed.
-    fn has_not_read(self) -> String {
+    /// resuming, but only while this bridge still has the connection: once
+    /// the bridge lets go, the adapter discards what arrived on the
+    /// connection that ended. An input awaiting its ack holds the app
+    /// [`UNACKED_HOLD`] past the idle window, and an input a stopped app has
+    /// not read awaits its ack, so the deadline is the window and the hold
+    /// together, from the agent's last tool call. A bridge that never lets
+    /// go (a zero window, or one handed in already spawned) has none. Past
+    /// it the agent is sent to check, not told the input landed.
+    fn has_not_read(self, sent: usize, idle_release: Option<Duration>) -> String {
         let pid = self.pid;
         let (what, resume) = match self.stop {
             Stop::Signal => ("is stopped", format!("Resume it (kill -CONT {pid})")),
             Stop::Job => (
                 "is suspended in its terminal",
-                "Ask the user to run fg in that terminal (kill -CONT only stops it again)"
-                    .to_string(),
+                format!("Ask the user to run fg in that terminal ({CONT_IN_BACKGROUND})"),
             ),
             Stop::Debugger => (
                 "is stopped in a debugger",
                 "Resume it from the debugger".to_string(),
             ),
         };
+        let (these, the_inputs, wait, them, effect) = if sent > 1 {
+            (
+                format!("these {sent} inputs"),
+                "the inputs",
+                "wait",
+                "them",
+                "their effect is",
+            )
+        } else {
+            (
+                "this input".to_string(),
+                "the input",
+                "waits",
+                "it",
+                "its effect is",
+            )
+        };
+        let fate = match idle_release {
+            Some(window) if !window.is_zero() => format!(
+                ". It applies {the_inputs} if it resumes within {} s of your last tool call, \
+                 before this bridge lets go of the app ({} s with no tool calls, then {} s more \
+                 while an input awaits its ack)",
+                seconds(window.saturating_add(UNACKED_HOLD)),
+                seconds(window),
+                seconds(UNACKED_HOLD)
+            ),
+            _ => format!(
+                "; {the_inputs} {wait} in the socket, and the app applies {them} once resumed, \
+                 since this bridge never lets go of the app"
+            ),
+        };
         format!(
-            "The app (pid {pid}) {what}, so it has not read this input yet; the input waits in \
-             the socket, and the app reads it once resumed. {resume}, then call read_tree, and \
-             resend the input if its effect is missing."
+            "The app (pid {pid}) {what}, so it has not read {these} yet{fate}. {resume}, then \
+             call read_tree, and resend {the_inputs} if {effect} missing."
         )
     }
 }
+
+/// How `kill -CONT` fails a suspended job, said wherever the answer sends
+/// the agent to the user's `fg` instead. See [`Stop::Job`].
+const CONT_IN_BACKGROUND: &str = "kill -CONT resumes it only in the background, where its next \
+use of the terminal stops it again";
 
 /// The peer `pid`, if it is a stopped process, or `None` when it is not
 /// stopped or this cannot tell.
@@ -1262,8 +1302,8 @@ fn stopped_peer(_pid: Option<i32>) -> Option<Stopped> {
 /// After the last `)` (see [`stat_state`]) come the state (field 3 of the
 /// line), the parent's pid, the process group (5), the session, the
 /// controlling terminal (7, 0 for none) and the terminal's foreground
-/// process group (8). A stopped process with a terminal, outside that
-/// terminal's foreground group, is a suspended job.
+/// process group (8, `tpgid`). A stopped process with a terminal, outside
+/// that terminal's foreground group, is a suspended job.
 #[cfg(target_os = "linux")]
 fn stop_of(stat: &str) -> Option<Stop> {
     match stat_state(stat)? {
@@ -1391,6 +1431,10 @@ struct Observed {
     /// yet, and the agent waits or resends for an app that cannot read
     /// anything until someone resumes it.
     stopped: Option<Stopped>,
+    /// This bridge's idle window, filled in with [`stopped`](Self::stopped):
+    /// how long an input a stopped app has not read can still be applied.
+    /// `None` for a bridge that never lets go.
+    window: Option<Duration>,
 }
 
 /// Watch the app's acks and snapshots for up to [`UPDATE_WAIT`], and report
@@ -1705,7 +1749,7 @@ fn report(
             // app whose reason this bridge can name. Only on Linux, and only
             // for an on-demand bridge, which records the peer's pid.
             None => match seen.stopped {
-                Some(stopped) => stopped.has_not_read(),
+                Some(stopped) => stopped.has_not_read(sent, seen.window),
                 None => format!(
                     "The app neither acknowledged this input nor changed its tree within {}ms. \
                      It may not report acknowledgements, or it may not have reacted yet; call \
@@ -2514,14 +2558,14 @@ mod tests {
             .expect_err("a held app serves this bridge no tree")
             .message
         };
-        // The window is said once, as the floor it is: an input awaiting its
-        // ack holds the app past it.
+        // The window is said once, then the hold past it: an input awaiting
+        // its ack holds the app longer.
         assert_eq!(
             after_release(DEFAULT_IDLE_RELEASE),
             "app 'demo' disconnected (last snapshot seq 7), and the app is now held by another \
-             bridge. That disconnect was this bridge letting go on purpose after 60 s or more with \
-             no tool calls (up to 30 s more while an input awaited its ack), so another session \
-             could use the app; it is not a fault. A holder started like this bridge lets go the \
+             bridge. That disconnect was this bridge letting go on purpose after 60 s with no tool \
+             calls, or up to 30 s later while an input awaited its ack, so another session could \
+             use the app; it is not a fault. A holder started like this bridge lets go the \
              same way, and this bridge takes over as soon as it does, with no restart; retry in a \
              minute. If the app stays held, another session is using it, or the holder is a \
              taria-mcp older than 0.3.2, which holds the app until its session ends."
@@ -2529,9 +2573,9 @@ mod tests {
         assert_eq!(
             after_release(Duration::from_secs(30)),
             "app 'demo' disconnected (last snapshot seq 7), and the app is now held by another \
-             bridge. That disconnect was this bridge letting go on purpose after 30 s or more with \
-             no tool calls (up to 30 s more while an input awaited its ack), so another session \
-             could use the app; it is not a fault. A holder started like this bridge lets go the \
+             bridge. That disconnect was this bridge letting go on purpose after 30 s with no tool \
+             calls, or up to 30 s later while an input awaited its ack, so another session could \
+             use the app; it is not a fault. A holder started like this bridge lets go the \
              same way, and this bridge takes over as soon as it does, with no restart; retry in 30 \
              s. If the app stays held, another session is using it, or the holder is a taria-mcp \
              older than 0.3.2, which holds the app until its session ends."
@@ -2706,7 +2750,8 @@ mod tests {
         assert_eq!(
             stopped(Stop::Job).cannot_answer(),
             "the app (pid 4242) is suspended in its terminal, so it cannot answer; ask the user to \
-             run fg in that terminal (kill -CONT only stops it again), then retry."
+             run fg in that terminal (kill -CONT resumes it only in the background, where its next \
+             use of the terminal stops it again), then retry."
         );
         assert_eq!(
             stopped(Stop::Debugger).cannot_answer(),
@@ -2718,24 +2763,79 @@ mod tests {
             "The socket path is right: this bridge's connection has waited 4.0s in the app's \
              listen queue with no handshake, because a stopped app accepts nothing."
         );
+        let default = Some(DEFAULT_IDLE_RELEASE);
         assert_eq!(
-            stopped(Stop::Signal).has_not_read(),
-            "The app (pid 4242) is stopped, so it has not read this input yet; the input waits in \
-             the socket, and the app reads it once resumed. Resume it (kill -CONT 4242), then \
-             call read_tree, and resend the input if its effect is missing."
+            stopped(Stop::Signal).has_not_read(1, default),
+            "The app (pid 4242) is stopped, so it has not read this input yet. It applies the \
+             input if it resumes within 90 s of your last tool call, before this bridge lets go of \
+             the app (60 s with no tool calls, then 30 s more while an input awaits its ack). \
+             Resume it (kill -CONT 4242), then call read_tree, and resend the input if its effect \
+             is missing."
         );
         assert_eq!(
-            stopped(Stop::Job).has_not_read(),
-            "The app (pid 4242) is suspended in its terminal, so it has not read this input yet; \
-             the input waits in the socket, and the app reads it once resumed. Ask the user to \
-             run fg in that terminal (kill -CONT only stops it again), then call read_tree, and \
-             resend the input if its effect is missing."
+            stopped(Stop::Job).has_not_read(1, default),
+            "The app (pid 4242) is suspended in its terminal, so it has not read this input yet. \
+             It applies the input if it resumes within 90 s of your last tool call, before this \
+             bridge lets go of the app (60 s with no tool calls, then 30 s more while an input \
+             awaits its ack). Ask the user to run fg in that terminal (kill -CONT resumes it only \
+             in the background, where its next use of the terminal stops it again), then call \
+             read_tree, and resend the input if its effect is missing."
         );
         assert_eq!(
-            stopped(Stop::Debugger).has_not_read(),
-            "The app (pid 4242) is stopped in a debugger, so it has not read this input yet; the \
-             input waits in the socket, and the app reads it once resumed. Resume it from the \
-             debugger, then call read_tree, and resend the input if its effect is missing."
+            stopped(Stop::Debugger).has_not_read(1, default),
+            "The app (pid 4242) is stopped in a debugger, so it has not read this input yet. It \
+             applies the input if it resumes within 90 s of your last tool call, before this \
+             bridge lets go of the app (60 s with no tool calls, then 30 s more while an input \
+             awaits its ack). Resume it from the debugger, then call read_tree, and resend the \
+             input if its effect is missing."
+        );
+    }
+
+    /// The input a stopped app has not read is applied only while this
+    /// bridge keeps the connection, so the answer names the bridge's own
+    /// deadline, and none for a bridge that never lets go; a burst is spoken
+    /// of as one.
+    #[test]
+    fn an_unread_input_is_promised_only_as_long_as_the_bridge_holds_the_app() {
+        let stopped = Stopped {
+            pid: 4242,
+            stop: Stop::Signal,
+        };
+        assert_eq!(
+            stopped.has_not_read(3, Some(Duration::from_secs(2))),
+            "The app (pid 4242) is stopped, so it has not read these 3 inputs yet. It applies the \
+             inputs if it resumes within 32 s of your last tool call, before this bridge lets go \
+             of the app (2 s with no tool calls, then 30 s more while an input awaits its ack). \
+             Resume it (kill -CONT 4242), then call read_tree, and resend the inputs if their \
+             effect is missing."
+        );
+        assert_eq!(
+            stopped.has_not_read(1, Some(Duration::from_millis(300))),
+            "The app (pid 4242) is stopped, so it has not read this input yet. It applies the \
+             input if it resumes within 30.3 s of your last tool call, before this bridge lets go \
+             of the app (0.3 s with no tool calls, then 30 s more while an input awaits its ack). \
+             Resume it (kill -CONT 4242), then call read_tree, and resend the input if its effect \
+             is missing."
+        );
+        let never = "The app (pid 4242) is stopped, so it has not read this input yet; the input \
+                     waits in the socket, and the app applies it once resumed, since this bridge \
+                     never lets go of the app. Resume it (kill -CONT 4242), then call read_tree, \
+                     and resend the input if its effect is missing.";
+        assert_eq!(stopped.has_not_read(1, Some(Duration::ZERO)), never);
+        assert_eq!(stopped.has_not_read(1, None), never, "an eager bridge");
+        assert_eq!(
+            stopped.has_not_read(2, None),
+            "The app (pid 4242) is stopped, so it has not read these 2 inputs yet; the inputs \
+             wait in the socket, and the app applies them once resumed, since this bridge never \
+             lets go of the app. Resume it (kill -CONT 4242), then call read_tree, and resend the \
+             inputs if their effect is missing."
+        );
+        // A library caller's window can be anything; the deadline saturates
+        // rather than overflowing.
+        assert!(
+            stopped
+                .has_not_read(1, Some(Duration::MAX))
+                .contains("of your last tool call"),
         );
     }
 
@@ -2757,7 +2857,21 @@ mod tests {
             stopped: Some(stopped),
             ..Observed::default()
         };
-        assert_eq!(text(silent()), stopped.has_not_read());
+        assert_eq!(text(silent()), stopped.has_not_read(1, None));
+        let burst = report(
+            Observed {
+                window: Some(DEFAULT_IDLE_RELEASE),
+                ..silent()
+            },
+            snapshot("after"),
+            3,
+            TreeFormat::Json,
+        )
+        .expect("a result");
+        assert_eq!(
+            result_text(&burst),
+            stopped.has_not_read(3, Some(DEFAULT_IDLE_RELEASE))
+        );
         assert!(
             text(Observed::default()).starts_with(
                 "The app neither acknowledged this input nor changed its tree within 500ms. It may \
@@ -2968,6 +3082,7 @@ mod tests {
             gone: None,
             rejected: None,
             stopped: None,
+            window: None,
         };
         let err = report(seen, snapshot("after"), 5, TreeFormat::Json)
             .expect_err("lost acks are not a success");
@@ -2991,6 +3106,7 @@ mod tests {
             gone: None,
             rejected: None,
             stopped: None,
+            window: None,
         };
         let err = report(seen, snapshot("after"), 1, TreeFormat::Json)
             .expect_err("lost acks are not a success");

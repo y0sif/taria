@@ -43,10 +43,10 @@ refuses a `target/debug` older than the sources.
   additive in Rust too. `MAX_NODE_DEPTH` is 32, against a measured ceiling of
   63 nested nodes before a JSON parser refuses; `Node::check_depth` reports a
   violation and names a node at the offending depth. Anything else bumps
-  `PROTOCOL_VERSION`. The one field added since 0.2.0 is `relayed` (0.3.3,
-  issue #6): a node marks its label and value as text from outside the app,
-  data and never instructions; strictly per node, never inherited, and absent
-  means not marked, not vouched for.
+  `PROTOCOL_VERSION`. The one field added since version 1 froze in 0.1.0 is
+  `relayed` (0.3.3, issue #6): a node marks its label and value as text from
+  outside the app, data and never instructions; strictly per node, never
+  inherited, and absent means not marked, not vouched for.
 - `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket, refuses a
   label that is not a plain file name (it binds and unlinks what the label
   resolves to), vets the socket directory, and serves one bridge client at a
@@ -88,21 +88,21 @@ refuses a `target/debug` older than the sources.
   1.2 s) for the `hello` and the tree; then it reconnects with capped backoff
   while tool calls want the app, and after 60 s with no tool calls
   (`--idle-release`, plain digits from 0 to 86400, `0` never) closes the
-  connection or leaves the backlog
-  and stops reconnecting, but not while an input awaits its ack, for up to
-  30 s past the window. `bridge::spawn` still connects at once and never lets
-  go, and `TariaMcpServer::new`/`with_tree_format` serve such a handle as in
-  0.3.1. That is the fix for issue #13: the adapter serves one bridge at a
-  time and a repo `.mcp.json` starts one in every session. A snapshot is kept
-  as the app's own line (minus the `type` framing key) beside the parse of it:
-  the line is what the agent reads, so an unknown role, action or field
-  survives by name; the parse is what the bridge validates and diffs against.
+  connection or leaves the backlog and stops reconnecting, but not while an
+  input awaits its ack, for up to 30 s past the window. `bridge::spawn`
+  still connects at once and never lets go, and
+  `TariaMcpServer::new`/`with_tree_format` serve such a handle as in 0.3.1.
+  That is the fix for issue #13: the adapter serves one bridge at a time and
+  a repo `.mcp.json` starts one in every session. A snapshot is kept as the
+  app's own line (minus the `type` framing key) beside the parse of it: the
+  line is what the agent reads, so an unknown role, action or field survives
+  by name; the parse is what the bridge validates and diffs against.
   `--tree-format outline` (default `json`) renders that line as one indented
   line per node (a relayed node prints `*relayed` before its label, and `*`
   is never bare otherwise, so the mark cannot be forged) for every tree an
-  agent receives, with action names taken from
-  the parse because that is what `act` checks, and swaps only the format
-  passages of the instructions and of the `read_tree` and `act` descriptions.
+  agent receives, with action names taken from the parse because that is
+  what `act` checks, and swaps only the format passages of the instructions
+  and of the `read_tree` and `act` descriptions.
   Those texts are short because they are resent with every model call: no
   parameter is described but `repeat`'s default, the `{"custom":...}` rule is
   in `act`'s description only, and a test pins both modes' text byte for byte.
@@ -131,13 +131,17 @@ refuses a `target/debug` older than the sources.
   rejected-line reason but `OVERSIZED_LINE`, so a reason seen on an open link
   is the current connection's, and a reconnected bridge quotes it instead of
   saying retry (issue #16). A bridge that let go after its window says so
-  after the kept opening, until a connect finds nothing listening, and the
-  retry hint names its own `--idle-release`. On Linux the app's pid
-  (`SO_PEERCRED` at connect) and `/proc/<pid>/stat` tell a stopped app from a
-  held one, in the silent-connection answers and the no-ack answer: a job
-  suspended in its terminal needs the user's `fg` (`kill -CONT` only stops it
-  again), anything else `kill -CONT`. An app that never sends `hello` is held
-  to the `protocol_version` its snapshots state.
+  after the kept opening, until a connect finds nothing listening or another
+  pid listening than the one it let go of, and the retry hint names its own
+  `--idle-release`. On Linux the app's pid (`SO_PEERCRED` at connect) and
+  `/proc/<pid>/stat` tell a stopped app from a held one, in the
+  silent-connection answers and the no-ack answer: a job suspended in its
+  terminal needs the user's `fg` (`kill -CONT` resumes it only in the
+  background, where its next use of the terminal stops it again), anything
+  else `kill -CONT`. The no-ack answer promises the unread input only if the
+  app resumes within the window plus 30 s of the last tool call, since a
+  bridge that lets go leaves the adapter to discard it. An app that never
+  sends `hello` is held to the `protocol_version` its first snapshot states.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
   identities (`IdSpace`), stable across deletes and restarts; the list

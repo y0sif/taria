@@ -28,13 +28,16 @@ reconnected to an app whose tree it could not read told the agent to retry
 with "disconnected", and agents went looking for a fault with `ss` and `ps`.
 A suspended app read as held by another bridge. Each now gets its own answer.
 
-This is the first addition to the wire since 0.2.0, and it is additive:
-`PROTOCOL_VERSION` stays 1. `relayed` is a new optional field (section 16.2),
-omitted when false, and a bridge built before it passes the field on in JSON
-and shows `relayed=true` at the end of an outline line. The Rust API only
-grows: the `Node::relayed` field and its setter. The `read_tree` description
-gains one sentence in both formats. All three crates move to 0.3.3 together,
-and taria-ratatui 0.3.3 needs taria 0.3.3.
+This is the first addition to the wire since version 1 froze in 0.1.0, and
+it is additive: `PROTOCOL_VERSION` stays 1. `relayed` is a new optional field
+(section 16.2), omitted when false, and a bridge built before it passes the
+field on in JSON and shows `relayed=true` among the fields at the end of an
+outline line. The Rust API grows by the `Node::relayed` field and its setter,
+and by `taria_mcp::args::MAX_IDLE_RELEASE_SECS`; `taria_mcp::args::parse`
+refuses values 0.3.2 took (see Upgrading). The `read_tree` description gains
+one sentence in both formats, and the outline's also gains `*relayed` in its
+grammar of a line. All three crates move to 0.3.3 together, and
+taria-ratatui 0.3.3 needs taria 0.3.3.
 
 ### For whoever drives an app
 
@@ -52,30 +55,36 @@ and taria-ratatui 0.3.3 needs taria 0.3.3.
   is unchanged.
 - **A bridge that let go says so.** Its held answer keeps the opening and
   `, and the app is now held by another bridge.`, then says the disconnect was
-  this bridge letting go on purpose after its window with no tool calls, and
-  that it is not a fault. Once a connect finds nothing listening, it stops
-  saying so.
+  this bridge letting go on purpose after its window with no tool calls, or
+  up to 30 s later while an input awaited its ack, and that it is not a
+  fault. Once a connect finds nothing listening, or another process listening
+  than the one it let go of (when the kernel names both), it stops saying so.
 - **The retry hint follows `--idle-release`.** At the default the text is as
   in 0.3.2. A bridge started with another window names it, and one started
   with `0` says it never lets go.
 - **A stopped app is named, on Linux.** When a connection waits unanswered,
   or an input draws no ack, the bridge checks the app's process: its pid from
   the socket, its state from `/proc`. A job suspended in its terminal needs
-  the user to run `fg` there, since `kill -CONT` only stops it again; any
-  other stop takes `kill -CONT <pid>`, or the debugger. An input sent to a
-  stopped app waits in the socket until the app resumes. Other platforms keep
-  the 0.3.2 answers.
-- **An app that never sends `hello` is held to its snapshots' version.** Every
-  snapshot carries `protocol_version`, and until a `hello` arrives the bridge
-  goes by it, so a snapshot stating another version refuses input exactly as
-  a mismatched `hello` does.
+  the user to run `fg` there, since `kill -CONT` resumes it only in the
+  background, where its next use of the terminal stops it again; any other
+  stop takes `kill -CONT <pid>`, or the debugger. An input sent to a stopped
+  app waits in the socket, and the answer promises it only if the app
+  resumes within the bridge's window plus 30 s of the last tool call (90 s
+  on the default): once the bridge lets go, the adapter discards it. With
+  `--idle-release 0` it waits for good. Other platforms keep the 0.3.2
+  answers.
+- **An app that never sends `hello` is held to its first snapshot's
+  version.** Every snapshot carries `protocol_version`, and until a `hello`
+  arrives the bridge goes by the first snapshot's, so one stating another
+  version refuses input exactly as a mismatched `hello` does.
 
 ### Upgrading
 
 - **`--idle-release` takes plain digits from 0 to 86400.** 0.3.2 accepted
   `+5`, and any value up to 2^64-1, where the largest silently meant never.
   Anything else is now a usage error and the bridge does not start. Use `0`
-  for never.
+  for never. `taria_mcp::args::parse` returns the same error to a library
+  caller, and `taria_mcp::args::MAX_IDLE_RELEASE_SECS` names the limit.
 
 ### For an app author adopting taria
 
@@ -93,13 +102,20 @@ and taria-ratatui 0.3.3 needs taria 0.3.3.
 
 - `docs/protocol.md` gains the `relayed` row in section 6.1 and section 6.4,
   "Relayed text", which section 14.3 points to.
-- Sections 3.5 and 5.2 say the reference bridge reads a snapshot's
-  `protocol_version` on a connection that sent no `hello`.
+- Sections 3.5 and 5.2 say the reference bridge reads the first snapshot's
+  `protocol_version` on a connection that sent no `hello`, and Appendix B
+  item 2 says so too.
 - Sections 1.3 and 9.4 say an input line that does not parse loses its id
   even when its text shows one, and why no conforming sender writes one.
 - Section 16.6 is renamed "Passing the line on beats degrading", so "relay"
-  means the field, and it now says the reference bridge's copy of a snapshot
-  has its keys sorted.
+  means the field, and it now says what the reference bridge's copy of a
+  snapshot respells: keys sorted, whitespace gone, numbers and escapes
+  written its own way, and a key repeated in one object kept once.
+- Section 14.5 gains a paragraph on how the reference bridge, on Linux, tells
+  a held app from a stopped one, and section 14.7 lists what a reconnected
+  bridge, one that let go and one facing a stopped app each say.
+- Appendix B gains item 11: what a bridge does with relayed text beyond
+  passing the mark on.
 
 ### The gates
 

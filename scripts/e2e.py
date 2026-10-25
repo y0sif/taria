@@ -134,16 +134,16 @@ HELD_GONE_RE = re.compile(HELD_GONE_OPENING + HELD_EXPLANATION)
 # The same, from a bridge whose own departure was letting go after its idle
 # window (`released_after`, its `--idle-release`): it says so, so that the
 # "disconnected" it opens with is not chased as a fault, then when to retry.
-# The window is said once, as a floor, and the retry names only when:
-# `window` is captured from "retry in N s" so a step can hold it to the
+# The window is said once, then the hold past it, and the retry names only
+# when: `window` is captured from "retry in N s" so a step can hold it to the
 # bridge's window as it does the held answer's, and is None for "a minute".
 HELD_RELEASED_RE = re.compile(
     HELD_GONE_OPENING
     + r"That disconnect was this bridge letting go on purpose after "
-    r"(?P<released_after>\d+(?:\.\d+)?) s or more with no tool calls \(up to 30 s more "
-    r"while an input awaited its ack\), so another session could use the app; it is not a "
-    r"fault\. A holder started like this bridge lets go the same way, and this bridge takes "
-    r"over as soon as it does, with no restart; retry in "
+    r"(?P<released_after>\d+(?:\.\d+)?) s with no tool calls, or up to 30 s later while an "
+    r"input awaited its ack, so another session could use the app; it is not a fault\. A "
+    r"holder started like this bridge lets go the same way, and this bridge takes over as "
+    r"soon as it does, with no restart; retry in "
     r"(?:a minute|(?P<window>\d+(?:\.\d+)?) s)\. "
     + HELD_STAYS
     + "$"
@@ -2612,8 +2612,10 @@ def step_z_restart_race_loser_is_held(ctx):
     it said the app "may have exited" while the app ran and served the
     winner. The restart is repeated, and every loser is held to it, whichever
     bridge it is; asking both before each kill checks the same answer between
-    restarts. A loser whose last departure was its own release says so, in
-    the released form of the same answer.
+    restarts. A loser whose last departure was its own release of the
+    instance still running says so, in the released form of the same answer;
+    one that let go of an instance since killed gets the plain form, since
+    the pid listening is not the one it let go of.
 
     Both windows are 2 s. The winner's starts when its own answer, the tree,
     returns at once, and the re-ask that checks the race has settled goes out

@@ -314,12 +314,12 @@ streams every subsequent publish.
 
 An app **MUST** send `hello`. A bridge **SHOULD** tolerate its absence rather
 than dropping the connection. Until a `hello` arrives, the reference bridge
-takes the peer's version from the `protocol_version` every snapshot carries
-(section 5.2), so a snapshot declaring another version refuses input exactly
-as a mismatched `hello` does; a later `hello` replaces it. No taria adapter
-has omitted the `hello`; the path exists for hand-written peers. The cost of
-relying on it is that version-mismatch protection (section 16.5) is only as
-good as the peer's honesty about its version.
+takes the peer's version from the first snapshot's `protocol_version`
+(section 5.2), so a first snapshot declaring another version refuses input
+exactly as a mismatched `hello` does; a later `hello` replaces it. No taria
+adapter has omitted the `hello`; the path exists for hand-written peers. The
+cost of relying on it is that version-mismatch protection (section 16.5) is
+only as good as the peer's honesty about its version.
 
 ## 4. Message catalogue
 
@@ -416,7 +416,8 @@ beyond that.
 ### 5.2 `protocol_version` on the snapshot
 
 Every snapshot states the version, and **the reference bridge reads it only
-on a connection that sent no `hello`** (section 3.5). Version negotiation
+on a connection that sent no `hello`, and only the first snapshot's**
+(section 3.5). Version negotiation
 happens on the `hello` (section 16.5). A `Snapshot` object carrying
 `"protocol_version":2` parses without complaint into this build's types, so a
 reader **MUST NOT** treat this field as a validity check.
@@ -984,7 +985,8 @@ the ack exists to remove.
   delivers keystrokes aimed at a UI that no longer exists. The reference
   bridge drains its queue on every reconnect.
 - A bridge **MUST** forget the peer's `protocol_version` when a connection
-  ends, so the next connection is not judged by the previous app's handshake.
+  ends, so the next connection is not judged by the previous app's handshake
+  or snapshot version.
 
 **Reference implementation.** The adapter tags each connection with a
 generation, stamps every queued input with the generation it arrived on, and
@@ -1307,11 +1309,21 @@ that waits says the app is held by another bridge, and when the holder lets
 go, so the agent retries: after 60 s with no tool calls on the default, or
 after the waiting bridge's own `--idle-release`, its best guess at a holder
 started the same way. Once the holder does (section 14.7), the waiting bridge
-is accepted. A waiting bridge that itself goes its window with no tool calls
-leaves the backlog. On Linux it tells a held app from a stopped one by the
-listener's state, read through the connection's peer credentials and `/proc`,
-and a job suspended in its terminal, which only `fg` there resumes, from a
-stop `kill -CONT` ends; nothing on the wire carries it.
+is accepted. A waiting bridge that itself goes a whole window with no tool
+calls leaves the backlog.
+
+A stopped app keeps its socket listening and accepts nothing, which leaves a
+connection exactly as silent as a held app does. On Linux the reference bridge
+tells the two apart by the listener's state. It takes the listener's pid from
+`SO_PEERCRED`, the pid the kernel records for the other end of a Unix socket
+(for a connection still in the backlog, the process listening), and reads that
+process's state from `/proc/<pid>/stat`. A stopped app is named with its pid
+and how to resume it. A job suspended in its terminal, stopped outside the
+terminal's foreground process group, resumes only with `fg` there:
+`kill -CONT` resumes it only in the background, where its next use of the
+terminal stops it again. A tracing stop (state `t`) ends from the debugger,
+and any other stop with `kill -CONT`. Nothing on the wire carries any of it,
+and elsewhere a stopped app reads as held.
 
 ### 14.6 Shutdown
 
@@ -1349,22 +1361,29 @@ On disconnect a bridge **SHOULD** fail tool calls fast with an error naming
 the app that went away, rather than acting on a stale tree.
 
 **Reference implementation.** The reference bridge connects on demand. It
-opens no connection until its first tool call, which waits for the `hello`
-and the latest snapshot the app sends on accept (section 3.4), so that call
-still answers with the live tree. The wait normally takes milliseconds and
-never runs past 1.2 s. After 60 s with no tool calls it closes its
-connection, or leaves the listen backlog, and stops reconnecting until the
-next tool call, so a bridge waiting for the app gets it. Stopping while no
-call wants the app is not giving up: the next call reconnects.
-`--idle-release` sets the delay, and `0` never lets go. It does not let go
-while an input it sent is still waiting for its ack, for up to 30 s past the
-delay, because the app discards an input whose connection has ended
-(section 11). A bridge that reconnects into the backlog behind another, as
-the one that loses the race does when an app restarts, says the app is held
-by another bridge rather than that it may have exited. One that reconnects
-to an app that greets it but has not published yet says that, and that a
-retry is served the first snapshot. None of this is a protocol rule. To the
-app, a bridge that let go is one that left.
+opens no connection until its first tool call, which waits for the `hello` and
+the latest snapshot the app sends on accept (section 3.4), so that call still
+answers with the live tree. The wait normally takes milliseconds and never
+runs past 1.2 s. After 60 s with no tool calls it closes its connection, or
+leaves the listen backlog, and stops reconnecting until the next tool call, so
+a bridge waiting for the app gets it. Stopping while no call wants the app is
+not giving up: the next call reconnects. `--idle-release` sets the delay, and
+`0` never lets go. It does not let go while an input it sent is still waiting
+for its ack, for up to 30 s past the delay, because the app discards an input
+whose connection has ended (section 11). A bridge that reconnects into the
+backlog behind another, as the one that loses the race does when an app
+restarts, says the app is held by another bridge rather than that it may have
+exited. One that reconnects to an app that greets it but has not published yet
+says that, and that a retry is served the first snapshot. One that reconnects
+and cannot read what the app sends quotes the line it could not read: a
+connect forgets every reason it held but an oversized line's (section 13.2),
+so the reason quoted is the new connection's. One that let go of the app after
+its window and finds it held says that the disconnect was its own release, not
+a fault, unless it has seen signs of a new instance since: nothing listening,
+or another pid listening than the one it let go of. On Linux, one whose
+connection is silent because the app is stopped names it as stopped, with its
+pid and how to resume it (section 14.5). None of this is a protocol rule. To
+the app, a bridge that let go is one that left.
 
 ## 15. Focus contract
 
@@ -1499,9 +1518,16 @@ a malformed one is still skipped.
 
 The one thing a bridge **SHOULD** remove from the line it passes on is the
 `"type":"snapshot"` framing key, which belongs to the transport rather than to
-the tree. The reference bridge removes it through a JSON value, so the line it
-hands on has its keys sorted and its whitespace gone, and every other key
-kept; neither order nor whitespace is information the app was carrying.
+the tree. The reference bridge removes it by parsing the line into a JSON
+value and writing that out again, which keeps every other key but not the
+app's spelling of the line: keys come out sorted and whitespace gone, string
+escapes are rewritten (`"\u00e9"` becomes `"é"`), numbers are rewritten
+(`1e3` becomes `1000.0`, `-0` becomes `-0.0`, and an integer outside the
+64-bit range becomes a float, keeping about 17 significant digits), and of a
+key repeated in one object only the last value is kept, though a repeated
+field the bridge knows never gets that far, because it fails the parse
+(section 2.2). A sender **MUST NOT** rely on any of these spellings reaching
+the agent.
 
 ### 16.7 What forces a version bump
 
@@ -1660,8 +1686,9 @@ behaviour a peer may rely on.
 
 1. **A second `hello` on one connection.** Neither reference peer accepts or
    rejects one explicitly (section 3.2).
-2. **A snapshot's `protocol_version` disagreeing with the `hello`'s.** Nothing
-   reads the snapshot field (section 5.2).
+2. **A snapshot's `protocol_version` disagreeing with the `hello`'s.** The
+   reference bridge goes by the `hello`, and before one by the first
+   snapshot's (sections 3.5, 5.2).
 3. **`seq` at the u64 maximum** (section 5.1).
 4. **Duplicate keys naming a field the reader does not know.** A duplicate of
    a known field fails the line in the reference implementation; a sender

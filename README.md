@@ -169,7 +169,7 @@ cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 python3 scripts/e2e.py           # end-to-end: 26 steps, demo app + bridge + MCP
-python3 scripts/adversarial.py   # 23 edge-case probes
+python3 scripts/adversarial.py   # 24 edge-case probes
 ```
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers the rest: the setup, the CI gate,

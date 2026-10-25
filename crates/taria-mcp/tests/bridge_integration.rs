@@ -3519,9 +3519,9 @@ async fn a_bridge_that_let_go_says_its_disconnect_was_on_purpose() {
     assert_eq!(
         err.message,
         "app 'fake-app' disconnected (last snapshot seq 1), and the app is now held by another \
-         bridge. That disconnect was this bridge letting go on purpose after 0.3 s or more with \
-         no tool calls (up to 30 s more while an input awaited its ack), so another session could \
-         use the app; it is not a fault. A holder started like this bridge lets go the same way, \
+         bridge. That disconnect was this bridge letting go on purpose after 0.3 s with no tool \
+         calls, or up to 30 s later while an input awaited its ack, so another session could use \
+         the app; it is not a fault. A holder started like this bridge lets go the same way, \
          and this bridge takes over as soon as it does, with no restart; retry in 0.3 s. If the \
          app stays held, another session is using it, or the holder is a taria-mcp older than \
          0.3.2, which holds the app until its session ends."
@@ -3624,8 +3624,8 @@ fn activate_btn() -> Parameters<ActParams> {
 /// A peer that never sends `hello` used to pass the version check, since
 /// only the handshake set the version and none read as "no mismatch known",
 /// so a peer on another version was sent input it cannot parse. Every
-/// snapshot states its version, and until a `hello` arrives that is the
-/// version the bridge goes by.
+/// snapshot states its version, and until a `hello` arrives the first
+/// snapshot's is the version the bridge goes by.
 #[tokio::test]
 async fn an_app_that_never_greets_is_held_to_the_version_its_snapshot_states() {
     let (_dir, listener, mut handle, server) = setup("no-hello-other").await;

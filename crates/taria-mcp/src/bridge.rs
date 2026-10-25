@@ -190,8 +190,10 @@ impl AppSnapshot {
     ///
     /// Removed through a `serde_json::Value`, which holds every key the line
     /// has, including the roles, actions and fields this build has never
-    /// heard of. Only the one key goes; key order and whitespace become the
-    /// serializer's again, and neither is information the app was carrying.
+    /// heard of. Only the one key goes, but the spelling of the rest becomes
+    /// the serializer's again: keys sorted, whitespace gone, escapes and
+    /// numbers rewritten (`1e3` as `1000.0`), and a key repeated in one object
+    /// kept once, with its last value (`docs/protocol.md` section 16.6).
     pub fn from_line(line: &str, parsed: Snapshot) -> Self {
         Self {
             tree_json: strip_envelope(line),
@@ -492,9 +494,23 @@ struct Activity {
     /// `pgrep`. Written where that record is (see [`Idle::note_disconnect`]), so
     /// it describes the same departure, and cleared once a connection serves
     /// a tree, so it can never outlive the record it is about. Cleared too
-    /// when a connect finds nothing listening: the app has gone since, so
+    /// when a connect finds nothing listening, or finds another process
+    /// listening than the one let go of (see
+    /// [`released_pid`](Self::released_pid)): the app has gone since, so
     /// the departure is no longer only this bridge's doing.
     pub(crate) released: bool,
+    /// The [`peer_pid`](Self::peer_pid) of the connection a release let go
+    /// of, kept with [`released`](Self::released) while the kernel named
+    /// one.
+    ///
+    /// An app that restarts while this bridge makes no call leaves nothing
+    /// for a connect to fail on, and once another bridge holds the new
+    /// instance, this one's next connect lands in its backlog: the silence
+    /// the held answer explains, which went on calling the departure this
+    /// bridge's own. The pid is how that connect tells the instance it let
+    /// go of from one that replaced it. Unknown on either side, the flag
+    /// stands.
+    pub(crate) released_pid: Option<i32>,
     /// The process at the other end of the open connection, as the kernel
     /// reported it at `connect`, or `None` with no connection open or no pid
     /// reported. For a connection still waiting in the listen backlog that is
@@ -780,10 +796,27 @@ impl Idle {
     /// about is unchanged.
     fn note_disconnect(&self, delivered_snapshot: bool, end: &ConnectionEnd) {
         self.note(|activity| {
-            activity.peer_pid = None;
+            let peer_pid = activity.peer_pid.take();
             if delivered_snapshot {
                 activity.released = matches!(end, ConnectionEnd::Released(_));
+                activity.released_pid = peer_pid.filter(|_| activity.released);
             } else if matches!(end, ConnectionEnd::AppClosed { .. }) {
+                activity.released = false;
+            }
+        });
+    }
+
+    /// Record the process at the other end of a connection just made, as
+    /// the kernel named it, and retire the release flag when that is not the
+    /// process the release let go of: the app has been replaced since, so
+    /// its departure is no longer only this bridge's doing. See
+    /// [`Activity::released_pid`].
+    fn note_connect(&self, peer_pid: Option<i32>) {
+        self.note(|activity| {
+            activity.peer_pid = peer_pid;
+            if let (Some(let_go), Some(now)) = (activity.released_pid, peer_pid)
+                && let_go != now
+            {
                 activity.released = false;
             }
         });
@@ -938,7 +971,7 @@ async fn manager_loop(
                             .ok()
                             .and_then(|cred| cred.pid())
                             .filter(|pid| *pid > 0);
-                        idle.note(|activity| activity.peer_pid = peer_pid);
+                        idle.note_connect(peer_pid);
                     }
                     let connected_at = Instant::now();
                     // Published before the connection is served, not after it
@@ -1901,6 +1934,46 @@ mod tests {
             None,
             "the pid was the ended connection's"
         );
+    }
+
+    /// A release is this bridge's own doing only while the app it let go of
+    /// is the one still listening. An app that restarted while this bridge
+    /// made no call, and was taken by another bridge before the next one,
+    /// is met by the next connect under another pid, and the claim goes.
+    /// The same pid keeps it, and so does a pid the kernel did not name, on
+    /// either side: nothing to tell the two apart by.
+    #[test]
+    fn a_connect_to_another_process_retires_the_release_flag() {
+        let (idle, demand) = idle_and_demand(Duration::from_secs(1));
+        let release = || {
+            ConnectionEnd::Released(Release {
+                quiet_since: TokioInstant::now(),
+                hold: Hold::None,
+            })
+        };
+        // A served connection to pid 42, let go of after the window.
+        idle.note_connect(Some(42));
+        idle.note_disconnect(true, &release());
+        assert!(demand.released());
+
+        idle.note_connect(Some(42));
+        assert!(demand.released(), "the app it let go of, held by another");
+        idle.note_disconnect(false, &release());
+        idle.note_connect(None);
+        assert!(demand.released(), "a peer the kernel did not name");
+        idle.note_disconnect(false, &release());
+        assert!(demand.released(), "a held connection let go of");
+        idle.note_connect(Some(43));
+        assert!(!demand.released(), "another process listens at the path");
+        assert_eq!(demand.peer_pid(), Some(43));
+
+        // A release of a peer the kernel did not name has nothing to compare.
+        idle.note_disconnect(false, &release());
+        idle.note_connect(None);
+        idle.note_disconnect(true, &release());
+        assert!(demand.released());
+        idle.note_connect(Some(44));
+        assert!(demand.released(), "the pid let go of is unknown");
     }
 
     /// A connection that serves a tree retires the release flag at once, so
