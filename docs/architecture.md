@@ -109,7 +109,7 @@ nothing, because what to do about a deep tree belongs to the adapter.
 
 The ratatui adapter cuts. Over the limit, every node at the limit publishes
 without its children, per branch, and the app is told through
-`truncated_snapshots()` and `last_truncation()`. The count is of snapshots
+`stats().truncated_snapshots` and `last_truncation`. The count is of snapshots
 sent, not frames drawn, so a deep tree that sits still while the app redraws
 it sixty times a second counts once. Cutting, because the other two answers
 are the same failure: publishing the tree as built puts a line on the wire the
@@ -169,10 +169,10 @@ focused one. The line is sized for the largest possible `seq`, so the same
 tree is always cut the same way and dedup still works on it: an edit past the
 cut of a trimmed value produces the tree already sent, and nothing goes out.
 
-The app is told through `oversized_snapshots()` and `last_oversize()`, whose
-`SnapshotTooLarge` carries the size the line would have had and the node
+The app is told through `stats().oversized_snapshots` and `last_oversize`,
+whose `SnapshotTooLarge` carries the size the line would have had and the node
 holding the longest string, ids and custom action names included. Like
-`truncated_snapshots()`, the count is of snapshots sent, not frames drawn.
+`truncated_snapshots`, the count is of snapshots sent, not frames drawn.
 Trimming rather than withholding, for the reason the depth cut gives: a
 withheld tree leaves the agent on a stale one.
 
@@ -361,7 +361,7 @@ the last ack wins.
 |---|---|---|
 | `delivered` | The app's event loop dequeued the input. | The adapter, automatically, as it hands the input over. |
 | `dropped` | The input never reached the app: its queue was full. | The adapter's reader thread. |
-| `ignored` | The app looked at the input and deliberately did nothing. | The app, with `layer.ack(id, InputStatus::Ignored)`. |
+| `ignored` | The app looked at the input and deliberately did nothing. | The app, by returning it from the `layer.drain` handler, or with `layer.ack(id, InputStatus::Ignored)` and the id `try_recv` handed over. |
 
 `delivered` says only that the input was dequeued, before the app knows what
 it will do with it. An app that then does nothing (an act a modal dialog
@@ -545,9 +545,8 @@ Bridge side (`taria-mcp`):
    the backoff growing instead of resetting it. After 60 s with no tool calls
    the bridge lets the app go and stops retrying until the next call (see
    On-demand connect and idle release). A library caller that builds the
-   bridge with `bridge::spawn` gets the old behaviour: connect at once, retry
-   forever, never let go. `TariaMcpServer::new` and `with_tree_format` serve
-   such a handle as in 0.3.1.
+   server with `TariaMcpServer::connected` gets the old behaviour: connect at
+   once, retry forever, never let go.
 2. On disconnect, the watch flips to `Disconnected`, keeping the app label
    and the last `seq`, so tool calls fail fast with an error that says which
    app went away instead of acting on a stale tree. Every such error opens
@@ -619,7 +618,7 @@ Bridge side (`taria-mcp`):
      the cause. Only the window and the hold past it are the held answer's
      words; the rest of the clause is its own. Any failure to read the state
      leaves the held answer, and other platforms always get it. Only a bridge
-     started on demand records the pid; one handed to `TariaMcpServer::new`
+     started on demand records the pid; one built with `TariaMcpServer::connected`
      gets the held answer, as in 0.3.2.
    - With no connection open, between two connects or because nothing is
      listening, the error says "it may have exited", in the words 0.3.1 used.
@@ -735,7 +734,7 @@ An input belongs to the connection it arrived on. Each connection is tagged
 with a generation, every queued input carries the generation it arrived on,
 and the reader retires that generation as it exits, before the disconnect is
 observable anywhere. An input from a retired generation is discarded at
-dequeue rather than applied, and counted in `stale_inputs()`.
+dequeue rather than applied, and counted in `stale_inputs`.
 
 Without this, a `key q` sent just before the bridge went away could quit the
 app after its sender was gone, with nobody left to hear about it. The
@@ -750,7 +749,7 @@ kernel's buffer until its turn. That client has seen no tree, so nothing it
 wrote can be a reply to one. So for a client that was already waiting when the
 previous session ended, the adapter reads off what is waiting just before the
 `hello` goes out and throws it away, unacked, counting each complete `input`
-line in `stale_inputs()`. If that read stops partway through a line, the rest
+line in `stale_inputs`. If that read stops partway through a line, the rest
 of the line is skipped when it arrives. More than 1 MiB waiting breaks the
 connection, like a line that long.
 
@@ -775,26 +774,27 @@ Guard rails on the app side: every line has 5 s in all to be written, so a
 peer that stops reading, or reads too slowly to take a whole line in that
 time, is dropped; the acks flushed at shutdown get 250 ms in all; and a
 bounded input queue (256 entries) drops the newest input, acks it `dropped`,
-and counts it in `dropped_inputs()` instead of blocking the socket thread.
+and counts it in `dropped_inputs` instead of blocking the socket thread.
 The ack queue is bounded too, at 1024, and drops from the opposite end: the
 oldest, because an ack answers one specific input and the answers an agent is
 still waiting on are the newest, while the oldest name inputs whose waiter has
 long since timed out. It has to be bounded because a bridge that reads
 steadily but far slower than an agent sends never stalls long enough for the
 write timeout to fire, and would otherwise grow the app's memory until the
-process is killed. Drops are counted in `dropped_acks()`, which is a report
+process is killed. Drops are counted in `dropped_acks`, which is a report
 about the bridge rather than the app: the input was applied and the caller
 was answered nowhere. On the bridge side, an input waits at most 500 ms for
 room in the queue to the app, so a stopped app fails a tool call instead of
 hanging it.
 
 Four counters in all record agent traffic that went nowhere:
-`dropped_inputs()`, `stale_inputs()`, `unknown_inputs()` and
-`dropped_acks()`. All are monotonic across reconnects, all are 0 on a
-disabled layer, and all are read after the terminal is restored, because the
-layer never prints. Two more, `truncated_snapshots()` and
-`oversized_snapshots()`, lose no input: they count trees the agent was handed
-cut (see Tree depth and Snapshot size).
+`dropped_inputs`, `stale_inputs`, `unknown_inputs` and `dropped_acks`. They
+are fields of the `LayerStats` that `layer.stats()` returns, all monotonic
+across reconnects, all 0 on a disabled layer, and all read after the terminal
+is restored, because the layer never prints. Two more, `truncated_snapshots`
+and `oversized_snapshots`, lose no input: they count trees the agent was
+handed cut (see Tree depth and Snapshot size). `LayerStats` is
+`#[non_exhaustive]`, so a new count is not a breaking change.
 
 ## Focus contract
 

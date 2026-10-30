@@ -992,7 +992,7 @@ the ack exists to remove.
 generation, stamps every queued input with the generation it arrived on, and
 retires that generation as the reader thread exits, before the disconnect is
 observable anywhere. An input from a retired generation is discarded at
-dequeue and counted in `stale_inputs()`. Input a waiting client wrote before
+dequeue and counted in `stats().stale_inputs`. Input a waiting client wrote before
 the `hello` is counted there too, though it never reaches the queue
 (section 14.5). The same bookkeeping decides who may still be answered: `ack`
 refuses an id whose connection has ended, and an id also stops being
@@ -1113,7 +1113,7 @@ marking it stale. This is why the obligation sits on the sender.
 **What to do about a tree that is too deep is the sender's choice**, not a
 protocol rule. The reference adapter **cuts**: every node at the limit
 publishes without its children, per branch, and the app is told through
-`truncated_snapshots()` and `last_truncation()`. Cutting, because the other
+`stats().truncated_snapshots` and `last_truncation`. Cutting, because the other
 two answers are the same failure: publishing the tree as built puts a line on
 the wire the bridge cannot parse, and skipping the publish is that same stale
 tree chosen deliberately. Only the cut still delivers the part of the tree
@@ -1291,7 +1291,7 @@ it would be answered in has not begun. A bridge that writes nothing before the
 already waiting in the backlog when the previous session ended. Just before
 writing that client's `hello`, it reads off whatever is already waiting and
 discards it, counting each complete `input` line, of any kind, in
-`stale_inputs()`. If what it read stops partway through a line, the rest of
+`stats().stale_inputs`. If what it read stops partway through a line, the rest of
 that line is skipped when it arrives. More than 1 MiB waiting is treated like
 a line over the cap and closes the connection. The first connection of a
 process, and a client that connects to an idle app, waited behind nobody and

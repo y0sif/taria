@@ -54,10 +54,10 @@ refuses a `target/debug` older than the sources.
   `bind_or_disabled` never fails, so taria cannot block startup; the layer
   never prints (the app reports `bind_error()` outside the alternate screen).
   Nodes come from `publish(nodes)` or `FrameRecorder`/`sem`; identical trees
-  are deduped. Input arrives via
-  `drain_acking`/`drain`/`drain_with_ids`/`try_recv`/`recv_timeout`, acked
-  `Delivered` on dequeue, `Dropped` when the queue is full, and `Ignored`
-  when the app says so, by returning it from `drain_acking` or calling `ack`.
+  are deduped. Input arrives via `drain`/`try_recv`/`recv_timeout` (the last
+  two hand over the `InputId`), acked `Delivered` on dequeue, `Dropped` when
+  the queue is full, and `Ignored` when the app says so, by returning it from
+  `drain` or calling `ack`.
   The wildcard arm `#[non_exhaustive]` forces on a `match` over `AgentInput`
   is the arm that swallows `Text`; the demo carries
   `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are flushed
@@ -68,14 +68,15 @@ refuses a `target/debug` older than the sources.
   is gone. Input written before the `hello` is discarded unacked, but only
   from a client that waited in the backlog behind the previous session. Each
   line written gets 5 s in all (`WRITE_TIMEOUT`), so a stuck bridge is
-  dropped and `Drop` stays bounded. Four counters of lost agent traffic:
-  `dropped_inputs()`, `stale_inputs()` (both discards), `unknown_inputs()`,
-  `dropped_acks()`. A tree over `MAX_NODE_DEPTH` is cut branch-wise at publish
-  rather than withheld (a withheld tree leaves the agent on a stale one),
-  reported via `truncated_snapshots()`/`last_truncation()`; then a tree over
-  `MAX_LINE_BYTES` is trimmed to fit (nodes that can never fit, then the
+  dropped and `Drop` stays bounded. Four counters of lost agent traffic,
+  fields of the `LayerStats` that `stats()` returns: `dropped_inputs`,
+  `stale_inputs` (both discards), `unknown_inputs`, `dropped_acks`. A tree
+  over `MAX_NODE_DEPTH` is cut branch-wise at publish rather than withheld
+  (a withheld tree leaves the agent on a stale one), reported via
+  `truncated_snapshots`/`last_truncation`; then a tree over `MAX_LINE_BYTES`
+  is trimmed to fit (nodes that can never fit, then the
   longest strings, then trailing nodes; ids and custom action names never
-  change), reported via `oversized_snapshots()`/`last_oversize()`. Both count
+  change), reported via `oversized_snapshots`/`last_oversize`. Both count
   snapshots sent, not frames, and an unchanged frame skips both cuts. Binding
   unlinks only a socket nothing is listening on, refuses a live one so a
   second instance cannot steal it, and the listener polls a shutdown flag so
@@ -89,9 +90,9 @@ refuses a `target/debug` older than the sources.
   while tool calls want the app, and after 60 s with no tool calls
   (`--idle-release`, plain digits from 0 to 86400, `0` never) closes the
   connection or leaves the backlog and stops reconnecting, but not while an
-  input awaits its ack, for up to 30 s past the window. `bridge::spawn`
-  still connects at once and never lets go, and
-  `TariaMcpServer::new`/`with_tree_format` serve such a handle as in 0.3.1.
+  input awaits its ack, for up to 30 s past the window.
+  `TariaMcpServer::connected` connects at once and never lets go, as every
+  bridge before 0.3.2 did.
   That is the fix for issue #13: the adapter serves one bridge at a time and
   a repo `.mcp.json` starts one in every session. A snapshot is kept as the
   app's own line (minus the `type` framing key) beside the parse of it: the
