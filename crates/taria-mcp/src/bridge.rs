@@ -166,16 +166,16 @@ pub(crate) const OVERSIZED_LINE: &str =
 /// A line reaches here only after it parsed, so a malformed line is still
 /// skipped rather than forwarded.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AppSnapshot {
+pub(crate) struct AppSnapshot {
     /// The app's snapshot as the agent reads it: its own line, minus the
     /// message framing. What `read_tree` and every tool result hand back.
     /// Built by [`from_line`](Self::from_line), which is the only thing that
     /// removes anything.
-    pub tree_json: String,
+    pub(crate) tree_json: String,
     /// The same message decoded into this build's types. For validation and
     /// change detection, never for output, except the action names in an
     /// outline, which have to be the names validation accepts.
-    pub parsed: Snapshot,
+    pub(crate) parsed: Snapshot,
 }
 
 impl AppSnapshot {
@@ -194,7 +194,7 @@ impl AppSnapshot {
     /// the serializer's again: keys sorted, whitespace gone, escapes and
     /// numbers rewritten (`1e3` as `1000.0`), and a key repeated in one object
     /// kept once, with its last value (`docs/protocol.md` section 16.6).
-    pub fn from_line(line: &str, parsed: Snapshot) -> Self {
+    pub(crate) fn from_line(line: &str, parsed: Snapshot) -> Self {
         Self {
             tree_json: strip_envelope(line),
             parsed,
@@ -226,7 +226,7 @@ fn strip_envelope(line: &str) -> String {
 /// "the app was never there" and "the app was there and died" call for very
 /// different next steps from the agent.
 #[derive(Clone, Debug, PartialEq)]
-pub enum BridgeState {
+pub(crate) enum BridgeState {
     /// No app has delivered a snapshot since the bridge started.
     Never,
     /// An app is connected; its latest snapshot is available.
@@ -251,7 +251,7 @@ pub enum BridgeState {
 /// call for opposite next steps: check the path, or leave the path alone
 /// because the bridge is connected to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LinkState {
+pub(crate) enum LinkState {
     /// No connection is open: the last connect attempt failed, or the last
     /// connection ended.
     Down,
@@ -266,7 +266,7 @@ pub enum LinkState {
 
 impl LinkState {
     /// How long the open connection has been up, or `None` when none is.
-    pub fn open_for(self) -> Option<Duration> {
+    pub(crate) fn open_for(self) -> Option<Duration> {
         match self {
             Self::Down => None,
             Self::Open { since } => Some(since.elapsed()),
@@ -288,14 +288,14 @@ static NEXT_INPUT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Handles the MCP tool layer uses to talk to the socket-manager task.
 #[derive(Clone)]
-pub struct BridgeHandle {
+pub(crate) struct BridgeHandle {
     /// Latest connection state; holds the current [`Snapshot`] while an app
     /// is connected.
-    pub state_rx: watch::Receiver<BridgeState>,
+    pub(crate) state_rx: watch::Receiver<BridgeState>,
     /// Queue of identified agent inputs to forward to the app.
-    pub input_tx: mpsc::Sender<(InputId, AgentInput)>,
+    pub(crate) input_tx: mpsc::Sender<(InputId, AgentInput)>,
     /// Every ack the app sends, republished for whoever is waiting on one.
-    pub ack_tx: broadcast::Sender<(InputId, InputStatus)>,
+    pub(crate) ack_tx: broadcast::Sender<(InputId, InputStatus)>,
     /// The `protocol_version` the connected app declared in its handshake.
     ///
     /// `None` before the peer has said anything, and again once the app goes
@@ -311,7 +311,7 @@ pub struct BridgeHandle {
     /// still delivers parseable snapshots while being unable to parse the
     /// inputs sent back to it, and reporting an input as sent to such a peer
     /// would be a lie.
-    pub protocol_rx: watch::Receiver<Option<u32>>,
+    pub(crate) protocol_rx: watch::Receiver<Option<u32>>,
     /// Why the most recent line from an app was thrown away, if one was.
     ///
     /// Set for every line the reader could not turn into an [`AppToBridge`],
@@ -340,7 +340,7 @@ pub struct BridgeHandle {
     /// Read only where no snapshot is available. Once a snapshot has arrived,
     /// a later rejected line says nothing about the tree being served, and
     /// the tools do not mention it.
-    pub rejected_rx: watch::Receiver<Option<String>>,
+    pub(crate) rejected_rx: watch::Receiver<Option<String>>,
     /// Whether this bridge currently holds an open connection, and since when.
     ///
     /// The one fact that separates "nothing is there" from "this bridge is
@@ -350,7 +350,7 @@ pub struct BridgeHandle {
     /// Read only where no snapshot is available, like
     /// [`rejected_rx`](Self::rejected_rx): once a tree is being served, the
     /// connection carrying it is not what an agent needs to hear about.
-    pub link_rx: watch::Receiver<LinkState>,
+    pub(crate) link_rx: watch::Receiver<LinkState>,
 }
 
 impl BridgeHandle {
@@ -360,7 +360,7 @@ impl BridgeHandle {
     /// handle: callers ask the bridge for an id rather than reaching for a
     /// counter of their own, and two tool calls racing still get different
     /// ids.
-    pub fn next_input_id(&self) -> InputId {
+    pub(crate) fn next_input_id(&self) -> InputId {
         InputId::new(NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -369,7 +369,7 @@ impl BridgeHandle {
     /// A broadcast receiver only sees what is published after it subscribes,
     /// so a caller that waits on an input must subscribe *before* sending it:
     /// the app can ack before the sending task is scheduled again.
-    pub fn subscribe_acks(&self) -> broadcast::Receiver<(InputId, InputStatus)> {
+    pub(crate) fn subscribe_acks(&self) -> broadcast::Receiver<(InputId, InputStatus)> {
         self.ack_tx.subscribe()
     }
 }
@@ -379,12 +379,13 @@ impl BridgeHandle {
 /// The manager connects at once and holds the app for as long as the returned
 /// handle (or a clone of its `input_tx`) lives, reconnecting whenever the
 /// connection ends. That is every bridge before 0.3.2, and what a library
-/// caller driving its own [`TariaMcpServer`](crate::server::TariaMcpServer)
-/// keeps getting. The `taria-mcp` binary connects on demand instead, through
+/// caller gets from
+/// [`TariaMcpServer::connected`](crate::server::TariaMcpServer::connected).
+/// The `taria-mcp` binary connects on demand instead, through
 /// [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand),
 /// so that a session with no tool calls in flight does not keep every other
 /// session away from the app.
-pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
+pub(crate) fn spawn(socket_path: PathBuf) -> BridgeHandle {
     spawn_manager(socket_path, None)
 }
 

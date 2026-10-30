@@ -84,7 +84,7 @@
 //! Actions are the one exception. The outline tells the agent to pass an
 //! action to `act` exactly as it prints, and `act` validates against the
 //! typed parse, so the name printed is the one that parse reads (see
-//! [`action_name`]). The name survives, since the parse keeps an action it
+//! [`Action::wire_name`]). The name survives, since the parse keeps an action it
 //! does not know as `Custom` under its own name, but nothing else in an
 //! action object does: `{"row":3}` in `{"scroll_to":{"row":3}}`, or
 //! `"icon":"x"` beside `"custom":"delete"`, is not shown, because `act` takes
@@ -94,12 +94,12 @@
 //! names the action after, can differ.
 
 use serde_json::{Map, Value};
-use taria::{Action, Node, Snapshot};
+use taria::{Action, Node};
 
 use crate::bridge::AppSnapshot;
-use crate::server::action_name;
 
-/// The text an agent reads a tree from.
+/// The text an agent reads a tree from: the app's own JSON line, or an
+/// outline rendered from it. The app sends the same JSON either way.
 ///
 /// `#[non_exhaustive]` so that a third format is not a breaking change for a
 /// caller that matches on this.
@@ -110,7 +110,9 @@ pub enum TreeFormat {
     /// and what every bridge before this option served.
     #[default]
     Json,
-    /// One line per node, indented by depth. See the module docs.
+    /// One line per node, indented by depth, carrying every node, field and
+    /// action name in fewer characters than the JSON. The grammar is in
+    /// [the CLI reference](https://github.com/y0sif/taria/blob/main/docs/cli.md#the-outline).
     Outline,
 }
 
@@ -139,7 +141,7 @@ impl TreeFormat {
     /// Render a snapshot the bridge holds in this format: its copy of the
     /// app's line, as it is or as an outline of it, with action names from
     /// its parse.
-    pub fn render(self, snapshot: &AppSnapshot) -> String {
+    pub(crate) fn render(self, snapshot: &AppSnapshot) -> String {
         match self {
             Self::Json => snapshot.tree_json.clone(),
             Self::Outline => outline_of(&snapshot.tree_json, Some(&snapshot.parsed.root)),
@@ -150,7 +152,7 @@ impl TreeFormat {
 /// Render `tree_json` as an outline, or return it unchanged when it is not a
 /// snapshot the outline can express.
 ///
-/// With no parse beside the text, this parses `tree_json` as a [`Snapshot`]
+/// With no parse beside the text, this parses `tree_json` as a [`Snapshot`](taria::Snapshot)
 /// itself, reading keys in the text's order as the bridge does, and names
 /// actions from that, so on an app's line it prints what the bridge would.
 /// Two cases can differ from [`TreeFormat::render`]. Given the bridge's
@@ -163,8 +165,9 @@ impl TreeFormat {
 /// A line that reached the bridge parsed as a snapshot, so the fallback is
 /// not reachable from a peer; it is here so that a shape this renderer has no
 /// spelling for costs the agent the shorter format, never part of the tree.
-pub fn outline(tree_json: &str) -> String {
-    let parsed = serde_json::from_str::<Snapshot>(tree_json).ok();
+#[cfg(test)]
+pub(crate) fn outline(tree_json: &str) -> String {
+    let parsed = serde_json::from_str::<taria::Snapshot>(tree_json).ok();
     outline_of(tree_json, parsed.as_ref().map(|parsed| &parsed.root))
 }
 
@@ -320,17 +323,17 @@ fn role(role: &Value) -> String {
     }
 }
 
-/// An action, spelled the way `act` takes it: [`action_name`] of the action
+/// An action, spelled the way `act` takes it: [`Action::wire_name`] of the action
 /// the bridge parsed, or, without that parse, of the action read off the
 /// text's `Value`, whose sorted keys can name an object with several keys
 /// differently. Only a value no action parse accepts, which cannot reach the
 /// outline from a line the bridge kept, prints as compact JSON.
 fn action(value: &Value, parsed: Option<&Action>) -> String {
     if let Some(parsed) = parsed {
-        return token(&action_name(parsed));
+        return token(parsed.wire_name());
     }
     match serde_json::from_value::<Action>(value.clone()) {
-        Ok(read) => token(&action_name(&read)),
+        Ok(read) => token(read.wire_name()),
         Err(_) => compact(value),
     }
 }

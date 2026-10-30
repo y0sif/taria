@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
+use crate::server::TariaMcpServer;
+use crate::tree_format::TreeFormat;
 use taria::wire::AppToBridge;
 use taria::{Node, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::server::TariaMcpServer;
-use taria_mcp::tree_format::TreeFormat;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -92,7 +92,7 @@ impl AppProcess {
         let mut child = Command::new(std::env::current_exe().expect("this test binary"))
             .args([
                 "--exact",
-                "fake_app_process",
+                "tests::released_restart::fake_app_process",
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",

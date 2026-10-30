@@ -5,13 +5,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::bridge::{self, AppSnapshot, BridgeHandle, BridgeState, LinkState};
+use crate::server::{ActParams, KeyParams, TariaMcpServer, TypeTextParams};
+use crate::tree_format::TreeFormat;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ContentBlock;
 use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{Action, AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::bridge::{self, AppSnapshot, BridgeHandle, BridgeState, LinkState};
-use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer, TypeTextParams};
-use taria_mcp::tree_format::TreeFormat;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};

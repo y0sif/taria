@@ -10,18 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::tree_format::TreeFormat;
-
-/// How long the bridge keeps the app with no tool calls before it lets go,
-/// when `--idle-release` does not say: 60 seconds.
-///
-/// Long enough that an agent working through a task never pays a reconnect
-/// between its calls, and short enough that a session that has gone quiet
-/// hands the app to the next one within a minute. A held bridge's answer
-/// names this number as the window a holder on the default lets go after,
-/// and names its own instead, as the best guess at the holder's, when it was
-/// started with another.
-pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(60);
+use taria_mcp::{DEFAULT_IDLE_RELEASE, TreeFormat};
 
 /// The longest `--idle-release` takes, in seconds: a day.
 ///
@@ -67,15 +56,9 @@ Environment:
                Logs go to stderr; stdout is the MCP channel.";
 
 /// Parsed command line.
-///
-/// `#[non_exhaustive]`, and so is [`Run`](Self::Run), so that the next flag
-/// is a field and the next mode a variant without breaking a caller's build:
-/// match with a wildcard arm and destructure `Run` with `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Cli {
     /// Run the bridge against this socket path.
-    #[non_exhaustive]
     Run {
         /// Path of the app's taria Unix socket.
         socket: PathBuf,
@@ -85,7 +68,7 @@ pub enum Cli {
         /// lets go (`--idle-release`, whole seconds up to
         /// [`MAX_IDLE_RELEASE_SECS`]). [`Duration::ZERO`]
         /// never lets go. See
-        /// [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand).
+        /// [`TariaMcpServer::on_demand`](taria_mcp::TariaMcpServer::on_demand).
         idle_release: Duration,
     },
     /// `--help` was requested.

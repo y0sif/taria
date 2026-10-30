@@ -9,14 +9,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::bridge::{self, AppSnapshot, BridgeState};
+use crate::server::{ActParams, TariaMcpServer};
+use crate::tree_format::TreeFormat;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 use taria::wire::{AppToBridge, BridgeToApp, InputStatus};
 use taria::{Action, AgentInput, Node, NodeId, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::bridge::{self, AppSnapshot, BridgeState};
-use taria_mcp::server::{ActParams, TariaMcpServer};
-use taria_mcp::tree_format::TreeFormat;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
