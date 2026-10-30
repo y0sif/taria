@@ -110,27 +110,20 @@ fn ack(id: u64, status: InputStatus) -> AppToBridge {
 }
 
 /// Poll `try_recv` until an input arrives or the timeout passes.
-fn poll_try_recv(layer: &TariaLayer) -> Option<AgentInput> {
+fn poll_try_recv(layer: &TariaLayer) -> Option<(InputId, AgentInput)> {
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
-        if let Some(input) = layer.try_recv() {
-            return Some(input);
+        if let Some(pair) = layer.try_recv() {
+            return Some(pair);
         }
         thread::sleep(Duration::from_millis(5));
     }
     None
 }
 
-/// [`poll_try_recv`], keeping the id the app has to ack.
-fn poll_try_recv_with_id(layer: &TariaLayer) -> Option<(InputId, AgentInput)> {
-    let deadline = Instant::now() + TIMEOUT;
-    while Instant::now() < deadline {
-        if let Some(pair) = layer.try_recv_with_id() {
-            return Some(pair);
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    None
+/// [`poll_try_recv`], keeping only the input, for a test that does not ack.
+fn poll_input(layer: &TariaLayer) -> Option<AgentInput> {
+    poll_try_recv(layer).map(|(_, input)| input)
 }
 
 fn publish_single_node(layer: &mut TariaLayer, id: &str) {
@@ -247,11 +240,11 @@ fn an_oversized_tree_is_replayed_as_a_line_the_bridge_can_read() {
     let value = snapshot.root.children[0].value.as_deref().unwrap();
     assert!(value.ends_with('\u{2026}'), "the cut is marked");
     assert!(draft.starts_with(value.trim_end_matches('\u{2026}')));
-    assert_eq!(layer.oversized_snapshots(), 1);
+    assert_eq!(layer.stats().oversized_snapshots, 1);
 
     // Still a working connection: an input goes in and its ack comes back.
     client.send_input(1, key("q"));
-    assert_eq!(poll_try_recv(&layer), Some(key("q")));
+    assert_eq!(poll_input(&layer), Some(key("q")));
     assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
 
     // Redrawn unchanged, the tree is not a new snapshot: the next one the
@@ -268,7 +261,7 @@ fn an_oversized_tree_is_replayed_as_a_line_the_bridge_can_read() {
     assert_eq!(snapshot.seq, 2, "the redraws published nothing");
     let value = snapshot.root.children[0].value.as_deref().unwrap();
     assert!(value.starts_with('x') && value.ends_with('\u{2026}'));
-    assert_eq!(layer.oversized_snapshots(), 2);
+    assert_eq!(layer.stats().oversized_snapshots, 2);
 }
 
 #[test]
@@ -285,14 +278,14 @@ fn inputs_reach_the_app_acked_delivered_and_malformed_lines_are_ignored() {
 
     let sent = key("q");
     client.send_input(1, sent.clone());
-    assert_eq!(poll_try_recv(&layer), Some(sent));
+    assert_eq!(poll_input(&layer), Some(sent));
     // Nothing was written before the app dequeued it: delivered means the
     // event loop took it, so the ack is the first thing the client sees.
     assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
 
     let act = AgentInput::act(taria::NodeId("btn".into()), taria::Action::Activate, None);
     client.send_input(2, act.clone());
-    assert_eq!(layer.recv_timeout(TIMEOUT), Some(act));
+    assert_eq!(layer.recv_timeout(TIMEOUT), Some((InputId::new(2), act)));
     assert_eq!(client.read_message(), ack(2, InputStatus::Delivered));
 }
 
@@ -314,13 +307,13 @@ fn an_input_kind_this_build_cannot_read_is_acked_ignored_without_reaching_the_ap
     client.write_line(r#"{"type":"input","id":41,"input":{"kind":"paste","text":"hi"}}"#);
     assert_eq!(client.read_message(), ack(41, InputStatus::Ignored));
     assert_eq!(
-        poll_try_recv(&layer),
+        poll_input(&layer),
         None,
         "an unreadable input must not be queued for the app"
     );
-    assert_eq!(layer.unknown_inputs(), 1);
+    assert_eq!(layer.stats().unknown_inputs, 1);
     assert_eq!(
-        layer.dropped_inputs(),
+        layer.stats().dropped_inputs,
         0,
         "it was answered, not dropped for want of queue space"
     );
@@ -328,9 +321,9 @@ fn an_input_kind_this_build_cannot_read_is_acked_ignored_without_reaching_the_ap
     // The connection is unharmed: a readable input right after it still works.
     let sent = key("q");
     client.send_input(42, sent.clone());
-    assert_eq!(poll_try_recv(&layer), Some(sent));
+    assert_eq!(poll_input(&layer), Some(sent));
     assert_eq!(client.read_message(), ack(42, InputStatus::Delivered));
-    assert_eq!(layer.unknown_inputs(), 1);
+    assert_eq!(layer.stats().unknown_inputs, 1);
 }
 
 /// A timeout the clock cannot turn into a deadline must not abort the app:
@@ -346,7 +339,10 @@ fn recv_timeout_survives_a_timeout_no_clock_can_hold() {
     // Queued before the wait starts, so the wait ends on the input rather
     // than on a deadline that does not exist.
     client.send_input(1, key("j"));
-    assert_eq!(layer.recv_timeout(Duration::MAX), Some(key("j")));
+    assert_eq!(
+        layer.recv_timeout(Duration::MAX),
+        Some((InputId::new(1), key("j")))
+    );
     assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
 }
 
@@ -357,7 +353,7 @@ fn ack_can_be_refined_to_ignored() {
     assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
 
     client.send_input(9, key("q"));
-    let (id, input) = poll_try_recv_with_id(&layer).expect("input should reach the app");
+    let (id, input) = poll_try_recv(&layer).expect("input should reach the app");
     assert_eq!((id, input), (InputId::new(9), key("q")));
     assert_eq!(client.read_message(), ack(9, InputStatus::Delivered));
 
@@ -382,7 +378,7 @@ fn a_late_ack_never_answers_the_next_bridge() {
     assert!(matches!(first.read_message(), AppToBridge::Hello { .. }));
 
     first.send_input(5, key("q"));
-    let (id, _) = poll_try_recv_with_id(&layer).expect("the input reaches the app");
+    let (id, _) = poll_try_recv(&layer).expect("the input reaches the app");
     assert_eq!(id, InputId::new(5));
     assert_eq!(first.read_message(), ack(5, InputStatus::Delivered));
 
@@ -421,7 +417,7 @@ fn a_late_ack_never_answers_the_next_bridge() {
         .set_read_timeout(Some(TIMEOUT))
         .unwrap();
     second.send_input(5, key("j"));
-    let (id, input) = poll_try_recv_with_id(&layer).expect("the new bridge's input");
+    let (id, input) = poll_try_recv(&layer).expect("the new bridge's input");
     assert_eq!((id, input), (InputId::new(5), key("j")));
     assert_eq!(second.read_message(), ack(5, InputStatus::Delivered));
     layer.ack(InputId::new(5), InputStatus::Ignored);
@@ -435,7 +431,7 @@ fn ack_precedes_the_snapshot_published_after_it() {
     assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
 
     client.send_input(3, key("j"));
-    assert_eq!(poll_try_recv(&layer), Some(key("j")));
+    assert_eq!(poll_input(&layer), Some(key("j")));
     // The app reacts to the input by publishing a new tree.
     publish_single_node(&mut layer, "moved");
 
@@ -448,9 +444,12 @@ fn ack_precedes_the_snapshot_published_after_it() {
     assert_eq!(snapshot.root.children[0].id.0, "moved");
 }
 
+/// The loop an app writes when it needs each input's id for something other
+/// than an immediate verdict: every queued input, in order, each with its id
+/// and its `Delivered` ack.
 #[test]
-fn drain_hands_over_every_queued_input_and_acks_each() {
-    let layer = bind_layer("drain");
+fn a_try_recv_loop_hands_over_every_queued_input_and_acks_each() {
+    let layer = bind_layer("recvloop");
     let mut client = Client::connect(&layer);
     assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
 
@@ -458,17 +457,19 @@ fn drain_hands_over_every_queued_input_and_acks_each() {
         client.send_input(id, key(&format!("k{id}")));
     }
 
-    // The inputs cross a socket, so drain until all three have landed.
+    // The inputs cross a socket, so loop until all three have landed.
     let mut got = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while got.len() < 3 && Instant::now() < deadline {
-        layer.drain_with_ids(|id, input| got.push((id.get(), input)));
+        while let Some((id, input)) = layer.try_recv() {
+            got.push((id.get(), input));
+        }
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
         got,
         vec![(0, key("k0")), (1, key("k1")), (2, key("k2"))],
-        "drain must hand over every queued input, in order"
+        "the loop must hand over every queued input, in order"
     );
 
     for id in 0..3 {
@@ -476,12 +477,12 @@ fn drain_hands_over_every_queued_input_and_acks_each() {
     }
 }
 
-/// `drain_acking` sends what the handler returns only where it says something
-/// the dequeue did not: an `Ignored` refines the `Delivered` ack, and a
+/// `drain` sends what the handler returns only where it says something the
+/// dequeue did not: an `Ignored` refines the `Delivered` ack, and a
 /// `Delivered` sends no second copy of it.
 #[test]
-fn drain_acking_sends_the_refinements_and_nothing_else() {
-    let mut layer = bind_layer("drainacking");
+fn drain_sends_the_refinements_and_nothing_else() {
+    let mut layer = bind_layer("drain");
     let mut client = Client::connect(&layer);
     assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
 
@@ -494,7 +495,7 @@ fn drain_acking_sends_the_refinements_and_nothing_else() {
     let mut got = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while got.len() < 3 && Instant::now() < deadline {
-        layer.drain_acking(|input| {
+        layer.drain(|input| {
             let status = if input == key("k1") {
                 InputStatus::Ignored
             } else {
@@ -542,7 +543,10 @@ fn client_can_reconnect_after_disconnect() {
 
     // The fresh connection is fully functional in both directions.
     second.send_input(1, key("esc"));
-    assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("esc")));
+    assert_eq!(
+        layer.recv_timeout(TIMEOUT),
+        Some((InputId::new(1), key("esc")))
+    );
     assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
 }
 
@@ -592,7 +596,7 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
     const QUEUE: u64 = 256;
 
     let mut layer = bind_layer("inputflood");
-    assert_eq!(layer.dropped_inputs(), 0, "no drops before any flood");
+    assert_eq!(layer.stats().dropped_inputs, 0, "no drops before any flood");
 
     // Read on a second thread for the whole flood: every dropped input is
     // acked, and a client that only wrote would let those acks back up until
@@ -673,12 +677,12 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
         "inputs queued on a dead connection must never be handed to the app"
     );
     assert_eq!(
-        layer.stale_inputs(),
+        layer.stats().stale_inputs,
         QUEUE,
         "the queue held {QUEUE} inputs, and each discard must be counted once"
     );
     assert_eq!(
-        layer.dropped_inputs(),
+        layer.stats().dropped_inputs,
         FLOOD - QUEUE,
         "each dropped input must be counted exactly once"
     );
@@ -722,14 +726,17 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
     assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
     assert!(matches!(second.read_message(), AppToBridge::Snapshot(_)));
     second.send_input(0, key("after"));
-    assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("after")));
+    assert_eq!(
+        layer.recv_timeout(TIMEOUT),
+        Some((InputId::new(0), key("after")))
+    );
     // A stale ack from the dead connection must not surface here: ids start
     // over with each client.
     assert_eq!(second.read_message(), ack(0, InputStatus::Delivered));
 
     // Accepted inputs never bump either counter.
-    assert_eq!(layer.dropped_inputs(), FLOOD - QUEUE);
-    assert_eq!(layer.stale_inputs(), QUEUE);
+    assert_eq!(layer.stats().dropped_inputs, FLOOD - QUEUE);
+    assert_eq!(layer.stats().stale_inputs, QUEUE);
 }
 
 /// The mirror image of the bridge dropping inputs it queued while no app was
@@ -773,7 +780,7 @@ fn inputs_from_a_dead_connection_are_discarded_and_the_next_ones_are_not() {
         waited >= WAIT,
         "recv_timeout returned after {waited:?}, short of its {WAIT:?} timeout"
     );
-    assert_eq!(layer.stale_inputs(), 1, "the discard must be counted");
+    assert_eq!(layer.stats().stale_inputs, 1, "the discard must be counted");
 
     // Nothing was acked for it either: the peer that would read the ack is
     // the one that is gone. A fresh session then works normally, and its
@@ -781,9 +788,16 @@ fn inputs_from_a_dead_connection_are_discarded_and_the_next_ones_are_not() {
     let mut second = Client::connect(&layer);
     assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
     second.send_input(1, key("j"));
-    assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("j")));
+    assert_eq!(
+        layer.recv_timeout(TIMEOUT),
+        Some((InputId::new(1), key("j")))
+    );
     assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
-    assert_eq!(layer.stale_inputs(), 1, "a live input is not a stale one");
+    assert_eq!(
+        layer.stats().stale_inputs,
+        1,
+        "a live input is not a stale one"
+    );
 }
 
 /// One bridge at a time, which is the design and not an accident: the accept
@@ -855,7 +869,10 @@ fn a_second_client_waits_until_the_first_is_gone() {
     // And it is a full session, not a leftover: its input reaches the app and
     // is acked on the connection it arrived on.
     second.send_input(1, key("j"));
-    assert_eq!(layer.recv_timeout(TIMEOUT), Some(key("j")));
+    assert_eq!(
+        layer.recv_timeout(TIMEOUT),
+        Some((InputId::new(1), key("j")))
+    );
     assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
 }
 
@@ -906,7 +923,7 @@ fn input_a_waiting_client_wrote_before_its_hello_never_reaches_the_app() {
 
     assert_eq!(
         layer.recv_timeout(TIMEOUT),
-        Some(key("j")),
+        Some((InputId::new(3), key("j"))),
         "neither the blind input nor the rest of the cut line may reach the app"
     );
     assert_eq!(
@@ -917,12 +934,12 @@ fn input_a_waiting_client_wrote_before_its_hello_never_reaches_the_app() {
     );
     assert_eq!(layer.try_recv(), None, "nothing else was queued");
     assert_eq!(
-        layer.stale_inputs(),
+        layer.stats().stale_inputs,
         1,
         "the whole blind input is counted once; the cut line is not counted"
     );
-    assert_eq!(layer.unknown_inputs(), 0);
-    assert_eq!(layer.dropped_inputs(), 0);
+    assert_eq!(layer.stats().unknown_inputs, 0);
+    assert_eq!(layer.stats().dropped_inputs, 0);
 
     // The second leaves, and the third, waiting since before the second was
     // served, is served at once.
@@ -935,13 +952,13 @@ fn input_a_waiting_client_wrote_before_its_hello_never_reaches_the_app() {
     third.send_input(2, key("k"));
     assert_eq!(
         layer.recv_timeout(TIMEOUT),
-        Some(key("k")),
+        Some((InputId::new(2), key("k"))),
         "a client served straight after another is drained like it"
     );
     assert_eq!(third.read_message(), ack(2, InputStatus::Delivered));
     assert_eq!(layer.try_recv(), None);
     assert_eq!(
-        layer.stale_inputs(),
+        layer.stats().stale_inputs,
         2,
         "the third's blind input is counted"
     );
@@ -965,12 +982,12 @@ fn a_lone_client_that_writes_before_reading_its_hello_keeps_its_input() {
         AppToBridge::hello("blindlone", PROTOCOL_VERSION)
     );
     assert_eq!(
-        poll_try_recv(&layer),
+        poll_input(&layer),
         Some(key("j")),
         "the first connection of a process waited behind nobody"
     );
     assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
-    assert_eq!(layer.stale_inputs(), 0, "nothing was discarded");
+    assert_eq!(layer.stats().stale_inputs, 0, "nothing was discarded");
 }
 
 /// The same for a client that connects once an earlier session is over and
@@ -996,12 +1013,12 @@ fn a_client_that_finds_the_app_idle_after_a_session_keeps_its_blind_input() {
     second.send_input(1, key("j"));
     assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
     assert_eq!(
-        poll_try_recv(&layer),
+        poll_input(&layer),
         Some(key("j")),
         "a client that connected to an idle app waited behind nobody"
     );
     assert_eq!(second.read_message(), ack(1, InputStatus::Delivered));
-    assert_eq!(layer.stale_inputs(), 0, "nothing was discarded");
+    assert_eq!(layer.stats().stale_inputs, 0, "nothing was discarded");
 }
 
 /// A common way out of an app answers an input and drops the layer in the
@@ -1024,7 +1041,7 @@ fn acks_queued_as_the_layer_drops_still_reach_the_bridge() {
     let mut handled = 0;
     let deadline = Instant::now() + TIMEOUT;
     while handled == 0 && Instant::now() < deadline {
-        layer.drain_acking(|_| {
+        layer.drain(|_| {
             handled += 1;
             InputStatus::Ignored
         });

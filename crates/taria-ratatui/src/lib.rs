@@ -37,7 +37,7 @@
 //!     // Drain agent input alongside terminal events. Each input is acked
 //!     // `Delivered` as it is handed over; return `Ignored` for one you
 //!     // looked at and deliberately did nothing with, and the layer sends it.
-//!     layer.drain_acking(|_input| {
+//!     layer.drain(|_input| {
 //!         // Apply to app state exactly like a keyboard event.
 //!         InputStatus::Delivered
 //!     });
@@ -63,7 +63,7 @@ mod test_util;
 
 pub use bound::SnapshotTooLarge;
 pub use key::{text_to_keys, to_crossterm, to_crossterm_key};
-pub use layer::TariaLayer;
+pub use layer::{LayerStats, TariaLayer};
 pub use recorder::FrameRecorder;
 pub use semantic::{Semantic, sem};
 

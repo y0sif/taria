@@ -33,7 +33,7 @@
 //! because some inputs are deliberately dropped (the modal gate, an unknown
 //! node id, an action a node does not handle, a `set_value` carrying no value)
 //! and an agent waiting on an effect from one of those should stop waiting.
-//! [`TariaLayer::drain_acking`](taria_ratatui::TariaLayer::drain_acking) sends
+//! [`TariaLayer::drain`](taria_ratatui::TariaLayer::drain) sends
 //! the [`Ignored`](InputStatus::Ignored) ones; a
 //! [`Delivered`](InputStatus::Delivered) adds nothing to the ack the layer
 //! already sent when it handed the input over.

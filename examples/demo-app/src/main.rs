@@ -52,7 +52,8 @@ fn main() -> io::Result<()> {
 
     // Safe to print again only now the alternate screen is gone. A nonzero
     // count means agent inputs arrived faster than this loop drained them.
-    let dropped = layer.dropped_inputs();
+    let stats = layer.stats();
+    let dropped = stats.dropped_inputs;
     if dropped > 0 {
         eprintln!("taria-demo: dropped {dropped} agent input(s): the app could not keep up");
     }
@@ -61,7 +62,7 @@ fn main() -> io::Result<()> {
     // them, or because a bridge waiting for the socket wrote them before its
     // hello. Nothing on the agent side hears about those, so the person
     // running the demo is the only one who can.
-    let stale = layer.stale_inputs();
+    let stale = stats.stale_inputs;
     if stale > 0 {
         eprintln!(
             "taria-demo: discarded {stale} agent input(s): their bridge connection ended first, \
@@ -72,7 +73,7 @@ fn main() -> io::Result<()> {
     // because their kind is one this build of taria cannot read. The agent
     // was told, so nothing is lost on that side, but the reason is a taria
     // version gap that only whoever runs the app can close.
-    let unknown = layer.unknown_inputs();
+    let unknown = stats.unknown_inputs;
     if unknown > 0 {
         eprintln!(
             "taria-demo: could not read {unknown} agent input(s): the bridge speaks a newer \
@@ -87,7 +88,7 @@ fn main() -> io::Result<()> {
     //
     // Worded to start differently from the three above, because the e2e gate
     // recognizes each of those lines by its opening words.
-    let acks = layer.dropped_acks();
+    let acks = stats.dropped_acks;
     if acks > 0 {
         eprintln!(
             "taria-demo: lost the answer to {acks} agent input(s): the bridge read them slower \
@@ -105,18 +106,18 @@ fn main() -> io::Result<()> {
     // because the draft is published whole on purpose: it is the case the
     // bound exists for. Both open with words of their own, like the four
     // above, so a gate can tell each line from the rest.
-    let truncated = layer.truncated_snapshots();
+    let truncated = stats.truncated_snapshots;
     if truncated > 0 {
-        let last = layer
-            .last_truncation()
+        let last = stats
+            .last_truncation
             .map(|err| format!("; the last: {err}"))
             .unwrap_or_default();
         eprintln!("taria-demo: cut {truncated} snapshot(s) to the depth limit{last}");
     }
-    let oversized = layer.oversized_snapshots();
+    let oversized = stats.oversized_snapshots;
     if oversized > 0 {
-        let last = layer
-            .last_oversize()
+        let last = stats
+            .last_oversize
             .map(|err| format!("; the last: {err}"))
             .unwrap_or_default();
         eprintln!("taria-demo: trimmed {oversized} snapshot(s) to fit one line{last}");
@@ -219,8 +220,8 @@ fn sync_state(state_file: &mut Option<StateFile>, app: &App) {
 /// The layer acks `Delivered` as it hands an input over, which only says the
 /// event loop dequeued it. `Ignored` is the follow-up that tells an agent
 /// waiting on an effect that no effect is coming, and last ack wins.
-/// `apply_agent_input` returns the status and `drain_acking` sends the ones
-/// that refine it, so no input id passes through this app at all.
+/// `apply_agent_input` returns the status and `drain` sends the ones that
+/// refine it, so no input id passes through this app at all.
 fn drain_agent_input(app: &mut App, layer: &TariaLayer) {
-    layer.drain_acking(|input| apply_agent_input(app, input));
+    layer.drain(|input| apply_agent_input(app, input));
 }

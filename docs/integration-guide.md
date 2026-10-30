@@ -99,7 +99,8 @@ fn main() -> std::io::Result<()> {
 
 `bind` returns an error; `bind_or_disabled` returns a disabled layer instead.
 Prefer the second. A user whose `$XDG_RUNTIME_DIR` is not writable should get
-their app, not a failure to launch over a feature they did not ask for.
+their app, not a failure to launch over a feature they did not ask for. At a
+path of your own the pair is `bind_at` and `bind_or_disabled_at`.
 
 Every method stays callable on a disabled layer: publishing does nothing, no
 input ever arrives, `frame()` still hands back a recorder. The render path
@@ -423,18 +424,16 @@ and agent input then sits in the queue until a human touches a key. The demo
 runs a tick thread that sends an event every 50 ms, which bounds the latency
 between an act and its effect.
 
-If you have no tick, `layer.recv_timeout_with_id(Duration::from_millis(50))`
-is a blocking wait on agent input with a deadline, usable as the loop's clock.
-It waits out the timeout even on a disabled layer, so an app that paces itself
+If you have no tick, `layer.recv_timeout(Duration::from_millis(50))` is a
+blocking wait on agent input with a deadline, usable as the loop's clock. It
+waits out the timeout even on a disabled layer, so an app that paces itself
 on it keeps its timing whether or not taria bound.
 
-Pace on that variant rather than `recv_timeout`. The plain one drops the
-`InputId`, and without the id you cannot ack `Ignored`, which
+It hands back the input with its `InputId`, as `try_recv` does. Keep the id:
+without it you cannot ack `Ignored`, which
 [Acknowledge what you ignore](#acknowledge-what-you-ignore) makes mandatory.
-The same pairing runs through the rest of the API: `try_recv_with_id` to
-`try_recv`, and `drain_with_ids` to `drain`, which is that loop already
-written for you. A loop that drains needs no id at all: `drain_acking` takes
-the status your handler returns and sends the ack itself.
+A loop that drains needs no id at all: `drain` takes the status your handler
+returns and sends the ack itself.
 
 ## Give things identities, not positions
 
@@ -492,20 +491,18 @@ not change, which reads as "it may not have reacted yet".
 use taria_ratatui::TariaLayer;
 
 fn drain_agent_input(app: &mut App, layer: &TariaLayer) {
-    layer.drain_acking(|input| apply_agent_input(app, input));
+    layer.drain(|input| apply_agent_input(app, input));
 }
 ```
 
 `apply_agent_input` returns an `InputStatus`: `Ignored` for an input it
-deliberately did nothing with, `Delivered` for the rest. `drain_acking` sends
-the `Ignored` ones, and last ack wins, so each refines the `Delivered` the
-dequeue already sent. A returned `Delivered` sends nothing, since it would only
-repeat that. That is why `apply_agent_input` returns a verdict instead of `()`,
-and the verdict is taria's own type rather than one you define: the demo and
-the typing tutor each wrote the same two-variant enum, and the same loop around
-`drain_with_ids` and `ack`, before `drain_acking` existed. Keep those two for
-an input you need the id of for something else, such as one you can only
-answer a frame later.
+deliberately did nothing with, `Delivered` for the rest. `drain` sends the
+`Ignored` ones, and last ack wins, so each refines the `Delivered` the dequeue
+already sent. A returned `Delivered` sends nothing, since it would only repeat
+that. That is why `apply_agent_input` returns a verdict instead of `()`, and
+the verdict is taria's own type rather than one you define: the demo and the
+typing tutor each wrote the same two-variant enum, and the same
+dequeue-and-`ack` loop, before the layer did it for them.
 
 An act on a node that has since gone is one of these. The demo publishes
 `dialog`, `dialog-confirm` and `dialog-cancel` only while the confirm-delete
@@ -521,6 +518,26 @@ ack queued first arrives first, and the bridge reports the refinement. Publish
 first and the bridge sees a changed tree behind a plain `Delivered`, returns
 that tree, and the `Ignored` arrives after the answer has already gone out.
 Draining before drawing, as above, gives you this for free.
+
+An input you can only answer later, a frame on or more, needs its id kept
+until then. For those, loop on `try_recv` instead of calling `drain`. It hands
+you each input with its `InputId`, and you pass the id to `ack` when the
+answer is ready:
+
+```rust
+use taria_ratatui::InputStatus;
+
+let mut pending = Vec::new();
+while let Some((id, input)) = layer.try_recv() {
+    apply(app, input);
+    pending.push(id);
+}
+
+// Later, once you know nothing came of them.
+for id in pending {
+    layer.ack(id, InputStatus::Ignored);
+}
+```
 
 ## Advertise a way out of every state
 
@@ -665,10 +682,11 @@ agent on the stale tree either way.
 You are told, because you are the only one who can fix it:
 
 ```rust
-let cut = layer.truncated_snapshots();
-if let Some(branch) = layer.last_truncation() {
+let stats = layer.stats();
+if let Some(branch) = stats.last_truncation {
     // Names the depth measured and a node found at it, which in a tree
     // generated from data is the only way to find the branch that ran away.
+    let cut = stats.truncated_snapshots;
     eprintln!("my-app: {cut} snapshot(s) published with a branch cut: {branch}");
 }
 ```
@@ -719,15 +737,16 @@ sends nothing new: the agent already has that tree.
 You are told, because you are the only one who can fix it:
 
 ```rust
-let trimmed = layer.oversized_snapshots();
-if let Some(last) = layer.last_oversize() {
+let stats = layer.stats();
+if let Some(last) = stats.last_oversize {
     // Names the line's size and the node holding the longest string,
     // which is where to look.
+    let trimmed = stats.oversized_snapshots;
     eprintln!("my-app: {trimmed} snapshot(s) trimmed to fit one line: {last}");
 }
 ```
 
-Both `oversized_snapshots()` and `truncated_snapshots()` count snapshots, not
+Both `oversized_snapshots` and `truncated_snapshots` count snapshots, not
 frames, so a tree that stays too large while the app redraws it counts once.
 
 Nothing laid out by hand comes near this; the demo's whole tree is under
@@ -815,7 +834,7 @@ each marked variant's literal: `AgentInput::act`, `key` and `text`,
 Through this adapter, the wildcard arm is not where an input kind you cannot
 read arrives. That is `AgentInput::Unknown`, the fallback a kind added after
 your build parses as, and the layer answers it `Ignored` on your behalf and
-never queues it, counting it in `unknown_inputs()`. The fallback exists
+never queues it, counting it in `stats().unknown_inputs`. The fallback exists
 because the `InputId` sits on the message rather than inside the input, so
 degrading the input is what keeps the id and makes an ack possible at all;
 without it the line fails whole and the agent waits out a timeout for an ack
@@ -996,16 +1015,18 @@ primary path.
 
 ## Report what the layer threw away
 
-Four counters record agent traffic that went nowhere. Read them after the
-terminal is restored, never while the alternate screen or a pinned panel is
-up ([Apps that draw only a panel](#apps-that-draw-only-a-panel)).
+`layer.stats()` returns a `LayerStats`, and four of its counts record agent
+traffic that went nowhere. Read it after the terminal is restored, never while
+the alternate screen or a pinned panel is up
+([Apps that draw only a panel](#apps-that-draw-only-a-panel)).
 
 ```rust
 ratatui::restore();
+let stats = layer.stats();
 
 // The agent sent input faster than the loop drained it. Each drop was
 // acked `Dropped`, so the agent knows; this is the app-side tally.
-let dropped = layer.dropped_inputs();
+let dropped = stats.dropped_inputs;
 if dropped > 0 {
     eprintln!("my-app: dropped {dropped} agent input(s): could not keep up");
 }
@@ -1013,34 +1034,35 @@ if dropped > 0 {
 // bridge connection they arrived on ended first, or a waiting client wrote
 // them before its session began. Nothing on the agent side is left to hear
 // about these, so the person running the app is the only one who can.
-let stale = layer.stale_inputs();
+let stale = stats.stale_inputs;
 if stale > 0 {
     eprintln!("my-app: discarded {stale} agent input(s): no live session");
 }
 // Inputs whose kind this build of taria cannot read. The layer acked each
 // one `Ignored` for you, so the agent was told; the version gap is yours.
-let unknown = layer.unknown_inputs();
+let unknown = stats.unknown_inputs;
 if unknown > 0 {
     eprintln!("my-app: could not read {unknown} agent input(s): raise the taria dependency");
 }
 // Answers the bridge was too slow to collect. These inputs were applied;
 // it is the acks that were dropped, so the agent calls waiting on them
 // timed out instead of hearing what happened.
-let acks = layer.dropped_acks();
+let acks = stats.dropped_acks;
 if acks > 0 {
     eprintln!("my-app: lost the answer to {acks} agent input(s): the bridge read too slowly");
 }
 ```
 
 All four are monotonic across reconnects and all four are 0 on a disabled
-layer. The input queue holds 256, so a nonzero `dropped_inputs` means an agent
-outpaced the loop by a lot; a loop that only wakes on keyboard events gets
-there first. A nonzero `stale_inputs` means one of two things. A bridge
-session ended with input still queued, which a harness restart mid-call will
-do. Or a second client wrote input while it waited for the first to leave,
-before the app's `hello` reached it; that input was thrown away unacked,
-because its writer had seen no tree. taria-mcp never does this: its input
-tools refuse to send before the app's first snapshot. A nonzero
+layer. `LayerStats` is `#[non_exhaustive]`, so a later release can add a count
+without breaking this code. The input queue holds 256, so a nonzero
+`dropped_inputs` means an agent outpaced the loop by a lot; a loop that only
+wakes on keyboard events gets there first. A nonzero `stale_inputs` means one
+of two things. A bridge session ended with input still queued, which a harness
+restart mid-call will do. Or a second client wrote input while it waited for
+the first to leave, before the app's `hello` reached it; that input was thrown
+away unacked, because its writer had seen no tree. taria-mcp never does this:
+its input tools refuse to send before the app's first snapshot. A nonzero
 `unknown_inputs` means the bridge is built against a newer taria than the app,
 and the agent is asking for something this build has no way to do.
 
@@ -1071,7 +1093,8 @@ it is that the layer binds *and unlinks* whatever the label resolves to, and
 absolute path. `bind` returns the error and `bind_or_disabled` comes back
 disabled with an empty `socket_path()`, because a refused label resolves to no
 path at all. If you want a path of your own, pass the path: `$TARIA_SOCK`, or
-`TariaLayer::bind_at`.
+`TariaLayer::bind_or_disabled_at` (`bind_at` if you would rather have the
+error).
 
 Unix domain socket paths are capped at the platform's `sun_path` minus the
 terminating NUL, and the buffer is not the same size everywhere: 108 bytes on
