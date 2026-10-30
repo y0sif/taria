@@ -15,6 +15,8 @@
 //! snapshot does not arrive at all, and nothing says so, which is why
 //! [`Node::check_depth`] exists for an adapter to call before publishing.
 
+#![warn(missing_docs)]
+
 mod action;
 pub mod id;
 pub mod key;

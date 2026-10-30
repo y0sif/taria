@@ -10,6 +10,8 @@ use crate::{Node, PROTOCOL_VERSION};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Snapshot {
+    /// The [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) the snapshot is
+    /// written in; version negotiation happens on the hello, not here.
     pub protocol_version: u32,
     /// Sequence number, incremented once per published snapshot within one run
     /// of the app.
@@ -23,6 +25,7 @@ pub struct Snapshot {
     /// published, does not move it either: it counts publishes, not frames.
     /// Compare whole snapshots to detect change.
     pub seq: u64,
+    /// The root of the tree.
     pub root: Node,
 }
 

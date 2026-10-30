@@ -51,6 +51,8 @@
 //! }
 //! ```
 
+#![warn(missing_docs)]
+
 mod bound;
 mod key;
 mod layer;

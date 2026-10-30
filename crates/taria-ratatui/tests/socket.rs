@@ -88,15 +88,15 @@ impl Client {
     }
 
     /// Send one input under `id`; every ack answering it carries that id.
-    fn send_input(&mut self, id: InputId, input: AgentInput) {
-        self.send(&BridgeToApp::input(id, input));
+    fn send_input(&mut self, id: u64, input: AgentInput) {
+        self.send(&BridgeToApp::input(InputId::new(id), input));
     }
 }
 
 /// Write one input straight to a stream, for tests that hand the read half to
 /// another thread and so cannot use [`Client`].
-fn write_input(stream: &mut UnixStream, id: InputId, input: AgentInput) {
-    let mut line = serde_json::to_string(&BridgeToApp::input(id, input)).unwrap();
+fn write_input(stream: &mut UnixStream, id: u64, input: AgentInput) {
+    let mut line = serde_json::to_string(&BridgeToApp::input(InputId::new(id), input)).unwrap();
     line.push('\n');
     stream.write_all(line.as_bytes()).unwrap();
 }
@@ -105,8 +105,8 @@ fn key(name: &str) -> AgentInput {
     AgentInput::key(name)
 }
 
-fn ack(id: InputId, status: InputStatus) -> AppToBridge {
-    AppToBridge::ack(id, status)
+fn ack(id: u64, status: InputStatus) -> AppToBridge {
+    AppToBridge::ack(InputId::new(id), status)
 }
 
 /// Poll `try_recv` until an input arrives or the timeout passes.
@@ -358,7 +358,7 @@ fn ack_can_be_refined_to_ignored() {
 
     client.send_input(9, key("q"));
     let (id, input) = poll_try_recv_with_id(&layer).expect("input should reach the app");
-    assert_eq!((id, input), (9, key("q")));
+    assert_eq!((id, input), (InputId::new(9), key("q")));
     assert_eq!(client.read_message(), ack(9, InputStatus::Delivered));
 
     // The app looked at it and deliberately did nothing. Last ack wins, so
@@ -383,7 +383,7 @@ fn a_late_ack_never_answers_the_next_bridge() {
 
     first.send_input(5, key("q"));
     let (id, _) = poll_try_recv_with_id(&layer).expect("the input reaches the app");
-    assert_eq!(id, 5);
+    assert_eq!(id, InputId::new(5));
     assert_eq!(first.read_message(), ack(5, InputStatus::Delivered));
 
     // The bridge dies with the app still holding id 5, then a new one
@@ -394,7 +394,7 @@ fn a_late_ack_never_answers_the_next_bridge() {
     assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
 
     // The app answers the id it kept, a frame late.
-    layer.ack(5, InputStatus::Ignored);
+    layer.ack(InputId::new(5), InputStatus::Ignored);
 
     second
         .reader
@@ -422,9 +422,9 @@ fn a_late_ack_never_answers_the_next_bridge() {
         .unwrap();
     second.send_input(5, key("j"));
     let (id, input) = poll_try_recv_with_id(&layer).expect("the new bridge's input");
-    assert_eq!((id, input), (5, key("j")));
+    assert_eq!((id, input), (InputId::new(5), key("j")));
     assert_eq!(second.read_message(), ack(5, InputStatus::Delivered));
-    layer.ack(5, InputStatus::Ignored);
+    layer.ack(InputId::new(5), InputStatus::Ignored);
     assert_eq!(second.read_message(), ack(5, InputStatus::Ignored));
 }
 
@@ -462,7 +462,7 @@ fn drain_hands_over_every_queued_input_and_acks_each() {
     let mut got = Vec::new();
     let deadline = Instant::now() + TIMEOUT;
     while got.len() < 3 && Instant::now() < deadline {
-        layer.drain_with_ids(|id, input| got.push((id, input)));
+        layer.drain_with_ids(|id, input| got.push((id.get(), input)));
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(
@@ -704,7 +704,7 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
         dropped.len()
     );
     assert!(
-        dropped.iter().all(|id| *id < FLOOD),
+        dropped.iter().all(|id| id.get() < FLOOD),
         "a dropped ack must name an input the client actually sent"
     );
     // Nothing was acked delivered: the app drained only after the flood, by

@@ -578,7 +578,7 @@ impl TariaMcpServer {
     ///
     /// The examples are bare, not quoted: every quote is two characters once
     /// the description is JSON, and the list reads the same without them. The
-    /// text rule is a preference, for the reason on [`INSTRUCTIONS`].
+    /// text rule is a preference, for the reason on `INSTRUCTIONS`.
     #[tool(
         description = "Send one raw key press (q, enter, tab, ctrl+c, f5) to wherever focus \
                        is; repeat sends it up to 64 times. A fallback where no advertised action \
@@ -3252,10 +3252,10 @@ mod tests {
         // Four acks into a two-slot channel, all published before the observer
         // reads: the two oldest are gone by its first recv.
         for id in 1..=4 {
-            let _ = ack_tx.send((id, InputStatus::Delivered));
+            let _ = ack_tx.send((InputId::new(id), InputStatus::Delivered));
         }
 
-        let seen = observe(acks, rx, &pre, &[1, 2, 3, 4]).await;
+        let seen = observe(acks, rx, &pre, &[1, 2, 3, 4].map(InputId::new)).await;
         assert_eq!(seen.lost, 2, "skipped acks must be counted: {seen:?}");
 
         let err = report(seen, pre, 4, TreeFormat::Json)
@@ -3355,11 +3355,11 @@ mod tests {
         let (_state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
         // A two-press burst, three acks: the first input is dropped and said
         // so twice.
-        let _ = ack_tx.send((1, InputStatus::Dropped));
-        let _ = ack_tx.send((1, InputStatus::Dropped));
-        let _ = ack_tx.send((2, InputStatus::Dropped));
+        let _ = ack_tx.send((InputId::new(1), InputStatus::Dropped));
+        let _ = ack_tx.send((InputId::new(1), InputStatus::Dropped));
+        let _ = ack_tx.send((InputId::new(2), InputStatus::Dropped));
 
-        let seen = observe(acks, rx, &pre, &[1, 2]).await;
+        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new)).await;
         assert_eq!(
             seen.dropped, 2,
             "two inputs were dropped however many acks said so: {seen:?}"
@@ -3386,12 +3386,12 @@ mod tests {
         let (ack_tx, acks) = broadcast::channel(8);
         let pre = snapshot("before");
         let (_state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
-        let _ = ack_tx.send((1, InputStatus::Dropped));
-        let _ = ack_tx.send((1, InputStatus::Delivered));
+        let _ = ack_tx.send((InputId::new(1), InputStatus::Dropped));
+        let _ = ack_tx.send((InputId::new(1), InputStatus::Delivered));
         // The last input's `Dropped` ends the window, so this stays fast.
-        let _ = ack_tx.send((2, InputStatus::Dropped));
+        let _ = ack_tx.send((InputId::new(2), InputStatus::Dropped));
 
-        let seen = observe(acks, rx, &pre, &[1, 2]).await;
+        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new)).await;
         assert_eq!(
             seen.dropped, 1,
             "only the input whose newest ack is a drop counts: {seen:?}"
@@ -3421,13 +3421,13 @@ mod tests {
         let (ack_tx, acks) = broadcast::channel(4);
         let pre = snapshot("before");
         let (state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
-        let _ = ack_tx.send((1, InputStatus::Delivered));
+        let _ = ack_tx.send((InputId::new(1), InputStatus::Delivered));
         state_tx.send_replace(BridgeState::Disconnected {
             app_label: Some("demo".to_string()),
             last_seq: 7,
         });
 
-        let seen = observe(acks, rx, &pre, &[1]).await;
+        let seen = observe(acks, rx, &pre, &[1].map(InputId::new)).await;
         assert!(
             seen.gone.is_some(),
             "a departure must be recorded: {seen:?}"
@@ -3561,7 +3561,7 @@ mod tests {
         let (ack_tx, acks) = broadcast::channel(4);
         let pre = snapshot("before");
         let (state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
-        let _ = ack_tx.send((1, InputStatus::Delivered));
+        let _ = ack_tx.send((InputId::new(1), InputStatus::Delivered));
         state_tx.send_replace(BridgeState::Disconnected {
             app_label: Some("demo".to_string()),
             last_seq: 7,
@@ -3576,7 +3576,7 @@ mod tests {
             state_tx.send_replace(BridgeState::Connected(after));
         });
 
-        let seen = observe(acks, rx, &pre, &[1]).await;
+        let seen = observe(acks, rx, &pre, &[1].map(InputId::new)).await;
         assert!(
             seen.gone.is_none(),
             "an app that came back is not gone: {seen:?}"

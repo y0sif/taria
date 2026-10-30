@@ -361,7 +361,7 @@ impl BridgeHandle {
     /// counter of their own, and two tool calls racing still get different
     /// ids.
     pub fn next_input_id(&self) -> InputId {
-        NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed)
+        InputId::new(NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Start receiving acks from now on.
@@ -1622,7 +1622,7 @@ fn handle_app_line(
             state_tx.send_replace(BridgeState::Connected(AppSnapshot::from_line(line, parsed)));
         }
         Ok(AppToBridge::Ack { id, status, .. }) => {
-            tracing::debug!(id, ?status, "input ack received");
+            tracing::debug!(id = id.get(), ?status, "input ack received");
             // An ack nobody is waiting for is the normal case (the tool call
             // that sent the input has already returned), so a send with no
             // subscribers is not an error worth reporting.
@@ -2255,14 +2255,14 @@ mod tests {
         let call = demand.begin();
         wiring
             .input_tx
-            .send((7, AgentInput::key("x")))
+            .send((InputId::new(7), AgentInput::key("x")))
             .await
             .expect("queued");
         let t0 = TokioInstant::now();
         drop(call);
         let app = async move {
             let mut reader = BufReader::new(app_end);
-            assert_eq!(next_input_id(&mut reader).await, 7);
+            assert_eq!(next_input_id(&mut reader).await, InputId::new(7));
             let mut rest = Vec::new();
             reader
                 .read_to_end(&mut rest)
@@ -2302,7 +2302,7 @@ mod tests {
             let call = demand.begin();
             wiring
                 .input_tx
-                .send((9, AgentInput::key("x")))
+                .send((InputId::new(9), AgentInput::key("x")))
                 .await
                 .expect("queued");
             let t0 = TokioInstant::now();
@@ -2311,10 +2311,13 @@ mod tests {
             let app = async move {
                 let (read, mut write) = app_end.into_split();
                 let mut reader = BufReader::new(read);
-                assert_eq!(next_input_id(&mut reader).await, 9);
+                assert_eq!(next_input_id(&mut reader).await, InputId::new(9));
                 tokio::time::sleep_until(t0 + acked_after).await;
-                let mut ack = serde_json::to_string(&AppToBridge::ack(9, InputStatus::Delivered))
-                    .expect("an ack serializes");
+                let mut ack = serde_json::to_string(&AppToBridge::ack(
+                    InputId::new(9),
+                    InputStatus::Delivered,
+                ))
+                .expect("an ack serializes");
                 ack.push('\n');
                 write.write_all(ack.as_bytes()).await.expect("send the ack");
                 // Until the bridge has read it: the next timer is the end of
@@ -2356,7 +2359,7 @@ mod tests {
         let call = demand.begin();
         wiring
             .input_tx
-            .send((11, AgentInput::key("x")))
+            .send((InputId::new(11), AgentInput::key("x")))
             .await
             .expect("queued");
         let t0 = TokioInstant::now();
@@ -2370,7 +2373,7 @@ mod tests {
         };
         let app = async move {
             let mut reader = BufReader::new(app_end);
-            assert_eq!(next_input_id(&mut reader).await, 11);
+            assert_eq!(next_input_id(&mut reader).await, InputId::new(11));
             tokio::time::sleep_until(t0 + leaves_after).await;
             // Gone with the input unacked, five seconds into the hold. Shut
             // down before the drop: a child process another test spawns holds
@@ -2441,19 +2444,19 @@ mod tests {
     #[test]
     fn the_unacked_inputs_are_bounded_and_the_oldest_forgotten() {
         let mut unacked = Unacked::default();
-        let past = MAX_UNACKED as InputId + 5;
+        let past = MAX_UNACKED as u64 + 5;
         for id in 1..=past {
-            unacked.sent(id);
+            unacked.sent(InputId::new(id));
         }
         assert_eq!(unacked.len(), MAX_UNACKED);
         assert_eq!(
             unacked.ids.first(),
-            Some(&6),
+            Some(&InputId::new(6)),
             "the five oldest are forgotten"
         );
 
         // Acking a forgotten input changes nothing, and is no error.
-        unacked.acked(1);
+        unacked.acked(InputId::new(1));
         assert_eq!(unacked.len(), MAX_UNACKED);
         assert!(unacked.cleared_at.is_none());
 
@@ -2466,7 +2469,7 @@ mod tests {
             }
         );
         for id in 6..=past {
-            unacked.acked(id);
+            unacked.acked(InputId::new(id));
         }
         assert!(!unacked.any());
         assert!(unacked.cleared_at.is_some());

@@ -66,12 +66,19 @@ pub enum Action {
 }
 
 impl Action {
-    /// Map a wire action name onto a built-in, degrading an unrecognized name
-    /// to [`Custom`](Self::Custom).
+    /// Map an action name onto an action, the way a reader does.
+    ///
+    /// Two rules, and they are the deserializer's: a built-in's wire name
+    /// (`"activate"`, `"set_value"`) becomes that built-in, and anything else
+    /// becomes [`Custom`](Self::Custom) keeping the name. The name is the bare
+    /// one, not the `{"custom":"name"}` envelope, so this is also the fold the
+    /// deserializer applies to an envelope: `from_wire("dismiss")` is
+    /// [`Dismiss`](Self::Dismiss) whichever spelling the name arrived in.
+    /// Matching is exact, so `"Activate"` is a custom action.
     ///
     /// The names must stay in step with what the derived [`Serialize`] emits;
     /// the `every_action_roundtrips` test is what enforces that.
-    fn from_wire(name: &str) -> Self {
+    pub fn from_wire(name: &str) -> Self {
         match name {
             "activate" => Action::Activate,
             "focus" => Action::Focus,
@@ -81,6 +88,25 @@ impl Action {
             "set_value" => Action::SetValue,
             "dismiss" => Action::Dismiss,
             other => Action::Custom(other.to_string()),
+        }
+    }
+
+    /// The action's name on the wire: a built-in's snake_case name, or the
+    /// name a [`Custom`](Self::Custom) carries, without the envelope.
+    ///
+    /// [`from_wire`](Self::from_wire) reads it back to the same action, except
+    /// for a `Custom` holding a built-in's name, which reads back as that
+    /// built-in, as it does off the wire.
+    pub fn wire_name(&self) -> &str {
+        match self {
+            Action::Activate => "activate",
+            Action::Focus => "focus",
+            Action::Select => "select",
+            Action::Toggle => "toggle",
+            Action::Scroll => "scroll",
+            Action::SetValue => "set_value",
+            Action::Dismiss => "dismiss",
+            Action::Custom(name) => name,
         }
     }
 }
@@ -164,8 +190,12 @@ pub enum AgentInput {
     /// Invoke an advertised action on a node.
     #[non_exhaustive]
     Act {
+        /// Id of the target node, from the snapshot the agent read.
         node: NodeId,
+        /// The action to invoke, one the node advertises.
         action: Action,
+        /// The action's argument, if it takes one; omitted on the wire when
+        /// `None`.
         #[serde(skip_serializing_if = "Option::is_none")]
         value: Option<String>,
     },
@@ -174,7 +204,10 @@ pub enum AgentInput {
     /// The string follows the grammar in [`key`](crate::key), which both peers
     /// parse with the same code.
     #[non_exhaustive]
-    Key { key: String },
+    Key {
+        /// The key press, as a string in the [`key`](crate::key) grammar.
+        key: String,
+    },
     /// Literal characters for whatever surface the app puts typing into. One
     /// message instead of one round trip per character.
     ///
@@ -198,7 +231,10 @@ pub enum AgentInput {
     ///
     /// [`text_to_keys`]: https://docs.rs/taria-ratatui/latest/taria_ratatui/fn.text_to_keys.html
     #[non_exhaustive]
-    Text { text: String },
+    Text {
+        /// The characters to type, in order.
+        text: String,
+    },
     /// An input whose `kind` this build does not recognize.
     ///
     /// It carries nothing beyond that fact. The tag it arrived under is gone
@@ -331,6 +367,31 @@ mod tests {
             let back: Action = serde_json::from_str(&json).unwrap();
             assert_eq!(back, action, "action {action:?} via {json}");
         }
+    }
+
+    #[test]
+    fn wire_name_reads_back_through_from_wire() {
+        // `from_wire` and `wire_name` are two hand-written tables of the same
+        // names, so pin each against the frozen JSON and against the other.
+        for (action, json) in action_json() {
+            let name = action.wire_name();
+            assert_eq!(Action::from_wire(name), action, "action {action:?}");
+            let bare = json.trim_matches('"');
+            if !matches!(action, Action::Custom(_)) {
+                assert_eq!(name, bare, "action {action:?}");
+            }
+        }
+        assert_eq!(Action::Custom("archive".into()).wire_name(), "archive");
+        // The fold: a custom holding a built-in's name reads back as the
+        // built-in, as it does off the wire.
+        assert_eq!(
+            Action::from_wire(Action::Custom("dismiss".into()).wire_name()),
+            Action::Dismiss
+        );
+        assert_eq!(
+            Action::from_wire("Activate"),
+            Action::Custom("Activate".into())
+        );
     }
 
     #[test]

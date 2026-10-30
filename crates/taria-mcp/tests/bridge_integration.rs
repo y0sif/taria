@@ -1087,7 +1087,11 @@ async fn acks_for_other_inputs_are_ignored() {
     let echo = tokio::spawn(async move {
         let mut app = app;
         let (id, _input) = app.recv_input().await;
-        app.ack(id.wrapping_add(1000), InputStatus::Dropped).await;
+        app.ack(
+            InputId::new(id.get().wrapping_add(1000)),
+            InputStatus::Dropped,
+        )
+        .await;
         app.send(&AppToBridge::Snapshot(Snapshot::new(
             2,
             demo_root("after-stray-ack"),

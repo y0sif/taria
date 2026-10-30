@@ -22,6 +22,8 @@
 //! ack, so a tool call can tell an input the app applied from one it ignored
 //! or dropped rather than guessing from whether the tree happened to change.
 
+#![warn(missing_docs)]
+
 pub mod args;
 pub mod bridge;
 pub mod server;

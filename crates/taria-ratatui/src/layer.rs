@@ -2475,7 +2475,7 @@ mod tests {
         assert_eq!(layer.try_recv_with_id(), None);
         assert_eq!(layer.recv_timeout(Duration::from_millis(1)), None);
         assert_eq!(layer.recv_timeout_with_id(Duration::from_millis(1)), None);
-        layer.ack(0, InputStatus::Ignored);
+        layer.ack(InputId::new(0), InputStatus::Ignored);
 
         let mut drained = 0;
         layer.drain(|_| drained += 1);
@@ -3030,7 +3030,7 @@ mod tests {
             // order: the app acked an input and published a new tree in
             // response to it.
             let mut state = shared.lock_state();
-            state.acks.push_back((7, InputStatus::Delivered));
+            state.acks.push_back((7.into(), InputStatus::Delivered));
             state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
             state.epoch = 1;
         }
@@ -3054,7 +3054,7 @@ mod tests {
         };
         assert_eq!(
             read_message(),
-            AppToBridge::ack(7, InputStatus::Delivered),
+            AppToBridge::ack(InputId::new(7), InputStatus::Delivered),
             "an agent that saw the snapshot first could not tell whether it \
              already reflects its input"
         );
@@ -3118,8 +3118,8 @@ mod tests {
         let shared = test_shared("exitflush");
         {
             let mut state = shared.lock_state();
-            state.acks.push_back((4, InputStatus::Delivered));
-            state.acks.push_back((4, InputStatus::Ignored));
+            state.acks.push_back((4.into(), InputStatus::Delivered));
+            state.acks.push_back((4.into(), InputStatus::Ignored));
             state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
             state.epoch = 1;
             state.shutdown = true;
@@ -3138,8 +3138,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                AppToBridge::ack(4, InputStatus::Delivered),
-                AppToBridge::ack(4, InputStatus::Ignored),
+                AppToBridge::ack(InputId::new(4), InputStatus::Delivered),
+                AppToBridge::ack(InputId::new(4), InputStatus::Ignored),
             ],
             "every queued ack goes out, in order, and the snapshot behind them does not"
         );
@@ -3165,8 +3165,8 @@ mod tests {
         let shared = test_shared("midbatch");
         {
             let mut state = shared.lock_state();
-            state.acks.push_back((1, InputStatus::Delivered));
-            state.acks.push_back((2, InputStatus::Delivered));
+            state.acks.push_back((1.into(), InputStatus::Delivered));
+            state.acks.push_back((2.into(), InputStatus::Delivered));
             state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
             state.epoch = 1;
         }
@@ -3183,7 +3183,7 @@ mod tests {
         }
         {
             let mut state = shared.lock_state();
-            state.acks.push_back((3, InputStatus::Ignored));
+            state.acks.push_back((3.into(), InputStatus::Ignored));
             state.shutdown = true;
             shared.cv.notify_all();
         }
@@ -3204,9 +3204,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                AppToBridge::ack(1, InputStatus::Delivered),
-                AppToBridge::ack(2, InputStatus::Delivered),
-                AppToBridge::ack(3, InputStatus::Ignored),
+                AppToBridge::ack(InputId::new(1), InputStatus::Delivered),
+                AppToBridge::ack(InputId::new(2), InputStatus::Delivered),
+                AppToBridge::ack(InputId::new(3), InputStatus::Ignored),
             ],
             "the batch in hand first, then what was queued behind it, and no snapshot"
         );
@@ -3229,7 +3229,7 @@ mod tests {
         let shared = test_shared("lastack");
         {
             let mut state = shared.lock_state();
-            state.acks.push_back((1, InputStatus::Delivered));
+            state.acks.push_back((1.into(), InputStatus::Delivered));
             state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
             state.epoch = 1;
         }
@@ -3265,7 +3265,7 @@ mod tests {
         }
         assert_eq!(
             lines,
-            [AppToBridge::ack(1, InputStatus::Delivered)],
+            [AppToBridge::ack(InputId::new(1), InputStatus::Delivered)],
             "the ack in hand goes out, and the snapshot behind it does not"
         );
         assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
@@ -3289,7 +3289,9 @@ mod tests {
         {
             let mut state = shared.lock_state();
             for id in 0..20 {
-                state.acks.push_back((id, InputStatus::Delivered));
+                state
+                    .acks
+                    .push_back((InputId::new(id), InputStatus::Delivered));
             }
             state.shutdown = true;
         }
@@ -3563,21 +3565,21 @@ mod tests {
     fn the_ack_queue_is_bounded_and_drops_the_oldest_answers() {
         let shared = test_shared("ackbound");
         let overflow = 10;
-        for id in 0..(ACK_QUEUE + overflow) as InputId {
-            shared.queue_ack(id, InputStatus::Dropped);
+        for id in 0..(ACK_QUEUE + overflow) as u64 {
+            shared.queue_ack(InputId::new(id), InputStatus::Dropped);
         }
 
         let state = shared.lock_state();
         assert_eq!(state.acks.len(), ACK_QUEUE, "the queue must stay bounded");
         assert_eq!(
             state.acks.front().map(|(id, _)| *id),
-            Some(overflow as InputId),
+            Some(InputId::new(overflow as u64)),
             "the oldest answers are the ones given up; a waiter on those has \
              long since timed out"
         );
         assert_eq!(
             state.acks.back().map(|(id, _)| *id),
-            Some((ACK_QUEUE + overflow - 1) as InputId),
+            Some(InputId::new((ACK_QUEUE + overflow - 1) as u64)),
             "the newest answer is the one an agent is still waiting on"
         );
         drop(state);
@@ -3597,20 +3599,23 @@ mod tests {
     fn an_app_ack_is_dropped_unless_its_input_belongs_to_the_live_connection() {
         let shared = test_shared("appack");
         shared.lock_state().generation = 7;
-        assert!(shared.deliver(7, 5), "the live connection's input delivers");
+        assert!(
+            shared.deliver(7, InputId::new(5)),
+            "the live connection's input delivers"
+        );
         shared.lock_state().acks.clear();
 
-        shared.queue_app_ack(5, InputStatus::Ignored);
+        shared.queue_app_ack(InputId::new(5), InputStatus::Ignored);
         assert_eq!(
             shared.lock_state().acks.pop_front(),
-            Some((5, InputStatus::Ignored)),
+            Some((InputId::new(5), InputStatus::Ignored)),
             "refining the ack of a live input is the whole point of `ack`"
         );
 
         // The connection ends and the next one starts; its ids start over.
         shared.retire_generation();
         shared.lock_state().generation += 1;
-        shared.queue_app_ack(5, InputStatus::Ignored);
+        shared.queue_app_ack(InputId::new(5), InputStatus::Ignored);
         assert!(
             shared.lock_state().acks.is_empty(),
             "an id from a bridge that is gone must answer nobody"
@@ -3622,16 +3627,16 @@ mod tests {
         // One delivery past what the layer remembers, so exactly the oldest
         // id falls out.
         let generation = shared.lock_state().generation;
-        for id in 100..=(100 + ACKABLE_INPUTS as InputId) {
-            assert!(shared.deliver(generation, id));
+        for id in 100..=(100 + ACKABLE_INPUTS as u64) {
+            assert!(shared.deliver(generation, InputId::new(id)));
         }
         shared.lock_state().acks.clear();
-        shared.queue_app_ack(100, InputStatus::Ignored);
+        shared.queue_app_ack(InputId::new(100), InputStatus::Ignored);
         assert!(shared.lock_state().acks.is_empty(), "id 100 was forgotten");
-        shared.queue_app_ack(101, InputStatus::Ignored);
+        shared.queue_app_ack(InputId::new(101), InputStatus::Ignored);
         assert_eq!(
             shared.lock_state().acks.pop_front(),
-            Some((101, InputStatus::Ignored)),
+            Some((InputId::new(101), InputStatus::Ignored)),
             "everything still remembered stays answerable"
         );
     }

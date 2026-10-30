@@ -138,6 +138,8 @@
 //! one, because an old peer parses the message successfully and acts on the old
 //! meaning.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentInput, Snapshot};
@@ -162,7 +164,46 @@ pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// to a live input, so a bridge that restarts its ids per connection can
 /// resolve a waiter with a dead app's verdict. A monotonic counter owned by the
 /// process satisfies this.
-pub type InputId = u64;
+///
+/// On the wire it is a bare JSON integer, an unsigned 64-bit one: the newtype
+/// is `#[serde(transparent)]`, so it exists only in Rust, where it keeps an id
+/// from being mistaken for a `seq` or a count. Build one with
+/// [`new`](Self::new) or `From<u64>`, and read the number back with
+/// [`get`](Self::get).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InputId(u64);
+
+impl InputId {
+    /// Wrap a number as an input id.
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    /// The number this id carries on the wire.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for InputId {
+    fn from(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+impl From<InputId> for u64 {
+    fn from(id: InputId) -> Self {
+        id.0
+    }
+}
+
+/// Prints the bare number, as it appears on the wire.
+impl fmt::Display for InputId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
 
 /// Message sent from a TUI app to the bridge.
 ///
@@ -199,6 +240,7 @@ pub enum AppToBridge {
     Ack {
         /// The [`InputId`] of the input being answered.
         id: InputId,
+        /// What became of that input; the last ack for an id wins.
         status: InputStatus,
     },
 }
@@ -291,6 +333,7 @@ pub enum BridgeToApp {
     Input {
         /// Identifier the app echoes in its [`AppToBridge::Ack`].
         id: InputId,
+        /// The agent input to apply.
         input: AgentInput,
     },
 }
@@ -364,7 +407,7 @@ mod tests {
         ];
         for (id, input) in inputs.into_iter().enumerate() {
             let msg = BridgeToApp::Input {
-                id: id as InputId,
+                id: InputId::new(id as u64),
                 input,
             };
             let json = serde_json::to_string(&msg).unwrap();
@@ -376,13 +419,38 @@ mod tests {
     #[test]
     fn input_message_json_shape_is_stable() {
         let msg = BridgeToApp::Input {
-            id: 7,
+            id: InputId::new(7),
             input: AgentInput::Key { key: "q".into() },
         };
         assert_eq!(
             serde_json::to_string(&msg).unwrap(),
             r#"{"type":"input","id":7,"input":{"kind":"key","key":"q"}}"#
         );
+    }
+
+    #[test]
+    fn input_id_is_a_bare_number_on_the_wire() {
+        // The newtype is Rust-only: the JSON must be the integer it was when
+        // `InputId` was a type alias for `u64`, in both directions and across
+        // the whole range.
+        for n in [0, 1, 41, u64::MAX] {
+            let id = InputId::new(n);
+            assert_eq!(serde_json::to_string(&id).unwrap(), n.to_string());
+            assert_eq!(serde_json::from_str::<InputId>(&n.to_string()).unwrap(), id);
+            assert_eq!(id.get(), n);
+            assert_eq!(u64::from(id), n);
+            assert_eq!(InputId::from(n), id);
+            assert_eq!(id.to_string(), n.to_string());
+        }
+        assert_eq!(
+            serde_json::to_string(&AppToBridge::ack(InputId::new(7), InputStatus::Delivered))
+                .unwrap(),
+            r#"{"type":"ack","id":7,"status":"delivered"}"#
+        );
+        // What the protocol rejects, the newtype rejects too.
+        for bad in [r#""7""#, "7.0", "-1", "null"] {
+            assert!(serde_json::from_str::<InputId>(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -393,7 +461,10 @@ mod tests {
             (InputStatus::Ignored, "ignored"),
         ];
         for (status, name) in cases {
-            let msg = AppToBridge::Ack { id: 7, status };
+            let msg = AppToBridge::Ack {
+                id: InputId::new(7),
+                status,
+            };
             let json = serde_json::to_string(&msg).unwrap();
             assert_eq!(
                 json,
@@ -412,7 +483,7 @@ mod tests {
         assert_eq!(
             msg,
             AppToBridge::Ack {
-                id: 7,
+                id: InputId::new(7),
                 status: InputStatus::Delivered,
             }
         );
@@ -464,16 +535,16 @@ mod tests {
             }
         );
         assert_eq!(
-            AppToBridge::ack(9, InputStatus::Dropped),
+            AppToBridge::ack(InputId::new(9), InputStatus::Dropped),
             AppToBridge::Ack {
-                id: 9,
+                id: InputId::new(9),
                 status: InputStatus::Dropped,
             }
         );
         assert_eq!(
-            BridgeToApp::input(9, AgentInput::key("q")),
+            BridgeToApp::input(InputId::new(9), AgentInput::key("q")),
             BridgeToApp::Input {
-                id: 9,
+                id: InputId::new(9),
                 input: AgentInput::Key { key: "q".into() },
             }
         );
@@ -488,7 +559,7 @@ mod tests {
         // survives, and an ack becomes possible.
         let line = r#"{"type":"input","id":41,"input":{"kind":"paste","text":"hi","from":"clip"}}"#;
         let BridgeToApp::Input { id, input, .. } = serde_json::from_str(line).unwrap();
-        assert_eq!(id, 41);
+        assert_eq!(id, InputId::new(41));
         assert_eq!(input, AgentInput::Unknown);
 
         // And that is the ack: the app truly did nothing with the input.

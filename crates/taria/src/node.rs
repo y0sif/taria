@@ -29,9 +29,13 @@ pub struct NodeId(pub String);
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Role {
+    /// The application root.
     App,
+    /// A region of the screen.
     Pane,
+    /// A flat collection of rows; it reports where a cursor sits.
     List,
+    /// One row of a [`List`](Self::List).
     ListItem,
     /// Hierarchical collection: a file browser, a repository's working tree, a
     /// database schema sidebar. Choose this over [`List`](Self::List) when an
@@ -43,11 +47,17 @@ pub enum Role {
     /// One entry in a [`Tree`](Self::Tree), with its own entries as children,
     /// so the shape of the node tree is the shape of the widget's.
     TreeItem,
+    /// A table of [`Row`](Self::Row)s.
     Table,
+    /// One row of a [`Table`](Self::Table).
     Row,
+    /// One cell of a [`Row`](Self::Row).
     Cell,
+    /// A field the app types into.
     TextInput,
+    /// A control whose primary action is to be pressed.
     Button,
+    /// A two-state control.
     Checkbox,
     /// A control that holds one choice out of a fixed set: a dropdown, a radio
     /// group, a settings picker. Choose this over [`List`](Self::List) when
@@ -60,13 +70,16 @@ pub enum Role {
     /// [`ListItem`](Self::ListItem) because activating it sets the parent's
     /// value rather than moving a cursor within it.
     Option,
+    /// A tab bar holding [`Tab`](Self::Tab) children.
     Tabs,
+    /// One tab in a [`Tabs`](Self::Tabs) bar.
     Tab,
     /// A reference to somewhere else: an OSC 8 terminal hyperlink, or a path,
     /// URL or issue number the app opens when it is activated. Put the
     /// destination in the node's value, so an agent can read where it leads
     /// without following it.
     Link,
+    /// Static text.
     Text,
     /// Append-only stream of lines: command output, a journal tail, a model's
     /// streaming response. Distinct from [`Text`](Self::Text) because the
@@ -88,6 +101,7 @@ pub enum Role {
     /// rendering is unreadable to an agent, so put the numbers that carry the
     /// meaning (the latest sample, the peak, the unit) in the node's value.
     Chart,
+    /// Progress as a known fraction of a known total.
     ProgressBar,
     /// A transient notice: a spinner, a throbber, a toast, a "saving" line
     /// that appears and clears itself. Distinct from
@@ -103,9 +117,14 @@ pub enum Role {
     /// is the only thing telling an agent that the pane it just read has more
     /// content past the edge. Put the position in the node's value.
     Scrollbar,
+    /// A dialog, typically modal.
     Dialog,
+    /// A menu holding [`MenuItem`](Self::MenuItem) children.
     Menu,
+    /// One entry in a [`Menu`](Self::Menu).
     MenuItem,
+    /// Nothing in the vocabulary fits, or the reader does not know the role
+    /// name that was sent.
     Other,
 }
 
@@ -279,7 +298,10 @@ impl Error for TreeTooDeep {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Node {
+    /// Identifier, unique within one snapshot and stable across snapshots
+    /// for as long as it names the same thing.
     pub id: NodeId,
+    /// What the widget is.
     pub role: Role,
     /// Human-readable label (list title, button text, input placeholder).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,6 +340,7 @@ pub struct Node {
     /// Actions an agent may invoke on this node right now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<Action>,
+    /// Child nodes, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Node>,
 }
