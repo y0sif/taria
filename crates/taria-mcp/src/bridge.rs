@@ -4,7 +4,7 @@
 //! as it wants the app. [`spawn`] wants it from the start and for good: it
 //! connects at once and holds the app until the session ends. The `taria-mcp`
 //! binary starts the manager on demand instead (through
-//! [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand)):
+//! [`TariaMcpServerBuilder::on_demand`](crate::TariaMcpServerBuilder::on_demand)):
 //! it opens no connection until the first tool call, and once no tool call has
 //! run for its idle window it lets go of the app, closing its connection and
 //! reconnecting only when the next call comes. Either way the task
@@ -380,9 +380,9 @@ impl BridgeHandle {
 /// handle (or a clone of its `input_tx`) lives, reconnecting whenever the
 /// connection ends. That is every bridge before 0.3.2, and what a library
 /// caller gets from
-/// [`TariaMcpServer::connected`](crate::server::TariaMcpServer::connected).
+/// [`TariaMcpServerBuilder::connected`](crate::TariaMcpServerBuilder::connected).
 /// The `taria-mcp` binary connects on demand instead, through
-/// [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand),
+/// [`TariaMcpServerBuilder::on_demand`](crate::TariaMcpServerBuilder::on_demand),
 /// so that a session with no tool calls in flight does not keep every other
 /// session away from the app.
 pub(crate) fn spawn(socket_path: PathBuf) -> BridgeHandle {

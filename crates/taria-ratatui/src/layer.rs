@@ -3554,7 +3554,11 @@ mod tests {
     /// disconnect it while answers pile up behind it.
     #[test]
     fn the_ack_queue_is_bounded_and_drops_the_oldest_answers() {
-        let shared = test_shared("ackbound");
+        // A bound layer rather than bare shared state, so the count is read
+        // the way an app reads it, through `stats()`. Nothing connects, so
+        // the writer never takes an ack off the queue.
+        let layer = bind_test_layer("taria-layer-", "ackbound");
+        let shared = &layer.inner.as_ref().expect("a bound layer").shared;
         let overflow = 10;
         for id in 0..(ACK_QUEUE + overflow) as u64 {
             shared.queue_ack(InputId::new(id), InputStatus::Dropped);
@@ -3575,7 +3579,7 @@ mod tests {
         );
         drop(state);
         assert_eq!(
-            shared.dropped_acks.load(Ordering::Relaxed),
+            layer.stats().dropped_acks,
             overflow as u64,
             "each dropped answer must be counted once"
         );

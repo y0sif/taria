@@ -545,8 +545,8 @@ Bridge side (`taria-mcp`):
    the backoff growing instead of resetting it. After 60 s with no tool calls
    the bridge lets the app go and stops retrying until the next call (see
    On-demand connect and idle release). A library caller that builds the
-   server with `TariaMcpServer::connected` gets the old behaviour: connect at
-   once, retry forever, never let go.
+   server with `TariaMcpServer::builder(..).connected()` gets the old
+   behaviour: connect at once, retry forever, never let go.
 2. On disconnect, the watch flips to `Disconnected`, keeping the app label
    and the last `seq`, so tool calls fail fast with an error that says which
    app went away instead of acting on a stale tree. Every such error opens
@@ -618,8 +618,9 @@ Bridge side (`taria-mcp`):
      the cause. Only the window and the hold past it are the held answer's
      words; the rest of the clause is its own. Any failure to read the state
      leaves the held answer, and other platforms always get it. Only a bridge
-     started on demand records the pid; one built with `TariaMcpServer::connected`
-     gets the held answer, as in 0.3.2.
+     started on demand records the pid; one built with
+     `TariaMcpServer::builder(..).connected()` gets the held answer, as in
+     0.3.2.
    - With no connection open, between two connects or because nothing is
      listening, the error says "it may have exited", in the words 0.3.1 used.
      This is the one state in which the bridge cannot tell an app that is

@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::Duration;
 
-use crate::server::TariaMcpServer;
-use crate::tree_format::TreeFormat;
+use crate::TariaMcpServer;
+use crate::server::Tools;
 use taria::wire::AppToBridge;
 use taria::{Node, PROTOCOL_VERSION, Role, Snapshot};
 use tokio::sync::mpsc;
@@ -154,6 +154,16 @@ fn result_text(result: &rmcp::model::CallToolResult) -> &str {
         .expect("a text result")
 }
 
+/// The tool layer of a server built the way the binary builds it, with
+/// `idle_release` as its window.
+fn on_demand(path: PathBuf, idle_release: Duration) -> Tools {
+    TariaMcpServer::builder(path)
+        .idle_release(idle_release)
+        .on_demand()
+        .expect("a tokio test runs inside a runtime")
+        .tools
+}
+
 /// A bridge lets go of the app after its window; the app is killed and a new
 /// process takes the path while the bridge makes no call; another session's
 /// bridge takes the new instance. The first bridge's next call lands in the
@@ -171,8 +181,7 @@ async fn a_release_of_an_app_since_replaced_is_not_called_the_reason() {
     let path = dir.path().join("replaced.sock");
 
     let mut first_app = AppProcess::start(&path).await;
-    let first =
-        TariaMcpServer::on_demand(path.clone(), TreeFormat::Json, Duration::from_millis(300));
+    let first = on_demand(path.clone(), Duration::from_millis(300));
     let tree = first.read_tree().await.expect("the bridge gets the app");
     let first_pid = format!("pid {}", first_app.pid);
     assert!(result_text(&tree).contains(&first_pid), "{tree:?}");
@@ -180,7 +189,7 @@ async fn a_release_of_an_app_since_replaced_is_not_called_the_reason() {
     drop(first_app);
 
     let second_app = AppProcess::start(&path).await;
-    let other = TariaMcpServer::on_demand(path, TreeFormat::Json, Duration::from_secs(30));
+    let other = on_demand(path, Duration::from_secs(30));
     let tree = other
         .read_tree()
         .await

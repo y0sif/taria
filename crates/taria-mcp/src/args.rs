@@ -68,7 +68,7 @@ pub enum Cli {
         /// lets go (`--idle-release`, whole seconds up to
         /// [`MAX_IDLE_RELEASE_SECS`]). [`Duration::ZERO`]
         /// never lets go. See
-        /// [`TariaMcpServer::on_demand`](taria_mcp::TariaMcpServer::on_demand).
+        /// [`TariaMcpServerBuilder::idle_release`](taria_mcp::TariaMcpServerBuilder::idle_release).
         idle_release: Duration,
     },
     /// `--help` was requested.

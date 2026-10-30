@@ -1,20 +1,32 @@
 //! The MCP tool surface: `read_tree`, `act`, `key`, and `type_text`.
 //!
-//! A server built with [`TariaMcpServer::connected`], or inside the crate with
-//! [`TariaMcpServer::with_tree_format`] around a handle of its own, serves a
-//! bridge that [`bridge::spawn`] connects at once and keeps connected.
-//! [`TariaMcpServer::on_demand`], which the `taria-mcp` binary uses, spawns
-//! its own bridge that connects on the first tool call and lets go of the app
-//! after an idle window, and every tool call then counts as activity and gives
-//! a bridge it woke a bounded moment to reach the app.
+//! [`TariaMcpServer::builder`] sets a server up, and its finalizers pick the
+//! bridge. [`TariaMcpServerBuilder::on_demand`], which the `taria-mcp` binary
+//! uses, spawns a bridge that connects on the first tool call and lets go of
+//! the app after an idle window, and every tool call then counts as activity
+//! and gives a bridge it woke a bounded moment to reach the app.
+//! [`TariaMcpServerBuilder::connected`], or inside the crate
+//! [`Tools::with_tree_format`] around a handle of its own, serves a bridge
+//! that [`bridge::spawn`] connects at once and keeps connected.
+//!
+//! The tools live on [`Tools`], a private type that the public
+//! [`TariaMcpServer`] wraps and delegates to. rmcp's `#[tool]` attribute gives
+//! the type it is used on a public `<name>_tool_attr()` function per tool, and
+//! takes no option to narrow it: on the public type those four functions were
+//! public API, which no caller needs and none could be kept from relying on.
 
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
-use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use taria::key::KeyPress;
 use taria::wire::{InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{Action, AgentInput, MAX_NODE_DEPTH, Node, NodeId, PROTOCOL_VERSION};
@@ -34,8 +46,9 @@ use crate::tree_format::TreeFormat;
 /// hands the app to the next one within a minute. A held bridge's answer
 /// names this number as the window a holder on the default lets go after,
 /// and names its own instead, as the best guess at the holder's, when it was
-/// started with another. Pass it to [`TariaMcpServer::on_demand`] to serve
-/// the way the `taria-mcp` binary does by default.
+/// started with another. It is what [`TariaMcpServerBuilder::idle_release`]
+/// starts from, so a builder that leaves it alone serves the way the
+/// `taria-mcp` binary does by default.
 pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(60);
 
 /// How long an input-sending tool waits for the app to answer, counting both
@@ -232,36 +245,205 @@ pub(crate) struct TypeTextParams {
 /// The MCP server: four tools, `read_tree`, `act`, `key` and `type_text`,
 /// served against a running taria-enabled app over its Unix socket.
 ///
-/// Build one with [`on_demand`](Self::on_demand), which connects on the
+/// Build one with [`builder`](Self::builder), finished with
+/// [`on_demand`](TariaMcpServerBuilder::on_demand), which connects on the
 /// first tool call and lets go of the app after an idle window, as the
-/// `taria-mcp` binary does, or with [`connected`](Self::connected), which
-/// connects at once and never lets go. Either way it implements rmcp's
-/// [`ServerHandler`], so it serves over any rmcp transport:
+/// `taria-mcp` binary does, or with
+/// [`connected`](TariaMcpServerBuilder::connected), which connects at once and
+/// never lets go. Either way it implements rmcp's [`ServerHandler`], so it
+/// serves over any rmcp transport:
 ///
 /// ```no_run
 /// use rmcp::ServiceExt;
-/// use taria_mcp::{DEFAULT_IDLE_RELEASE, TariaMcpServer, TreeFormat};
+/// use taria_mcp::{TariaMcpServer, TreeFormat};
 ///
 /// # async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-/// let server = TariaMcpServer::on_demand(
-///     "/run/user/1000/taria/demo.sock".into(),
-///     TreeFormat::Json,
-///     DEFAULT_IDLE_RELEASE,
-/// );
+/// let server = TariaMcpServer::builder("/run/user/1000/taria/demo.sock")
+///     .tree_format(TreeFormat::Outline)
+///     .on_demand()?;
 /// server.serve(rmcp::transport::stdio()).await?.waiting().await?;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// The tools are reached through [`ServerHandler`] only, as `tools/call`
+/// requests on a served session.
 #[derive(Clone)]
 pub struct TariaMcpServer {
+    /// The tool layer every [`ServerHandler`] method this server overrides
+    /// passes through to. Visible to the crate so its tests can build a
+    /// server the public way and still call the tools directly.
+    pub(crate) tools: Tools,
+}
+
+impl TariaMcpServer {
+    /// Start setting up a server for the app whose taria socket is `socket`.
+    ///
+    /// Every tree reaches the agent as the app's own JSON, and a server
+    /// finished with [`on_demand`](TariaMcpServerBuilder::on_demand) lets go
+    /// of the app after [`DEFAULT_IDLE_RELEASE`], unless the builder is told
+    /// otherwise.
+    pub fn builder(socket: impl Into<PathBuf>) -> TariaMcpServerBuilder {
+        TariaMcpServerBuilder {
+            socket: socket.into(),
+            tree_format: TreeFormat::Json,
+            idle_release: DEFAULT_IDLE_RELEASE,
+        }
+    }
+}
+
+/// The four methods rmcp's `#[tool_handler]` fills in, passed through to the
+/// tool layer this server wraps, which is where the tools live. Every other
+/// method is rmcp's default, as it is on the tool layer.
+impl ServerHandler for TariaMcpServer {
+    fn get_info(&self) -> ServerConfig {
+        self.tools.get_info()
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.tools.call_tool(request, context).await
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        self.tools.list_tools(request, context).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tools.get_tool(name)
+    }
+}
+
+/// How a [`TariaMcpServer`] is set up, from [`TariaMcpServer::builder`].
+///
+/// Each setting starts at its default and is changed by the method named
+/// after it. A finalizer then spawns the bridge and returns the server:
+/// [`on_demand`](Self::on_demand), which is how the `taria-mcp` binary
+/// serves, or [`connected`](Self::connected). Settings added later get a
+/// method of their own here, so a caller that sets only what it needs keeps
+/// compiling.
+#[derive(Clone, Debug)]
+#[must_use = "a builder serves nothing until on_demand() or connected() builds the server"]
+pub struct TariaMcpServerBuilder {
+    socket: PathBuf,
+    tree_format: TreeFormat,
+    idle_release: Duration,
+}
+
+impl TariaMcpServerBuilder {
+    /// How every tree reaches the agent. [`TreeFormat::Json`], the app's own
+    /// line, unless set.
+    pub fn tree_format(mut self, tree_format: TreeFormat) -> Self {
+        self.tree_format = tree_format;
+        self
+    }
+
+    /// How long a server built with [`on_demand`](Self::on_demand) keeps the
+    /// app with no tool calls before it lets go. [`DEFAULT_IDLE_RELEASE`]
+    /// unless set, and [`Duration::ZERO`] never lets go once connected.
+    ///
+    /// [`connected`](Self::connected) ignores it: that bridge never lets go.
+    pub fn idle_release(mut self, idle_release: Duration) -> Self {
+        self.idle_release = idle_release;
+        self
+    }
+
+    /// Build the server and the bridge it serves, a bridge that connects only
+    /// while tool calls want the app. This is what the `taria-mcp` binary
+    /// runs.
+    ///
+    /// No connection is opened until the first tool call: building the
+    /// server, MCP `initialize`, `server/discover` and `tools/list` connect to
+    /// nothing. A call that finds the bridge idle (or between reconnect
+    /// attempts) wakes it and waits a moment for the app's tree, normally
+    /// milliseconds and never more than 1.2 s, so the first call still
+    /// answers with the live tree. Once no tool call has run for the
+    /// [`idle_release`](Self::idle_release) window, the bridge lets go of the
+    /// app: it closes its connection, or leaves the listen backlog if it was
+    /// waiting behind another bridge, and stops reconnecting until the next
+    /// call. A taria adapter serves one bridge at a time, so letting go is
+    /// what hands the app to another session. It does not let go while an
+    /// input it sent is still waiting for the app's ack, for up to 30 s past
+    /// the window, because a connection that ends discards the inputs the
+    /// app has not dequeued yet.
+    ///
+    /// # Errors
+    ///
+    /// The bridge is a task on the current tokio runtime, so outside one this
+    /// returns an error and spawns nothing. The runtime needs its IO and time
+    /// drivers, as [`enable_all`](tokio::runtime::Builder::enable_all) turns
+    /// on.
+    pub fn on_demand(self) -> io::Result<TariaMcpServer> {
+        require_runtime("on_demand")?;
+        let (handle, demand) = bridge::spawn_on_demand(self.socket, self.idle_release);
+        let tools = Tools {
+            demand: Some(demand),
+            idle_release: Some(self.idle_release),
+            ..Tools::with_tree_format(handle, self.tree_format)
+        };
+        Ok(TariaMcpServer { tools })
+    }
+
+    /// Build the server and the bridge it serves, a bridge that connects at
+    /// once and never lets go of the app.
+    ///
+    /// The bridge connects to the socket as soon as it is spawned, holds the
+    /// app for as long as this server or a clone of it lives, and reconnects
+    /// whenever the connection ends, whether or not tool calls want the app.
+    /// That is how every bridge before 0.3.2 served. A taria adapter serves
+    /// one bridge at a time, so while this one holds the app no other session
+    /// reaches it: [`on_demand`](Self::on_demand) is the one to use unless
+    /// this server is the app's only client. The
+    /// [`idle_release`](Self::idle_release) setting is ignored.
+    ///
+    /// # Errors
+    ///
+    /// As [`on_demand`](Self::on_demand): outside a tokio runtime this
+    /// returns an error and spawns nothing.
+    pub fn connected(self) -> io::Result<TariaMcpServer> {
+        require_runtime("connected")?;
+        let tools = Tools::with_tree_format(bridge::spawn(self.socket), self.tree_format);
+        Ok(TariaMcpServer { tools })
+    }
+}
+
+/// Refuse to build outside a tokio runtime, where spawning the bridge task
+/// would panic.
+///
+/// `finalizer` names the builder method in the error, so a caller sees which
+/// call has to move into the runtime.
+fn require_runtime(finalizer: &str) -> io::Result<()> {
+    tokio::runtime::Handle::try_current()
+        .map(drop)
+        .map_err(|err| {
+            io::Error::other(format!(
+                "TariaMcpServerBuilder::{finalizer} has to be called from inside a tokio \
+                 runtime, because the bridge it starts is a task on that runtime: {err}"
+            ))
+        })
+}
+
+/// The tool layer: the bridge handle, the router of the four tools, and
+/// everything a tool call reads. [`TariaMcpServer`] wraps it, so that the
+/// `<name>_tool_attr()` functions rmcp generates on it stay private.
+#[derive(Clone)]
+pub(crate) struct Tools {
     bridge: BridgeHandle,
     tool_router: ToolRouter<Self>,
     /// How every tree this server returns is spelled for the agent.
     tree_format: TreeFormat,
     /// How tool calls reach a bridge that connects on demand, which only
-    /// [`on_demand`](Self::on_demand) builds. `None` for a bridge handed in
-    /// already spawned: that one connects on its own schedule, and calls are
-    /// served exactly as they were before on-demand bridges existed.
+    /// [`TariaMcpServerBuilder::on_demand`] builds. `None` for a bridge
+    /// handed in already spawned: that one connects on its own schedule, and
+    /// calls are served exactly as they were before on-demand bridges
+    /// existed.
     demand: Option<Demand>,
     /// The idle window of a bridge that connects on demand, which a held
     /// answer names: the best guess at a holder's is that it was started the
@@ -270,67 +452,15 @@ pub struct TariaMcpServer {
     idle_release: Option<Duration>,
 }
 
-impl TariaMcpServer {
-    /// Build the handler on top of a spawned bridge, serving the tree as the
-    /// app's own JSON.
+impl Tools {
+    /// Build the tool layer on top of a spawned bridge, serving the tree as
+    /// the app's own JSON.
     #[cfg(test)]
     pub(crate) fn new(handle: BridgeHandle) -> Self {
         Self::with_tree_format(handle, TreeFormat::Json)
     }
 
-    /// Build the handler and the bridge it serves, a bridge that connects
-    /// only while tool calls want the app. This is what the `taria-mcp`
-    /// binary runs.
-    ///
-    /// No connection is opened until the first tool call: starting the
-    /// server, MCP `initialize` and `tools/list` connect to nothing. A call
-    /// that finds the bridge idle (or between reconnect attempts) wakes it
-    /// and waits a moment for the app's tree, normally milliseconds and never
-    /// more than 1.2 s, so the first call still answers with the live tree.
-    /// Once no tool call has run
-    /// for `idle_release`, the bridge lets go of the app: it closes its
-    /// connection, or leaves the listen backlog if it was waiting behind
-    /// another bridge, and stops reconnecting until the next call. A taria
-    /// adapter serves one bridge at a time, so letting go is what hands the
-    /// app to another session. It does not let go while an input it sent is
-    /// still waiting for the app's ack, for up to 30 s past the window,
-    /// because a connection that ends discards the inputs the app has not
-    /// dequeued yet. [`Duration::ZERO`] never lets go once connected.
-    ///
-    /// `socket` is the app's taria socket path and `tree_format` how every
-    /// tree reaches the agent. The binary passes [`DEFAULT_IDLE_RELEASE`] as
-    /// `idle_release` unless `--idle-release` says otherwise.
-    ///
-    /// Spawns the bridge task, so it has to be called from inside a tokio
-    /// runtime, like [`connected`](Self::connected).
-    pub fn on_demand(socket: PathBuf, tree_format: TreeFormat, idle_release: Duration) -> Self {
-        let (handle, demand) = bridge::spawn_on_demand(socket, idle_release);
-        Self {
-            demand: Some(demand),
-            idle_release: Some(idle_release),
-            ..Self::with_tree_format(handle, tree_format)
-        }
-    }
-
-    /// Build the handler and the bridge it serves, a bridge that connects at
-    /// once and never lets go of the app.
-    ///
-    /// The bridge connects to `socket` as soon as it is spawned, holds the
-    /// app for as long as this server or a clone of it lives, and reconnects
-    /// whenever the connection ends, whether or not tool calls want the app.
-    /// That is how every bridge before 0.3.2 served. A taria adapter serves
-    /// one bridge at a time, so while this one holds the app no other session
-    /// reaches it: [`on_demand`](Self::on_demand) is the one to use unless
-    /// this server is the app's only client. Every tree reaches the agent in
-    /// `tree_format`.
-    ///
-    /// Spawns the bridge task, so it has to be called from inside a tokio
-    /// runtime.
-    pub fn connected(socket: PathBuf, tree_format: TreeFormat) -> Self {
-        Self::with_tree_format(bridge::spawn(socket), tree_format)
-    }
-
-    /// Build the handler on top of a spawned bridge, serving the tree in
+    /// Build the tool layer on top of a spawned bridge, serving the tree in
     /// `tree_format`.
     ///
     /// The tool descriptions come from the `#[tool]` attributes, which
@@ -532,7 +662,7 @@ impl TariaMcpServer {
 }
 
 #[tool_router]
-impl TariaMcpServer {
+impl Tools {
     /// The `read_tree` tool: latest snapshot as compact JSON.
     ///
     /// The sentence about relayed nodes sits outside `READ_TREE_PASSAGE`,
@@ -725,7 +855,7 @@ impl TariaMcpServer {
 }
 
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for TariaMcpServer {
+impl ServerHandler for Tools {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
@@ -744,7 +874,7 @@ impl ServerHandler for TariaMcpServer {
 /// parameter carries a description to swap. A route shaped other than
 /// expected is left alone rather than failed on; the tests pin that every
 /// passage is found.
-fn describe_outline(router: &mut ToolRouter<TariaMcpServer>) {
+fn describe_outline(router: &mut ToolRouter<Tools>) {
     if let Some(route) = router.map.get_mut("read_tree") {
         swap_description(&mut route.attr.description, &READ_TREE_PASSAGE);
     }
@@ -800,7 +930,7 @@ struct LinkReport {
     /// While a connection is open, any reason but [`OVERSIZED_LINE`] came
     /// from that connection: the bridge clears the others at every connect,
     /// before the link reads as open, and the link is read first (see
-    /// [`TariaMcpServer::link_report`]). With none open, a reason may be the
+    /// [`Tools::link_report`]). With none open, a reason may be the
     /// last connection's.
     rejected: Option<String>,
     /// The `protocol_version` the peer declared, if it has said anything at
@@ -1950,6 +2080,11 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    // These tests drive the tool layer, which the public server wraps. Under
+    // the name the two shared before the wrap, the pinned-text tests below
+    // read exactly as they did, so a diff of them shows the pinned text has
+    // not moved. The public type is `crate::TariaMcpServer` here.
+    use super::Tools as TariaMcpServer;
     use taria::{Role, Snapshot};
 
     /// A built-in's wire name reaches the built-in a node advertises.
@@ -4172,5 +4307,76 @@ mod tests {
             "a capped list is what keeps the error small, but it is {} bytes",
             listed.len()
         );
+    }
+
+    /// A socket path nothing listens on, for servers that never call a tool.
+    const NOWHERE: &str = "/nonexistent/taria-mcp-test.sock";
+
+    /// The public server answers from the tool layer it wraps, in either
+    /// format: the same instructions and the same four tools, so the pinned
+    /// text above is what a harness reads. The builder's defaults land in
+    /// the tool layer: JSON unless told otherwise, and the default window.
+    #[tokio::test]
+    async fn the_public_server_serves_what_its_tool_layer_does() {
+        let server = crate::TariaMcpServer::builder(NOWHERE)
+            .on_demand()
+            .expect("a tokio test runs inside a runtime");
+        assert_eq!(server.tools.tree_format, TreeFormat::Json);
+        assert_eq!(server.tools.idle_release, Some(DEFAULT_IDLE_RELEASE));
+
+        for format in [TreeFormat::Json, TreeFormat::Outline] {
+            let server = crate::TariaMcpServer::builder(NOWHERE)
+                .tree_format(format)
+                .idle_release(Duration::from_secs(5))
+                .on_demand()
+                .expect("a tokio test runs inside a runtime");
+            assert_eq!(server.tools.tree_format, format);
+            assert_eq!(server.tools.idle_release, Some(Duration::from_secs(5)));
+            assert_eq!(
+                server.get_info().instructions,
+                server.tools.get_info().instructions
+            );
+            for name in ["read_tree", "act", "key", "type_text"] {
+                let tool = server.get_tool(name);
+                assert!(tool.is_some(), "{name} is listed");
+                assert_eq!(tool, server.tools.get_tool(name), "{name}");
+            }
+        }
+
+        // A connected server has no window: it never lets go, whatever the
+        // builder was told.
+        let server = crate::TariaMcpServer::builder(NOWHERE)
+            .idle_release(Duration::from_secs(5))
+            .connected()
+            .expect("a tokio test runs inside a runtime");
+        assert!(server.tools.demand.is_none());
+        assert_eq!(server.tools.idle_release, None);
+    }
+
+    /// Outside a tokio runtime both finalizers refuse and name themselves,
+    /// where spawning the bridge task would have panicked.
+    #[test]
+    fn the_builder_refuses_to_build_outside_a_tokio_runtime() {
+        let built = [
+            (
+                "on_demand",
+                crate::TariaMcpServer::builder(NOWHERE).on_demand(),
+            ),
+            (
+                "connected",
+                crate::TariaMcpServer::builder(NOWHERE).connected(),
+            ),
+        ];
+        for (name, built) in built {
+            let Err(err) = built else {
+                panic!("{name} built a server outside a runtime");
+            };
+            assert!(
+                err.to_string().starts_with(&format!(
+                    "TariaMcpServerBuilder::{name} has to be called from inside a tokio runtime"
+                )),
+                "{err}"
+            );
+        }
     }
 }

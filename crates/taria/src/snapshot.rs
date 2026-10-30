@@ -10,7 +10,7 @@ use crate::{Node, PROTOCOL_VERSION};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Snapshot {
-    /// The [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) the snapshot is
+    /// The [`PROTOCOL_VERSION`] the snapshot is
     /// written in; version negotiation happens on the hello, not here.
     pub protocol_version: u32,
     /// Sequence number, incremented once per published snapshot within one run
@@ -30,8 +30,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Create a snapshot at the crate's current
-    /// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION).
+    /// Create a snapshot at the crate's current [`PROTOCOL_VERSION`].
     pub fn new(seq: u64, root: Node) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,

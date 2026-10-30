@@ -13,6 +13,84 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [Unreleased]
+
+**The Rust API is cut to what a caller needs.** Each crate had grown entry
+points that did one thing several ways, or that exposed internals: a
+`TariaLayer` had seven ways to take input, and `taria-mcp` exported its
+bridge, its tool methods and its command-line parser. They are removed or
+folded together before an alpha freezes the API, and what is left has room
+to grow without a break: `LayerStats` is `#[non_exhaustive]`, and a
+`taria-mcp` server is set up through a builder.
+
+This breaks Rust callers of all three crates; the table under Upgrading maps
+every removed name to what replaces it. Nothing on the wire moved:
+`PROTOCOL_VERSION` stays 1, and `InputId`, a newtype in Rust now, is still a
+bare integer in the JSON. Every text an agent reads through `taria-mcp`, from
+the instructions to each answer, is unchanged byte for byte, and so is the
+binary's command line.
+
+### Upgrading
+
+| Was | Now |
+| --- | --- |
+| `taria::wire::InputId`, an alias of `u64` | a newtype: `InputId::new(n)` or `n.into()`, read with `.get()` or `u64::from(id)` |
+| `TariaLayer::drain_acking(f)` | `TariaLayer::drain(f)` |
+| `TariaLayer::drain(f)`, `f` returning nothing | `drain(f)`, `f` returning `InputStatus::Delivered` |
+| `try_recv()` and `try_recv_with_id()` | `try_recv()`, returning `Option<(InputId, AgentInput)>` |
+| `recv_timeout(t)` and `recv_timeout_with_id(t)` | `recv_timeout(t)`, returning `Option<(InputId, AgentInput)>` |
+| `drain_with_ids(f)` | `while let Some((id, input)) = layer.try_recv() { .. }` |
+| `dropped_inputs()`, `stale_inputs()`, `unknown_inputs()`, `dropped_acks()` | fields of the same names on `stats()` |
+| `truncated_snapshots()`, `last_truncation()`, `oversized_snapshots()`, `last_oversize()` | fields of the same names on `stats()` |
+| `taria_mcp::server::TariaMcpServer`, `taria_mcp::tree_format::TreeFormat`, `taria_mcp::args::DEFAULT_IDLE_RELEASE` | `taria_mcp::{TariaMcpServer, TreeFormat, DEFAULT_IDLE_RELEASE}` |
+| `TariaMcpServer::on_demand(socket, format, idle)` | `TariaMcpServer::builder(socket).tree_format(format).idle_release(idle).on_demand()?` |
+| `TariaMcpServer::new(h)` or `with_tree_format(h, format)`, with `h` from `bridge::spawn(socket)` | `TariaMcpServer::builder(socket).tree_format(format).connected()?` |
+| `server::parse_action(name)`, `server::action_name(&action)` | `taria::Action::from_wire(name)`, `action.wire_name()` |
+| the tool methods `read_tree`, `act`, `key` and `type_text`, their `*_tool_attr()` functions, and `ActParams`, `KeyParams`, `TypeTextParams` | rmcp's `ServerHandler`, through a `tools/call` request |
+| `bridge::{spawn, BridgeHandle, AppSnapshot, BridgeState, LinkState}` | none: a finalizer spawns the bridge |
+| `tree_format::outline(line)`, `TreeFormat::render(&snapshot)` | none |
+| `args::{parse, Cli, HELP, MAX_IDLE_RELEASE_SECS, resolve_socket_path}` | none: they are the binary's own, and `taria::socket::resolve_path` derives a socket path |
+| rmcp 3 | rmcp 3.8 or later |
+
+- **`drain` is a new method under an old name.** It is 0.3's `drain_acking`,
+  so a 0.3 `drain` call still finds a `drain` and fails on its closure
+  (expected `InputStatus`, found `()`), not on a missing method. Return
+  `InputStatus::Delivered` from the closure for 0.3's behaviour.
+- **An `InputId` is no longer a number in Rust.** The JSON is the same bare
+  integer. A `tracing` field that logged the id as a number needs
+  `id = id.get()`.
+- **`taria-mcp` is reached through its root, and its tools through rmcp.** Its
+  modules are private. In-process tool calls, watching the bridge's state and
+  rendering a saved line are no longer possible from outside the crate. Each
+  can come back as an addition if someone needs it: open an issue.
+- **Both finalizers return `std::io::Result`.** Outside a tokio runtime they
+  return an error, where 0.3's constructors panicked. `connected()` ignores
+  `idle_release`: that bridge never lets go.
+
+### For an app author adopting taria
+
+- **`stats()` gathers what the layer lost.** One call returns the eight counts
+  as a `LayerStats`, all zero on a disabled layer, to read once the terminal
+  is restored, as before. A count added later is a new field, not a break.
+- **`TariaLayer::bind_or_disabled_at(label, path)` is public.** It binds at a
+  path the app chose and returns a disabled layer when that fails, as
+  `bind_or_disabled` does at the resolved path.
+
+### For a second implementer
+
+- **`Action::from_wire` is public, and `Action::wire_name` is new.** They map
+  between an action and the name the wire spells it by, so a bridge written in
+  Rust no longer keeps its own copy of the names.
+
+### The gates
+
+- `scripts/e2e.py` keeps its 26 steps and `scripts/adversarial.py` its 24
+  probes.
+- New `taria-mcp` tests drive a server built with `connected()` over MCP,
+  check that `server/discover` and a `tools/list` sent the 2026-07-28 way open
+  no connection to the app, and check that the builder refuses outside a
+  tokio runtime.
+
 ## [0.3.3] - 2026-10-25
 
 **A node can say that its text is not the app's.** A node's label and value

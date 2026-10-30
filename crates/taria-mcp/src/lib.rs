@@ -5,8 +5,9 @@
 //! startup, and it lets go of the app again once no tool call has run for an
 //! idle window (`--idle-release`, 60 s by default). A taria adapter serves one
 //! bridge at a time, so letting go is what lets several agent sessions share
-//! one app; see [`TariaMcpServer::on_demand`]. [`TariaMcpServer::connected`],
-//! for a caller that wants the app held, connects at once and never lets go.
+//! one app; see [`TariaMcpServerBuilder::on_demand`].
+//! [`TariaMcpServerBuilder::connected`], for a caller that wants the app held,
+//! connects at once and never lets go.
 //!
 //! The binary speaks MCP over stdio to the harness and the taria ndjson
 //! protocol over a Unix domain socket to the app. It exposes four tools:
@@ -22,8 +23,9 @@
 //! ack, so a tool call can tell an input the app applied from one it ignored
 //! or dropped rather than guessing from whether the tree happened to change.
 //!
-//! The library is the server the binary runs: a [`TariaMcpServer`] built by
-//! one of its two constructors serves over any rmcp transport.
+//! The library is the server the binary runs: a [`TariaMcpServer`], set up
+//! with [`TariaMcpServer::builder`] and built by one of the builder's two
+//! finalizers, serves over any rmcp transport.
 
 #![warn(missing_docs)]
 
@@ -31,7 +33,7 @@ mod bridge;
 mod server;
 mod tree_format;
 
-pub use server::{DEFAULT_IDLE_RELEASE, TariaMcpServer};
+pub use server::{DEFAULT_IDLE_RELEASE, TariaMcpServer, TariaMcpServerBuilder};
 pub use tree_format::TreeFormat;
 
 #[cfg(test)]

@@ -6,7 +6,7 @@
 //! the app is let go of again once no tool call has run for the idle window
 //! (60 s by default), so a session that has gone quiet does not lock every
 //! other session out of the app. See
-//! [`TariaMcpServer::on_demand`](taria_mcp::TariaMcpServer::on_demand).
+//! [`TariaMcpServerBuilder::on_demand`](taria_mcp::TariaMcpServerBuilder::on_demand).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -72,7 +72,10 @@ async fn run(
         taria_protocol = taria::PROTOCOL_VERSION,
         "taria-mcp starting; connecting to the app on the first tool call"
     );
-    let service = TariaMcpServer::on_demand(socket, tree_format, idle_release)
+    let service = TariaMcpServer::builder(socket)
+        .tree_format(tree_format)
+        .idle_release(idle_release)
+        .on_demand()?
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;

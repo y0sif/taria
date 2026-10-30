@@ -171,7 +171,10 @@ pub(crate) fn outline(tree_json: &str) -> String {
     outline_of(tree_json, parsed.as_ref().map(|parsed| &parsed.root))
 }
 
-/// [`outline`], naming actions from `parsed_root` where it lines up.
+/// Render `tree_json` as an outline, or return it unchanged when it is not a
+/// snapshot the outline can express, naming actions from `parsed_root` where
+/// it lines up. [`TreeFormat::render`] passes the bridge's own parse; the
+/// test-only `outline` passes a parse of the text itself.
 fn outline_of(tree_json: &str, parsed_root: Option<&Node>) -> String {
     let Ok(Value::Object(snapshot)) = serde_json::from_str::<Value>(tree_json) else {
         return tree_json.to_string();

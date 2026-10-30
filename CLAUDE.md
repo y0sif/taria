@@ -84,15 +84,15 @@ refuses a `target/debug` older than the sources.
 - `crates/taria-mcp`: rmcp stdio server exposing
   `read_tree`/`act`/`key`/`type_text`. A socket-manager task holds the latest
   snapshot in a watch channel and rebroadcasts acks. The binary connects on
-  demand (`TariaMcpServer::on_demand`): nothing until the first tool call
-  (`initialize` and `tools/list` open nothing), which waits briefly (at most
-  1.2 s) for the `hello` and the tree; then it reconnects with capped backoff
-  while tool calls want the app, and after 60 s with no tool calls
+  demand (`TariaMcpServer::builder(..).on_demand()`): nothing until the first
+  tool call (`initialize` and `tools/list` open nothing), which waits briefly
+  (at most 1.2 s) for the `hello` and the tree; then it reconnects with capped
+  backoff while tool calls want the app, and after 60 s with no tool calls
   (`--idle-release`, plain digits from 0 to 86400, `0` never) closes the
   connection or leaves the backlog and stops reconnecting, but not while an
   input awaits its ack, for up to 30 s past the window.
-  `TariaMcpServer::connected` connects at once and never lets go, as every
-  bridge before 0.3.2 did.
+  `TariaMcpServer::builder(..).connected()` connects at once and never lets
+  go, as every bridge before 0.3.2 did.
   That is the fix for issue #13: the adapter serves one bridge at a time and
   a repo `.mcp.json` starts one in every session. A snapshot is kept as the
   app's own line (minus the `type` framing key) beside the parse of it: the
