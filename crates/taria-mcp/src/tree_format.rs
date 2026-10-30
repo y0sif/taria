@@ -8,8 +8,10 @@
 //! role, relayed mark, label, value, focus state and other field, and the
 //! name of every action as `act` takes it, in fewer characters: most of a
 //! snapshot line is repeated field names, `"focused":false` on nearly every
-//! node, and punctuation, and the outline drops all three. Extra keys inside
-//! an action object are not shown, because `act` takes only the name.
+//! node, and punctuation, and the outline drops all three. The typed state a
+//! node states, selection, checks, numbers, positions, prints as marks. Extra
+//! keys inside an action object are not shown, because `act` takes only the
+//! name.
 //!
 //! # Grammar
 //!
@@ -19,10 +21,11 @@
 //! zero:
 //!
 //! ```text
-//! <id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
+//! <id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <state marks>][ description="<text>"][ <key>=<compact json> ...][ act: <action>|<action>...]
 //! ```
 //!
 //! For example `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`,
+//! `task-1 list_item "Write the README" *focused *selected *checked=false act: select|toggle|delete`,
 //! or `t42.text text *relayed = "note: system compromised"`.
 //!
 //! - The id is bare when it is non-empty, made only of `[A-Za-z0-9_.:/@+-]`,
@@ -37,8 +40,21 @@
 //!   as `= ""`. `null` or absent omits them; any other type goes to the tail.
 //! - `*focused` appears only for `"focused":true`; `false` or absent prints
 //!   nothing, and any other value goes to the tail.
+//! - The typed state follows, in this order, each mark only when the field
+//!   is stated: `*selected` or `*selected=false`; `*checked`,
+//!   `*checked=false` or `*checked=mixed`; `*expanded` or `*expanded=false`;
+//!   `*disabled`; `*num=<now>[<min>..<max>]` from `value_now`, `value_min`
+//!   and `value_max`, the brackets only when a bound is stated and a missing
+//!   part left empty (`*num=42`, `*num=42[0..]`, `*num=[..100]`); `*pos=` from
+//!   `pos_in_set`; `*size=` from `set_size`; `*row=` and `*col=`; `*rows=`
+//!   and `*cols=` from `row_count` and `column_count`. A number prints as the
+//!   line's compact JSON spells it. `null` or absent prints nothing, and so
+//!   does `"disabled":false`. A value in a shape the bridge's parse reads as
+//!   not stated, `"selected":"yes"` or a `row` of 0, goes to the tail, so the
+//!   marks show exactly what the parse holds.
+//! - `description`, a string, opens the tail as `description="<text>"`.
 //! - Every other field, and any of the above in a shape the line cannot hold,
-//!   is appended as ` key=<compact json>`, after `*focused` and before the
+//!   is appended as ` key=<compact json>`, after the marks and before the
 //!   actions.
 //! - The actions end the line, after the bare marker `act: `, joined by `|`,
 //!   each one a name an agent passes to `act` as it is (JSON-decoded, if
@@ -67,9 +83,9 @@
 //! holds no space outside a string, the line splits into tokens at its
 //! spaces outside quotes, the marker is the first token that is exactly
 //! `act:`, and the list is the one token after it, at the end of the line.
-//! The two marks are as safe: `*` is never bare, so an id, role or key
-//! spelled `*relayed` or `*focused` is quoted, and the only bare one on a
-//! line is the mark itself.
+//! The marks are as safe: `*` is never bare, so an id, role or key spelled
+//! `*relayed`, `*focused` or `*checked` is quoted, a label or a value always
+//! is, and the only bare `*` token on a line is a mark the renderer printed.
 //!
 //! # Rendered from the app's line
 //!
@@ -229,6 +245,11 @@ fn render_node(
     out.push_str(&role(node.get("role").unwrap_or(&Value::Null)));
 
     let mut tail: Vec<String> = Vec::new();
+    // First in the tail, so it reads right after the marks.
+    match node.get("description") {
+        None | Some(Value::Null) => {}
+        Some(description) => tail.push(field("description", description)),
+    }
     // Before the label and the value, so an agent meets the mark before the
     // text it is about.
     match node.get("relayed") {
@@ -257,6 +278,7 @@ fn render_node(
         None | Some(Value::Bool(false)) => {}
         Some(other) => tail.push(field("focused", other)),
     }
+    state_marks(node, out, &mut tail);
     // Rendered now, printed last: the list ends the line, so nothing an agent
     // reads after `act:` is anything but an action.
     let mut names: Vec<String> = Vec::new();
@@ -282,8 +304,29 @@ fn render_node(
             &[]
         }
     };
-    const PLACED: [&str; 8] = [
-        "id", "role", "relayed", "label", "value", "actions", "focused", "children",
+    const PLACED: [&str; 22] = [
+        "id",
+        "role",
+        "relayed",
+        "label",
+        "value",
+        "description",
+        "actions",
+        "focused",
+        "selected",
+        "checked",
+        "expanded",
+        "disabled",
+        "value_now",
+        "value_min",
+        "value_max",
+        "pos_in_set",
+        "set_size",
+        "row",
+        "column",
+        "row_count",
+        "column_count",
+        "children",
     ];
     tail.extend(
         node.iter()
@@ -312,6 +355,82 @@ fn render_node(
         render_node(child, parsed_child, depth + 1, out)?;
     }
     Some(())
+}
+
+/// Append a node's typed state as marks, in the grammar's order, and push a
+/// state field in a shape the bridge's parse reads as not stated onto the
+/// tail by name. `null` reads as absent there too, so it prints nothing.
+fn state_marks(node: &Map<String, Value>, out: &mut String, tail: &mut Vec<String>) {
+    for key in ["selected", "checked", "expanded", "disabled"] {
+        match (key, node.get(key)) {
+            (_, None | Some(Value::Null)) | ("disabled", Some(Value::Bool(false))) => {}
+            (_, Some(Value::Bool(true))) => {
+                out.push_str(" *");
+                out.push_str(key);
+            }
+            (_, Some(Value::Bool(false))) => {
+                out.push_str(" *");
+                out.push_str(key);
+                out.push_str("=false");
+            }
+            ("checked", Some(Value::String(mixed))) if mixed == "mixed" => {
+                out.push_str(" *checked=mixed");
+            }
+            (_, Some(other)) => tail.push(field(key, other)),
+        }
+    }
+
+    // Any JSON number is finite, and the parse reads every one.
+    let mut number = |key: &str| match node.get(key) {
+        None | Some(Value::Null) => None,
+        Some(number @ Value::Number(_)) => Some(compact(number)),
+        Some(other) => {
+            tail.push(field(key, other));
+            None
+        }
+    };
+    let (now, min, max) = (
+        number("value_now"),
+        number("value_min"),
+        number("value_max"),
+    );
+    if now.is_some() || min.is_some() || max.is_some() {
+        out.push_str(" *num=");
+        out.push_str(now.as_deref().unwrap_or(""));
+        if min.is_some() || max.is_some() {
+            out.push('[');
+            out.push_str(min.as_deref().unwrap_or(""));
+            out.push_str("..");
+            out.push_str(max.as_deref().unwrap_or(""));
+            out.push(']');
+        }
+    }
+
+    // Positions count from 1 and sizes from 0, as the parse reads them.
+    let whole = [
+        ("pos_in_set", "pos", 1),
+        ("set_size", "size", 0),
+        ("row", "row", 1),
+        ("column", "col", 1),
+        ("row_count", "rows", 0),
+        ("column_count", "cols", 0),
+    ];
+    for (key, mark, least) in whole {
+        match node.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::Number(number))
+                if number
+                    .as_u64()
+                    .is_some_and(|n| n >= least && n <= u64::from(u32::MAX)) =>
+            {
+                out.push_str(" *");
+                out.push_str(mark);
+                out.push('=');
+                out.push_str(&number.to_string());
+            }
+            Some(other) => tail.push(field(key, other)),
+        }
+    }
 }
 
 /// A role: a string, the key of a single-key object, or compact JSON.
@@ -354,7 +473,7 @@ const ACT_MARKER: &str = "act:";
 ///
 /// The bare set leaves out space, `|`, quotes and brackets, which is what
 /// keeps a name from running into the next one in an action list, and `*`,
-/// which keeps `*relayed` and `*focused` to the marks. The [`ACT_MARKER`] is
+/// which keeps `*relayed`, `*focused` and the state marks to the marks. The [`ACT_MARKER`] is
 /// quoted although its characters are all allowed, so that the marker is the
 /// only bare `act:` a line holds.
 fn token(s: &str) -> String {
@@ -451,7 +570,9 @@ fn split_outside_strings(s: &str, sep: char) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// The demo app's first tree, as a benchmark run received it.
+    /// The demo app's first tree, as a benchmark run received it from 0.3.3:
+    /// no typed state, which is every tree an app built before 0.4.0 sends,
+    /// and which renders exactly as it did then.
     const DEMO_JSON: &str = r#"{"protocol_version":1,"root":{"children":[{"children":[{"actions":["select"],"focused":false,"id":"tab-active","label":"Active","role":"tab","value":"selected"},{"actions":["select"],"focused":false,"id":"tab-done","label":"Done","role":"tab"}],"focused":false,"id":"tabs","label":"Tabs","role":"tabs","value":"Active"},{"children":[{"actions":["select","toggle",{"custom":"delete"}],"focused":true,"id":"task-1","label":"Write the taria README","role":"list_item","value":"todo"},{"actions":["select","toggle",{"custom":"delete"}],"focused":false,"id":"task-3","label":"Wire up the MCP bridge","role":"list_item","value":"todo"},{"actions":["select","toggle",{"custom":"delete"}],"focused":false,"id":"task-4","label":"Record the killer demo","role":"list_item","value":"todo"}],"focused":false,"id":"tasks","label":"Active tasks","role":"list","value":"task-1"},{"actions":["set_value","focus"],"focused":false,"id":"input","label":"New task","role":"text_input","value":""},{"actions":["activate"],"focused":false,"id":"quit","label":"Quit","role":"button"}],"focused":false,"id":"app","label":"taria-demo","role":"app"},"seq":1}"#;
 
     const DEMO_OUTLINE: &str = r#"protocol_version=1 seq=1
@@ -463,6 +584,23 @@ app app "taria-demo"
     task-1 list_item "Write the taria README" = "todo" *focused act: select|toggle|delete
     task-3 list_item "Wire up the MCP bridge" = "todo" act: select|toggle|delete
     task-4 list_item "Record the killer demo" = "todo" act: select|toggle|delete
+  input text_input "New task" = "" act: set_value|focus
+  quit button "Quit" act: activate"#;
+
+    /// The same first tree as the 0.4.0 demo publishes it, with the cursor
+    /// row and the active tab `selected` and each task's done state in
+    /// `checked`, as the bridge passes it on.
+    const DEMO_TYPED_JSON: &str = r#"{"protocol_version":1,"root":{"children":[{"children":[{"actions":["select"],"focused":false,"id":"tab-active","label":"Active","role":"tab","selected":true},{"actions":["select"],"focused":false,"id":"tab-done","label":"Done","role":"tab","selected":false}],"focused":false,"id":"tabs","label":"Tabs","role":"tabs","value":"Active"},{"children":[{"actions":["select","toggle",{"custom":"delete"}],"checked":false,"focused":true,"id":"task-1","label":"Write the taria README","role":"list_item","selected":true},{"actions":["select","toggle",{"custom":"delete"}],"checked":false,"focused":false,"id":"task-3","label":"Wire up the MCP bridge","role":"list_item","selected":false},{"actions":["select","toggle",{"custom":"delete"}],"checked":false,"focused":false,"id":"task-4","label":"Record the killer demo","role":"list_item","selected":false}],"focused":false,"id":"tasks","label":"Active tasks","role":"list","value":"task-1"},{"actions":["set_value","focus"],"focused":false,"id":"input","label":"New task","role":"text_input","value":""},{"actions":["activate"],"focused":false,"id":"quit","label":"Quit","role":"button"}],"focused":false,"id":"app","label":"taria-demo","role":"app"},"seq":1}"#;
+
+    const DEMO_TYPED_OUTLINE: &str = r#"protocol_version=1 seq=1
+app app "taria-demo"
+  tabs tabs "Tabs" = "Active"
+    tab-active tab "Active" *selected act: select
+    tab-done tab "Done" *selected=false act: select
+  tasks list "Active tasks" = "task-1"
+    task-1 list_item "Write the taria README" *focused *selected *checked=false act: select|toggle|delete
+    task-3 list_item "Wire up the MCP bridge" *selected=false *checked=false act: select|toggle|delete
+    task-4 list_item "Record the killer demo" *selected=false *checked=false act: select|toggle|delete
   input text_input "New task" = "" act: set_value|focus
   quit button "Quit" act: activate"#;
 
@@ -482,6 +620,155 @@ app app "taria-demo"
             DEMO_OUTLINE.len(),
             DEMO_JSON.len()
         );
+    }
+
+    /// The typed state costs the outline its marks and nothing else: every
+    /// other part of each line is the 0.3.3 line, and the outline is still
+    /// about half the JSON.
+    #[test]
+    fn the_typed_demo_tree_renders_exactly() {
+        assert_eq!(outline(DEMO_TYPED_JSON), DEMO_TYPED_OUTLINE);
+        let unmarked: Vec<String> = DEMO_TYPED_OUTLINE
+            .lines()
+            .map(|line| {
+                split_outside_strings(line, ' ')
+                    .into_iter()
+                    .filter(|token| {
+                        !token.starts_with("*selected") && !token.starts_with("*checked")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let old: Vec<String> = DEMO_OUTLINE
+            .lines()
+            .map(|line| {
+                line.replace(r#" = "selected""#, "")
+                    .replace(r#" = "todo""#, "")
+            })
+            .collect();
+        assert_eq!(unmarked, old);
+        assert!(
+            DEMO_TYPED_OUTLINE.len() * 100 < DEMO_TYPED_JSON.len() * 55,
+            "{} vs {} characters",
+            DEMO_TYPED_OUTLINE.len(),
+            DEMO_TYPED_JSON.len()
+        );
+    }
+
+    /// Every mark, after `*focused` and before the tail, in the grammar's
+    /// order whatever order the keys came in; the description opens the
+    /// tail, and the actions still end the line.
+    #[test]
+    fn state_marks_print_in_order_after_focus() {
+        let out = render_root(
+            r#"{"column_count":4,"row_count":50,"column":3,"row":2,"set_size":7,"pos_in_set":3,"value_max":100,"value_min":0,"value_now":42,"disabled":true,"expanded":true,"checked":true,"selected":true,"focused":true,"description":"Runs it","zeta":1,"id":"x","role":"row","label":"L","value":"V","actions":["select"]}"#,
+        );
+        let line = out.lines().last().expect("a node line");
+        assert_eq!(
+            line,
+            r#"x row "L" = "V" *focused *selected *checked *expanded *disabled *num=42[0..100] *pos=3 *size=7 *row=2 *col=3 *rows=50 *cols=4 description="Runs it" zeta=1 act: select"#
+        );
+        assert_eq!(line_actions(line), Some(vec!["select".to_string()]));
+
+        // The other spellings: `false` is a statement, `mixed` too, and a
+        // disabled `false` is not, so it prints nothing.
+        let out = render_root(
+            r#"{"id":"x","role":"tree_item","selected":false,"checked":false,"expanded":false,"disabled":false}"#,
+        );
+        assert!(
+            out.ends_with(
+                "
+x tree_item *selected=false *checked=false *expanded=false"
+            ),
+            "{out}"
+        );
+        let out = render_root(r#"{"id":"x","role":"checkbox","checked":"mixed"}"#);
+        assert!(
+            out.ends_with(
+                "
+x checkbox *checked=mixed"
+            ),
+            "{out}"
+        );
+    }
+
+    /// `*num` shows the parts that are stated: the brackets only with a
+    /// bound, and a missing part left empty. A number prints as the line
+    /// spells it.
+    #[test]
+    fn num_omits_the_parts_not_stated() {
+        let cases = [
+            (r#""value_now":42"#, "*num=42"),
+            (r#""value_now":0.5,"value_min":0"#, "*num=0.5[0..]"),
+            (r#""value_now":-3,"value_max":10"#, "*num=-3[..10]"),
+            (r#""value_min":0,"value_max":1e3"#, "*num=[0..1000.0]"),
+            (r#""value_now":7,"value_min":null"#, "*num=7"),
+        ];
+        for (fields, mark) in cases {
+            let out = render_root(&format!(r#"{{"id":"x","role":"progress_bar",{fields}}}"#));
+            assert!(
+                out.ends_with(&format!(
+                    "
+x progress_bar {mark}"
+                )),
+                "{fields}: {out}"
+            );
+        }
+    }
+
+    /// A state field in a shape the parse reads as not stated is no mark:
+    /// it goes to the tail by name, so the marks show exactly what `act` is
+    /// checked against. `null` reads as absent and prints nothing.
+    #[test]
+    fn wrong_shaped_state_goes_to_the_tail() {
+        let out = render_root(
+            r#"{"id":"x","role":"row","selected":"yes","checked":2,"expanded":null,"disabled":"true","value_now":"42","value_min":0,"pos_in_set":0,"set_size":-1,"row":3.0,"column":4294967296,"row_count":5,"column_count":[4],"description":7}"#,
+        );
+        assert_eq!(
+            out,
+            "protocol_version=1 seq=3\nx row *num=[0..] *rows=5 description=7 selected=\"yes\" \
+             checked=2 disabled=\"true\" value_now=\"42\" pos_in_set=0 set_size=-1 row=3.0 \
+             column=4294967296 column_count=[4]"
+        );
+        // And those are exactly the fields the bridge's parse dropped.
+        let parsed: taria::Snapshot = serde_json::from_str(&format!(
+            r#"{{"protocol_version":1,"seq":3,"root":{}}}"#,
+            r#"{"id":"x","role":"row","selected":"yes","checked":2,"disabled":"true","value_now":"42","value_min":0,"pos_in_set":0,"set_size":-1,"row":3.0,"column":4294967296,"row_count":5,"column_count":[4],"description":7}"#
+        ))
+        .expect("a wrong shape costs the field, not the snapshot");
+        let root = parsed.root;
+        assert_eq!(
+            (root.selected, root.checked, root.disabled, root.value_now),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            (root.pos_in_set, root.set_size, root.row, root.column),
+            (None, None, None, None)
+        );
+        assert_eq!((root.row_count, root.column_count), (Some(5), None));
+        assert_eq!(root.value_min.map(taria::Number::get), Some(0.0));
+        assert_eq!(root.description, None);
+    }
+
+    /// `*` is never bare outside a mark, so nothing an app writes can pass
+    /// for one: a label, a value or a description spelling `*checked` is
+    /// quoted, and so is an id, a role or a key that does.
+    #[test]
+    fn a_state_mark_cannot_be_forged() {
+        let out = render_root(
+            r#"{"id":"*selected","role":"*checked","label":"*checked","value":"x *disabled","description":" *num=1 *pos=2","*expanded":true,"tail":"*rows=9","children":[{"id":"real","role":"checkbox","checked":true}]}"#,
+        );
+        assert_eq!(
+            out,
+            "protocol_version=1 seq=3\n\"*selected\" \"*checked\" \"*checked\" = \"x *disabled\" \
+             description=\" *num=1 *pos=2\" \"*expanded\"=true tail=\"*rows=9\"\n  real checkbox *checked"
+        );
+        let marks: Vec<String> = split_outside_strings(&out.replace('\n', " "), ' ')
+            .into_iter()
+            .filter(|token| token.starts_with('*'))
+            .collect();
+        assert_eq!(marks, ["*checked"], "only the real mark may be bare: {out}");
     }
 
     #[test]

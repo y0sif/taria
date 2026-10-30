@@ -34,7 +34,7 @@ refuses a `target/debug` older than the sources.
   envelope folds back onto the built-ins on the way in. Version 1 is frozen:
   additive changes only (new optional fields, new message variants, new roles
   and actions, which peers degrade to `other` / `Custom` instead of failing
-  the snapshot). The eleven types such an addition can reach are
+  the snapshot). The twelve types such an addition can reach are
   `#[non_exhaustive]`, and so are the six struct-like variants inside them
   (`AppToBridge::Hello`/`Ack`, `BridgeToApp::Input`, `AgentInput::Act`/`Key`/
   `Text`), which is why peers build through constructors and destructure with
@@ -43,17 +43,27 @@ refuses a `target/debug` older than the sources.
   additive in Rust too. `MAX_NODE_DEPTH` is 32, against a measured ceiling of
   63 nested nodes before a JSON parser refuses; `Node::check_depth` reports a
   violation and names a node at the offending depth. Anything else bumps
-  `PROTOCOL_VERSION`. The one field added since version 1 froze in 0.1.0 is
+  `PROTOCOL_VERSION`. Two additions since version 1 froze in 0.1.0. First
   `relayed` (0.3.3, issue #6): a node marks its label and value as text from
   outside the app, data and never instructions; strictly per node, never
-  inherited, and absent means not marked, not vouched for.
+  inherited, and absent means not marked, not vouched for. Then typed state
+  (0.4.0), flat optional node fields: `selected`, `checked` (`true`, `false`
+  or `"mixed"`, `taria::Checked`), `expanded`, `disabled` (only `true` is
+  sent), `description` (the app's own words, never relayed text),
+  `value_now`/`value_min`/`value_max` (`taria::Number`, finite only, so
+  `Node` keeps `Eq`), `pos_in_set`/`set_size`, `row`/`column` and
+  `row_count`/`column_count` (positions from 1). Absent means not stated,
+  never `false`, and a wrong shape reads as not stated rather than failing
+  the node (`relayed` stays strict). Hidden has no field: it is not
+  published. A node setting none of them serializes as in 0.3.3.
 - `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket, refuses a
   label that is not a plain file name (it binds and unlinks what the label
   resolves to), vets the socket directory, and serves one bridge client at a
   time from background threads (listener plus per-connection reader/writer).
   `bind_or_disabled` never fails, so taria cannot block startup; the layer
   never prints (the app reports `bind_error()` outside the alternate screen).
-  Nodes come from `publish(nodes)` or `FrameRecorder`/`sem`; identical trees
+  Nodes come from `publish(nodes)` or `FrameRecorder`/`sem`; a node marked
+  `disabled` is published with no actions (no counter); identical trees
   are deduped. Input arrives via `drain`/`try_recv`/`recv_timeout` (the last
   two hand over the `InputId`), acked `Delivered` on dequeue, `Dropped` when
   the queue is full, and `Ignored` when the app says so, by returning it from
@@ -99,18 +109,22 @@ refuses a `target/debug` older than the sources.
   line is what the agent reads, so an unknown role, action or field survives
   by name; the parse is what the bridge validates and diffs against.
   `--tree-format outline` (default `json`) renders that line as one indented
-  line per node (a relayed node prints `*relayed` before its label, and `*`
-  is never bare otherwise, so the mark cannot be forged) for every tree an
-  agent receives, with action names taken from the parse because that is
-  what `act` checks, and swaps only the format passages of the instructions
-  and of the `read_tree` and `act` descriptions.
+  line per node (a relayed node prints `*relayed` before its label, typed
+  state prints as marks after `*focused`, `*selected`, `*checked=false`,
+  `*num=42[0..100]`, and `*` is never bare otherwise, so no mark can be
+  forged) for every tree an agent receives, with action names taken from the
+  parse because that is what `act` checks, and swaps only the format
+  passages of the instructions and of the `read_tree` and `act`
+  descriptions.
   Those texts are short because they are resent with every model call: no
   parameter is described but `repeat`'s default, the `{"custom":...}` rule is
   in `act`'s description only, and a test pins both modes' text byte for byte.
   The input tools promise the tree only if it changed: three answers that are
-  not errors carry a note and no tree. `act` validates node ids and advertised
-  actions and bounds `value` (4096 chars), `key` parses the shared grammar and
-  bounds `repeat` (1-64), `type_text` bounds the payload (4096 chars). Results
+  not errors carry a note and no tree. `act` validates node ids, refuses a
+  node marked `disabled` before resolving the action (never inferred from an
+  empty action list), validates advertised actions and bounds `value` (4096
+  chars), `key` parses the shared grammar and bounds `repeat` (1-64),
+  `type_text` bounds the payload (4096 chars). Results
   are anchored on the app's ack, not on whatever the tree did: dropped,
   ignored, delivered-and-changed, delivered-and-unchanged, no ack, partial
   burst, lost acks, and the app disconnecting. A protocol mismatch keeps
@@ -145,15 +159,17 @@ refuses a `target/debug` older than the sources.
   sends `hello` is held to the `protocol_version` its first snapshot states.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
-  identities (`IdSpace`), stable across deletes and restarts; the list
-  publishes its selection as its own value; chords are never treated as the
-  plain key they contain. Typed text is routed to the new-task input and
-  `Ignored` elsewhere. The input advertises `Focus` while the keyboard is
-  elsewhere, `Dismiss` while it holds it, and `Activate` only while the draft
-  would submit, and a `quit` node advertises the way out of the app, so every
-  state an agent can enter has an advertised way out; acts on nodes that are
-  gone (the dialog's, a deleted task) report `Ignored`. Submitting switches
-  to the tab the new task landed on, so the effect is in the next snapshot.
+  identities (`IdSpace`), stable across deletes and restarts; a task's done
+  state is `checked`, the cursor row and the active tab are `selected`, and
+  the list and the tab bar still name them in their values, for the bench;
+  chords are never treated as the plain key they contain. Typed text is
+  routed to the new-task input and `Ignored` elsewhere. The input
+  advertises `Focus` while the keyboard is elsewhere, `Dismiss` while it
+  holds it, and `Activate` only while the draft would submit, and a `quit`
+  node advertises the way out of the app, so every state an agent can enter
+  has an advertised way out; acts on nodes that are gone (the dialog's, a
+  deleted task) report `Ignored`. Submitting switches to the tab the new
+  task landed on, so the effect is in the next snapshot.
   At exit it prints every nonzero layer counter. The draft is published
   whole on purpose: e2e step w grows it past 1 MiB to make the adapter trim.
   `tree.rs` and `update.rs` are pure and unit-tested, including the

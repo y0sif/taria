@@ -23,9 +23,11 @@ pub const TASK_IDS: IdSpace = IdSpace::new("task");
 /// mirroring how [`mod@crate::update`] gates keys and acts behind the modal.
 ///
 /// Focus and selection are separate facts. `focused` says where a raw key
-/// would land, so only one node carries it; the list's value says which row
-/// the cursor sits on, and it is published in every state so moving the
-/// cursor is observable even when the keyboard belongs to the input.
+/// would land, so only one node carries it; `selected` says which row the
+/// cursor sits on and which tab is showing, and the list's value names the
+/// selected row too. Both are published in every state, so moving the cursor
+/// is observable even when the keyboard belongs to the input. A task's done
+/// state is its `checked`.
 pub fn build_nodes(app: &App) -> Vec<Node> {
     let mut nodes = vec![
         tabs_node(app),
@@ -42,12 +44,11 @@ pub fn build_nodes(app: &App) -> Vec<Node> {
 fn tabs_node(app: &App) -> Node {
     let modal = app.dialog.is_some();
     let tab_child = |id: &str, tab: Tab| {
-        let mut node = Node::new(id, Role::Tab).label(tab.label());
+        let mut node = Node::new(id, Role::Tab)
+            .label(tab.label())
+            .selected(app.tab == tab);
         if !modal {
             node = node.action(Action::Select);
-        }
-        if app.tab == tab {
-            node = node.value("selected");
         }
         node
     };
@@ -69,8 +70,9 @@ fn list_node(app: &App) -> Node {
         .map(|(pos, task)| {
             let mut node = Node::new(TASK_IDS.id(task.id), Role::ListItem)
                 .label(task.title.clone())
-                .value(if task.done { "done" } else { "todo" })
-                .focused(list_focused && pos == app.selection);
+                .focused(list_focused && pos == app.selection)
+                .selected(pos == app.selection)
+                .checked(task.done);
             if !modal {
                 node = node.actions([
                     Action::Select,
@@ -91,13 +93,14 @@ fn list_node(app: &App) -> Node {
         .focused(list_focused && items.is_empty())
         .children(items);
     // Selection is not focus. The cursor sits on a row whether or not the
-    // list owns the keyboard, so the list publishes the selected item's id as
-    // its own value the way the tabs node publishes the active tab. Without
-    // it, a `select` sent while the input has focus would move the cursor
-    // without changing anything an agent can read, and the bridge would
-    // truthfully report no change for an input the app handled. An empty
-    // list has no row to name and so has no value, matching the tab children
-    // where an absent value means "not selected".
+    // list owns the keyboard, so the rows carry `selected` and the list
+    // publishes the selected item's id as its own value, the way the tabs
+    // node publishes the active tab. Without them, a `select` sent while the
+    // input has focus would move the cursor without changing anything an
+    // agent can read, and the bridge would truthfully report no change for an
+    // input the app handled. The value predates `selected` and stays, so a
+    // reader built before 0.4.0, and the benchmark, still find it. An empty
+    // list has no row to name and so has no value.
     if let Some(selected) = app.selected_id() {
         node = node.value(TASK_IDS.id(selected));
     }
@@ -183,7 +186,7 @@ fn dialog_node(app: &App) -> Option<Node> {
 
 #[cfg(test)]
 mod tests {
-    use taria::AgentInput;
+    use taria::{AgentInput, Checked};
 
     use super::*;
     use crate::update::apply_agent_input;
@@ -338,10 +341,9 @@ mod tests {
     fn task_ids_stay_stable_across_toggle_and_tab_switch() {
         let mut app = App::new();
         let title = app.tasks[0].title.clone();
-        assert_eq!(
-            find(&build_nodes(&app), "task-1").unwrap().value.as_deref(),
-            Some("todo")
-        );
+        let task = find(&build_nodes(&app), "task-1").unwrap().clone();
+        assert_eq!(task.checked, Some(Checked::False));
+        assert_eq!(task.value, None, "done is `checked`, not a value");
 
         apply_agent_input(&mut app, act("task-1", Action::Toggle));
         apply_agent_input(&mut app, act("tab-done", Action::Select));
@@ -349,7 +351,40 @@ mod tests {
         let nodes = build_nodes(&app);
         let node = find(&nodes, "task-1").expect("same id on the Done tab");
         assert_eq!(node.label.as_deref(), Some(title.as_str()));
-        assert_eq!(node.value.as_deref(), Some("done"));
+        assert_eq!(node.checked, Some(Checked::True));
+    }
+
+    /// The cursor row is `selected` and every other row says it is not, in
+    /// every focus state, and it moves with the cursor.
+    #[test]
+    fn exactly_the_cursor_row_is_selected() {
+        let mut app = App::new();
+        let selected = |app: &App| -> Vec<(String, Option<bool>)> {
+            find(&build_nodes(app), "tasks")
+                .unwrap()
+                .children
+                .iter()
+                .map(|row| (row.id.0.clone(), row.selected))
+                .collect()
+        };
+        let rows = |flags: [bool; 3]| -> Vec<(String, Option<bool>)> {
+            ["task-1", "task-3", "task-4"]
+                .into_iter()
+                .zip(flags)
+                .map(|(id, flag)| (id.to_string(), Some(flag)))
+                .collect()
+        };
+        assert_eq!(selected(&app), rows([true, false, false]));
+
+        apply_agent_input(&mut app, act("task-4", Action::Select));
+        assert_eq!(selected(&app), rows([false, false, true]));
+
+        app.focus = Focus::Input;
+        assert_eq!(
+            selected(&app),
+            rows([false, false, true]),
+            "selection stays readable while the input holds the keyboard"
+        );
     }
 
     #[test]
@@ -360,20 +395,15 @@ mod tests {
             find(&nodes, "tabs").unwrap().value.as_deref(),
             Some("Active")
         );
-        assert_eq!(
-            find(&nodes, "tab-active").unwrap().value.as_deref(),
-            Some("selected")
-        );
-        assert_eq!(find(&nodes, "tab-done").unwrap().value, None);
+        assert_eq!(find(&nodes, "tab-active").unwrap().selected, Some(true));
+        assert_eq!(find(&nodes, "tab-done").unwrap().selected, Some(false));
+        assert_eq!(find(&nodes, "tab-active").unwrap().value, None);
 
         app.tab = Tab::Done;
         let nodes = build_nodes(&app);
         assert_eq!(find(&nodes, "tabs").unwrap().value.as_deref(), Some("Done"));
-        assert_eq!(find(&nodes, "tab-active").unwrap().value, None);
-        assert_eq!(
-            find(&nodes, "tab-done").unwrap().value.as_deref(),
-            Some("selected")
-        );
+        assert_eq!(find(&nodes, "tab-active").unwrap().selected, Some(false));
+        assert_eq!(find(&nodes, "tab-done").unwrap().selected, Some(true));
         assert_eq!(
             find(&nodes, "tasks").unwrap().label.as_deref(),
             Some("Done tasks")
@@ -555,7 +585,9 @@ mod tests {
         assert_eq!(input.label.as_deref(), Some("New task"));
         let task = find(&nodes, "task-1").unwrap();
         assert_eq!(task.label.as_deref(), Some(app.tasks[0].title.as_str()));
-        assert_eq!(task.value.as_deref(), Some("todo"));
+        assert_eq!(task.checked, Some(Checked::False));
+        assert_eq!(task.selected, Some(true));
+        assert_eq!(task.disabled, None, "inert behind the modal, not disabled");
 
         // The dialog keeps its own actions.
         assert_eq!(

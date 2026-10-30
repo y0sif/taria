@@ -700,6 +700,11 @@ def show_tab(client, tab_id):
         f"selected {tab_id}, but the tabs node reads "
         f"{find(tree, 'tabs').get('value')!r}, expected {TAB_LABELS[tab_id]!r}",
     )
+    flags = {tab: find(tree, tab).get("selected") for tab in TAB_LABELS}
+    require(
+        flags == {tab: tab == tab_id for tab in TAB_LABELS},
+        f"selected {tab_id}, but the tabs' selected flags read {flags}",
+    )
     return tree
 
 
@@ -785,14 +790,36 @@ def step_c_act_select(client, ctx):
         after == target and after != before,
         f"focus went {before} -> {after}, expected {target}",
     )
+    # The cursor row says so with `selected`, and every other row says it is
+    # not: the typed state, beside the list's value naming the same row.
+    flags = {row["id"]: row.get("selected") for row in task_items(tree)}
+    require(
+        flags.pop(target, None) is True and all(flag is False for flag in flags.values()),
+        f"after select {target}, the rows' selected flags read {flags}",
+    )
+    require(
+        find(tree, "tasks").get("value") == target,
+        f"the list's value is {find(tree, 'tasks').get('value')!r}, expected {target}",
+    )
     ctx["snapshot"] = tree
     ctx["selected"] = target
-    return f"focus {before} -> {after}"
+    return f"focus {before} -> {after}, selected moved with it"
+
+
+def done_state(node):
+    """A task row's done state as the demo publishes it: `checked`, true or
+    false, never absent on a row."""
+    checked = node.get("checked")
+    require(
+        isinstance(checked, bool),
+        f"{node.get('id')} has checked {checked!r}, expected true or false",
+    )
+    return "done" if checked else "todo"
 
 
 def step_d_act_toggle(client, ctx):
     target = ctx["selected"]
-    before_val = find(ctx["snapshot"], target)["value"]
+    before_val = done_state(find(ctx["snapshot"], target))
     require(before_val == "todo", f"{target} starts as {before_val!r}, expected todo")
 
     # Toggle: the task flips to done and therefore moves to the Done tab.
@@ -804,9 +831,9 @@ def step_d_act_toggle(client, ctx):
     tree = show_tab(client, "tab-done")
     node = find(tree, target)
     require(node is not None, f"{target} not found on the Done tab after toggle")
-    require(node["value"] == "done", f"{target} value {node['value']!r}, expected done")
+    require(done_state(node) == "done", f"{target} is {done_state(node)!r}, expected done")
 
-    # Toggle back: value returns to todo (visible again on the Active tab).
+    # Toggle back: checked returns to false (visible again on the Active tab).
     tree = act(client, target, "toggle")
     require(
         find(tree, target) is None,
@@ -815,7 +842,7 @@ def step_d_act_toggle(client, ctx):
     tree = show_tab(client, "tab-active")
     node = find(tree, target)
     require(node is not None, f"{target} not back on the Active tab")
-    require(node["value"] == "todo", f"{target} value {node['value']!r}, expected todo")
+    require(done_state(node) == "todo", f"{target} is {done_state(node)!r}, expected todo")
     one_focused(tree, "after toggle round-trip")
     ctx["snapshot"] = tree
     return f"{target}: todo -> done -> todo"
@@ -842,7 +869,7 @@ def step_e_add_task(client, ctx):
         f"expected exactly one node labelled {title!r} after activate, got "
         f"{len(added)}: {[n['id'] for n in added]}",
     )
-    require(added[0]["value"] == "todo", "new task should start as todo")
+    require(done_state(added[0]) == "todo", "new task should start as todo")
     require(
         find(tree, "input")["value"] in (None, ""),
         "input should clear after submitting",
@@ -966,7 +993,7 @@ def step_i_type_text(client, ctx):
         node["id"] not in before_ids,
         f"{node['id']} existed before type_text; no new task was created",
     )
-    require(node["value"] == "todo", f"typed task value {node['value']!r}, expected todo")
+    require(done_state(node) == "todo", f"typed task is {done_state(node)!r}, expected todo")
     require(
         find(tree, "input")["value"] in (None, ""),
         "input should clear after the typed newline submits it",
@@ -1922,6 +1949,21 @@ def step_v_outline_format(ctx):
             ),
             f"{target} is not the focused row after select:\n{answer}",
         )
+        # The typed state prints as marks: the cursor row alone `*selected`,
+        # the others `*selected=false`, and every active task `*checked=false`.
+        marks = {
+            line.split()[0]: [t for t in outline_tokens(line) if t.startswith("*")]
+            for line in after
+            if re.match(r"^    task-\S+ list_item ", line)
+        }
+        require(
+            all(
+                ("*selected" if node == target else "*selected=false") in found
+                and "*checked=false" in found
+                for node, found in marks.items()
+            ),
+            f"the task rows' state marks after select {target}: {marks}",
+        )
 
         def node_line(outline, depth, node_id):
             prefix = "  " * depth + node_id + " "
@@ -2863,7 +2905,7 @@ def main():
         ("a tools/list exact", step_a_tools_list),
         ("b read_tree shape", step_b_read_tree),
         ("c act select moves focus", step_c_act_select),
-        ("d act toggle flips value", step_d_act_toggle),
+        ("d act toggle flips checked", step_d_act_toggle),
         ("e set_value+activate adds task", step_e_add_task),
         ("f custom delete dialog + cancel", step_f_dialog),
         ("g error messages", step_g_errors),

@@ -464,10 +464,28 @@ A node with nothing set beyond its identity:
 | `role` | string (or object, section 7.2) | yes | always emitted | parse error |
 | `label` | string | no | **omitted when unset** | no label |
 | `value` | string | no | **omitted when unset** | no value |
+| `description` | string | no | **omitted when unset** | not stated |
 | `focused` | boolean | no | **always emitted**, including `false` | `false` |
 | `relayed` | boolean | no | **omitted when `false`** | `false`: not marked |
+| `selected` | boolean | no | **omitted when unset**; `true` and `false` both sent | not stated |
+| `checked` | `true`, `false` or `"mixed"` | no | **omitted when unset**; all three sent | not stated |
+| `expanded` | boolean | no | **omitted when unset**; `true` and `false` both sent | not stated: the node does not expand |
+| `disabled` | boolean | no | **omitted unless `true`** | not stated: enabled |
+| `value_now` | number | no | **omitted when unset** | not stated |
+| `value_min` | number | no | **omitted when unset** | not stated |
+| `value_max` | number | no | **omitted when unset** | not stated |
+| `pos_in_set` | integer, 1 to 4294967295 | no | **omitted when unset** | not stated |
+| `set_size` | integer, 0 to 4294967295 | no | **omitted when unset** | not stated |
+| `row` | integer, 1 to 4294967295 | no | **omitted when unset** | not stated |
+| `column` | integer, 1 to 4294967295 | no | **omitted when unset** | not stated |
+| `row_count` | integer, 0 to 4294967295 | no | **omitted when unset** | not stated |
+| `column_count` | integer, 0 to 4294967295 | no | **omitted when unset** | not stated |
 | `actions` | array | no | **omitted when empty** | no actions advertised |
 | `children` | array | no | **omitted when empty** | a leaf |
+
+`description` and the twelve fields from `selected` to `column_count` are the
+typed state, added in 0.4.0 (section 16.8). Section 6.5 says what each
+means.
 
 Rules a reader has to implement:
 
@@ -494,6 +512,23 @@ Rules a reader has to implement:
   "invalid type: null" in the reference implementation, a value of any other
   wrong type fails it too, and failing takes the whole snapshot with it.
 - `id` **MUST** be a JSON string. Verified: `{"id":7,...}` fails.
+- A reader **MUST** accept every typed state field absent, and **MUST** read
+  absence as not stated, never as `false` or zero.
+- A reader **MUST** read a typed state field of the wrong type or shape as not
+  stated, exactly as if it were absent, and **MUST NOT** fail the node over
+  it: `"selected":"yes"`, `"checked":2`, `"checked":"partial"`, a negative or
+  zero `row`, `"pos_in_set":3.5`, a `set_size` over 4294967295, a string
+  where a number goes. `null` reads as absent too. This is the opposite of
+  `focused` and `relayed`, whose wrong type fails the line; the reason is in
+  section 16.8. Verified:
+  `{"id":"c","role":"checkbox","checked":2,"row":-1,"selected":"yes"}`
+  parses as a node with none of the three stated.
+- A sender **MUST NOT** send `"disabled":false`; it sends `true` or nothing.
+  A reader reads `false` as not stated.
+- A number is a JSON number, so it is always finite: JSON has no spelling for
+  `NaN` or an infinity. A sender **MUST** leave a field unset rather than
+  invent one. The reference `taria::Number` cannot hold either, and writes a
+  whole number within 2^53 without a fraction (`42`, not `42.0`).
 
 ### 6.2 Node ids
 
@@ -560,6 +595,62 @@ peer can check it. A bridge needs nothing new to carry it: it passes the mark
 on with the rest of the line, and a bridge built before the field does too,
 because it hands the agent the app's line rather than its parse of it
 (section 16.6).
+
+### 6.5 Typed state
+
+A node's role says what a widget is; its typed state says what condition it
+is in, in fields an agent can read without parsing prose out of a `value`.
+Every field is optional and is a statement only when present: absent means
+the app said nothing, never `false`. An app built before 0.4.0 states
+nothing.
+
+- **`selected`**: whether the node is the selected one among its siblings:
+  the row a list's cursor sits on, the active tab, the chosen option.
+  Selection is not focus (section 15): a cursor sits on a row whether or not
+  the list holds the keyboard. `false` is a statement too, so a list whose
+  rows all say `false` has no selection, while a row without the field says
+  nothing either way.
+- **`checked`**: whether a checkable node is checked: `true`, `false`, or
+  `"mixed"` for a parent whose children disagree.
+- **`expanded`**: `true` is expanded, `false` collapsed, and absent says the
+  node does not expand at all.
+- **`disabled`**: the node is shown but takes no action until the app enables
+  it. Only `true` is sent. A sender **SHOULD** advertise no actions on a
+  disabled node, and the reference adapter strips every action from one when
+  it publishes. A bridge **SHOULD** refuse an `act` naming a disabled node,
+  and the reference bridge does, before it looks at the action, with an
+  answer that says the node is disabled. A reader **MUST NOT** infer
+  `disabled` from an empty action list: a node advertises nothing for other
+  reasons, such as a modal dialog in front of it, and is not disabled then.
+  Neither `key` nor `text` is affected: they go where the app sends them.
+- **`description`**: longer text than the label, in the app's own words: a
+  hint, what a setting does, why a button is disabled. `relayed` covers the
+  label and the value only, so a sender **MUST NOT** put relayed text in a
+  description; text from outside the app goes in a child marked relayed
+  (section 6.4).
+- **`value_now`**, **`value_min`**, **`value_max`**: a numeric value and its
+  bounds, for a progress bar, a slider, a gauge. Any of the three may come
+  without the others. Nothing checks that the value lies within its bounds.
+- **`pos_in_set`** and **`set_size`**: an item's position among its
+  siblings, counting from 1, and on the container (a `list`, `tree`,
+  `tree_item`, `tabs`, `select` or `menu`) how many items it holds. Both count
+  every item, published or not: row 40 of 1000 is `"pos_in_set":40` beside
+  `"set_size":1000` when the app publishes only the rows on screen.
+- **`row`** and **`column`**: the row and column a table `row` or `cell` is
+  in, counting from 1; a `row` node carries only `row`. **`row_count`** and
+  **`column_count`**: how many rows and columns the `table` holds, published
+  or not.
+
+Positions count from 1 on the wire, as a person counts rows. AccessKit counts
+`position_in_set`, row and column indices from 0, so an exporter to it
+subtracts one (`docs/architecture.md` has the mapping).
+
+**Hidden** has no field. A node an app hides, a collapsed branch, a
+scrolled-away row, a closed panel, is simply not published. So a node with
+`"expanded":true` and fewer children than its `set_size` has children that
+were not published, cut to fit the line (section 13.2) or off screen, not a
+set that is empty, and a reader **MUST NOT** read the published children as
+all of them.
 
 ## 7. Role vocabulary
 
@@ -1412,9 +1503,12 @@ decides where typed characters go is the app, not the protocol.
 a row whether or not that list owns the keyboard. An app that publishes only
 focus makes a moved cursor invisible, and a bridge then truthfully reports
 "the tree did not change" for an input the app handled. Publish the selection
-as its own readable fact: the demo puts the selected item's node id in the
-list node's `value`, which is visible in the capture in section 18 as the
-list's `"value":"task-1"` moving to `"value":"task-3"` after a `down` key.
+as its own readable fact, in `selected` (section 6.5): the demo marks the
+cursor row `"selected":true` and every other row `"selected":false`, and also
+names the selected row's id in the list node's `value`, as it did before
+`selected` existed. Both are visible in the capture in section 18, where a
+`down` key moves `"selected":true` from `task-1` to `task-3` and the list's
+`"value":"task-1"` to `"value":"task-3"`.
 
 ## 16. Versioning
 
@@ -1541,6 +1635,40 @@ Anything that is not additive:
 The last is the dangerous one, because an old peer parses the message
 successfully and acts on the old meaning.
 
+### 16.8 Typed state (0.4.0)
+
+The second addition since version 1 froze, after `relayed` in 0.3.3: thirteen
+optional node fields, `description` and the twelve from `selected` to
+`column_count` (sections 6.1 and 6.5). Each is a new optional field, omitted
+when unset, so the addition is additive under section 16.2 and
+`PROTOCOL_VERSION` stays 1.
+
+- **An older reader** ignores the fields as unknown (section 2.7) and parses
+  every node as before. It reads no state, so to it a node is exactly what a
+  0.3.3 app would have sent, `value` and all.
+- **An older reference bridge** (taria-mcp 0.3.x) passes the fields on in the
+  JSON tree with the rest of the app's line (section 16.6). Its outline, in
+  0.3.0 to 0.3.3, shows them among the fields at the end of the line,
+  `checked=false selected=true`, rather than as marks, and its `read_tree`
+  description says nothing about them. It does not refuse `act` on a
+  disabled node, but against the reference adapter there is nothing to send:
+  the node advertises no actions, so its own validation refuses the act as
+  unadvertised.
+- **An older app** sends none of them, so every node reads as stating
+  nothing, which is what absent means.
+- **Leniently read.** A field added later fails the node when it is read
+  strictly, and a failed node fails the line, which the reader skips: the
+  agent is left on a stale tree with nothing saying why, over one field.
+  `relayed` is read strictly because a mark that is not a boolean is no
+  clearer about who wrote the text; state is not like that, so every field
+  added in 0.4.0 reads a wrong shape as not stated (section 6.1), and
+  `relayed` keeps its 0.3.3 rule.
+- **What changed for the demo.** The reference demo now states a task's done
+  state as `checked` instead of the value `"todo"` or `"done"`, and the
+  active tab and the cursor row as `selected` instead of a tab's value
+  `"selected"`. It keeps the list's and the tab bar's values. A reader that
+  matched the old values reads the demo, and only the demo, differently.
+
 ## 17. Rust language binding (non-normative)
 
 **This section is a language binding, not a wire rule.** A peer in another
@@ -1554,9 +1682,9 @@ peers this format is written for are exactly the ones that match on these
 types.
 
 So every type a version-1 addition can reach is `#[non_exhaustive]`. There are
-**eleven**: `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`,
-`Action`, `Role`, `Node`, `Snapshot`, `key::Key`, `key::Modifiers` and
-`key::KeyPress`. The key types are on the list even though a key travels as a
+**twelve**: `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`,
+`Action`, `Role`, `Node`, `Checked`, `Snapshot`, `key::Key`, `key::Modifiers`
+and `key::KeyPress`. The key types are on the list even though a key travels as a
 string, because the string is parsed into them and an adapter takes the result
 by value.
 
@@ -1602,10 +1730,10 @@ message is followed by a single `\n`.
 
 ```
 app->bridge	{"type":"hello","app_label":"taria-demo","protocol_version":1}
-app->bridge	{"type":"snapshot","protocol_version":1,"seq":1,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","value":"selected","focused":false,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-1","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","value":"todo","focused":true,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","value":"todo","focused":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","value":"todo","focused":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
+app->bridge	{"type":"snapshot","protocol_version":1,"seq":1,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"selected":true,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"selected":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-1","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","focused":true,"selected":true,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
 bridge->app	{"type":"input","id":1,"input":{"kind":"act","node":"tab-done","action":"select"}}
 app->bridge	{"type":"ack","id":1,"status":"delivered"}
-app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Done","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","value":"selected","focused":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Done tasks","value":"task-2","focused":false,"children":[{"id":"task-2","role":"list_item","label":"Sketch the protocol wire types","value":"done","focused":true,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-5","role":"list_item","label":"Publish a snapshot per frame","value":"done","focused":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
+app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Done","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"selected":false,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"selected":true,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Done tasks","value":"task-2","focused":false,"children":[{"id":"task-2","role":"list_item","label":"Sketch the protocol wire types","focused":true,"selected":true,"checked":true,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-5","role":"list_item","label":"Publish a snapshot per frame","focused":false,"selected":false,"checked":true,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
 ```
 
 What to read out of it:
@@ -1619,14 +1747,19 @@ What to read out of it:
   (`tab-done`, `select`). Neither was guessed.
 - The ack precedes the snapshot published after it.
 - The effect is legible in the next tree: the tabs node's value moved from
-  `Active` to `Done`, `tab-done` gained `"value":"selected"`, and the list
-  node re-labelled itself and published a different set of children. A tree
-  diff, without the ack, could not have told that from an unrelated redraw.
+  `Active` to `Done`, `"selected":true` moved from `tab-active` to
+  `tab-done`, and the list node re-labelled itself and published a different
+  set of children, whose `"checked":true` says they are done. A tree diff,
+  without the ack, could not have told that from an unrelated redraw.
 - Exactly one node is focused in each snapshot, and it is not the root: the
   root carries `"focused":false` because a recorded node below it has focus.
-- The list publishes its selection as its own `value` (`task-1`, then
-  `task-2`), which is the focus-is-not-selection rule (section 15) in
-  practice.
+- The list publishes its selection twice: the cursor row says
+  `"selected":true` and every other row `"selected":false` (section 6.5), and
+  the list names the row in its own `value` (`task-1`, then `task-2`). That
+  is the focus-is-not-selection rule (section 15) in practice.
+- The typed state sits between `focused` and `actions` in the app's line, and
+  every field is omitted where the app states nothing: no node here says
+  `expanded` or `disabled`.
 
 ### 18.2 The four ack shapes
 
@@ -1641,7 +1774,7 @@ bridge->app	{"type":"input","id":2,"input":{"kind":"paste","text":"hi","from":"c
 app->bridge	{"type":"ack","id":2,"status":"ignored"}
 bridge->app	{"type":"input","id":3,"input":{"kind":"key","key":"down"}}
 app->bridge	{"type":"ack","id":3,"status":"delivered"}
-app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","value":"selected","focused":false,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-3","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","value":"todo","focused":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","value":"todo","focused":true,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","value":"todo","focused":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
+app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"selected":true,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"selected":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-3","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","focused":true,"selected":true,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
 bridge->app	{"type":"input","id":4,"input":{"kind":"act","node":"nope","action":"activate"}}
 app->bridge	{"type":"ack","id":4,"status":"delivered"}
 app->bridge	{"type":"ack","id":4,"status":"ignored"}
@@ -1712,3 +1845,7 @@ behaviour a peer may rely on.
     as fencing or escaping it in what an agent reads. The reference bridge
     alters no text: it hands the mark on, and its outline prints it as
     `*relayed` (section 6.4).
+12. **Typed state that contradicts itself**: a `value_now` outside its
+    bounds, a `pos_in_set` past its parent's `set_size`, several siblings
+    `selected` in a widget that selects one, `checked` on a role that cannot
+    be checked. Neither reference peer checks any of it (section 6.5).

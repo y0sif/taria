@@ -31,10 +31,26 @@ but no `read_tree` description before 0.3.3 says what the mark means. An app
 built before 0.3.3 never sends it, so nothing in its tree is marked, whoever
 wrote it.
 
-In Rust the same promise is `#[non_exhaustive]` on the eleven types a version-1
-addition can reach, from `Role` and `Action` to the two wire message enums,
-and on the six struct-like variants inside them, where a new optional field
-would land. So a new role, key, field or message variant costs an app that
+The typed state, added in 0.4.0, is the same case again: `description`,
+`selected`, `checked`, `expanded`, `disabled`, `value_now`, `value_min`,
+`value_max`, `pos_in_set`, `set_size`, `row`, `column`, `row_count` and
+`column_count`, all optional and omitted when unset ([protocol section
+6.5](protocol.md#65-typed-state)). With them a node's fields are, in the
+order the reference `Node` writes them: `id`, `role`, `label`, `value`,
+`description`, `focused`, `relayed`, the state from `selected` to
+`column_count`, `actions`, `children`. A taria-mcp older than 0.4.0 passes
+the state on in the JSON tree, and its outline shows it among the fields at
+the end of the line, `checked=false selected=true`, rather than as marks such
+as `*checked=false *selected`. It does not refuse `act` on a disabled node
+itself, but the 0.4.0 adapter publishes a disabled node with no actions, so
+the older bridge refuses the act as unadvertised. An app built before 0.4.0
+states nothing, which reads as not stated, never as `false`. A state field in
+a shape a 0.4.0 peer cannot read costs only that field, not the node.
+
+In Rust the same promise is `#[non_exhaustive]` on the twelve types a version-1
+addition can reach, from `Role`, `Action` and `Checked` to the two wire message
+enums, and on the six struct-like variants inside them, where a new optional
+field would land. So a new role, key, field or message variant costs an app that
 integrated taria a recompile rather than a repair, in exchange for building
 messages through their constructors and ending a destructuring pattern with
 `..`. An input kind this build cannot read parses as `AgentInput::Unknown`,
@@ -75,7 +91,7 @@ has a lint that catches it.
   longer line costs the app its bridge on every reconnect. The adapter trims
   at publish and tells the app (the stages are in architecture.md, Snapshot
   size): it drops any node that could never fit, shortens the longest values
-  and labels, marking each cut with `…`, and drops more nodes only when that
+  and descriptions, then labels, marking each cut with `…`, and drops more nodes only when that
   is not enough, keeping each node's first children with no gap apart from a
   node that could never fit. Once nodes are dropped, the strings left are cut
   only as far as the smaller tree needs.

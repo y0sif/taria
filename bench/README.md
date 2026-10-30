@@ -21,7 +21,9 @@ agent a set of tools). All are registered as `tui`, so the agent sees
   line per node, `id role "label" = "value" *focused act: a|b|c`, the
   actions last, absent when a node has none, as in
   `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`
-  (the grammar is in `docs/cli.md`, The outline), and its instructions and
+  (the grammar is in `docs/cli.md`, The outline). From 0.4.0 a line also
+  carries typed state marks after `*focused`, such as `*selected` and
+  `*checked=false`, which the dry-run solver reads too. Its instructions and
   its `read_tree` and `act` descriptions describe the outline instead of the
   JSON. It measures whether the outline cuts tokens without hurting pass
   rates. Batches outline1 and probe3 ran the outline before the actions

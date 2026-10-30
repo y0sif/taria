@@ -81,6 +81,25 @@ and an input the app deliberately dropped looks like a slow one.
   model call as well. Protocol section 6.4 has the rule, and the integration
   guide shows a transcript that carries speakers in structure instead of in
   prefixes the content can spell.
+- Typed state, added in 0.4.0: `selected`, `checked` (`true`, `false` or
+  `"mixed"`), `expanded`, `disabled` (sent only as `true`), `description`,
+  `value_now`/`value_min`/`value_max`, `pos_in_set`/`set_size`,
+  `row`/`column` and `row_count`/`column_count`. Flat optional fields on the
+  node rather than a nested object, each omitted when unset, so a node that
+  states nothing is the line 0.3.3 wrote, byte for byte. Absent means not
+  stated, never `false`, which is why `selected` and `expanded` send `false`
+  when they mean it. Every one of them reads a wrong shape as not stated
+  instead of failing the node, unlike `focused` and `relayed`: a field that
+  fails the node fails the snapshot, and a reader that skips it leaves the
+  agent on a stale tree over one field. Numbers are `taria::Number`, a
+  finite-only `f64`, so `Node` keeps `Eq` and the frame dedupe keeps working:
+  a `NaN` is unequal to itself and would have republished every frame.
+  Positions count from 1. `disabled` is enforced at both ends: the adapter
+  strips a disabled node's actions at publish, and the bridge refuses `act`
+  on one before looking at the action, so the agent is told why. An empty
+  action list never means disabled, because the demo's modal strips actions
+  from nodes that are not. Hidden has no field: a hidden node is not
+  published. Protocol section 6.5 has the rules.
 
 ### Tree depth
 
@@ -147,8 +166,9 @@ as the tree fits:
 1. every node that could never be published goes, with everything under it,
    and its siblings stay. That is a node whose id, role, actions and strings
    cut to 256 bytes of JSON cannot fit with only its ancestors beside it;
-2. the longest values, all down to one shared length, then values and labels
-   together, the same way. No string of 256 bytes of JSON or less is cut;
+2. the longest values and descriptions, all down to one shared length, then
+   labels with them, the same way. A description is content, like a value;
+   a label is a name. No string of 256 bytes of JSON or less is cut;
 3. every node keeps at most one shared number of children, the largest that
    fits. This stage and the next plan as stage 1 does, with every string at
    that 256-byte floor. Once they have dropped nodes, the kept tree's strings
@@ -304,9 +324,10 @@ message variant it cannot parse, but a peer rebuilt against the version that
 added one meets it in an exhaustive `match` and stops compiling, and the peers
 this format is written for are exactly the ones that match on these types: an
 adapter dispatching `BridgeToApp`, a bridge dispatching `AppToBridge`. So every
-type a version-1 addition can reach is `#[non_exhaustive]`. Eleven of them:
+type a version-1 addition can reach is `#[non_exhaustive]`. Twelve of them:
 `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`, `Action`, `Role`,
-`Node`, `Snapshot`, `key::Key`, `key::Modifiers` and `key::KeyPress`. Marking a
+`Node`, `Checked`, `Snapshot`, `key::Key`, `key::Modifiers` and
+`key::KeyPress`. Marking a
 type is itself a breaking change, which is why it was done before the first
 release rather than at the first addition. Each costs an outside peer one
 wildcard arm, or one `..` in a pattern, and buys back that a new variant,
@@ -820,8 +841,40 @@ Focus is not selection. Focus says where a key would go; a cursor sits on a
 row whether or not that list owns the keyboard. An app that publishes only
 focus makes a moved cursor invisible, and the bridge then truthfully reports
 "the tree did not change" for an input the app handled. Publish the
-selection as its own readable fact; the demo puts the selected item's node
-id in the list node's `value`.
+selection as its own readable fact, in `selected`: the demo marks the cursor
+row `selected` and every other row `selected: false`, and the active tab the
+same way. Before 0.4.0 that fact had nowhere to go but a `value`, and the
+demo still also names the selected row's id in the list node's `value`, and
+the active tab in the tab bar's, so a reader built earlier and the
+benchmark's recorded runs read it where they always did.
+
+## Mapping to AccessKit
+
+taria's vocabulary is close to AccessKit's on purpose, so an exporter from a
+taria tree to AccessKit 0.25, and through it to AT-SPI, UIA and NSAccessibility,
+is a table rather than a design. None ships yet. The fields map one to one:
+
+| taria | AccessKit 0.25 |
+| --- | --- |
+| `label`, `value`, `description` | `set_label`, `set_value`, `set_description` |
+| `focused: true` | the `TreeUpdate`'s `focus`, not a node property |
+| `selected` | `set_selected(bool)` |
+| `checked` | `set_toggled(Toggled::True)`, `Toggled::False`, `Toggled::Mixed` |
+| `expanded` | `set_expanded(bool)` |
+| `disabled: true` | `set_disabled()` |
+| `value_now`, `value_min`, `value_max` | `set_numeric_value`, `set_min_numeric_value`, `set_max_numeric_value` |
+| `pos_in_set` | `set_position_in_set(pos_in_set - 1)` |
+| `set_size` | `set_size_of_set` |
+| `row`, `column` | `set_row_index(row - 1)`, `set_column_index(column - 1)` |
+| `row_count`, `column_count` | `set_row_count`, `set_column_count` |
+| `relayed` | nothing: AccessKit has no mark for text from outside the app |
+| `activate`, `focus`, `set_value`, custom | `Action::Click`, `Action::Focus`, `Action::SetValue`, `set_custom_actions` |
+| roles | by name (`list_item` is `Role::ListItem`, `scrollbar` `Role::ScrollBar`), except `app` `Role::Application`, `tabs` `Role::TabList`, `select` `Role::ComboBox`, `option` `Role::ListBoxOption`, `text` `Role::Label`, `progress_bar` `Role::ProgressIndicator`, `chart` `Role::Figure`, `other` `Role::Unknown` |
+
+AccessKit counts positions, rows and columns from 0, and taria from 1, as a
+person counts rows and as ARIA's `aria-posinset` and `aria-rowindex` do, so
+the exporter subtracts one. A count (`set_size`, `row_count`, `column_count`) needs no
+shift.
 
 ## Deferred
 
@@ -848,8 +901,8 @@ landed in 0.2. All are additive, so they can land in a later 0.x without a
   fragment length, alphabet size); `select` is a stretch, since there are no
   options to pick from, and `list_item` says nothing about a number with
   bounds. Most config screens have some. A peer that does not know the role
-  reads `other`. The bounds themselves belong with node attributes, which are
-  deferred on their own.
+  reads `other`. The bounds themselves have been node fields since 0.4.0,
+  `value_now`, `value_min` and `value_max`, so only the role is missing.
 - A bad `IdSpace` prefix fails at a lookup that may never run. `new` is const
   and infallible so a space can stand in a `const`, so a prefix carrying the
   separator builds a space that owns nothing, including the ids it builds

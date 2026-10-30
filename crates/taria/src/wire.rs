@@ -92,7 +92,8 @@
 //! addition can reach is `#[non_exhaustive]`: those three, [`AgentInput`],
 //! [`Action`](crate::Action), [`Key`](crate::key::Key),
 //! [`Modifiers`](crate::key::Modifiers), [`KeyPress`](crate::key::KeyPress),
-//! [`Role`](crate::Role), [`Node`](crate::Node) and [`Snapshot`]. The key types
+//! [`Role`](crate::Role), [`Node`](crate::Node), [`Checked`](crate::Checked)
+//! and [`Snapshot`]. The key types
 //! are on that list even though a key travels as a string, because the string
 //! is parsed into them and an adapter takes the result by value. Marking them
 //! is itself a breaking
@@ -211,6 +212,13 @@ impl fmt::Display for InputId {
 /// message variant additive, and that is only true on the wire: a bridge
 /// matches on this enum to dispatch every line it reads, so without the
 /// attribute the additive change breaks its build.
+///
+/// The [`Snapshot`](Self::Snapshot) variant holds its root by value and is a
+/// few hundred bytes since [`Node`](crate::Node) gained its typed state,
+/// which clippy flags beside a small [`Hello`](Self::Hello). Allowed rather
+/// than boxed: a message is parsed and taken apart at once, never stored in
+/// bulk, and a `Box` would change the variant every peer matches on.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 #[non_exhaustive]

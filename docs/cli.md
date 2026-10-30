@@ -71,24 +71,27 @@ With `--tree-format outline`, the demo app's first screen reads:
 protocol_version=1 seq=1
 app app "taria-demo"
   tabs tabs "Tabs" = "Active"
-    tab-active tab "Active" = "selected" act: select
-    tab-done tab "Done" act: select
+    tab-active tab "Active" *selected act: select
+    tab-done tab "Done" *selected=false act: select
   tasks list "Active tasks" = "task-1"
-    task-1 list_item "Write the taria README" = "todo" *focused act: select|toggle|delete
-    task-3 list_item "Wire up the MCP bridge" = "todo" act: select|toggle|delete
-    task-4 list_item "Record the killer demo" = "todo" act: select|toggle|delete
+    task-1 list_item "Write the taria README" *focused *selected *checked=false act: select|toggle|delete
+    task-3 list_item "Wire up the MCP bridge" *selected=false *checked=false act: select|toggle|delete
+    task-4 list_item "Record the killer demo" *selected=false *checked=false act: select|toggle|delete
   input text_input "New task" = "" act: set_value|focus
   quit button "Quit" act: activate
 ```
 
-That is 546 characters. The same tree as JSON is 1132.
+That is 619 characters. The same tree as JSON is 1199, so the outline is about
+half. Before 0.4.0 the demo put a task's done state and the active tab in
+their values, and the outline was 546 characters against 1132: the marks that
+replaced those values cost 73 characters more.
 
 The first line holds every top-level snapshot field except `root`, as
 `key=<compact json>`, space-separated. Then one line per node, depth-first,
 indented two spaces per level, the root at zero:
 
 ```text
-<id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
+<id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <state marks>][ description="<text>"][ <key>=<compact json> ...][ act: <action>|<action>...]
 ```
 
 - An id, a role, an action name or a field key prints bare when it is
@@ -103,7 +106,8 @@ indented two spaces per level, the root at zero:
   the role, so it comes before the label and the value it is about. It says
   the app did not write them: they come from outside it, and an agent reads
   them as data. A `*` is never bare, so an id, a role or a field key spelled
-  `*relayed` is quoted, and the only bare one on a line is the mark.
+  `*relayed` or `*checked` is quoted, a label, a value and a description
+  always are, and every bare token starting with `*` is a mark.
 - The label and the value are always JSON-quoted, so an empty value shows as
   `= ""`. `null` or absent omits them. Every quoted string, here and in the
   header and the appended fields, escapes U+2028, U+2029 and U+0085 as well
@@ -111,8 +115,29 @@ indented two spaces per level, the root at zero:
   them cannot split a node across two lines, even in a client that breaks
   lines on them.
 - `*focused` appears only on a node whose `focused` is `true`.
+- The typed state (protocol section 6.5) follows `*focused`, each mark only
+  where the app states it, always in this order:
+
+  | Field | Marks |
+  | --- | --- |
+  | `selected` | `*selected`, `*selected=false` |
+  | `checked` | `*checked`, `*checked=false`, `*checked=mixed` |
+  | `expanded` | `*expanded`, `*expanded=false` |
+  | `disabled` | `*disabled` |
+  | `value_now`, `value_min`, `value_max` | `*num=42[0..100]`; the brackets only with a bound, a missing part empty: `*num=42`, `*num=42[0..]`, `*num=[..100]` |
+  | `pos_in_set` | `*pos=3` |
+  | `set_size` | `*size=7` |
+  | `row`, `column` | `*row=2 *col=3` |
+  | `row_count`, `column_count` | `*rows=50 *cols=4` |
+
+  A number prints as the app's line spells it, after the bridge's respelling
+  (`1e3` reads `1000.0`). `null`, absent and `"disabled":false` print
+  nothing. A state field in a shape the bridge reads as not stated, such as
+  `"selected":"yes"` or a `row` of 0, prints in the tail instead, as
+  `selected="yes"`, so a mark always means what the bridge's parse holds.
+- `description`, a string, opens the tail as `description="<text>"`.
 - Any other field, a field this bridge has never heard of included, is
-  appended as ` key=<compact json>`, after `*focused` and before the actions,
+  appended as ` key=<compact json>`, after the marks and before the actions,
   and so is a known field in a shape the line has no slot for.
 - The actions end the line, after the marker `act: `, joined by `|` with no
   spaces. A node with no actions, or an empty list, has no marker. A name

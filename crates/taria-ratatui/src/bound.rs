@@ -17,10 +17,10 @@
 //!    ancestors beside it: one huge id or a long run of custom actions,
 //!    which no cut shortens. Left in, it would have every later stage cut
 //!    the rest of the tree to make room it can never be given;
-//! 2. strings are cut: the longest values first, down to one shared length,
-//!    so the biggest strings shrink first and shorter ones are untouched,
-//!    then values and labels together, the same way, once values alone are
-//!    not enough;
+//! 2. strings are cut: the longest values and descriptions first, down to
+//!    one shared length, so the biggest strings shrink first and shorter
+//!    ones are untouched, then labels with them, the same way, once values
+//!    and descriptions alone are not enough;
 //! 3. every node keeps at most one shared number of children, the largest
 //!    that fits, so a list of fifty thousand rows loses its last rows while
 //!    a status bar beside it keeps its place;
@@ -146,8 +146,8 @@ impl SnapshotTooLarge {
         self.limit
     }
 
-    /// How many labels and values were shortened among the nodes that were
-    /// published. A node that was dropped is counted in
+    /// How many labels, values and descriptions were shortened among the
+    /// nodes that were published. A node that was dropped is counted in
     /// [`nodes_dropped`](Self::nodes_dropped) instead, whatever it held.
     pub fn strings_trimmed(&self) -> usize {
         self.strings_trimmed
@@ -160,7 +160,8 @@ impl SnapshotTooLarge {
     }
 
     /// Id of the node holding the longest string before the cut, measured as
-    /// JSON: its id, its label, its value or one of its custom action names.
+    /// JSON: its id, its label, its value, its description or one of its
+    /// custom action names.
     /// Ids and custom action names count although they are never cut,
     /// because when one of them is what ran over, that node is where the
     /// app has to look. Several nodes can tie; this is the first in tree
@@ -334,7 +335,8 @@ pub(crate) fn cut_to_fit(root: &mut Node, budget: usize, before: Option<usize>) 
 /// or `None`, with nothing cut, when cutting every one to [`STRING_FLOOR`]
 /// would not be enough.
 ///
-/// Values first, and labels with them only once values alone fall short.
+/// Values and descriptions first, and labels with them only once those
+/// alone fall short.
 fn cut_strings(root: &mut Node, survey: &mut Survey, excess: usize) -> Option<usize> {
     if let Some(level) = water_level(&mut survey.values, excess) {
         return Some(trim_strings(root, level, Strings::Values));
@@ -348,7 +350,8 @@ fn cut_strings(root: &mut Node, survey: &mut Survey, excess: usize) -> Option<us
     Some(trim_strings(root, level, Strings::ValuesAndLabels))
 }
 
-/// Which strings a water-fill cuts.
+/// Which strings a water-fill cuts. A description is cut with the values,
+/// because like a value it is content, while a label is a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Strings {
     Values,
@@ -431,9 +434,9 @@ fn measure(node: &Node) -> Option<usize> {
     Some(count.0)
 }
 
-/// Exact length of `node`'s JSON without its children, with its label and
-/// value as they would be cut to [`STRING_FLOOR`]: the part of it no stage
-/// but dropping it can shrink.
+/// Exact length of `node`'s JSON without its children, with its label,
+/// value and description as they would be cut to [`STRING_FLOOR`]: the part
+/// of it no stage but dropping it can shrink.
 ///
 /// Measured by setting the children aside rather than modelling the fields,
 /// less what [`floor_saving`] says the cut would take off, so nothing is cut
@@ -444,10 +447,14 @@ fn measure_own_at_floor(node: &mut Node) -> Option<usize> {
     let own = measure(node);
     node.children = children;
     let keep = keep_for(node.role);
-    let saving = [(&node.value, keep), (&node.label, Keep::Head)]
-        .into_iter()
-        .filter_map(|(text, keep)| Some(floor_saving(text.as_deref()?, keep)))
-        .fold(0usize, usize::saturating_add);
+    let saving = [
+        (&node.value, keep),
+        (&node.description, Keep::Head),
+        (&node.label, Keep::Head),
+    ]
+    .into_iter()
+    .filter_map(|(text, keep)| Some(floor_saving(text.as_deref()?, keep)))
+    .fold(0usize, usize::saturating_add);
     own?.checked_sub(saving)
 }
 
@@ -457,18 +464,18 @@ fn measure_own_at_floor(node: &mut Node) -> Option<usize> {
 /// are dropped, so the string stages plan on what is left. Everything else
 /// describes the tree as it came, because that is what the report is about.
 struct Survey {
-    /// Escaped lengths of the values over [`STRING_FLOOR`], the only ones a
-    /// cut can touch.
+    /// Escaped lengths of the values and descriptions over [`STRING_FLOOR`],
+    /// the only ones a cut can touch, which the first string tier cuts.
     values: Vec<usize>,
     /// Escaped lengths of the labels over [`STRING_FLOOR`].
     labels: Vec<usize>,
-    /// The node holding the longest string: id, label, value or custom
-    /// action name.
+    /// The node holding the longest string: id, label, value, description
+    /// or custom action name.
     largest: NodeId,
     /// Every node in the tree, the root included.
     nodes: usize,
-    /// The root's own label and value over [`STRING_FLOOR`], which are what
-    /// the bare root ends up cutting whatever ran before it.
+    /// The root's own label, value and description over [`STRING_FLOOR`],
+    /// which are what the bare root ends up cutting whatever ran before it.
     root_over_floor: usize,
 }
 
@@ -496,8 +503,16 @@ impl Survey {
                     largest = (len, &node.id);
                 }
             }
-            for (text, lengths) in [(&node.value, &mut values), (&node.label, &mut labels)] {
+            // A description is cut in the values' tier, so it is counted
+            // with them.
+            let strings = [
+                (&node.value, false),
+                (&node.description, false),
+                (&node.label, true),
+            ];
+            for (text, is_label) in strings {
                 let Some(text) = text else { continue };
+                let lengths = if is_label { &mut labels } else { &mut values };
                 let len = escaped_len(text);
                 if len > largest.0 {
                     largest = (len, &node.id);
@@ -516,7 +531,8 @@ impl Survey {
             largest: largest.1.clone(),
             nodes,
             root_over_floor: usize::from(over_floor(root.label.as_deref()))
-                + usize::from(over_floor(root.value.as_deref())),
+                + usize::from(over_floor(root.value.as_deref()))
+                + usize::from(over_floor(root.description.as_deref())),
         }
     }
 
@@ -573,6 +589,12 @@ fn trim_strings(root: &mut Node, level: usize, which: Strings) -> usize {
             trim_to(value, level, keep);
             trimmed = trimmed.saturating_add(1);
         }
+        if let Some(description) = node.description.as_mut()
+            && escaped_len(description) > level
+        {
+            trim_to(description, level, Keep::Head);
+            trimmed = trimmed.saturating_add(1);
+        }
         if which == Strings::ValuesAndLabels
             && let Some(label) = node.label.as_mut()
             && escaped_len(label) > level
@@ -585,8 +607,8 @@ fn trim_strings(root: &mut Node, level: usize, which: Strings) -> usize {
     trimmed
 }
 
-/// Cut `node`'s own label and value down to [`STRING_FLOOR`], returning how
-/// many it cut.
+/// Cut `node`'s own label, value and description down to [`STRING_FLOOR`],
+/// returning how many it cut.
 fn trim_to_floor(node: &mut Node) -> usize {
     let keep = keep_for(node.role);
     let mut trimmed = 0;
@@ -594,6 +616,12 @@ fn trim_to_floor(node: &mut Node) -> usize {
         && escaped_len(value) > STRING_FLOOR
     {
         trim_to(value, STRING_FLOOR, keep);
+        trimmed += 1;
+    }
+    if let Some(description) = node.description.as_mut()
+        && escaped_len(description) > STRING_FLOOR
+    {
+        trim_to(description, STRING_FLOOR, Keep::Head);
         trimmed += 1;
     }
     if let Some(label) = node.label.as_mut()
@@ -1040,8 +1068,8 @@ fn keep_only(root: &mut Node, slots: &[Slot], kept: &[bool]) {
     }
 }
 
-/// The last resort: the root with no children, its own label and value cut
-/// to the floor.
+/// The last resort: the root with no children, its own label, value and
+/// description cut to the floor.
 ///
 /// Always fits for the root the layer builds, whose id is `app` and which
 /// carries no actions: what is left is a few hundred bytes. Its actions and
@@ -1178,6 +1206,24 @@ mod tests {
                     (0..index).map(|n| Node::new(format!("leaf-{index}-{n}"), Role::Cell)),
                 );
             }
+            // The typed state, a different part of it on each node.
+            node = match index % 4 {
+                0 => node
+                    .description(ESCAPE_HEAVY.repeat(index % 5))
+                    .selected(index % 8 == 0)
+                    .checked(taria::Checked::Mixed),
+                1 => node
+                    .expanded(false)
+                    .disabled(true)
+                    .range(-0.5, -1e300, 1e300),
+                2 => node
+                    .range(index as f64, 0.0, 29.0)
+                    .pos_in_set(1 + index as u32),
+                _ => node
+                    .set_size(u32::MAX)
+                    .cell(index as u32, 2)
+                    .table_size(0, 7),
+            };
             root = root.child(node);
         }
         root
@@ -1453,6 +1499,76 @@ mod tests {
             escaped_len(&value) > STRING_FLOOR,
             "the shared level sits above the floor"
         );
+    }
+
+    /// A description is content, like a value, so it is cut in the first
+    /// tier with the values, and to the same shared level, while the label,
+    /// a name, waits for the second.
+    #[test]
+    fn descriptions_are_cut_with_values_before_labels() {
+        let root = Node::new("app", Role::App).label("described").child(
+            Node::new("field", Role::TextInput)
+                .label("l".repeat(3000))
+                .value("v".repeat(3000))
+                .description("d".repeat(3000))
+                .checked(true)
+                .range(1.0, 0.0, 2.0),
+        );
+        let field = |root: &Node| root.children[0].clone();
+
+        let mut first = root.clone();
+        let budget = json_len(&root) - 4000;
+        let bounded = bound_root(&mut first, budget).expect("over budget");
+        assert_eq!(bounded.strings_trimmed, 2);
+        assert!(json_len(&first) <= budget);
+        let cut = field(&first);
+        assert_eq!(cut.label, field(&root).label, "the label is untouched");
+        let (value, description) = (cut.value.unwrap(), cut.description.unwrap());
+        assert!(value.ends_with(MARKER) && description.ends_with(MARKER));
+        assert_eq!(escaped_len(&value), escaped_len(&description));
+        assert_eq!(cut.checked, Some(taria::Checked::True));
+        assert_eq!(cut.value_now.map(taria::Number::get), Some(1.0));
+
+        // More than the two can give before the floor: the label joins them.
+        let mut all = root.clone();
+        let budget = json_len(&root) - 7000;
+        let bounded = bound_root(&mut all, budget).expect("over budget");
+        assert_eq!(bounded.strings_trimmed, 3);
+        assert!(json_len(&all) <= budget);
+        let cut = field(&all);
+        let label = cut.label.unwrap();
+        assert!(label.ends_with(MARKER));
+        assert_eq!(escaped_len(&label), escaped_len(&cut.description.unwrap()));
+    }
+
+    /// A long description is a string a cut can shorten, so a node holding
+    /// one is cut, never dropped as a node that could never fit, and it is
+    /// what the report names as the largest.
+    #[test]
+    fn a_long_description_is_cut_not_dropped_and_named_largest() {
+        let root = Node::new("app", Role::App).label("described").children([
+            Node::new("help", Role::Text).description("d".repeat(100_000)),
+            Node::new("status", Role::Status).value("ok"),
+        ]);
+        let mut cut = root.clone();
+        let budget = 2000;
+        let bounded = bound_root(&mut cut, budget).expect("over budget");
+        assert!(json_len(&cut) <= budget);
+        assert_eq!(bounded.nodes_dropped, 0);
+        assert_eq!(bounded.strings_trimmed, 1);
+        assert_eq!(bounded.largest, NodeId("help".into()));
+        let description = cut.children[0].description.as_deref().unwrap();
+        assert!(description.ends_with(MARKER));
+        assert!(
+            escaped_len(description) > STRING_FLOOR,
+            "cut only as far as needed"
+        );
+
+        // The bare root cuts its own description to the floor too.
+        let mut bare = Node::new("app", Role::App).description("d".repeat(5000));
+        let bounded = bound_root(&mut bare, 1000).expect("over budget");
+        assert_eq!(bounded.strings_trimmed, 1);
+        assert!(json_len(&bare) <= 1000);
     }
 
     /// A cut shortens the text a node relays and says nothing new about who
@@ -2010,6 +2126,13 @@ mod tests {
         if rng.one_in(2) {
             node = node.value(rng.text());
         }
+        if rng.one_in(4) {
+            node = node
+                .description(rng.text())
+                .checked(rng.one_in(2))
+                .range(rng.below(1000) as f64 / 7.0, 0.0, 1e9)
+                .pos_in_set(rng.below(100) as u32);
+        }
         if rng.one_in(3) {
             let actions: Vec<Action> = built_in_actions()
                 .into_iter()
@@ -2245,7 +2368,12 @@ mod tests {
                 assert_eq!(node.role, was.role, "seed {seed}");
                 assert_eq!(node.actions, was.actions, "seed {seed}");
                 assert_eq!(node.focused, was.focused, "seed {seed}");
-                for (now, then) in [(&node.label, &was.label), (&node.value, &was.value)] {
+                let strings = [
+                    (&node.label, &was.label),
+                    (&node.value, &was.value),
+                    (&node.description, &was.description),
+                ];
+                for (now, then) in strings {
                     if now == then {
                         continue;
                     }

@@ -1105,7 +1105,13 @@ def probe_text_with_nothing_typing(client, ctx):
 
     def state(snapshot):
         return {
-            n["id"]: (n.get("label"), n.get("value"), bool(n.get("focused")))
+            n["id"]: (
+                n.get("label"),
+                n.get("value"),
+                bool(n.get("focused")),
+                n.get("checked"),
+                n.get("selected"),
+            )
             for n in flatten(snapshot["root"])
         }
 

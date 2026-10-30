@@ -823,6 +823,15 @@ impl TariaLayer {
     /// one thing. The nodes are wrapped in the same auto-generated root, so
     /// both paths produce the same tree.
     ///
+    /// # Disabled nodes
+    ///
+    /// A node marked [`disabled`](Node::disabled) is published with no
+    /// actions, whatever it was built with: the mark says the app takes none
+    /// until it enables the node again, so an advertised action there would
+    /// be a promise the app has already said it will not keep. Nothing counts
+    /// this, because it is the app saying what it means, not something lost.
+    /// The node keeps everything else, its focus and its children included.
+    ///
     /// # Trees too deep to send
     ///
     /// A tree deeper than [`taria::MAX_NODE_DEPTH`], counting the root this
@@ -865,10 +874,10 @@ impl TariaLayer {
     ///    its strings at the floor, cannot fit beside its ancestors, are
     ///    dropped with everything under them before any string is cut, so
     ///    that they cost their siblings nothing;
-    /// 2. strings are cut: the longest values first, all down to one shared
-    ///    length, so the biggest shrink first and shorter ones are untouched,
-    ///    then values and labels together, the same way, when values alone
-    ///    are not enough. A cut value ends in `…`, except that a
+    /// 2. strings are cut: the longest values and descriptions first, all
+    ///    down to one shared length, so the biggest shrink first and shorter
+    ///    ones are untouched, then labels with them, the same way, when those
+    ///    alone are not enough. A cut value ends in `…`, except that a
     ///    [`Role::Log`] or [`Role::Terminal`] value keeps its end and starts
     ///    with `…` instead, because the end is where those grow. A string of
     ///    256 bytes of JSON or less, the floor, is never cut;
@@ -928,6 +937,9 @@ impl TariaLayer {
         let mut root = Node::new("app", Role::App)
             .label(inner.shared.app_label.clone())
             .children(nodes);
+        // Before anything compares or measures the tree, so the tree kept to
+        // compare the next frame against is the one that goes out.
+        strip_disabled_actions(&mut root);
         // Focus is decided on the tree as built, so that a tree no cut
         // touches is already the snapshot it goes out as, and the next frame
         // can be compared against that snapshot with no second copy kept.
@@ -1285,6 +1297,21 @@ fn focused_below(root: &Node) -> bool {
         }
     }
     false
+}
+
+/// Take every action off each node marked disabled, so the tree never
+/// advertises an action the app has said it will not take.
+///
+/// Iterative, like [`focused_below`], because it runs on the tree as built,
+/// which can be deeper than the call stack.
+fn strip_disabled_actions(root: &mut Node) {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.disabled == Some(true) {
+            node.actions.clear();
+        }
+        pending.extend(node.children.iter_mut());
+    }
 }
 
 /// Are `a` and `b` the same tree?
@@ -3000,6 +3027,90 @@ mod tests {
         assert!(!root.focused, "a focused node unfocuses the auto root");
         let ids: Vec<&str> = root.children.iter().map(|c| c.id.0.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
+    }
+
+    /// A disabled node goes out with no actions, at any depth and whatever
+    /// it was built with, and keeps everything else; an enabled sibling keeps
+    /// its own. An empty action list alone marks nothing disabled.
+    #[test]
+    fn a_disabled_node_is_published_with_no_actions() {
+        let mut layer = bind_test_layer("taria-layer-", "disabled");
+        let save = |disabled: bool| {
+            Node::new("save", Role::Button)
+                .label("Save")
+                .disabled(disabled)
+                .focused(true)
+                .actions([taria::Action::Activate, taria::Action::Custom("x".into())])
+        };
+        let nested = Node::new("menu", Role::Menu).disabled(true).child(
+            Node::new("open", Role::MenuItem)
+                .disabled(true)
+                .action(taria::Action::Activate),
+        );
+        let quit = Node::new("quit", Role::Button).action(taria::Action::Activate);
+        let empty = Node::new("idle", Role::Button);
+        layer.publish([save(true), nested, quit.clone(), empty.clone()]);
+
+        let snapshot = layer.latest_snapshot().expect("published");
+        let root = &snapshot.root;
+        let saved = &root.children[0];
+        assert!(saved.actions.is_empty(), "{saved:?}");
+        assert_eq!(saved.disabled, Some(true));
+        assert!(saved.focused && saved.label.as_deref() == Some("Save"));
+        assert!(root.children[1].actions.is_empty());
+        assert!(root.children[1].children[0].actions.is_empty());
+        assert_eq!(root.children[2], quit);
+        assert_eq!(root.children[3], empty);
+        assert_eq!(root.children[3].disabled, None);
+
+        // The same frame again is the snapshot already sent, and enabling
+        // the node brings its actions back.
+        layer.publish([
+            save(true),
+            Node::new("menu", Role::Menu).disabled(true).child(
+                Node::new("open", Role::MenuItem)
+                    .disabled(true)
+                    .action(taria::Action::Activate),
+            ),
+            quit.clone(),
+            empty.clone(),
+        ]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        layer.publish([save(false)]);
+        let snapshot = layer.latest_snapshot().expect("published");
+        assert_eq!(snapshot.seq, 2);
+        assert_eq!(snapshot.root.children[0], save(false));
+    }
+
+    /// A number that is not finite cannot be stored on a node, so it never
+    /// reaches the line, which could not spell it, and never leaves a tree
+    /// unequal to itself, which would have defeated the comparison that skips
+    /// an unchanged frame: every frame would have gone out again.
+    #[test]
+    fn a_number_that_is_not_finite_never_ships_or_breaks_the_dedupe() {
+        let mut layer = bind_test_layer("taria-layer-", "nan");
+        let bar = || {
+            let mut bar = Node::new("bar", Role::ProgressBar).range(f64::NAN, 0.0, f64::INFINITY);
+            bar.value_max = taria::Number::new(f64::NEG_INFINITY);
+            bar
+        };
+        layer.publish([bar()]);
+        layer.publish([bar()]);
+        layer.publish([bar()]);
+        let snapshot = layer.latest_snapshot().expect("published");
+        assert_eq!(snapshot.seq, 1, "the same frame drawn again is not resent");
+        let published = &snapshot.root.children[0];
+        assert_eq!(
+            (published.value_now, published.value_max),
+            (None, None),
+            "{published:?}"
+        );
+        assert_eq!(published.value_min.map(taria::Number::get), Some(0.0));
+        let line = serde_json::to_string(&snapshot).expect("serializes");
+        assert!(
+            !line.contains("NaN") && !line.contains("inf") && !line.contains("null"),
+            "{line}"
+        );
     }
 
     /// The ordering [`writer_loop`] promises, exercised where it actually

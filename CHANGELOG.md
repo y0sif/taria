@@ -24,11 +24,30 @@ to grow without a break: `LayerStats` is `#[non_exhaustive]`, and a
 `taria-mcp` server is set up through a builder.
 
 This breaks Rust callers of all three crates; the table under Upgrading maps
-every removed name to what replaces it. Nothing on the wire moved:
-`PROTOCOL_VERSION` stays 1, and `InputId`, a newtype in Rust now, is still a
-bare integer in the JSON. Every text an agent reads through `taria-mcp`, from
-the instructions to each answer, is unchanged byte for byte, and so is the
-binary's command line.
+every removed name to what replaces it. The cut moves nothing on the wire:
+`InputId`, a newtype in Rust now, is still a bare integer in the JSON. Every
+text an agent reads through `taria-mcp`, from the instructions to each
+answer, is unchanged byte for byte but the two below, and so is the binary's
+command line.
+
+**A node can say what state it is in.** Which row is selected, whether a box
+is checked, whether a branch is open, whether a button can be pressed yet,
+how far a progress bar has got, where a row sits in a list longer than the
+screen: each was prose in a `value` string an app made up, or nowhere. A
+node now carries them as typed state: `selected`, `checked` (`true`, `false`
+or `"mixed"`), `expanded`, `disabled`, `description`, `value_now`,
+`value_min`, `value_max`, `pos_in_set`, `set_size`, `row`, `column`,
+`row_count` and `column_count`.
+
+This is the second addition to the wire since version 1 froze, and it is
+additive: `PROTOCOL_VERSION` stays 1. Every field is optional and omitted
+when unset, so a node that states nothing is the line 0.3.3 wrote, byte for
+byte, and a 0.3.3 `taria-mcp` reads a 0.4.0 tree without error, passing the
+new fields on in JSON and showing them among the fields at the end of an
+outline line. Absent means not stated, never `false`, and a field of the
+wrong type or shape reads as not stated instead of failing the node. The
+outline's `read_tree` description changes in one place; the JSON mode's
+texts do not move.
 
 ### Upgrading
 
@@ -69,6 +88,31 @@ binary's command line.
 
 ### For whoever drives an app
 
+- **Typed state in the tree.** In JSON a node carries `"selected":true`,
+  `"checked":false`, `"value_now":42` and the rest as plain fields. The
+  outline prints them as marks after `*focused`: `*selected` or
+  `*selected=false`; `*checked`, `*checked=false` or `*checked=mixed`;
+  `*expanded` or `*expanded=false`; `*disabled`; `*num=42[0..100]`;
+  `*pos=3`; `*size=7`; `*row=2 *col=3`; `*rows=50 *cols=4`; and a
+  `description="..."` opening the tail. A `*` is still never bare
+  otherwise, so no mark can be forged. Positions count from 1, and a node
+  with `expanded` set and fewer children than its `set_size` has children
+  that were not published, not an empty set.
+- **The outline's `read_tree` description shows a state mark.** Its legend
+  reads `id role *relayed "label" = "value" *focused *checked=false act:
+  a|b`, which teaches the `*name=value` shape: 15 characters more than
+  0.3.3's. Nothing else in either mode's instructions or descriptions moves.
+- **`act` on a disabled node is refused before anything is sent**, with
+  ``node `<id>` is disabled and accepts no actions until the app enables it;
+  call read_tree to see when it does``. The reference adapter publishes a
+  disabled node with no actions anyway. `key` and `type_text` are not
+  affected, and an empty action list alone never reads as disabled.
+- **The demo states its state.** A task's done state is `checked` instead
+  of the value `"todo"` or `"done"`, and the cursor row and the active tab
+  are `selected` instead of a tab's value `"selected"`. The list's value
+  (the selected task's id) and the tab bar's (the tab on screen) stay. The
+  demo's first tree is 1199 characters as JSON and 619 as an outline, where
+  0.3.3's was 1132 and 546.
 - **rmcp 3.8 answers a few requests differently; taria's own texts do not
   move.** A request with `"id":null` now gets a `-32600` (invalid request)
   reply, where 0.3.3 sent nothing. Requests before `initialize` no longer end
@@ -82,6 +126,24 @@ binary's command line.
 
 ### For an app author adopting taria
 
+- **Set state with the new setters.** `selected(bool)`, `checked(..)`
+  (a `bool` or a `taria::Checked`), `expanded(bool)`, `disabled(bool)`,
+  `description(..)`, `range(now, min, max)`, `pos_in_set(u32)`,
+  `set_size(u32)`, `cell(row, column)` and `table_size(rows, columns)`, each
+  chainable beside `relayed`. `range` leaves a number that is not finite
+  unstated, so `f64::INFINITY` is an open bound, and a 0 position leaves the
+  field unset. The integration guide's new section "Say what state a node is
+  in" covers them.
+- **A disabled node is published with no actions.** The adapter strips them
+  at publish, on both `publish` and `FrameRecorder`, and counts nothing:
+  the app said what it meant. Do not mark a node disabled only because a
+  modal is in front of it.
+- **Hidden is not a field.** Leave a hidden node out of the tree, and say how
+  many items there are with `set_size`, published or not.
+- **A description is trimmed with the values.** When a snapshot runs over
+  the line limit, the adapter cuts the longest values and descriptions
+  first, then labels with them, and `SnapshotTooLarge::largest` can name a
+  description.
 - **`stats()` gathers what the layer lost.** One call returns a `LayerStats`:
   the six counts, all zero on a disabled layer, and the two `last_*`
   details, `None` until a cut, to read once the terminal is restored, as
@@ -92,6 +154,20 @@ binary's command line.
 
 ### For a second implementer
 
+- **`docs/protocol.md` gains the typed state.** Section 6.1 lists the thirteen
+  fields and the reading rule (absent and wrong-shaped both read as not
+  stated; only `"disabled":true` is ever sent), new section 6.5 says what
+  each means, the disabled rule and why there is no hidden field, section
+  16.8 says what an older peer does with them, and Appendix B item 12 lists
+  the contradictions nobody checks. Section 18's captures are taken again
+  from the 0.4.0 demo.
+- **`taria::Number` and `taria::Checked` are new.** `Number` is a finite-only
+  `f64` with `Eq` and `Hash`, so `Node` and `Snapshot` keep `Eq`; it writes a
+  whole number within 2^53 as an integer. Both deserialize strictly on their
+  own; the node's fields read them leniently.
+- **`docs/architecture.md` maps taria to AccessKit 0.25**, role by role and
+  field by field, including the shift from taria's 1-based positions to
+  AccessKit's 0-based ones.
 - **`Action::from_wire` is public, and `Action::wire_name` is new.** They map
   between an action and the name the wire spells it by, so a bridge written in
   Rust no longer keeps its own copy of the names.
@@ -99,7 +175,16 @@ binary's command line.
 ### The gates
 
 - `scripts/e2e.py` keeps its 26 steps and `scripts/adversarial.py` its 24
-  probes.
+  probes. Steps d, e and i read a task's done state from `checked`, step c
+  and every tab switch check `selected`, and step v checks the outline's
+  `*selected` and `*checked=false` marks. The text probe compares `checked`
+  and `selected` too.
+- New tests pin a node without state to its 0.3.3 bytes, read every state
+  field in a wrong shape as not stated, strip a disabled node's actions and
+  refuse `act` on it, keep `NaN` and infinities out of the tree and the
+  dedupe, trim descriptions with the values, render every mark, and keep a
+  label spelling `*checked` from passing for one. The 0.3.3 demo tree still
+  renders exactly as it did.
 - New `taria-mcp` tests drive a server built with `connected()` over MCP,
   check that `server/discover` and a `tools/list` sent the 2026-07-28 way open
   no connection to the app, and check that the builder refuses outside a

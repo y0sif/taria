@@ -118,10 +118,14 @@ these systems separates which role (closed, degradable) from what to call it
 (open, optional, alongside a real role). Adding the roles is what the prior
 art tells you to do.
 
-The larger finding is deferred, not dismissed: most of the 26% is not
+The larger finding was deferred, not dismissed: most of the 26% is not
 role-shaped at all. It wants node attributes, `selected` distinct from
 `focused`, position in a list, scroll offset, `expanded` and `level` for
 trees, and `mode` for modal editors. That last one is a safety issue rather
 than a completeness one: without it an agent typing into a vim-modal editor
 runs commands instead of typing. Attributes are additive under the freeze,
-so they belong to a version that can design them properly.
+so they waited for a version that could design them properly. 0.4.0 shipped
+the first set as typed node state: `selected`, `checked`, `expanded`,
+`disabled`, `description`, a numeric value with its bounds, `pos_in_set` and
+`set_size`, and table rows and columns (protocol section 6.5). Scroll
+offset, `level` and `mode` are still to come.

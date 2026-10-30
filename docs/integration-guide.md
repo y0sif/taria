@@ -317,6 +317,90 @@ something. Say so rather than inventing a role name of your own: a role added
 to taria is additive and every peer learns it, while a role each app names for
 itself is one vocabulary per app.
 
+## Say what state a node is in
+
+The role says what a widget is. Its state, which row is selected, whether a
+box is ticked, whether a branch is open, whether a button can be pressed
+yet, has its own fields since 0.4.0, so an agent reads it instead of parsing
+it out of a `value` string you made up. Each is a chainable setter beside
+`label` and `value`:
+
+```rust
+use taria::{Checked, Node, Role};
+
+// A task row: done is `checked`, the cursor row is `selected`, and its place
+// in the whole list, not only the rows on screen.
+Node::new(TASK_IDS.id(task.id), Role::ListItem)
+    .label(task.title.clone())
+    .checked(task.done)
+    .selected(pos == app.cursor)
+    .pos_in_set(pos as u32 + 1);
+
+// The list says how many rows it holds, published or not.
+Node::new("tasks", Role::List).set_size(app.tasks.len() as u32);
+
+// A parent whose children are partly ticked, a branch that is open, a
+// button that cannot be pressed yet and why.
+Node::new("all", Role::Checkbox).checked(Checked::Mixed);
+Node::new("src", Role::TreeItem).expanded(true);
+Node::new("save", Role::Button)
+    .label("Save")
+    .description("Writes the open file to disk")
+    .disabled(!app.dirty);
+
+// A gauge, and a table cell and its table, rows and columns from 1.
+Node::new("cpu", Role::ProgressBar).range(app.cpu, 0.0, 100.0);
+Node::new(format!("r{row}c{col}"), Role::Cell).cell(row, col);
+Node::new("results", Role::Table).table_size(app.rows.len() as u32, 4);
+```
+
+What each one promises:
+
+- **Absent means you said nothing**, never `false`. So set `selected` on
+  every row of a list, `false` on all but the cursor's, and `expanded` on
+  every branch that can open: a row with no `selected` says nothing about
+  whether it is the cursor's. Leave a field unset only where it does not
+  apply.
+- **Selection is not focus.** `focused` is where a raw key lands; `selected`
+  is where the cursor sits, which stays true while the keyboard is
+  elsewhere. Publish both.
+- **`disabled` takes the actions with it.** A node you mark disabled is
+  published with no actions, whatever you built it with: the adapter strips
+  them, so you do not have to, and `taria-mcp` refuses `act` on it with an
+  answer that says it is disabled, so the agent waits for the tree to change
+  instead of trying other names. `key` and `type_text` are not affected.
+  `disabled(false)` clears the mark, and only `true` is ever sent. The
+  reverse does not hold: an empty action list does not mean disabled, so
+  do not mark a node disabled because a modal is in front of it. The demo's
+  rows behind its confirm dialog advertise nothing and are not disabled.
+- **`description` is your own words.** `relayed` covers a node's label and
+  value only. Text from outside your app, a file's contents or a model's
+  reply, goes in a child marked relayed (see "Mark relayed text"), never in
+  a description.
+- **Positions count from 1**, as a person counts rows: `pos_in_set`, `row`
+  and `column`. A 0 passed to `pos_in_set` or `cell` leaves that field
+  unset, so a `row` node passes 0 for its column. Counts, `set_size`,
+  `row_count` and `column_count`, may be 0.
+- **Numbers are finite.** `range(now, min, max)` leaves any argument that is
+  not finite unstated, so an open-ended bound is `f64::INFINITY`:
+  `.range(bytes, 0.0, f64::INFINITY)` states a value and a floor and no
+  ceiling. A `NaN` never reaches the wire, which could not spell it, and
+  never stops the adapter from noticing that a frame is unchanged.
+
+**Hidden is not a field: do not publish it.** A collapsed branch's children,
+a closed panel, the rows scrolled out of view are simply left out of the
+tree. That is also why the counts say "published or not": a branch with
+`expanded(true)` and `set_size(40)` that publishes 12 children tells an
+agent the other 28 exist and are not on screen, not that the set has 12.
+Publish what the widget draws, and state the size of what it draws from.
+
+A reader that predates 0.4.0 ignores all of this and sees the node it always
+saw, so publishing state never costs an older agent anything. It does cost
+the reader you replace it with, though: the demo moved a task's done state
+from `value("todo")` to `checked`, and anything that matched the old value
+had to move too. Keep a `value` an existing reader relies on, as the demo
+keeps its list's selected id, until you know nothing reads it.
+
 ## Mark relayed text
 
 Most strings in a tree are the app's own words: a button's text, a tab's
@@ -717,8 +801,8 @@ newline. Both peers enforce it.
 The adapter trims every snapshot to fit at publish, after the depth cut, and
 stops as soon as the tree fits. A node that could never fit goes first, with
 everything under it; its siblings are not dropped with it. Then the longest
-values are cut to one shared length, then labels with them; a string of 256
-bytes of JSON or less is never cut. A cut is marked with `…`: a `Role::Log` or
+values and descriptions are cut to one shared length, then labels with them;
+a string of 256 bytes of JSON or less is never cut. A cut is marked with `…`: a `Role::Log` or
 `Role::Terminal` value keeps its end, because that is where those grow, and
 every other string keeps its start. When more nodes have to go, a list keeps
 its first rows with no gap, and the strings left are cut only as far as the
@@ -817,9 +901,9 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) -> InputStatus {
 ```
 
 Neither the `..` nor the wildcard arm is boilerplate to skip, and they answer
-different additions. Eleven types in `taria` are `#[non_exhaustive]`:
-`AgentInput`, `Action`, `Role`, `Node`, `Snapshot`, `InputStatus`, the two
-wire message enums, `key::Key`, `key::Modifiers` and `key::KeyPress`. So are
+different additions. Twelve types in `taria` are `#[non_exhaustive]`:
+`AgentInput`, `Action`, `Role`, `Node`, `Checked`, `Snapshot`, `InputStatus`,
+the two wire message enums, `key::Key`, `key::Modifiers` and `key::KeyPress`. So are
 six struct-like variants inside them: `AppToBridge::Hello` and `Ack`,
 `BridgeToApp::Input`, and `AgentInput`'s `Act`, `Key` and `Text`. The enums
 are where a new variant lands and the variants are where a new field lands,

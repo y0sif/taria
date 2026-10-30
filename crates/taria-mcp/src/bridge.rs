@@ -225,6 +225,12 @@ fn strip_envelope(line: &str) -> String {
 /// [`Disconnected`](Self::Disconnected) exists purely for error messages:
 /// "the app was never there" and "the app was there and died" call for very
 /// different next steps from the agent.
+///
+/// [`Connected`](Self::Connected) holds a whole tree by value, which clippy
+/// flags beside the small variants since a node gained its typed state. One
+/// value lives in the watch channel and its clones are short-lived, so the
+/// size costs nothing a `Box` would win back.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BridgeState {
     /// No app has delivered a snapshot since the bridge started.
