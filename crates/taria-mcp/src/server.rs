@@ -292,6 +292,17 @@ impl TariaMcpServer {
     }
 }
 
+/// The settings a server was built with. The bridge and the tool router it
+/// holds have no `Debug` of their own, so they are left out.
+impl std::fmt::Debug for TariaMcpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TariaMcpServer")
+            .field("tree_format", &self.tools.tree_format)
+            .field("idle_release", &self.tools.idle_release)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The four methods rmcp's `#[tool_handler]` fills in, passed through to the
 /// tool layer this server wraps, which is where the tools live. Every other
 /// method is rmcp's default, as it is on the tool layer.
@@ -2080,11 +2091,6 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    // These tests drive the tool layer, which the public server wraps. Under
-    // the name the two shared before the wrap, the pinned-text tests below
-    // read exactly as they did, so a diff of them shows the pinned text has
-    // not moved. The public type is `crate::TariaMcpServer` here.
-    use super::Tools as TariaMcpServer;
     use taria::{Role, Snapshot};
 
     /// A built-in's wire name reaches the built-in a node advertises.
@@ -3773,8 +3779,8 @@ mod tests {
 
     /// A server with no app behind it, which is all the value bound needs:
     /// an oversized value is refused before the bridge is asked for anything.
-    fn detached_server() -> TariaMcpServer {
-        TariaMcpServer::new(detached_handle())
+    fn detached_server() -> Tools {
+        Tools::new(detached_handle())
     }
 
     /// A bridge handle with nothing on the other end.
@@ -3841,7 +3847,7 @@ mod tests {
         tree if it changed.";
 
     /// A tool's input schema as `tools/list` serves it.
-    fn input_schema(server: &TariaMcpServer, name: &str) -> serde_json::Value {
+    fn input_schema(server: &Tools, name: &str) -> serde_json::Value {
         let tool = server
             .get_tool(name)
             .unwrap_or_else(|| panic!("{name} is listed"));
@@ -3849,7 +3855,7 @@ mod tests {
     }
 
     /// A tool's description as `tools/list` serves it.
-    fn description(server: &TariaMcpServer, name: &str) -> String {
+    fn description(server: &Tools, name: &str) -> String {
         server
             .get_tool(name)
             .and_then(|tool| tool.description)
@@ -3862,7 +3868,7 @@ mod tests {
     /// but `repeat`'s default and keep every bound.
     #[test]
     fn json_mode_serves_the_pinned_text() {
-        let server = TariaMcpServer::new(detached_handle());
+        let server = Tools::new(detached_handle());
         assert_eq!(server.tree_format, TreeFormat::Json);
         assert_eq!(
             server.get_info().instructions.as_deref(),
@@ -3922,10 +3928,10 @@ mod tests {
         // Every other byte of the listing too: names, schemas, annotations.
         assert_eq!(
             server.tool_router.list_all(),
-            TariaMcpServer::tool_router().list_all(),
+            Tools::tool_router().list_all(),
             "the JSON mode must list the tools exactly as the attributes wrote them"
         );
-        let explicit = TariaMcpServer::with_tree_format(detached_handle(), TreeFormat::Json);
+        let explicit = Tools::with_tree_format(detached_handle(), TreeFormat::Json);
         assert_eq!(
             explicit.tool_router.list_all(),
             server.tool_router.list_all()
@@ -3944,10 +3950,10 @@ mod tests {
     /// prove nothing else moved.
     #[test]
     fn outline_mode_describes_the_outline_and_nothing_else_changes() {
-        let json = TariaMcpServer::new(detached_handle());
-        let outline = TariaMcpServer::with_tree_format(detached_handle(), TreeFormat::Outline);
+        let json = Tools::new(detached_handle());
+        let outline = Tools::with_tree_format(detached_handle(), TreeFormat::Outline);
 
-        let names = |server: &TariaMcpServer| {
+        let names = |server: &Tools| {
             server
                 .tool_router
                 .list_all()
@@ -4092,7 +4098,7 @@ mod tests {
         let (_rejected_tx, rejected_rx) = watch::channel(None);
         let (_link_tx, link_rx) = watch::channel(LinkState::Down);
         let app_acks = ack_tx.clone();
-        let server = TariaMcpServer::with_tree_format(
+        let server = Tools::with_tree_format(
             BridgeHandle {
                 state_rx,
                 input_tx,
@@ -4318,24 +4324,28 @@ mod tests {
     /// the tool layer: JSON unless told otherwise, and the default window.
     #[tokio::test]
     async fn the_public_server_serves_what_its_tool_layer_does() {
-        let server = crate::TariaMcpServer::builder(NOWHERE)
+        let server = TariaMcpServer::builder(NOWHERE)
             .on_demand()
             .expect("a tokio test runs inside a runtime");
         assert_eq!(server.tools.tree_format, TreeFormat::Json);
         assert_eq!(server.tools.idle_release, Some(DEFAULT_IDLE_RELEASE));
+        assert_eq!(
+            format!("{server:?}"),
+            "TariaMcpServer { tree_format: Json, idle_release: Some(60s), .. }"
+        );
 
         for format in [TreeFormat::Json, TreeFormat::Outline] {
-            let server = crate::TariaMcpServer::builder(NOWHERE)
+            let server = TariaMcpServer::builder(NOWHERE)
                 .tree_format(format)
                 .idle_release(Duration::from_secs(5))
                 .on_demand()
                 .expect("a tokio test runs inside a runtime");
             assert_eq!(server.tools.tree_format, format);
             assert_eq!(server.tools.idle_release, Some(Duration::from_secs(5)));
-            assert_eq!(
-                server.get_info().instructions,
-                server.tools.get_info().instructions
-            );
+            // The whole answer to `initialize`, not just the instructions, so
+            // a handler method an rmcp macro adds to the tool layer and the
+            // wrapper does not pass through shows here.
+            assert_eq!(server.get_info(), server.tools.get_info());
             for name in ["read_tree", "act", "key", "type_text"] {
                 let tool = server.get_tool(name);
                 assert!(tool.is_some(), "{name} is listed");
@@ -4345,7 +4355,7 @@ mod tests {
 
         // A connected server has no window: it never lets go, whatever the
         // builder was told.
-        let server = crate::TariaMcpServer::builder(NOWHERE)
+        let server = TariaMcpServer::builder(NOWHERE)
             .idle_release(Duration::from_secs(5))
             .connected()
             .expect("a tokio test runs inside a runtime");
@@ -4358,14 +4368,8 @@ mod tests {
     #[test]
     fn the_builder_refuses_to_build_outside_a_tokio_runtime() {
         let built = [
-            (
-                "on_demand",
-                crate::TariaMcpServer::builder(NOWHERE).on_demand(),
-            ),
-            (
-                "connected",
-                crate::TariaMcpServer::builder(NOWHERE).connected(),
-            ),
+            ("on_demand", TariaMcpServer::builder(NOWHERE).on_demand()),
+            ("connected", TariaMcpServer::builder(NOWHERE).connected()),
         ];
         for (name, built) in built {
             let Err(err) = built else {

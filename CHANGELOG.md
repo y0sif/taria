@@ -49,7 +49,7 @@ binary's command line.
 | the tool methods `read_tree`, `act`, `key` and `type_text`, their `*_tool_attr()` functions, and `ActParams`, `KeyParams`, `TypeTextParams` | rmcp's `ServerHandler`, through a `tools/call` request |
 | `bridge::{spawn, BridgeHandle, AppSnapshot, BridgeState, LinkState}` | none: a finalizer spawns the bridge |
 | `tree_format::outline(line)`, `TreeFormat::render(&snapshot)` | none |
-| `args::{parse, Cli, HELP, MAX_IDLE_RELEASE_SECS, resolve_socket_path}` | none: they are the binary's own, and `taria::socket::resolve_path` derives a socket path |
+| `args::{parse, Cli, HELP, MAX_IDLE_RELEASE_SECS, resolve_socket_path}` | none: they are the binary's own. `taria::socket::resolve_path` derives a socket path from a `user` string the caller passes, while the adapter and the binary derive theirs privately: the uid on Linux (from `/proc/self`), else `$USER`, else `$LOGNAME`. A caller passing `$USER` gets a different temp-dir fallback path on Linux than the adapter binds |
 | rmcp 3 | rmcp 3.8 or later |
 
 - **`drain` is a new method under an old name.** It is 0.3's `drain_acking`,
@@ -67,11 +67,25 @@ binary's command line.
   return an error, where 0.3's constructors panicked. `connected()` ignores
   `idle_release`: that bridge never lets go.
 
+### For whoever drives an app
+
+- **rmcp 3.8 answers a few requests differently; taria's own texts do not
+  move.** A request with `"id":null` now gets a `-32600` (invalid request)
+  reply, where 0.3.3 sent nothing. Requests before `initialize` no longer end
+  the session after the third: each is answered `-32602`, and `initialize` is
+  still accepted after them. rmcp's stderr report of a malformed `initialize`
+  is worded differently.
+- **The stateless 2026-07-28 lifecycle is accepted too.** `server/discover`,
+  like `initialize`, opens no connection to the app. In that mode
+  `resources/list` and `prompts/list` carry
+  `"ttlMs":0,"cacheScope":"private"`.
+
 ### For an app author adopting taria
 
-- **`stats()` gathers what the layer lost.** One call returns the eight counts
-  as a `LayerStats`, all zero on a disabled layer, to read once the terminal
-  is restored, as before. A count added later is a new field, not a break.
+- **`stats()` gathers what the layer lost.** One call returns a `LayerStats`:
+  the six counts, all zero on a disabled layer, and the two `last_*`
+  details, `None` until a cut, to read once the terminal is restored, as
+  before. A count added later is a new field, not a break.
 - **`TariaLayer::bind_or_disabled_at(label, path)` is public.** It binds at a
   path the app chose and returns a disabled layer when that fails, as
   `bind_or_disabled` does at the resolved path.
@@ -1017,6 +1031,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[Unreleased]: https://github.com/y0sif/taria/compare/v0.3.3...HEAD
 [0.3.3]: https://github.com/y0sif/taria/releases/tag/v0.3.3
 [0.3.2]: https://github.com/y0sif/taria/releases/tag/v0.3.2
 [0.3.1]: https://github.com/y0sif/taria/releases/tag/v0.3.1

@@ -90,11 +90,11 @@ refuses a `target/debug` older than the sources.
   backoff while tool calls want the app, and after 60 s with no tool calls
   (`--idle-release`, plain digits from 0 to 86400, `0` never) closes the
   connection or leaves the backlog and stops reconnecting, but not while an
-  input awaits its ack, for up to 30 s past the window.
+  input awaits its ack, for up to 30 s past the window. Connecting on demand
+  and letting go when idle is the fix for issue #13: the adapter serves one
+  bridge at a time and a repo `.mcp.json` starts one in every session.
   `TariaMcpServer::builder(..).connected()` connects at once and never lets
-  go, as every bridge before 0.3.2 did.
-  That is the fix for issue #13: the adapter serves one bridge at a time and
-  a repo `.mcp.json` starts one in every session. A snapshot is kept as the
+  go, as every bridge before 0.3.2 did. A snapshot is kept as the
   app's own line (minus the `type` framing key) beside the parse of it: the
   line is what the agent reads, so an unknown role, action or field survives
   by name; the parse is what the bridge validates and diffs against.
