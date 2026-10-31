@@ -25,6 +25,8 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +44,7 @@ jobs:
       # Both licences travel with the binary, since the dual licence is the
       # offer being made to whoever redistributes it.
       - name: Package
+        if: runner.os != 'Windows'
         run: |
           set -euo pipefail
           mkdir -p staging
@@ -51,11 +54,29 @@ jobs:
           tar czf ../taria-mcp-${{ matrix.target }}.tar.gz *
           cd ..
           shasum -a 256 taria-mcp-${{ matrix.target }}.tar.gz > taria-mcp-${{ matrix.target }}.tar.gz.sha256
+      # A zip, which Windows opens without extra tools, beside a checksum file
+      # in shasum's own format (`<hash>  <name>`, then a newline), so
+      # `sha256sum -c` reads it as it reads the tarballs' ones.
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "taria-mcp-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/taria-mcp.exe staging/
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE staging/
+          Compress-Archive -Path staging/* -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          Set-Content -Path "$archive.sha256" -Value "$hash  $archive`n" -NoNewline -Encoding ascii
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: taria-mcp-${{ matrix.target }}
-          path: taria-mcp-${{ matrix.target }}.tar.gz*
+          path: |
+            taria-mcp-${{ matrix.target }}.tar.gz*
+            taria-mcp-${{ matrix.target }}.zip*
+          if-no-files-found: error
 
   release:
     name: Create Release
