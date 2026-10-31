@@ -18,7 +18,8 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -585,23 +586,59 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 /// The current effective uid, without `unsafe` or extra dependencies.
 ///
 /// On Linux, `/proc/self` is owned by this process's effective uid. On other
-/// Unixes, fall back to creating a probe file in the system temp dir: a file
-/// this process creates is owned by its effective uid.
+/// Unixes, fall back to [`uid_from_probe`] in the system temp dir.
+///
+/// Learned once per process and kept: only a success is kept, so a failed
+/// attempt is made again on the next call. Two threads that call it first at
+/// the same time may both learn it, which is harmless, since each probe has a
+/// file of its own and both learn the same uid.
 fn current_uid() -> io::Result<u32> {
-    if let Ok(meta) = fs::metadata("/proc/self") {
-        return Ok(meta.uid());
+    static UID: OnceLock<u32> = OnceLock::new();
+    if let Some(&uid) = UID.get() {
+        return Ok(uid);
     }
-    let probe = env::temp_dir().join(format!("taria-uid-probe-{}", std::process::id()));
-    let _ = fs::remove_file(&probe);
-    let file = fs::OpenOptions::new()
+    let uid = match fs::metadata("/proc/self") {
+        Ok(meta) => meta.uid(),
+        Err(_) => uid_from_probe(&env::temp_dir())?,
+    };
+    Ok(*UID.get_or_init(|| uid))
+}
+
+/// The effective uid this process creates files with, from the owner of a
+/// probe file it creates in `dir` and then removes.
+///
+/// Every call creates a file of its own, named by the pid and a counter, so
+/// threads probing at once never meet on one name. The file is created with
+/// `create_new`, so one already at that name (left by a killed run under a
+/// reused pid, or planted) is never opened, read or removed: the call fails
+/// instead, and the next call tries the next name.
+fn uid_from_probe(dir: &Path) -> io::Result<u32> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let probe = dir.join(format!(
+        "taria-uid-probe-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let uid = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&probe)?;
-    let uid = file.metadata()?.uid();
-    drop(file);
-    let _ = fs::remove_file(&probe);
-    Ok(uid)
+        .open(&probe)
+        .and_then(|file| {
+            let uid = file.metadata().map(|meta| meta.uid());
+            drop(file);
+            let _ = fs::remove_file(&probe);
+            uid
+        });
+    uid.map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "cannot learn this process's uid from a probe file at {}: {err}",
+                probe.display()
+            ),
+        )
+    })
 }
 
 /// Uid where available (via `/proc/self` on Linux), else `$USER`/`$LOGNAME`,
@@ -613,4 +650,80 @@ pub(crate) fn user_identity() -> String {
     env::var("USER")
         .or_else(|_| env::var("LOGNAME"))
         .unwrap_or_else(|_| "default".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+
+    use super::*;
+
+    /// Threads of one process share its pid, and the probe was once named by
+    /// the pid alone: binds made at once raced on one file, and one of them
+    /// failed with a bare `File exists`. That made a few of the socket tests
+    /// fail at random on macOS, where every bind probes. Each round releases
+    /// eight probes together into one directory.
+    #[test]
+    fn probes_made_at_once_all_learn_the_uid() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 50;
+
+        let dir = tempfile::tempdir().expect("create a probe dir");
+        let expected = current_uid().expect("learn the uid");
+        // A directory this process created is owned by its effective uid.
+        let owner = fs::metadata(dir.path()).expect("stat the probe dir").uid();
+        assert_eq!(expected, owner);
+        if let Ok(meta) = fs::metadata("/proc/self") {
+            assert_eq!(expected, meta.uid());
+        }
+
+        for round in 0..ROUNDS {
+            let barrier = Barrier::new(THREADS);
+            let results: Vec<io::Result<u32>> = thread::scope(|scope| {
+                let probes: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            uid_from_probe(dir.path())
+                        })
+                    })
+                    .collect();
+                probes
+                    .into_iter()
+                    .map(|probe| probe.join().expect("a probe thread panicked"))
+                    .collect()
+            });
+            for result in results {
+                match result {
+                    Ok(uid) => assert_eq!(uid, expected, "round {round}"),
+                    Err(err) => panic!("round {round}: a probe failed: {err}"),
+                }
+            }
+        }
+
+        let left: Vec<_> = fs::read_dir(dir.path())
+            .expect("list the probe dir")
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<_>>()
+            .expect("read the probe dir");
+        assert!(left.is_empty(), "probe files left behind: {left:?}");
+    }
+
+    /// A probe that cannot be made says where it was made and what for, and
+    /// keeps the kind of the error underneath.
+    #[test]
+    fn a_failed_probe_names_its_path_and_purpose() {
+        let dir = tempfile::tempdir().expect("create a probe dir");
+        let missing = dir.path().join("missing");
+        let err = uid_from_probe(&missing).expect_err("a probe in a missing dir fails");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "cannot learn this process's uid from a probe file at {}",
+                missing.join("taria-uid-probe-").display()
+            )),
+            "{message}"
+        );
+    }
 }

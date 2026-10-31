@@ -101,6 +101,13 @@ the 500 ms window are as in 0.3.3.
   its end. An app restarted at once waits that out instead of running with
   taria off. `bind_error()` says why a bind failed, and the integration
   guide's "Socket paths" section gains "On Windows" with each reason.
+- **Binds made at once from several threads work on macOS and the BSDs.**
+  There the layer learns your uid from a probe file in the temp dir, and
+  since 0.1.0 every thread of a process used the same file name, so one of
+  two binds made at once could fail with a bare `File exists`. The uid is now
+  learned once per process, each probe has a name of its own, and a failed
+  probe names its path. Linux, which reads the uid from `/proc/self`, was not
+  affected.
 
 ### For whoever drives an app
 
