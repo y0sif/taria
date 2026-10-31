@@ -319,21 +319,21 @@ the connection, so `PROTOCOL_VERSION` stays 1. `docs/protocol.md` sections
   every state field in a wrong shape as not stated. Against a fake app that
   stamps they cover a slow act, the 3 s cap, a late tree, bursts, `Ignored`
   and racing ids; against one that does not, 0.3.3's answers byte for byte.
-- CI runs on three platforms. New macOS and Windows jobs run the Rust
-  suites. The macOS job also runs both Python scripts (the one probe that
-  needs `/proc` says it was skipped), and the Windows job runs clippy,
-  builds and tests. Every job builds with `--locked`. The Linux job adds clippy for the
-  Windows target and a docs build with warnings denied, and the MSRV job
-  (the oldest Rust the crates support) checks the Windows target too. The
-  scripts cannot run on Windows, which has no pseudo-terminal for the demo,
-  no `/proc` and no `AF_UNIX`.
+- CI runs on three platforms. New macOS and Windows jobs run the Rust suites.
+  The macOS job also runs both Python scripts (the one probe that needs
+  `/proc` says it was skipped), and the Windows job runs clippy, builds and
+  tests. Every job builds with `--locked`. The Linux job adds clippy for the
+  Windows target and a docs build with warnings denied, and the MSRV job (the
+  oldest Rust the crates support) checks the Windows target too. The scripts
+  cannot run on Windows, which has no pseudo-terminal for the demo, no `/proc`
+  and no `AF_UNIX`.
 - New `crates/taria-mcp/tests/adapter_e2e.rs` runs a real `TariaLayer` in a
   child process against the real `taria-mcp` binary over stdio, on every
   platform: tools and acks, an act that changes nothing, a held app, idle
-  release, an app restarted under a new pid, and a second app refused. It is the end-to-end gate on Windows.
-  Tests of the pipe itself cover its owner and DACL, busy, silent, foreign
-  and denied pipes, both retries, the write deadline, and each Windows
-  answer byte for byte.
+  release, an app restarted under a new pid, and a second app refused. It is
+  the end-to-end gate on Windows. Tests of the pipe itself cover its owner and
+  DACL, busy, silent, foreign and denied pipes, both retries, the write
+  deadline, and each Windows answer byte for byte.
 - `scripts/wine-test.sh` runs the Windows build of the tests under Wine from
   Linux (`CONTRIBUTING.md` lists what it needs). Wine is a stand-in; the
   Windows CI job is the gate.
