@@ -8,9 +8,9 @@ something else.
 There are two places to solve this problem. Outside the app: run it under a
 pseudo-terminal, read the rendered screen, send keystrokes. Inside the app:
 have the app itself say what it is showing and what can be done with it right
-now. Every tool in the table below except taria works outside. taria works
-inside. That single difference decides everything else, including the problems
-taria cannot touch at all.
+now. Most tools below work outside the app. taria works inside. That single
+difference decides everything else, including the problems taria cannot touch
+at all.
 
 ## The tools
 
@@ -22,6 +22,8 @@ taria cannot touch at all.
 | [agent-tui](https://github.com/pproenca/agent-tui) | PTY daemon serving screenshots and input over a CLI and JSON-RPC. | Outside | Any program |
 | [tui-use](https://github.com/onesuper/tui-use) | Screen capture plus keystrokes, packaged for agents. | Outside | Any program |
 | [agent-terminal](https://github.com/jasonkneen/agent-terminal) | Headless terminal automation built on node-pty. | Outside | Any program |
+| [Termwright](https://github.com/gorce-ai/termwright) | End-to-end tests for CLIs and TUIs in the style of Playwright (a browser test framework): runs the program under a PTY, sends input, asserts on the screen, and has an MCP server. Optional probes for Ratatui, Ink, Textual, Bubble Tea and others report roles, labels and state; the Ratatui one patches ratatui-core. A probe's actions still resolve through terminal input. | Outside, with an optional probe inside | Any program; roles and state where a probe is installed |
+| [molerat](https://github.com/orhun/molerat) | The app builds an AccessKit tree (AccessKit is an accessibility toolkit for Rust UIs). Optional features serve it to agents over MCP and to Linux screen readers over AT-SPI, the Linux desktop's accessibility bus, which taria does not reach. Version 0.1.0, not on crates.io. | Inside | Rust apps whose authors adopted it |
 | **taria** | The app publishes its widget tree, focus, and the actions available right now. An MCP bridge hands that tree to a harness and carries input back, with a per-input acknowledgement saying what the app did with it. | Inside | Apps whose authors adopted it |
 
 ## What the line costs on each side

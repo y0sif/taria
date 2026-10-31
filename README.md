@@ -1,24 +1,84 @@
 # taria
 
+[![CI](https://github.com/y0sif/taria/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/y0sif/taria/actions/workflows/ci.yml)
+[![taria-ratatui on crates.io](https://img.shields.io/crates/v/taria-ratatui?label=taria-ratatui)](https://crates.io/crates/taria-ratatui)
+[![taria-mcp on crates.io](https://img.shields.io/crates/v/taria-mcp?label=taria-mcp)](https://crates.io/crates/taria-mcp)
+[![docs.rs](https://img.shields.io/docsrs/taria-ratatui?label=docs.rs)](https://docs.rs/taria-ratatui)
+
 **ARIA for terminals.** taria is an agent accessibility layer for terminal
 user interfaces. A TUI app declares its live widget tree, focus state, and
 available actions through a small protocol. An MCP bridge exposes that tree
 to any agent harness (Claude Code, OpenCode, Cursor): the harness drives the
 app through ordinary MCP tools, with no taria-specific code of its own.
 
+![An MCP client driving the taria demo app](demo/demo.gif)
+
+The client on the right is a script, `demo/drive.py`, not a model: it makes
+six fixed tool calls through the real `taria-mcp` bridge.
+
 Agents today reach TUIs by scraping rendered screens through tmux or headless
 terminals and guessing at structure. taria works on the other side of the
 terminal: the app publishes what is on screen semantically, the way
 accessibility trees transformed GUI automation.
 
-> Status: pre-alpha, at version 0.3.3. The vertical slice works end to end: a
-> ratatui adapter, an MCP bridge, and a demo app an agent can drive today. The
-> wire format is frozen at `PROTOCOL_VERSION` 1. See `CHANGELOG.md` for what
-> this release changed and what the freeze promises, `docs/comparison.md` for
-> how this differs from tmux, ht and the other ways agents reach a TUI,
-> `docs/architecture.md` for how the pieces fit, `docs/protocol.md` for the
-> wire format itself, and `docs/integration-guide.md` for adding taria to an
-> app you already have.
+> Status: alpha, at 0.4.0. The wire format is frozen at `PROTOCOL_VERSION` 1,
+> so an app and a bridge built months apart still work together. The Rust
+> API may still change in a 0.x minor release, and each such change gets an
+> upgrade note in [CHANGELOG.md](CHANGELOG.md). CI tests Linux, macOS and
+> Windows.
+
+## Why taria
+
+- **The app answers, not the screen.** An agent names a widget by the id
+  your app gave it, not by where it sits on screen, and picks one of the
+  actions the app offers for it right now. The app says what it did with
+  each input: took it, ignored it, or dropped it because its queue was full.
+  When the input changed something, the agent gets the new tree with the
+  answer.
+- **Partial coverage still works.** Describe three widgets and stop. An
+  agent reaches the rest with raw key presses and typed text, which your app
+  takes through its own input handling, as it takes a person's.
+- **Safe to ship.** Each app gets its own socket, or a named pipe on
+  Windows, that only your user can open. The message format between app and
+  bridge is frozen and only grows, so their versions can differ. The library
+  returns errors instead of panicking, and if it cannot start, your app runs
+  as before.
+
+In a benchmark on 2026-10-12, against the 0.3.0 demo, Claude Haiku 5.5
+passed 30 of 30 runs reading taria's JSON tree, with a median of 14,045
+tokens read and 3 tool calls per run, and 29 of 30 reading the screen
+through tmux, with 26,722 tokens and 6.5 tool calls. On Sonnet 5.5 the two
+were close: tmux used 7.7% fewer tokens than taria's JSON tree, and 1.7%
+more than its outline format. Method and caveats:
+[bench/RESULTS.md](bench/RESULTS.md).
+
+## In your app
+
+A ratatui app publishes nodes after it draws and takes agent input in its
+event loop, beside its terminal events:
+
+```rust
+use taria_ratatui::taria::{Action, Node, Role};
+use taria_ratatui::{InputStatus, TariaLayer};
+
+// Never fails: if taria cannot bind, the layer does nothing.
+let mut layer = TariaLayer::bind_or_disabled("my-app");
+loop {
+    terminal.draw(|frame| view(&app, frame))?;
+    // Say what is on screen, after every draw.
+    layer.publish([Node::new("save", Role::Button)
+        .label("Save")
+        .action(Action::Activate)]);
+    wait_for_event(&mut app)?; // your event handling, unchanged
+    layer.drain(|input| {
+        app.apply(input); // as if a person had done it
+        InputStatus::Delivered // or Ignored, if it did nothing
+    });
+}
+```
+
+[docs/integration-guide.md](docs/integration-guide.md) walks through adding
+taria to an app you already have, including the loop's timing rules.
 
 ## Install
 
@@ -172,6 +232,8 @@ examples/demo-app     Demo ratatui app driven by an agent through taria
 scripts/              Python verification harnesses (e2e, adversarial)
 docs/                 Protocol spec, architecture, integration guide,
                       comparison, landscape research
+bench/                Benchmark harness and results: taria against tmux
+demo/                 The GIF above and the scripted client that records it
 ```
 
 In `docs/`: `protocol.md` specifies the wire format message by message,
@@ -222,3 +284,10 @@ three that decide whether taria fits at all:
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.
+
+## MCP registry
+
+The [MCP registry](https://registry.modelcontextprotocol.io/) reads the line
+below to check that the `taria-mcp` crate belongs to this server.
+
+mcp-name: io.github.y0sif/taria-mcp

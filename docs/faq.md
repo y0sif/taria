@@ -130,12 +130,19 @@ app.
 
 **Is the protocol stable?**
 
-The wire format is frozen at `PROTOCOL_VERSION` 1, and changes within it are
-additive: new optional fields, new message variants, new roles, new action
-names. A peer that meets a role or action it does not know degrades that one
-field instead of failing the tree. The crates are pre-alpha and their Rust
-APIs can still move under semantic versioning; the format is the part that
-made a promise.
+The wire format is. It is frozen at `PROTOCOL_VERSION` 1 and only grows: new
+optional fields, new message variants, new roles, new action names. A peer
+that meets one it does not know degrades that one field, not the tree, so an
+app and a bridge built months apart still work together.
+`docs/compatibility.md` says what each version pairing gets.
+
+The Rust API is not frozen. taria is alpha and the crates are 0.x, so a
+minor release, such as 0.4 to 0.5, may rename or remove a method. When one
+does, its CHANGELOG entry says what to change. A patch release, such as
+0.4.0 to 0.4.1, never breaks your build.
+
+Few apps use taria yet, so expect rough edges, and please
+[file them](https://github.com/y0sif/taria/issues).
 
 **What happens to the parts of my UI I have not annotated?**
 

@@ -3,13 +3,19 @@
 Live-web research done before scaffolding. It is where the README intro, the
 positioning the rest of the docs assume, and the project's keywords come from.
 
+The claims below are as of 2026-09-04 unless a row says otherwise; star
+counts and statuses move. Since then, other projects have been found reading
+a TUI's widget tree from inside the app: a recheck on 2026-10-30 found two,
+one of them public since 2026-09-21. Each has a row in the matrix, marked
+with the recheck's date.
+
 ## The original idea, and why it pivoted
 
 The starting idea was an agent-side driver that lets AI agents use TUIs by
 taking over input and reading the screen. Research showed that side of the
-problem is already well-served, so taria pivoted to the unclaimed framework
-side: a semantic accessibility layer that TUI apps opt into, so agents read a
-widget tree instead of scraping a screen.
+problem is already well-served, so taria pivoted to the framework side, which
+nothing the research found had taken: a semantic accessibility layer that TUI
+apps opt into, so agents read a widget tree instead of scraping a screen.
 
 ## Competitive matrix
 
@@ -23,6 +29,8 @@ widget tree instead of scraping a screen.
 | [agent-terminal](https://github.com/jasonkneen/agent-terminal) | OSS, node-pty | Active | Headless terminal automation | Screen-level |
 | tuibot / tuicov ([arXiv 2608.03743](https://arxiv.org/abs/2608.03743)) | Academic OSS | Released 2026 | Instrumented LLM testing of TUIs across ratatui, bubbletea, textual, ink | Testing-focused; its finding that LLMs are weak at raw screen interaction is taria's motivation |
 | Claude Code tmux skills ([obra/superpowers-lab](https://claudemarketplaces.com/skills/obra/superpowers-lab/using-tmux-for-interactive-commands)) | Harness-level pattern | Shipping today | Skills teaching agents to drive vim/REPLs via tmux | Proof harnesses want this; still screen-level underneath |
+| [molerat](https://github.com/orhun/molerat) | Rust library, by a ratatui maintainer | Rechecked 2026-10-30: 0.1.0, public since 2026-09-21, not on crates.io | Inside the app: the app builds an AccessKit tree (AccessKit is an accessibility toolkit for Rust UIs). One optional feature serves it to agents over MCP, another to Linux screen readers over AT-SPI, the Linux desktop's accessibility bus | Same side as taria. taria answers each input with the app's verdict, keeps raw key and text fallbacks, and freezes a plain ndjson format any language can speak; molerat reaches screen readers, which taria does not |
+| [Termwright](https://github.com/gorce-ai/termwright) | OSS, TypeScript, MIT | Rechecked 2026-10-30: active | End-to-end tests for CLIs and TUIs in the style of Playwright (a browser test framework): a PTY, input, screen assertions, and an MCP server. Optional probes for Ratatui, Ink, Textual, Bubble Tea and others report roles, labels and state from inside the app; the Ratatui probe patches ratatui-core | Testing-focused. Its probe's actions are hints that still resolve through terminal input; taria hands an action to the app's event loop, and the app answers it |
 
 ## Platform threats
 
@@ -42,9 +50,13 @@ Given that ht, tmux+send-keys, and a crowd of PTY/MCP drivers already let
 agents scrape TUI screens, taria earns its existence by working on the other
 side of the terminal: a framework-level semantic protocol that lets TUI apps
 expose their widget tree, focus state, and available actions directly to
-agents. It is the accessibility-tree moment for terminals, which no existing
-tool provides, starting as a ratatui integration with an MCP bridge so any
-harness can consume it unchanged.
+agents. It is the accessibility-tree moment for terminals, starting as a
+ratatui integration with an MCP bridge so any harness can consume it
+unchanged. The 2026-09-04 research found no tool doing this. By the
+2026-10-30 recheck, two other projects read the tree from inside the app
+(see the matrix), so taria's case now rests on what it does there: a verdict
+from the app for every input, raw key and text fallbacks for what is not
+annotated, and a frozen wire format that any language can implement.
 
 ## Supporting research signals
 
@@ -53,8 +65,8 @@ harness can consume it unchanged.
   interaction; input semantics are where they win. Screen-scraping is a weak
   agent interface.
 - CI4A (arXiv 2601.14790) and LUMOS (arXiv 2606.30697): semantic component
-  interfaces beat raw observation for web and OS agents. No TUI equivalent
-  exists.
+  interfaces beat raw observation for web and OS agents. The research found
+  no TUI equivalent.
 - "Terminal Is All You Need" (arXiv 2603.10664): terminal-based agent tools
   dominate in practice; representational compatibility between agent and
   interface is a core design property.

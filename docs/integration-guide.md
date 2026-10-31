@@ -34,7 +34,7 @@ has the details and a lint that catches it.
 
 ## Add the dependency
 
-Both crates are on crates.io, at version `0.3.3`.
+Both crates are on crates.io, at version `0.4.0`.
 
 ```bash
 cargo add taria-ratatui

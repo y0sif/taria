@@ -1,8 +1,9 @@
 # taria
 
 Agent accessibility layer for TUIs (ARIA for terminals): protocol + ratatui
-adapter + MCP bridge. Pre-alpha; the vertical slice (adapter + bridge +
-demo) works end to end. Wire format frozen at `PROTOCOL_VERSION` 1.
+adapter + MCP bridge. Alpha at 0.4.0: adapter, bridge and demo work end to
+end on Linux, macOS and Windows, but few apps use it yet and the Rust API
+may still change in a 0.x minor. Wire format frozen at `PROTOCOL_VERSION` 1.
 
 ## Commands
 
