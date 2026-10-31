@@ -17,7 +17,8 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -62,7 +63,7 @@ pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(60);
 /// stamps waits on [`SETTLE_WAIT`] instead. This is also how long an
 /// `Ignored` ack from a peer that stamps waits for the tree published after
 /// it.
-const UPDATE_WAIT: Duration = Duration::from_millis(500);
+pub(crate) const UPDATE_WAIT: Duration = Duration::from_millis(500);
 
 /// How long an input-sending tool waits for a peer that stamps its snapshots
 /// to publish a tree after its input: 3 s.
@@ -75,7 +76,7 @@ const UPDATE_WAIT: Duration = Duration::from_millis(500);
 /// app that is slow or publishes nothing. Long enough for a handler that
 /// rebuilds its state, short enough that an app which never publishes again
 /// does not hold the agent long.
-const SETTLE_WAIT: Duration = Duration::from_secs(3);
+pub(crate) const SETTLE_WAIT: Duration = Duration::from_secs(3);
 
 /// How long one input waits for room in the bridge's queue to the app.
 ///
@@ -485,6 +486,45 @@ pub(crate) struct Tools {
     /// same way. `None` for a bridge handed in already spawned, which never
     /// lets go, and whose answers name only the default.
     idle_release: Option<Duration>,
+    /// What the calls so far have learned about whether the connected app
+    /// keeps the `stamps` its hello claimed. Shared by every clone, because
+    /// it describes the connection, not a call.
+    stamp_claim: Arc<Mutex<StampClaim>>,
+}
+
+/// Whether the app on one connection keeps the `stamps` its hello claimed,
+/// as far as the calls on that connection could tell.
+///
+/// Kept per connection, because a hello is: the next connection may be
+/// another app, or the same one fixed, and starts with a clean record.
+#[derive(Debug, Default)]
+struct StampClaim {
+    /// The connection the rest describes, by when it opened (see
+    /// [`LinkState::Open`]).
+    link: Option<Instant>,
+    /// A tree with a stamp, or one surely after a `Delivered` ack, has
+    /// arrived on it. From then on an app that stamps sends no tree without
+    /// a stamp, so the one unstamped tree [`observe`] lets through after an
+    /// ack is no longer owed.
+    settled: bool,
+    /// It sent a tree without a stamp where an app that stamps cannot, and
+    /// the log has said so. Every later call on it is answered by the rules
+    /// for a peer that does not stamp, window and texts included.
+    broken: bool,
+}
+
+impl StampClaim {
+    /// The record for the connection that opened at `link`, started afresh
+    /// if the one held is another connection's.
+    fn on(&mut self, link: Instant) -> &mut Self {
+        if self.link != Some(link) {
+            *self = Self {
+                link: Some(link),
+                ..Self::default()
+            };
+        }
+        self
+    }
 }
 
 impl Tools {
@@ -512,7 +552,19 @@ impl Tools {
             tree_format,
             demand: None,
             idle_release: None,
+            stamp_claim: Arc::default(),
         }
+    }
+
+    /// The record of the stamps claim on the connection that opened at
+    /// `link`, for one short look. A poisoned lock still holds a record worth
+    /// reading: nothing that can panic runs while it is held.
+    fn with_stamp_claim<T>(&self, link: Instant, f: impl FnOnce(&mut StampClaim) -> T) -> T {
+        let mut claim = self
+            .stamp_claim
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        f(claim.on(link))
     }
 
     /// Count this tool call into the bridge's activity window, and give a
@@ -567,8 +619,20 @@ impl Tools {
     ) -> Result<CallToolResult, McpError> {
         self.check_protocol()?;
         // Read before anything is sent, from the hello of the connection the
-        // baseline tree came from.
-        let stamped = *self.bridge.stamps_rx.borrow();
+        // baseline tree came from, and from what earlier calls learned of that
+        // connection: a peer whose claim to stamp proved false on it is
+        // answered as a peer that does not stamp.
+        let claimed = *self.bridge.stamps_rx.borrow();
+        let link = match *self.bridge.link_rx.borrow() {
+            LinkState::Open { since } => Some(since),
+            LinkState::Down => None,
+        };
+        let (stamped, settled) = match link {
+            Some(link) if claimed => {
+                self.with_stamp_claim(link, |claim| (!claim.broken, claim.settled))
+            }
+            _ => (claimed, false),
+        };
         // Subscribe before anything is sent: an ack published before this
         // point is one the receiver would never see.
         let acks = self.bridge.subscribe_acks();
@@ -604,7 +668,12 @@ impl Tools {
                 }
             }
         }
-        let mut seen = observe(acks, rx, &pre, &ids, stamped).await;
+        let mut seen = observe(acks, rx, &pre, &ids, stamped, settled).await;
+        if let Some(link) = link
+            && stamped
+        {
+            self.note_stamps(link, &seen);
+        }
         if rejected.has_changed().unwrap_or(false) {
             seen.rejected = rejected.borrow_and_update().clone();
         }
@@ -677,6 +746,30 @@ impl Tools {
             released: self.demand.as_ref().is_some_and(Demand::released),
             peer_pid: self.demand.as_ref().and_then(Demand::peer_pid),
             idle_release: self.idle_release,
+        }
+    }
+
+    /// Keep what one call against a peer that stamps learned about the
+    /// connection that opened at `link`, and say once per connection, in the
+    /// log, that the peer's claim to stamp is false.
+    ///
+    /// The log is the one place to say it: the agent gets its answer by the
+    /// rules for a peer that does not stamp, and needs nothing more, while
+    /// the app's author has a hello that promises what the app does not do.
+    fn note_stamps(&self, link: Instant, seen: &Observed) {
+        let newly_broken = self.with_stamp_claim(link, |claim| {
+            claim.settled |= seen.settles;
+            let newly = seen.degraded && !claim.broken;
+            claim.broken |= seen.degraded;
+            newly
+        });
+        if newly_broken {
+            tracing::warn!(
+                "the app's hello said it stamps its snapshots, but after acknowledging an \
+                 input it published a snapshot with no after_input, which an app that stamps \
+                 never does; this connection is answered as one that does not stamp \
+                 (docs/protocol.md section 5.3)"
+            );
         }
     }
 
@@ -1449,6 +1542,52 @@ impl Stopped {
     /// go (a zero window) has none, and neither does an unset one. Past it
     /// the agent is sent to check, not told the input landed.
     fn has_not_read(self, sent: usize, idle_release: Option<Duration>) -> String {
+        let unread = if sent > 1 {
+            Unread {
+                these: format!("these {sent} inputs"),
+                the_inputs: "the inputs".to_string(),
+                many: true,
+            }
+        } else {
+            Unread {
+                these: "this input".to_string(),
+                the_inputs: "the input".to_string(),
+                many: false,
+            }
+        };
+        self.not_read("", &unread, idle_release)
+    }
+
+    /// [`has_not_read`](Self::has_not_read) for a burst whose first `acked`
+    /// inputs the app acknowledged before it stopped: only the others are
+    /// unread, and the answer says how many were taken. Only a peer that
+    /// stamps gets it; a peer that does not is answered as in 0.3.3.
+    fn has_not_read_the_rest(
+        self,
+        acked: usize,
+        sent: usize,
+        idle_release: Option<Duration>,
+    ) -> String {
+        let left = sent.saturating_sub(acked);
+        let rest = if left > 1 {
+            format!("the other {left}")
+        } else {
+            "the other one".to_string()
+        };
+        let unread = Unread {
+            these: rest.clone(),
+            the_inputs: rest,
+            many: left > 1,
+        };
+        let taken = format!(" after acknowledging {acked} of the {sent} inputs this call sent");
+        self.not_read(&taken, &unread, idle_release)
+    }
+
+    /// The answer [`has_not_read`](Self::has_not_read) and
+    /// [`has_not_read_the_rest`](Self::has_not_read_the_rest) share, with
+    /// `taken` after what the app is and `unread` naming what it has not
+    /// read.
+    fn not_read(self, taken: &str, unread: &Unread, idle_release: Option<Duration>) -> String {
         let pid = self.pid;
         let (what, resume) = match self.stop {
             Stop::Signal => ("is stopped", format!("Resume it (kill -CONT {pid})")),
@@ -1461,22 +1600,13 @@ impl Stopped {
                 "Resume it from the debugger".to_string(),
             ),
         };
-        let (these, the_inputs, wait, them, effect) = if sent > 1 {
-            (
-                format!("these {sent} inputs"),
-                "the inputs",
-                "wait",
-                "them",
-                "their effect is",
-            )
+        let Unread {
+            these, the_inputs, ..
+        } = unread;
+        let (wait, them, effect) = if unread.many {
+            ("wait", "them", "their effect is")
         } else {
-            (
-                "this input".to_string(),
-                "the input",
-                "waits",
-                "it",
-                "its effect is",
-            )
+            ("waits", "it", "its effect is")
         };
         let fate = match idle_release {
             Some(window) if !window.is_zero() => format!(
@@ -1493,10 +1623,19 @@ impl Stopped {
             ),
         };
         format!(
-            "The app (pid {pid}) {what}, so it has not read {these} yet{fate}. {resume}, then \
-             call read_tree, and resend {the_inputs} if {effect} missing."
+            "The app (pid {pid}) {what}{taken}, so it has not read {these} yet{fate}. {resume}, \
+             then call read_tree, and resend {the_inputs} if {effect} missing."
         )
     }
+}
+
+/// The inputs a stopped app has not read, as [`Stopped::not_read`] names
+/// them: once as the object of "has not read", once as the subject of the
+/// rest, and whether there are several.
+struct Unread {
+    these: String,
+    the_inputs: String,
+    many: bool,
 }
 
 /// How `kill -CONT` fails a suspended job, said wherever the answer sends
@@ -1616,9 +1755,16 @@ fn snapshot_text(snapshot: &AppSnapshot, format: TreeFormat) -> String {
 /// [`UPDATE_WAIT`] for a peer that does not stamp its snapshots, and
 /// [`SETTLE_WAIT`] for one that does.
 #[derive(Debug, Default)]
-struct Observed {
+pub(crate) struct Observed {
     /// Newest ack naming the last input of the burst, if the app sent one.
     status: Option<InputStatus>,
+    /// How many inputs of the burst the app acknowledged at all, whatever it
+    /// said. Per input, like [`dropped`](Self::dropped).
+    ///
+    /// Read only for a peer that stamps and left the last input unanswered:
+    /// a burst whose first presses were acknowledged is not an app that said
+    /// nothing, and its answer says how many were.
+    acked: usize,
     /// How many inputs of the burst the app's newest ack for each calls
     /// [`Dropped`](InputStatus::Dropped).
     ///
@@ -1651,6 +1797,17 @@ struct Observed {
     /// known, and [`changed`](Self::changed) being empty means it did not
     /// change rather than that nothing came.
     credited: bool,
+    /// From a peer whose hello said it stamps: it published a tree without a
+    /// stamp where an app that stamps cannot, so the rest of the window was
+    /// read the way a peer that does not stamp is read, every tree compared
+    /// with the one the input was aimed at. See [`observe`].
+    degraded: bool,
+    /// From a peer that stamps: the connection no longer owes the one
+    /// unstamped tree an app that stamps can send after an ack, because an
+    /// earlier call found so, or a tree arrived with a stamp, or one arrived
+    /// that surely followed one of this burst's `Delivered` acks on the wire.
+    /// Kept per connection, in [`StampClaim::settled`].
+    settles: bool,
     /// The state the bridge was left in when the app went away and had not
     /// come back by the end of the window.
     ///
@@ -1738,14 +1895,44 @@ struct Observed {
 ///
 /// An `Ignored` ack still ends the wait early: at once when the credited tree
 /// is already in, and otherwise at the first one to come, or [`UPDATE_WAIT`]
-/// after the ack if none does. A `Dropped` ack ends it at once, as for any
-/// peer.
+/// after the ack if none does. So does the app going away: the first
+/// departure brings the deadline forward to [`UPDATE_WAIT`] after it, which
+/// is time for a restarted app's tree and no more, so an acknowledged quit or
+/// a crash is answered within half a second of it rather than at the cap. A
+/// `Dropped` ack ends it at once, as for any peer. Neither moves the deadline
+/// later than it was.
 ///
 /// One gap is left, and it is the watch channel's: it keeps only the newest
 /// tree, so a tree stamped below the burst and the credited one arriving back
 /// to back can be read as the credited one alone, and the baseline is then
 /// the tree before both. The earlier input's effect is then read as this
 /// call's.
+///
+/// ## A claim to stamp that does not hold
+///
+/// Once the app has dequeued an input, every tree it publishes is stamped,
+/// so a tree without a stamp after a `Delivered` ack breaks the claim its
+/// hello made, with one exception the reference adapter can produce: its
+/// writer sends the acks queued before each snapshot, so a tree published
+/// before the connection's first dequeue can go out right after that
+/// dequeue's ack, still unstamped. One such tree is let through, as any
+/// unstamped tree is, as the baseline. Once it is spent, by a tree that
+/// surely followed the ack, by any tree with a stamp (nothing the app
+/// publishes after one goes without), or in an earlier call on this
+/// connection (`settled`), a tree without a stamp read after one of this
+/// burst's `Delivered` acks is a broken claim, and the rest of the window is
+/// read as for a peer that does not stamp:
+/// every tree compared with `pre` as 0.3.3 compared it, so a tree that
+/// changed is this call's answer, on the window already running, never a
+/// longer one. [`Observed::degraded`] reports it, and the caller keeps it for
+/// the connection.
+///
+/// "After the ack" is the wire's order, and acks and trees arrive on two
+/// channels. Read in wire order, as the `biased` select reads them, a tree
+/// read after an ack came after it, unless it was already waiting when the
+/// ack was read: then it may be the tree just before the ack, and is not
+/// counted as after it. An app that stamps is never taken for one that does
+/// not.
 ///
 /// # Either way
 ///
@@ -1757,15 +1944,18 @@ struct Observed {
 /// app that received this input is not there any more, and no ack or tree
 /// answers that. An app that comes back inside the window clears it, because
 /// its tree is a real answer and the better one.
-async fn observe(
+pub(crate) async fn observe(
     mut acks: broadcast::Receiver<(InputId, InputStatus)>,
     mut rx: watch::Receiver<BridgeState>,
     pre: &AppSnapshot,
     ids: &[InputId],
     stamped: bool,
+    settled: bool,
 ) -> Observed {
     let mut seen = Observed {
         stamped,
+        // What an earlier call learned of this connection holds for this one.
+        settles: settled,
         ..Observed::default()
     };
     let mut reconnected = false;
@@ -1780,7 +1970,15 @@ async fn observe(
     // before the app dequeued any of this burst. Only a peer that stamps
     // moves it.
     let mut baseline = pre.parsed.root.clone();
-    let started = tokio::time::Instant::now();
+    // Whether a `Delivered` ack for this burst has been read, and whether a
+    // tree was already waiting in the channel when the first one was: that
+    // tree may have come before the ack on the wire.
+    let mut delivered = false;
+    let mut waiting_at_delivery = false;
+    // Whether a departure has brought the deadline forward already: only
+    // the first one does, so an app that keeps reconnecting cannot hold the
+    // call open past half a second from when it first went.
+    let mut departed = false;
     let window = if stamped { SETTLE_WAIT } else { UPDATE_WAIT };
     let deadline = tokio::time::sleep(window);
     tokio::pin!(deadline);
@@ -1809,6 +2007,14 @@ async fn observe(
                         .iter()
                         .filter(|fate| **fate == Some(InputStatus::Dropped))
                         .count();
+                    seen.acked = fates.iter().filter(|fate| fate.is_some()).count();
+                    // Only `Delivered` says the app dequeued the input, which
+                    // is what obliges it to stamp: `Ignored` alone is also the
+                    // answer to a kind it cannot read, which never stamps.
+                    if status == InputStatus::Delivered && !delivered {
+                        delivered = true;
+                        waiting_at_delivery = rx.has_changed().unwrap_or(false);
+                    }
                     // Every id counts towards the drop tally, but only the
                     // last one decides when there is nothing left to wait for.
                     if Some(acked) != last {
@@ -1836,9 +2042,7 @@ async fn observe(
                     // so the wait is for that one tree, and no longer than a
                     // peer that does not stamp would have waited for any.
                     if stamped && status == InputStatus::Ignored {
-                        let by = (tokio::time::Instant::now() + UPDATE_WAIT)
-                            .min(started + SETTLE_WAIT);
-                        deadline.as_mut().reset(by);
+                        bring_forward(deadline.as_mut());
                     }
                 }
                 // Lagging drops the oldest acks, and the oldest are this
@@ -1858,11 +2062,48 @@ async fn observe(
                     state @ (BridgeState::Never | BridgeState::Disconnected { .. }) => {
                         reconnected = true;
                         seen.gone = Some(state);
+                        // A peer that does not stamp has only half a second
+                        // in all. One that does would otherwise hold an
+                        // acknowledged quit, or a crash, for the whole cap,
+                        // for a tree its exit means is not coming.
+                        if stamped && !departed {
+                            departed = true;
+                            bring_forward(deadline.as_mut());
+                        }
                     }
                     BridgeState::Connected(snapshot) => {
                         seen.gone = None;
+                        // Surely after a `Delivered` ack of this burst on the
+                        // wire: read after it, and not already waiting when
+                        // it was read. Only the first tree read after the ack
+                        // can have been waiting. A reconnect ends the
+                        // question: the tree is a fresh connection's, and the
+                        // ack was the last one's.
+                        let after_delivery = !reconnected
+                            && delivered
+                            && !std::mem::take(&mut waiting_at_delivery);
+                        let unstamped = snapshot.parsed.after_input.is_none();
+                        if stamped
+                            && !reconnected
+                            && !seen.degraded
+                            && delivered
+                            && unstamped
+                            && seen.settles
+                        {
+                            seen.degraded = true;
+                            seen.credited = false;
+                        }
+                        // The one unstamped tree is spent by a tree surely
+                        // after the ack, and by any stamped tree: the app
+                        // publishes nothing unstamped after one.
+                        seen.settles |= after_delivery || (!reconnected && !unstamped);
                         let answers = if reconnected {
                             true
+                        } else if seen.degraded {
+                            // The claim did not hold, so the stamp cannot
+                            // say which tree follows this input: read as a
+                            // bridge built before stamps read every peer.
+                            !same_tree_unstamped(&snapshot.parsed, &pre.parsed)
                         } else if stamped {
                             match stamp_of(&snapshot.parsed, ids) {
                                 Stamp::Before => {
@@ -1894,6 +2135,16 @@ async fn observe(
             }
         }
     }
+}
+
+/// Bring `deadline` forward to [`UPDATE_WAIT`] from now, if that is sooner.
+///
+/// Never later than it was, so never past the [`SETTLE_WAIT`] cap, and a
+/// second reason to end early (an `Ignored` ack after a departure, a second
+/// `Ignored` for the same input) cannot push back the first.
+fn bring_forward(deadline: std::pin::Pin<&mut tokio::time::Sleep>) {
+    let by = (tokio::time::Instant::now() + UPDATE_WAIT).min(deadline.deadline());
+    deadline.reset(by);
 }
 
 /// Where a snapshot's stamp falls against a burst of inputs.
@@ -1930,6 +2181,12 @@ fn stamp_of(snapshot: &taria::Snapshot, ids: &[InputId]) -> Stamp {
 
 /// Whether two snapshots are the same as a bridge built before stamps saw
 /// them: every field but `after_input`, which such a bridge never read.
+///
+/// Field by field rather than a derived `==`, which now counts the stamp, so
+/// it does not follow [`Snapshot`](taria::Snapshot) on its own: when the
+/// snapshot gains a field, add it here unless, like `after_input`, it says
+/// when the tree was published rather than what it is. `Snapshot` is
+/// `#[non_exhaustive]`, so no destructuring here can make the compiler say so.
 fn same_tree_unstamped(a: &taria::Snapshot, b: &taria::Snapshot) -> bool {
     a.protocol_version == b.protocol_version && a.seq == b.seq && a.root == b.root
 }
@@ -1940,7 +2197,7 @@ fn same_tree_unstamped(a: &taria::Snapshot, b: &taria::Snapshot) -> bool {
 /// ignored the input and published nothing newer. `sent` is how many inputs
 /// the burst carried, which the two partial answers need: a drop somewhere in
 /// the burst, and an observation with acks missing from it.
-fn report(
+pub(crate) fn report(
     seen: Observed,
     fallback: AppSnapshot,
     sent: usize,
@@ -2086,10 +2343,26 @@ fn report(
         (Some(InputStatus::Delivered), None) => Ok(text_result(delivered_without_a_tree(
             seen.stamped,
             seen.credited,
+            seen.degraded,
         ))),
         // No ack at all is how an adapter that predates acks behaves. Its
         // changed tree is the only answer it can give, and answer enough.
         (None, Some(snapshot)) => tree_result(&snapshot, format),
+        // A peer that stamps acks every input it dequeues, ahead of the tree
+        // it publishes next, so its silence has texts of its own: neither
+        // 0.3.3's "it may not report acknowledgements" nor its "changed its
+        // tree" is true of it.
+        (None, None) if seen.stamped => Ok(text_result(stamped_silence(
+            &Silence {
+                rejected: seen.rejected,
+                stopped: seen.stopped,
+                window: seen.window,
+                credited: seen.credited,
+                degraded: seen.degraded,
+                acked: seen.acked,
+            },
+            sent,
+        ))),
         // Silence, with the one thing that can turn out not to be silence
         // at all: a line the app sent in this window that the bridge threw
         // away. An ack whose status this build cannot name is exactly that,
@@ -2163,12 +2436,16 @@ fn window(stamped: bool) -> Duration {
 /// input and published nothing after it, which is a slow handler or an app
 /// that publishes only on change, so the answer says it may still be working
 /// rather than that nothing changed.
-fn delivered_without_a_tree(stamped: bool, credited: bool) -> String {
-    if !stamped {
+///
+/// A peer whose claim to stamp broke during the call (`degraded`) was read as
+/// one that does not stamp, so it gets that answer, naming the window it was
+/// actually given, which was the stamped one.
+fn delivered_without_a_tree(stamped: bool, credited: bool, degraded: bool) -> String {
+    if !stamped || degraded {
         format!(
             "The app received this input, and its tree did not change within {}ms. Call \
              read_tree if you expect a delayed effect.",
-            UPDATE_WAIT.as_millis()
+            window(stamped).as_millis()
         )
     } else if credited {
         "The app received this input, and its tree did not change.".to_string()
@@ -2178,6 +2455,87 @@ fn delivered_without_a_tree(stamped: bool, credited: bool) -> String {
              still be working. Call read_tree to see its effect.",
             SETTLE_WAIT.as_millis()
         )
+    }
+}
+
+/// What [`stamped_silence`] reads of an [`Observed`] whose last input got no
+/// ack and no tree to answer with.
+struct Silence {
+    rejected: Option<String>,
+    stopped: Option<Stopped>,
+    window: Option<Duration>,
+    credited: bool,
+    degraded: bool,
+    acked: usize,
+}
+
+/// The answer to a burst of `sent` inputs, from a peer that stamps, whose
+/// last input the app neither acknowledged nor answered with a changed tree
+/// inside the window.
+///
+/// Such a peer acks every input it dequeues, before the tree it publishes
+/// next, so silence from it is never an app that does not report
+/// acknowledgements, which is what a peer that does not stamp is told it may
+/// be. It is an app that is stuck, busy or stopped, or one whose answer this
+/// bridge could not read. And "changed its tree" is the wrong test for it: a
+/// tree stamped before the input can change without answering it.
+///
+/// Four answers, in the order of what is known:
+///
+/// - A tree stamped at the input arrived unchanged. The stamp says the app
+///   dequeued it, which is what `Delivered` would have said, and the tree
+///   says nothing came of it, so the answer is "did not change", ack or not.
+/// - A line arrived that this bridge could not read, which may have been the
+///   ack, as for a peer that does not stamp.
+/// - The app is stopped ([`Stopped`]), which answers the silence outright.
+/// - Neither, and the agent is sent to `read_tree`.
+///
+/// A burst whose first inputs were acknowledged says how many: it is not an
+/// app that said nothing, and the inputs it took may have landed. The window
+/// is the whole of [`SETTLE_WAIT`], since only an ack or a departure ends the
+/// wait early and there was neither for the last input. A peer whose claim to
+/// stamp broke during the call is said to have not changed its tree rather
+/// than to have published none, since its trees could not be placed.
+fn stamped_silence(silence: &Silence, sent: usize) -> String {
+    if silence.credited {
+        return delivered_without_a_tree(true, true, false);
+    }
+    let partial = silence.acked > 0;
+    let after = if silence.degraded {
+        "changed its tree"
+    } else {
+        "published a tree after it"
+    };
+    let ms = SETTLE_WAIT.as_millis();
+    let opening = if partial {
+        format!(
+            "The app acknowledged {} of the {sent} inputs this call sent, then neither \
+             acknowledged the last nor {after} within {ms}ms",
+            silence.acked
+        )
+    } else {
+        format!("The app neither acknowledged this input nor {after} within {ms}ms")
+    };
+    if let Some(err) = &silence.rejected {
+        let whose = if partial {
+            "the last input's"
+        } else {
+            "this input's"
+        };
+        return format!(
+            "{opening}, but it did send a line this bridge could not read ({err}). That line may \
+             have been {whose} acknowledgement: an acknowledgement whose status this bridge does \
+             not know fails as a whole and takes the input id with it, so it arrives here as \
+             silence. If it was, matching the app's taria dependency to this bridge's makes it \
+             readable; call read_tree for the current tree either way."
+        );
+    }
+    match silence.stopped {
+        Some(stopped) if partial => {
+            stopped.has_not_read_the_rest(silence.acked, sent, silence.window)
+        }
+        Some(stopped) => stopped.has_not_read(sent, silence.window),
+        None => format!("{opening}; it may be stuck, busy or stopped. Call read_tree to check."),
     }
 }
 
@@ -3453,6 +3811,70 @@ mod tests {
         );
     }
 
+    /// From a peer that stamps, a stop is still the answer to silence, and a
+    /// burst that stopped partway says how many presses the app took before
+    /// it stopped, naming only the rest as unread. A single input, and any
+    /// peer that does not stamp, get the answer every peer got in 0.3.3.
+    #[test]
+    fn a_stopped_stamping_app_names_only_the_inputs_it_has_not_read() {
+        let stopped = Stopped {
+            pid: 4242,
+            stop: Stop::Signal,
+        };
+        let text = |seen: Observed, sent| {
+            let result = report(seen, snapshot("after"), sent, TreeFormat::Json).expect("a result");
+            result_text(&result).to_string()
+        };
+        let stamped = |acked| Observed {
+            stamped: true,
+            stopped: Some(stopped),
+            window: Some(DEFAULT_IDLE_RELEASE),
+            acked,
+            ..Observed::default()
+        };
+        assert_eq!(
+            text(stamped(0), 1),
+            stopped.has_not_read(1, Some(DEFAULT_IDLE_RELEASE))
+        );
+        assert_eq!(
+            text(stamped(0), 3),
+            stopped.has_not_read(3, Some(DEFAULT_IDLE_RELEASE))
+        );
+        assert_eq!(
+            text(stamped(2), 3),
+            "The app (pid 4242) is stopped after acknowledging 2 of the 3 inputs this call sent, \
+             so it has not read the other one yet. It applies the other one if it resumes within \
+             90 s of your last tool call, before this bridge lets go of the app (60 s with no \
+             tool calls, then 30 s more while an input awaits its ack). Resume it (kill -CONT \
+             4242), then call read_tree, and resend the other one if its effect is missing."
+        );
+        assert_eq!(
+            text(
+                Observed {
+                    window: Some(Duration::ZERO),
+                    ..stamped(1)
+                },
+                3
+            ),
+            "The app (pid 4242) is stopped after acknowledging 1 of the 3 inputs this call sent, \
+             so it has not read the other 2 yet; the other 2 wait in the socket, and the app \
+             applies them once resumed, since this bridge never lets go of the app. Resume it \
+             (kill -CONT 4242), then call read_tree, and resend the other 2 if their effect is \
+             missing."
+        );
+        assert_eq!(
+            text(
+                Observed {
+                    stamped: false,
+                    ..stamped(2)
+                },
+                3
+            ),
+            stopped.has_not_read(3, Some(DEFAULT_IDLE_RELEASE)),
+            "a peer that does not stamp is answered as in 0.3.3"
+        );
+    }
+
     /// A `sleep` a test stops, resumed and killed when dropped, so a failing
     /// assertion never leaves a stopped process behind.
     #[cfg(target_os = "linux")]
@@ -3614,7 +4036,15 @@ mod tests {
             let _ = ack_tx.send((InputId::new(id), InputStatus::Delivered));
         }
 
-        let seen = observe(acks, rx, &pre, &[1, 2, 3, 4].map(InputId::new), false).await;
+        let seen = observe(
+            acks,
+            rx,
+            &pre,
+            &[1, 2, 3, 4].map(InputId::new),
+            false,
+            false,
+        )
+        .await;
         assert_eq!(seen.lost, 2, "skipped acks must be counted: {seen:?}");
 
         let err = report(seen, pre, 4, TreeFormat::Json)
@@ -3651,6 +4081,9 @@ mod tests {
             window: None,
             stamped: false,
             credited: false,
+            degraded: false,
+            settles: false,
+            acked: 0,
         };
         let err = report(seen, snapshot("after"), 5, TreeFormat::Json)
             .expect_err("lost acks are not a success");
@@ -3677,6 +4110,9 @@ mod tests {
             window: None,
             stamped: false,
             credited: false,
+            degraded: false,
+            settles: false,
+            acked: 0,
         };
         let err = report(seen, snapshot("after"), 1, TreeFormat::Json)
             .expect_err("lost acks are not a success");
@@ -3722,7 +4158,7 @@ mod tests {
         let _ = ack_tx.send((InputId::new(1), InputStatus::Dropped));
         let _ = ack_tx.send((InputId::new(2), InputStatus::Dropped));
 
-        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new), false).await;
+        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new), false, false).await;
         assert_eq!(
             seen.dropped, 2,
             "two inputs were dropped however many acks said so: {seen:?}"
@@ -3754,7 +4190,7 @@ mod tests {
         // The last input's `Dropped` ends the window, so this stays fast.
         let _ = ack_tx.send((InputId::new(2), InputStatus::Dropped));
 
-        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new), false).await;
+        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new), false, false).await;
         assert_eq!(
             seen.dropped, 1,
             "only the input whose newest ack is a drop counts: {seen:?}"
@@ -3790,7 +4226,7 @@ mod tests {
             last_seq: 7,
         });
 
-        let seen = observe(acks, rx, &pre, &[1].map(InputId::new), false).await;
+        let seen = observe(acks, rx, &pre, &[1].map(InputId::new), false, false).await;
         assert!(
             seen.gone.is_some(),
             "a departure must be recorded: {seen:?}"
@@ -3939,7 +4375,7 @@ mod tests {
             state_tx.send_replace(BridgeState::Connected(after));
         });
 
-        let seen = observe(acks, rx, &pre, &[1].map(InputId::new), false).await;
+        let seen = observe(acks, rx, &pre, &[1].map(InputId::new), false, false).await;
         assert!(
             seen.gone.is_none(),
             "an app that came back is not gone: {seen:?}"

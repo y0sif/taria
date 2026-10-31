@@ -65,6 +65,16 @@ NO_CHANGE_STAMPED = "The app received this input, and its tree did not change."
 # only on change. No step expects it of the demo, which publishes every frame.
 NO_TREE_PREFIX = "The app received this input but published no tree after it within"
 NO_ACK_PREFIX = "The app neither acknowledged this input nor changed its tree within"
+# The same silence from a peer that stamps, the demo among them: it acks every
+# input it dequeues, so the answer does not say it may not report acks, and
+# a burst whose first presses were acknowledged says how many were.
+NO_ACK_STAMPED_PREFIX = (
+    "The app neither acknowledged this input nor published a tree after it within"
+)
+NO_ACK_STAMPED_BURST_RE = re.compile(
+    r"The app acknowledged \d+ of the \d+ inputs this call sent, then neither "
+    r"acknowledged the last nor (published a tree after it|changed its tree) within"
+)
 # An input the app took delivery of and did not survive. A result rather than
 # an error, because the input's fate is known and an advertised `quit` reaches
 # this state on purpose; the shape exists so a working quit is not reported as
@@ -221,7 +231,8 @@ def parse_result(text):
       "no_change" the app acked Delivered but published nothing new
       "no_tree"   the app acked Delivered and, though it stamps its trees,
                   published none after the input inside the bridge's window
-      "no_ack"    no ack and no new tree inside the bridge's window
+      "no_ack"    no ack and no new tree inside the bridge's window (for a
+                  burst to a peer that stamps: no ack for its last input)
       "gone"      the app acked the input and then disconnected; no tree,
                   because the app it would describe is gone
 
@@ -245,7 +256,11 @@ def parse_result(text):
         return "no_change", None
     if text.startswith(NO_TREE_PREFIX):
         return "no_tree", None
-    if text.startswith(NO_ACK_PREFIX):
+    if (
+        text.startswith(NO_ACK_PREFIX)
+        or text.startswith(NO_ACK_STAMPED_PREFIX)
+        or NO_ACK_STAMPED_BURST_RE.match(text)
+    ):
         return "no_ack", None
     if text.startswith(GONE_PREFIX):
         return "gone", None
@@ -1841,6 +1856,8 @@ def step_u_dropped_counter(ctx):
 # (`TARIA_DEMO_SLOW_MS`): past the 500 ms a bridge gives a peer that does not
 # stamp, well inside the 3 s it gives one that does.
 SLOW_MS = 800
+# The bridge's cap on a wait for a peer that stamps (`SETTLE_WAIT`), in s.
+SETTLE_S = 3.0
 
 
 def step_aa_slow_handler_credited(ctx):
@@ -1897,8 +1914,14 @@ def step_aa_slow_handler_credited(ctx):
                     f"re-selecting the tab on screen should read as no change "
                     f"from a demo that stamps; answered {kind!r}: {text[:200]}",
                 )
+                # A bridge that waited out its cap answers at 3 s or later
+                # with these same words, so the bound has to sit under the
+                # cap; anything under it says the answer came on the stamped
+                # tree. The quarter second short of it is all the margin the
+                # check needs, and leaves a slow runner almost 2 s past the
+                # handler's 0.8 s for the frame and the round trip.
                 require(
-                    took < 2.5,
+                    took < SETTLE_S - 0.25,
                     f"the unchanged act took {took:.3f}s: the bridge waited out "
                     "its cap instead of answering on the stamped tree",
                 )

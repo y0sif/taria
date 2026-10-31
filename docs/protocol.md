@@ -69,8 +69,8 @@ the app is the one that speaks first (section 3).
 2. Send exactly one `hello` as the first message on every accepted connection,
    before any other message (section 3).
 3. Publish `snapshot` messages whose `protocol_version` is 1, whose `seq`
-   increases within one run, and whose tree obeys section 6 and the depth
-   limit in section 13.
+   never decreases within one run and repeats only on the resend section 5.1
+   allows, and whose tree obeys section 6 and the depth limit in section 13.
 4. Answer every `input` message it reads on a live connection with at least
    one `ack` naming the same `id` (section 10). An input the app cannot act on
    is answered `ignored`, not left unanswered. The exceptions are a line
@@ -285,13 +285,13 @@ the reference adapter does from 0.4.0:
 | `type` | string | yes | `"hello"` |
 | `app_label` | string | yes | Human-readable app name shown to agents, typically the binary name. |
 | `protocol_version` | integer (u32) | yes | The version this app speaks. `1` for this specification. |
-| `stamps` | boolean | no | `true` when every snapshot this app sends on the connection carries `after_input` as section 5.3 defines it. **Omitted when false.** Added in 0.4.0. |
+| `stamps` | boolean | no | `true` when this app stamps its snapshots on the connection by the rules of section 5.3. **Omitted when false.** Added in 0.4.0. |
 
 A reader **MUST** read `stamps` leniently: anything but `true`, a wrong type
 included, reads as a peer that does not stamp, and fails nothing else in the
 line. An app **MUST NOT** say `"stamps":true` unless it stamps every
-snapshot by the rules of section 5.3, since a bridge that believes it will
-answer "did not change" on the strength of an unchanged stamped tree.
+snapshot by the rules of section 5.3, since a bridge that believes the claim
+answers "did not change" on one unchanged stamped tree.
 
 `app_label` is free-form UTF-8. No length bound and no character restriction
 is specified for it. It is not the same thing as the socket label, which does
@@ -327,7 +327,7 @@ one.
 Immediately after `hello` the app **SHOULD** send its latest snapshot, if it
 has one, so a bridge that connects mid-session is not left with no tree until
 the app's next state change. The reference adapter does exactly this, then
-streams every subsequent publish.
+streams every later publish and stamp resend (section 14.5).
 
 ### 3.5 An app that sends no hello
 
@@ -398,8 +398,9 @@ adding to this direction is narrower than "additive": see section 16.4.
 
 Every field marked required is required in both directions. Verified:
 removing any one of them from an otherwise valid line fails the parse with
-"missing field". The two optional ones were added in 0.4.0 (section 16.9);
-a line without them is a line from a peer that does not stamp.
+"missing field". The two optional ones were added in 0.4.0 (section 16.9).
+A hello without `stamps` is from a peer that does not stamp; a snapshot
+without `after_input` is unstamped.
 
 ## 5. Snapshot
 
@@ -414,7 +415,7 @@ own fields, not nested under one.
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `protocol_version` | integer (u32) | yes | The version the snapshot is written in. Always emitted. |
-| `seq` | integer (u64) | yes | Publish counter within one app run. Always emitted. |
+| `seq` | integer (u64) | yes | Counts the trees published within one app run; repeats only on a resend whose sole change is `after_input` (section 5.1). Always emitted. |
 | `after_input` | integer (u64) | no | The newest input id the app had dequeued on this connection when it published the tree (section 5.3). **Omitted when unset**, and written before `root`. |
 | `root` | Node | yes | The root of the tree. Always emitted. |
 
@@ -428,25 +429,27 @@ an input on the connection. A stamped snapshot:
 
 ### 5.1 `seq`
 
-`seq` increments once per **published** snapshot within one run of the app. It
-says which of two snapshots from the same run is the newer one and nothing
-beyond that.
+`seq` counts the trees an app publishes within one run; it never decreases,
+and repeats only on a resend whose sole change is `after_input`. It says which
+of two snapshots from the same run is the newer one, and that two from the
+same run under one `seq` carry the same tree, and nothing beyond that.
 
 - A restarted app starts counting again, so a **lower `seq` with different
   content is a change, not a stale tree**. A reader **MUST NOT** order
   snapshots by `seq` across connections, and **SHOULD** detect change by
-  comparing whole snapshots rather than by `seq`.
+  comparing trees, the `root` of each, rather than by `seq`.
 - `seq` counts publishes, not frames. A sender **MAY** skip publishing a tree
   identical to the one it last published, in which case `seq` does not move
   (the reference adapter deduplicates exactly this way, and the whole publish
   is skipped).
 - The one exception is a stamp moving (section 5.3). An app that stamps and
-  has dequeued an input since its last snapshot went out **MUST NOT** skip
-  the next tree it publishes, identical or not. If it is identical, it
-  **SHOULD** send the last snapshot again, unchanged but for `after_input`
-  and under the **same `seq`**, which is what the reference adapter does. A
-  reader that ignores `after_input` then sees the same snapshot twice, and
-  one that compares whole snapshots reads it as unchanged, `seq` included.
+  has dequeued an input since its last snapshot went out **MUST** send a
+  snapshot for the next tree it builds, identical or not. If that tree is
+  identical, the app **SHOULD** send the last snapshot again, unchanged but
+  for `after_input` and under the **same `seq`**, which is what the
+  reference adapter does. Such a resend is not a publish: no new tree went
+  out, so `seq` does not move. A reader that ignores `after_input` then sees
+  the same snapshot twice, `seq` included, and reads it as unchanged.
 - No behaviour is specified for `seq` reaching the u64 maximum.
 
 ### 5.2 `protocol_version` on the snapshot
@@ -488,18 +491,31 @@ these rules on that connection:
   first snapshot a new connection receives, the latest one resent on accept
   (section 3.4), **MUST** go out unstamped, and stamps on a connection name
   only inputs that arrived on it.
-- **No skipped stamp.** Once the app has dequeued an input, the next tree it
-  publishes **MUST** go out stamped, even when it is identical to the last
-  one (section 5.1).
-- **Acks first.** Section 10.4 applies to stamped snapshots too: an `ignored`
-  ack for an input **MUST** reach the bridge before any snapshot published
-  after it, the resend of an identical tree included.
+- **No skipped stamp.** Once the app has dequeued an input, it **MUST** send
+  a stamped snapshot for the next tree it builds, even when that tree is
+  identical to the last one (section 5.1).
+- **Acks first.** An app that answers an input `ignored` **SHOULD** send that
+  ack before the first snapshot it publishes after dequeuing the input. That
+  snapshot is the one a bridge credits to the input, and an `ignored` behind
+  it arrives after the answer has gone out. Section 10.4 keeps an ack ahead
+  of every snapshot sent after it, a resend included, so an app that decides
+  inside the drain and acks there keeps this rule for free; the reference
+  adapter's `drain` does. An app that can decide only later **SHOULD**
+  publish, in that first snapshot, a status node saying the input is under
+  way, so the answer it is credited with says so.
 
 A stamp covers the dequeue, not the effect. An app that publishes between
 taking an input and applying it sends a stamped tree without the effect, and
 a bridge credits that tree to the input. The integration guide ("Drain agent
 input around the blocking call") asks for the first tree published after a
 drain to carry the effect, or a status saying it is under way.
+
+Nor does a stamp separate two inputs applied in one drain. A handler slower
+than the bridge's wait (3 s in the reference bridge) whose next input is
+already queued can have both applied in one drain, before the app publishes
+again, so the one tree, stamped at the later id, carries the earlier input's
+effect too, and the earlier input's call has already ended without a
+credited tree.
 
 A bridge that reads stamps **SHOULD** treat them like this, which is what the
 reference bridge does against a peer whose `hello` said `stamps`:
@@ -520,6 +536,12 @@ reference bridge does against a peer whose `hello` said `stamps`:
   baseline.
 - Strip `after_input` from what it hands an agent, as it strips `type`
   (section 16.6).
+- Answer a call by the rules for a peer that does not stamp when the peer's
+  hello said `stamps` but its snapshots go out unstamped where these rules
+  require a stamp: a tree that differs from the one before the input is then
+  credited, as it was before stamps existed. Its claim and its snapshots
+  disagree, and believing the claim would leave every input waiting for a
+  stamp that never comes.
 
 **Reference implementation.** The reference bridge waits up to 3 s for a
 credited tree from a peer that stamps, against 500 ms for one that does not,
@@ -528,10 +550,15 @@ this input, and its tree did not change." With no credited tree inside the
 3 s it answers "The app received this input but published no tree after it
 within 3000ms; it may still be working. Call read_tree to see its effect." An
 `ignored` ack still ends the wait early, at the first credited tree, or
-500 ms after the ack when none comes; a `dropped` ack ends it at once. Its
-snapshot channel keeps only the newest tree, so a tree stamped below the
-input and the credited one arriving back to back can be read as the credited
-one alone, compared with the tree before both: the one gap it leaves.
+500 ms after the ack when none comes; a `dropped` ack ends it at once. A
+disconnect mid-wait is answered within 500 ms of the disconnect, inside the
+3 s cap. Its no-ack and rejected-line answers to a peer that stamps name the
+3000ms window, not the 500ms one. A peer that said `stamps` and sends
+unstamped snapshots is degraded for that call as above, and the bridge logs
+a warning. Its snapshot channel keeps only the newest tree, so a tree stamped
+below the input and the credited one arriving back to back can be read as
+the credited one alone, compared with the tree before both: the one gap it
+leaves.
 
 ## 6. Node
 
@@ -1149,8 +1176,9 @@ snapshot post-dates the input.
 What it may read instead is the stamp. A snapshot from a peer that stamps
 (section 5.3) says in `after_input` which inputs it post-dates, whatever
 order it arrived in, and the rule above holds for stamped snapshots too: a
-resend of an identical tree with its stamp moved is a snapshot published
-after the acks queued before it, and goes out behind them.
+resend of an identical tree with its stamp moved is not a publish (section
+5.1), but it is sent after the acks queued before it, and goes out behind
+them.
 
 ### 10.5 No fallback for an unknown status
 
@@ -1489,8 +1517,9 @@ does. On accept it sends, in this order:
 
 1. the `hello`,
 2. the latest snapshot, if it has one, unstamped (section 5.3),
-3. every subsequent publish, as it happens, the stamped resend of an
-   identical tree included (section 5.1).
+3. every snapshot published after that, as it happens, and every resend of
+   the last one with only its stamp moved, which is not a publish (section
+   5.1).
 
 Multiple simultaneous bridge clients per app are a deferred feature, not a
 protocol rule. With a one-at-a-time adapter, a second bridge's `connect`
@@ -1824,6 +1853,15 @@ is one behaviour, which section 5.1 now allows: an app that stamps sends its
 latest snapshot again, under the same `seq`, when the app has dequeued an
 input since it went out.
 
+That resend moves what `seq` promises, from one number per snapshot sent to
+one per tree published, and section 16.7 makes a change of meaning the one
+that forces a bump. It does not force one here, because nothing an older
+reader could infer from `seq` stops being true. Within one run `seq` still
+never decreases, so a higher one is still the newer tree, and an equal one
+still means the same tree: the resend differs only in `after_input`, which
+such a reader never reads. Across runs `seq` promised nothing before and
+promises nothing now (section 5.1).
+
 - **An older reader** ignores both fields as unknown (section 2.7). It reads
   the hello it always read, and every snapshot as the snapshot it was. The
   resend of an identical tree is, to it, the same snapshot twice: `seq` and
@@ -1832,13 +1870,21 @@ input since it went out.
 - **An older reference bridge** from 0.1.0 to 0.3.3 hands the agent the app's
   own line (section 16.6), so its JSON tree shows `"after_input":N` once the
   app has dequeued an input, and its outline, in 0.3.0 to 0.3.3, shows
-  `after_input=N` among the header's fields. Its answers do not move: it
-  still waits its 500 ms and still reads a slow handler as "did not change",
-  the behaviour issue #17 is about, which only a bridge that reads the stamp
-  avoids.
+  `after_input=N` among the header's fields. To an agent that can look like
+  a change, since two reads of one tree differ in it, and it names an input
+  id the agent never sent: ids are the bridge's, and no tool shows them.
+  Its answers do not move: it still waits its 500 ms and still reads a slow
+  handler as "did not change", the behaviour issue #17 is about, which only
+  a bridge that reads the stamp avoids.
 - **An older app** sends neither field. A bridge that reads stamps answers it
   as it answered every peer before stamps existed, window and texts
   included: the reference bridge does so byte for byte.
+- **An app that claims stamps and does not stamp** says `"stamps":true` and
+  sends unstamped snapshots where section 5.3 requires a stamp. A bridge that
+  reads stamps degrades that call to the rules for a peer that does not
+  stamp, so a tree that differs is credited as it was before stamps existed,
+  rather than leaving every input waiting for a stamp that never comes. The
+  reference bridge also logs a warning, since the claim is the app's bug.
 - **Leniently read.** A `stamps` that is not `true`, and an `after_input`
   that is not an unsigned 64-bit integer, read as absent rather than failing
   the line: the hello would otherwise take the version and label with it,
@@ -1945,7 +1991,8 @@ What to read out of it:
 ### 18.2 The four ack shapes
 
 From a second capture against the same app, showing every acknowledgement
-pattern in one session:
+pattern in one session. The `hello` and the unstamped `seq` 1 the app sent on
+accept, the same two lines that open section 18.1, are left out:
 
 ```
 bridge->app	{"type":"input","id":1,"input":{"kind":"text","text":"hello"}}

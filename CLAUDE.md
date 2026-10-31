@@ -75,9 +75,11 @@ refuses a `target/debug` older than the sources.
   `stamps: true`. Input arrives via `drain`/`try_recv`/`recv_timeout` (the
   last two hand over the `InputId`), acked `Delivered` on dequeue, `Dropped`
   when the queue is full, and `Ignored` when the app says so, by returning it
-  from `drain` or calling `ack`. The wildcard arm `#[non_exhaustive]` forces
-  on a `match` over `AgentInput` is the arm that swallows `Text`; the demo
-  carries `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are
+  from `drain` or calling `ack`, before its next publish: the first tree
+  after a dequeue answers the input, so a later `Ignored` is too late. The
+  wildcard arm `#[non_exhaustive]` forces on a `match` over `AgentInput` is
+  the arm that swallows `Text`; the demo carries
+  `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are
   flushed before the snapshot published after them, from a bounded queue that
   drops its oldest, and once more at shutdown, within `SHUTDOWN_FLUSH` (250
   ms). Inputs are tagged with their connection's generation and discarded (not
@@ -135,11 +137,15 @@ refuses a `target/debug` older than the sources.
   partial burst, lost acks, and the app disconnecting. Against a peer whose
   hello says `stamps`, a tree is credited to an input only once stamped at or
   after its id (ids are claimed and queued under one lock, so id order is send
-  order), compared on `root`; an earlier-stamped tree rebases, an unchanged
-  credited tree answers "did not change." at once, and the cap is 3 s
-  (`SETTLE_WAIT`), `Ignored` 500 ms past its ack. Any other peer keeps the 500
-  ms window (`UPDATE_WAIT`) and 0.3.3's texts byte for byte. The stamp is
-  stripped like `type`. A protocol mismatch keeps `read_tree` for as long as
+  order), compared on `root`; an earlier-stamped tree is the new baseline, an
+  unchanged credited tree answers "did not change." at once, and the cap is
+  3 s (`SETTLE_WAIT`), `Ignored` at the first credited tree, or 500 ms past
+  its ack, within the 3 s. A disconnect mid-wait is answered within 500 ms
+  of it, inside the cap; a peer that says `stamps` but sends unstamped
+  snapshots is read by the unstamped rules for that call (a changed tree is
+  credited), with a warning logged. Any other peer keeps the 500 ms window
+  (`UPDATE_WAIT`) and 0.3.3's texts byte for byte. The stamp is stripped
+  like `type`. A protocol mismatch keeps `read_tree` for as long as
   the peer's snapshots parse, and refuses every input tool. When lines from
   the app were rejected, `read_tree` says the socket path is right and quotes
   the reason rather than sending an adopter back to check the path. A line
@@ -184,6 +190,9 @@ refuses a `target/debug` older than the sources.
   task landed on, so the effect is in the next snapshot.
   At exit it prints every nonzero layer counter. The draft is published
   whole on purpose: e2e step w grows it past 1 MiB to make the adapter trim.
+  `TARIA_DEMO_SLOW_MS=<n>` holds each agent input `n` ms between its dequeue
+  and its effect, so issue #17 reproduces; e2e step aa runs the demo at 800
+  and holds three acts to their own answers.
   `tree.rs` and `update.rs` are pure and unit-tested, including the
   one-focused-node and modal-dialog invariants.
 

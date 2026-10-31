@@ -630,22 +630,36 @@ impl TariaLayer {
     ///
     /// Reach for [`drain`](Self::drain) first: it loops this and sends those
     /// acks itself. Loop this by hand when the app needs the id for something
-    /// else, such as an input it can only answer after a later frame:
+    /// else, such as remembering which input started a job:
     ///
     /// ```no_run
-    /// # use taria_ratatui::{InputStatus, TariaLayer};
-    /// # fn apply(_input: taria_ratatui::taria::AgentInput) {}
+    /// # use taria_ratatui::{InputId, InputStatus, TariaLayer};
+    /// # enum Outcome { Applied, Refused, Started }
+    /// # fn apply(_input: taria_ratatui::taria::AgentInput) -> Outcome { Outcome::Applied }
     /// # let layer = TariaLayer::bind_or_disabled("my-app");
-    /// let mut pending = Vec::new();
+    /// let mut jobs: Vec<InputId> = Vec::new();
     /// while let Some((id, input)) = layer.try_recv() {
-    ///     apply(input);
-    ///     pending.push(id);
-    /// }
-    /// // A later frame shows nothing came of them.
-    /// for id in pending {
-    ///     layer.ack(id, InputStatus::Ignored);
+    ///     match apply(input) {
+    ///         Outcome::Applied => {}
+    ///         // Now, before the frame that follows publishes: the layer
+    ///         // sends every queued ack ahead of the next snapshot.
+    ///         Outcome::Refused => layer.ack(id, InputStatus::Ignored),
+    ///         // Under way: the next frame publishes a node saying so, and
+    ///         // the job's result lands in a later one.
+    ///         Outcome::Started => jobs.push(id),
+    ///     }
     /// }
     /// ```
+    ///
+    /// An [`Ignored`](InputStatus::Ignored) ack belongs before the first
+    /// snapshot the app publishes after dequeuing the input. A bridge that
+    /// reads stamps (section 5.3 of `docs/protocol.md`) answers on that
+    /// snapshot, so an `Ignored` sent a frame later arrives after the agent
+    /// has been told the input changed nothing. The layer writes queued acks
+    /// ahead of the next snapshot, so an ack sent before the frame that
+    /// follows the dequeue is always in time. An app that can only decide
+    /// later should not hold the ack back: it publishes a status node saying
+    /// the input is under way, and the tree carries the outcome when it comes.
     ///
     /// Inputs left over from a bridge connection that has since ended are
     /// discarded here rather than handed over, and input a client wrote before
@@ -745,9 +759,14 @@ impl TariaLayer {
     /// reading slower than the app answers costs the refinements queued
     /// behind it (see [`LayerStats::dropped_acks`]).
     ///
-    /// An app that needs the id for something else, such as an input it can
-    /// only answer after a later frame, loops [`try_recv`](Self::try_recv)
-    /// instead and calls [`ack`](Self::ack) itself.
+    /// The statuses go out before the snapshot of the frame that follows, the
+    /// order a bridge that reads stamps needs: an `Ignored` it reads after the
+    /// first tree published after the input comes too late to change its
+    /// answer (see [`try_recv`](Self::try_recv)).
+    ///
+    /// An app that needs the id for something else, such as remembering which
+    /// input started a job, loops [`try_recv`](Self::try_recv) instead and
+    /// calls [`ack`](Self::ack) itself, before that frame publishes.
     pub fn drain(&self, mut f: impl FnMut(AgentInput) -> InputStatus) {
         while let Some((id, input)) = self.try_recv() {
             let status = f(input);
@@ -770,8 +789,13 @@ impl TariaLayer {
     /// kind this build has never heard of. [`InputStatus::Ignored`] draws the
     /// line, including why a key bound to nothing is still delivered.
     ///
-    /// The ack travels the same path as snapshots, so it can never overtake
-    /// the snapshot published after it. Does nothing on a disabled layer.
+    /// The ack travels the same path as snapshots and goes out ahead of the
+    /// next one, so the snapshot published after it can never overtake it.
+    /// Send it before the app publishes its first snapshot after dequeuing
+    /// the input: a bridge that reads stamps answers on that snapshot, and an
+    /// `Ignored` that follows it arrives after the agent was told the input
+    /// changed nothing (see [`try_recv`](Self::try_recv)). Does nothing on a
+    /// disabled layer.
     ///
     /// An id whose bridge connection has since ended is answered nowhere.
     /// Ids are unique only within a bridge process and a fresh bridge counts

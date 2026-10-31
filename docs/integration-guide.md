@@ -514,11 +514,11 @@ layer stamps every snapshot with the newest input it has handed you
 (`after_input`), and `taria-mcp` credits a tree to an input only once it is
 stamped at that input. So an act your handler takes a second over is still
 answered with its own tree, an act that changes nothing is answered "did not
-change" within a frame, and a tree that lands late is never credited to the
-input after it. The stamp says when you took the input, though, not when you
-applied it. Whatever tree you publish first after the drain is the one the
-agent is handed, so it has to carry the effect, or a status saying the
-effect is under way.
+change" within a frame, and a tree that lands late is no longer credited to
+the input after it, but for one race (protocol section 5.3). The stamp says
+when you took the input, though, not when you applied it. Whatever tree you
+publish first after the drain is the one the agent is handed, so it has to
+carry the effect, or a status saying the effect is under way.
 
 The loop to avoid publishes at the top and applies at the bottom:
 
@@ -534,11 +534,12 @@ while app.running {
 }
 ```
 
-Apply what you drained before the next publish, as the loop above does. If
-the work takes long enough to show, set a status first (a `Role::Status`
-node reading "Switching language", or a `disabled` control) and publish
-that, so the agent's answer says the input is being worked on rather than
-that it changed nothing, then publish the result when it is done.
+Apply what you drained before the next publish, as the first loop in this
+section does. If the work takes long enough to show, set a status first (a
+`Role::Status` node reading "Switching language", or a `disabled` control)
+and publish that, so the agent's answer says the input is being worked on
+rather than that it changed nothing, then publish the result when it is
+done.
 
 Publish every frame, not only when you think the tree changed. The layer
 skips a frame identical to the last one, but right after a dequeue it sends
@@ -651,25 +652,31 @@ tree stamped at the input answers it, and a `Delivered` in front of an
 unchanged one reads as "did not change". Draining before drawing, as above,
 gives you this for free.
 
-An input you can only answer later, a frame on or more, needs its id kept
-until then. For those, loop on `try_recv` instead of calling `drain`. It hands
-you each input with its `InputId`, and you pass the id to `ack` when the
-answer is ready:
+So there is no acking `Ignored` a frame or more later. The first tree you
+publish after dequeuing an input is stamped at it and answers it, and an
+`Ignored` sent behind that tree arrives after the agent has been answered
+(protocol section 5.3). If you need the `InputId` in hand, loop on
+`try_recv` and ack in the same pass, before you publish:
 
 ```rust
 use taria_ratatui::InputStatus;
 
-let mut pending = Vec::new();
 while let Some((id, input)) = layer.try_recv() {
-    apply(app, input);
-    pending.push(id);
+    if apply_agent_input(app, input) == InputStatus::Ignored {
+        layer.ack(id, InputStatus::Ignored);
+    }
 }
-
-// Later, once you know nothing came of them.
-for id in pending {
-    layer.ack(id, InputStatus::Ignored);
-}
+// Publish only after the loop: every Ignored is already queued ahead.
+layer.publish(tree::build_nodes(app));
 ```
+
+An input whose verdict comes only later, once some work has run, cannot be
+acked in time. Do not hold its id for a late `Ignored`; instead, publish a
+status node in the first tree after the drain saying the input is under way
+(a `Role::Status` node, as in the drain section above), so the answer it is
+credited with says so, and publish the outcome, a status saying nothing
+came of it included, when the work is done. The agent's next `read_tree`
+shows it.
 
 ## Advertise a way out of every state
 

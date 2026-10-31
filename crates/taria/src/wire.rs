@@ -322,6 +322,14 @@ impl AppToBridge {
 /// one input reach the bridge in the order the app sent them, so the newest
 /// one received is the app's current answer.
 ///
+/// The follow-up has a deadline: the first snapshot the app publishes after
+/// the dequeue. A bridge that reads the stamp
+/// ([`Snapshot::after_input`](crate::Snapshot::after_input)) answers on that
+/// snapshot, so an `Ignored` sent a frame later arrives after the agent has
+/// been told the input changed nothing (`docs/protocol.md` section 5.3). An
+/// app that can only decide later publishes a node saying the input is under
+/// way instead.
+///
 /// A status name this build does not know fails the [`AppToBridge::Ack`]
 /// carrying it, and the reader skips that line. There is no fallback variant
 /// here, unlike [`Role::Other`](crate::Role::Other) and

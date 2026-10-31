@@ -28,10 +28,11 @@ every removed name to what replaces it. The cut moves nothing on the wire:
 `InputId`, a newtype in Rust now, is still a bare integer in the JSON. The
 binary's command line is unchanged, and so is every text an agent reads
 through `taria-mcp`, from the instructions to each answer, byte for byte,
-with four exceptions, all under "For whoever drives an app": the typed state
+with six exceptions, all under "For whoever drives an app": the typed state
 changes the outline's `read_tree` description and adds the answer to `act`
-on a disabled node, and the stamps add the two answers to an input from an
-app that stamps.
+on a disabled node, and against an app that stamps, the stamps add two
+answers to an input and move the no-ack answer and its rejected-line
+variant to "within 3000ms".
 
 **A node can say what state it is in.** Which row is selected, whether a box
 is checked, whether a branch is open, whether a button can be pressed yet,
@@ -118,6 +119,33 @@ exactly as 0.3.3 did.
   runtime, while `new` and `with_tree_format` took a handle and started
   nothing. `connected()` ignores `idle_release`: that bridge never lets go.
 
+The stamps break no build, but they change what an app's loop has to do to
+be answered well by a 0.4.0 `taria-mcp`:
+
+- **Publishing only on change costs up to 3 s per no-op.** An input that
+  changes nothing is answered at once only when a tree stamped at it
+  arrives. The layer sends that tree for you, the last snapshot again with
+  its stamp moved, but only from a `publish` (or a `FrameRecorder` frame)
+  after the drain: it never republishes on its own. An app that publishes
+  only when its tree changed leaves each such input waiting out the 3 s,
+  then answered "published no tree after it". Publish every frame, or at
+  least once after every drain, and let the layer skip identical trees.
+- **An `Ignored` acked later arrives too late.** The first tree published
+  after an input is dequeued answers it, so an `ack(id, Ignored)` sent a
+  frame or more later reaches the bridge after the agent was answered. Ack
+  inside `drain`, or from `try_recv` in the same pass, before the next
+  publish. Where the verdict comes only later, publish a status node in that
+  first tree saying the input is under way.
+- **A tree published between taking an input and applying it answers that
+  input.** The stamp covers the dequeue, not the effect, so a loop that
+  drains at the top, publishes, and applies at the bottom hands the agent the
+  tree from before its input. Apply what you drained before the next
+  publish; the integration guide's drain section shows the loop to avoid.
+- **`Snapshot` equality covers `after_input`.** `==` on two `Snapshot`s now
+  compares the stamp too, so a Rust peer comparing whole snapshots reads the
+  stamp-only resend of an unchanged tree as a change. Compare `root`, or
+  `seq` and `root` together.
+
 ### For whoever drives an app
 
 - **Typed state in the tree.** In JSON a node carries `"selected":true`,
@@ -166,10 +194,26 @@ exactly as 0.3.3 did.
   demo is about a frame. If none comes, `The app received this input but
   published no tree after it within 3000ms; it may still be working. Call
   read_tree to see its effect.` A tree published before the input, however
-  late it arrives, is never the answer. An ignored input still ends the wait
-  at once, and its answer is unchanged; an app that has stopped costs 3 s of
-  silence instead of 500 ms. Against an app that does not stamp, every
-  answer and the 500 ms window are as in 0.3.3, word for word.
+  late it arrives, is no longer the answer, but for one race (protocol
+  section 5.3). An ignored input ends the wait at the tree published after
+  it, or 500 ms after the ack when none comes, and its answer is unchanged.
+  An app that disconnects mid-wait is answered within 500 ms of the
+  disconnect. An app that has stopped costs 3 s of silence instead of
+  500 ms. When neither an ack nor a tree comes, the answer no longer
+  suggests the app may not report acknowledgements, since one that stamps
+  always does: `The app neither acknowledged this input nor published a
+  tree after it within 3000ms; it may be stuck, busy or stopped. Call
+  read_tree to check.` A burst says how many of its inputs were
+  acknowledged (`The app acknowledged N of the M inputs this call sent,
+  then neither acknowledged the last nor published a tree after it within
+  3000ms; ...`), and the answer that quotes a line the bridge could not
+  read opens the same way. The stopped-app answer counts the inputs the
+  app has not read yet. An app whose hello says `stamps` but whose
+  snapshots are unstamped is answered by the 0.3.3 rules from then on,
+  within the 3 s for the call that shows it, a changed tree credited, and
+  `taria-mcp` logs a warning once per connection. Against an app that does
+  not stamp, every answer and the 500 ms window are as in 0.3.3, word for
+  word.
 - **The stamp never reaches the agent.** `taria-mcp` strips `after_input`
   from the tree in both formats, as it strips `type`. A 0.3.3 `taria-mcp`
   does not: its JSON tree shows `"after_input":N` and its outline header
@@ -250,14 +294,17 @@ exactly as 0.3.3 did.
 - **`docs/protocol.md` gains the stamps.** Section 3.1 adds `stamps` to the
   hello, section 5 `after_input` to the snapshot, and new section 5.3 states
   what a stamping app must do (stamp only inputs it dequeued, start each
-  connection unstamped, never skip a stamp, flush acks first) and how a
-  bridge should read one: credit a tree to an input only at or after its id
-  in the bridge's own send order, compare on `root` and never `seq`, rebase
-  on an earlier tree, and strip the field. Section 5.1 allows the resend of
-  an identical tree under the same `seq`, section 16.6 strips the stamp
-  beside `type`, section 16.9 says what an older peer does, Appendix B item
-  13 lists the stamps nobody checks, and section 18's captures are taken
-  again from the 0.4.0 demo.
+  connection unstamped, never skip a stamp) and should do (send an
+  `ignored` before the first snapshot after the dequeue), and how a bridge
+  should read one: credit a tree to an input only at or after its id in the
+  bridge's own send order, compare on `root` and never `seq`, take an
+  earlier tree as the new baseline, read a peer that claims stamps and does
+  not stamp as one that does not, and strip the field. Section 5.1 allows
+  the resend of an identical tree under the same `seq`, and section 16.9
+  argues why that leaves `seq` meaning what an older reader took it to mean.
+  Section 16.6 strips the stamp beside `type`, section 16.9 says what an
+  older peer does, Appendix B item 13 lists the stamps nobody checks, and
+  section 18's captures are taken again from the 0.4.0 demo.
 - **`Snapshot::after_input` and the hello's `stamps` are new**, set with
   `Snapshot::after(id)` and `AppToBridge::hello(..).stamps(true)`. Both read
   leniently: a wrong shape reads as absent. A Rust peer comparing whole

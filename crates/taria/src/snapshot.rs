@@ -9,6 +9,14 @@ use crate::{Node, PROTOCOL_VERSION, state};
 /// are the format's cheapest additive change, and [`new`](Self::new) already
 /// builds one, so closing the struct literal costs a caller nothing.
 /// [`after_input`](Self::after_input) is the first such field.
+///
+/// The derived [`PartialEq`] compares every field, the stamp included, so two
+/// snapshots of the same tree compare unequal once the stamp has moved. That
+/// is the right answer for a value, and the wrong one for a reader asking
+/// whether the tree changed: a reader comparing trees across snapshots should
+/// leave `after_input` out, and compare `root` (or `root` and `seq`) instead.
+/// An adapter that stamps sends its latest tree again, under the same `seq`,
+/// when only its stamp moves, and that restamp is not a change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Snapshot {

@@ -55,10 +55,11 @@ and an input the app deliberately dropped looks like a slow one.
   (`taria::wire::MAX_LINE_BYTES`) and treat the connection as broken rather
   than buffering without bound. The adapter trims every snapshot to fit; see
   Snapshot size below.
-- `seq`: increments per published snapshot within one app run. It resets
-  when the app restarts, so the bridge detects change by comparing whole
-  snapshots, not by `seq` ordering. `seq` signals staleness only within one
-  connection.
+- `seq`: counts the trees published within one app run; it never decreases,
+  and repeats only on a resend whose sole change is `after_input` (Dedup,
+  below). It resets when the app restarts, so the bridge detects change by
+  comparing trees on their `root`, not by `seq` ordering. `seq` signals
+  staleness only within one connection.
 - Dedup: a frame whose tree is the one the previous frame built is skipped
   before anything is cut or measured, and a frame whose cut tree is the
   snapshot already sent is skipped after the cut. Either way `seq` does not
@@ -410,7 +411,11 @@ the last ack wins.
 `delivered` says only that the input was dequeued, before the app knows what
 it will do with it. An app that then does nothing (an act a modal dialog
 blocks, an unknown node id, a `set_value` with no value) refines that to
-`ignored`.
+`ignored`, and should do so before the first snapshot it publishes after
+dequeuing the input, which is the tree a stamping bridge credits to it
+(protocol section 5.3). Returning `Ignored` from the `drain` handler does
+that; an app that can decide only later publishes a status node saying the
+input is under way instead.
 
 Acks share the connection's writer with snapshots and are flushed first in
 every pass, so an ack always reaches the bridge before the snapshot
@@ -441,14 +446,19 @@ the baseline on its `root`, not its `seq`, it is the answer when it differs,
 and "did not change" at once when it does not, so a no-op still costs about
 a frame. A tree stamped before the input, or not at all, was published before
 the app had it, so it becomes the baseline rather than the answer, and a late
-tree is never credited to the input after it. For a burst the stamp has to
-reach the last press, and the baseline is the tree before the first. An
-`ignored` ends the wait at the first stamped tree, or 500 ms after the ack;
-a `dropped` at once. For the comparison to be sound, the bridge claims each
-id and queues its input under one lock, so ids reach the app in the order
-they were claimed even when tool calls overlap. The one gap is the snapshot
-watch, which keeps only the newest tree: a tree stamped before the input and
-the credited one arriving back to back are read as the credited one alone.
+tree is no longer credited to the input after it, but for one race
+(protocol section 5.3, and below). For a burst the stamp has to reach the
+last press, and the baseline is the tree before the first. An `ignored` ends
+the wait at the first credited tree, or 500 ms after the ack; a `dropped` at
+once; a disconnect within 500 ms of it, inside the 3 s cap. A peer whose
+hello says `stamps` but whose snapshots go out unstamped where a stamp is
+due is read, for that call, as a peer that does not stamp (a tree that
+differs is credited), and the bridge logs a warning. For the comparison to
+be sound, the bridge claims each id and queues its input under one lock, so
+ids reach the app in the order they were claimed even when tool calls
+overlap. The one gap is the snapshot watch, which keeps only the newest
+tree: a tree stamped before the input and the credited one arriving back to
+back are read as the credited one alone.
 
 | Outcome | Tool answer |
 |---|---|
@@ -464,7 +474,7 @@ the credited one arriving back to back are read as the credited one alone.
 | `delivered`, tree unchanged | Text: received, no change within 500 ms, from a peer that does not stamp. From one that does: received, no change, once a tree stamped at the input arrives unchanged. |
 | `delivered`, no stamped tree within 3 s (a peer that stamps) | Text: received, but no tree published after it within 3000 ms; it may still be working, call `read_tree`. |
 | No ack, tree changed | The new tree. |
-| No ack, no change | Text: neither acknowledged nor changed; it may be an adapter that sends no acks. If a line was rejected inside the window, that line is quoted instead, because it may have been this input's ack. Otherwise, on Linux, if the app is stopped, the text says so instead, with its pid. The input waits in the socket, and the app applies it only if it resumes while the bridge still holds the connection: the window plus 30 s from the last tool call, since the input awaits its ack, and for good with `--idle-release 0`. A bridge that lets go first leaves the adapter to discard it. So the agent is told that deadline and how to resume the app (as for a stopped app below), then to call `read_tree` and resend the input if its effect is missing. A burst is spoken of as one: "these 3 inputs". |
+| No ack, no change | Text: neither acknowledged nor changed within the window (500 ms, or 3 s from a peer that stamps); it may be an adapter that sends no acks. If a line was rejected inside the window, that line is quoted instead, because it may have been this input's ack. Otherwise, on Linux, if the app is stopped, the text says so instead, with its pid. The input waits in the socket, and the app applies it only if it resumes while the bridge still holds the connection: the window plus 30 s from the last tool call, since the input awaits its ack, and for good with `--idle-release 0`. A bridge that lets go first leaves the adapter to discard it. So the agent is told that deadline and how to resume the app (as for a stopped app below), then to call `read_tree` and resend the input if its effect is missing. A burst is spoken of as one: "these 3 inputs". |
 
 The order matters. The two send failures come first: an input that never left
 the bridge has no ack to wait for, and a burst cut short still waits out the

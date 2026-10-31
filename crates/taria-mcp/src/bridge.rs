@@ -404,7 +404,7 @@ impl BridgeHandle {
     /// handle: callers ask the bridge for an id rather than reaching for a
     /// counter of their own, and two tool calls racing still get different
     /// ids.
-    fn next_input_id(&self) -> InputId {
+    pub(crate) fn next_input_id(&self) -> InputId {
         InputId::new(NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed))
     }
 
