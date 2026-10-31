@@ -25,13 +25,13 @@ to grow without a break: `LayerStats` is `#[non_exhaustive]`, and a
 
 This breaks Rust callers of all three crates; the table under Upgrading maps
 every removed name to what replaces it. The cut moves nothing on the wire:
-`InputId`, a newtype in Rust now, is still a bare integer in the JSON. Every
-text an agent reads through `taria-mcp`, from the instructions to each
-answer, is unchanged byte for byte but two the typed state brings, the
-outline's `read_tree` description and the answer to `act` on a disabled node,
-and two the stamps bring, both answers to an input from an app that stamps
-(all under "For whoever drives an app"), and so is the binary's command
-line.
+`InputId`, a newtype in Rust now, is still a bare integer in the JSON. The
+binary's command line is unchanged, and so is every text an agent reads
+through `taria-mcp`, from the instructions to each answer, byte for byte,
+with four exceptions, all under "For whoever drives an app": the typed state
+changes the outline's `read_tree` description and adds the answer to `act`
+on a disabled node, and the stamps add the two answers to an input from an
+app that stamps.
 
 **A node can say what state it is in.** Which row is selected, whether a box
 is checked, whether a branch is open, whether a button can be pressed yet,
@@ -130,11 +130,13 @@ exactly as 0.3.3 did.
   otherwise, so no mark can be forged. Positions count from 1, and a node
   with `"expanded":true` and fewer children than its `set_size` has children
   that were not published, not an empty set.
-- **A number reaches the agent as the app wrote it.** `taria-mcp` now reads
-  JSON numbers exactly (`serde_json`'s `float_roundtrip`), so a value such as
-  `1.4000000000000001` is no longer shown as `1.4`, in JSON or in the
-  outline. A spelling that is not a double's shortest form is still
-  respelled: `1e3` reads `1000.0`.
+- **A number reaches the agent as the double the app wrote.** `taria-mcp`
+  now reads JSON numbers exactly (`serde_json`'s `float_roundtrip`), so a
+  value such as `1.4000000000000001` is no longer shown as `1.4`, in JSON or
+  in the outline. The spelling is still serde_json's, not the app's: an
+  integer in the 64-bit range prints as written, `-0` aside, and any other
+  number as serde_json writes that double, so `1e3` reads `1000.0`, `-0`
+  `-0.0`, `1e21` `1e+21` and `1e-07` `1e-7`.
 - **The outline's `read_tree` description shows a state mark.** Its legend
   reads `id role *relayed "label" = "value" *focused *checked=false act:
   a|b`, which teaches the `*name=value` shape: 15 characters more than
@@ -232,6 +234,11 @@ exactly as 0.3.3 did.
   `f64` with `Eq` and `Hash`, so `Node` and `Snapshot` keep `Eq`; it writes a
   whole number within 2^53 as an integer. Both deserialize strictly on their
   own; the node's fields read them leniently.
+- **A repeated state key now fails the line.** A 0.4.0 reader fails a line
+  whose node repeats one of the keys it newly knows, such as `"checked"`
+  twice, with "duplicate field", where a 0.3.3 reader skipped both copies
+  as unknown. Section 2.2 already forbids a sender to repeat a key, so no
+  conforming line changes meaning (protocol section 16.8).
 - **`docs/architecture.md` maps taria to AccessKit 0.25**, role by role and
   field by field, including the shift from taria's 1-based positions to
   AccessKit's 0-based ones.

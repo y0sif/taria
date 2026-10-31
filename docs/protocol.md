@@ -1750,15 +1750,17 @@ shown it reads an id it never sent as a fact about the app, and a tree sent
 again with only its stamp moved as one that changed. The reference bridge
 removes both, from every peer and in both tree formats, by parsing the line
 into a JSON value and writing that out again, which keeps every other key but
-not the app's
-spelling of the line: keys come out sorted and whitespace gone, string escapes
-are rewritten (`"\u00e9"` becomes `"é"`), numbers are rewritten (`1e3` becomes
-`1000.0`, `-0` becomes `-0.0`, and an integer outside the 64-bit range becomes a
-float, keeping about 17 significant digits, while a double in its shortest
-round-trip form, such as `1.4000000000000001`, comes through digit for digit,
-which before 0.4.0 it did not: that one read `1.4`), and of a key repeated in
-one object only the last value is kept, though a repeated field the bridge knows
-never gets that far, because it fails the parse (section 2.2). A sender
+not the app's spelling of the line: keys come out sorted and whitespace gone,
+string escapes are rewritten (`"\u00e9"` becomes `"é"`), and of a key
+repeated in one object only the last value is kept, though a repeated field
+the bridge knows never gets that far, because it fails the parse (section
+2.2). Numbers are rewritten too. An integer in the 64-bit range comes through
+as written, `-0` aside; any other number is read as the double nearest it and
+printed as serde_json writes that double: `1e3` becomes `1000.0`, `-0`
+becomes `-0.0`, `1e21` becomes `1e+21`, `1e-07` becomes `1e-7`, and an
+integer outside the 64-bit range becomes a float, keeping about 17
+significant digits. The read is exact since 0.4.0, so `1.4000000000000001`
+comes through digit for digit, where before 0.4.0 it read `1.4`. A sender
 **MUST NOT** rely on any of these spellings reaching the agent.
 
 ### 16.7 What forces a version bump
@@ -1784,15 +1786,14 @@ when unset, so the addition is additive under section 16.2 and
 - **An older reader** ignores the fields as unknown (section 2.7) and parses
   every node as before. It reads no state, so to it a node is exactly what a
   0.3.3 app would have sent, `value` and all.
-- **An older reference bridge** from 0.2.0 to 0.3.3, which hands the agent the
+- **An older reference bridge** from 0.1.0 to 0.3.3, which hands the agent the
   app's own line (section 16.6), passes the fields on in the JSON tree with the
   rest of it. Its outline, in 0.3.0 to 0.3.3, shows them among the fields at the
   end of the line, `checked=false selected=true`, rather than as marks, and its
   `read_tree` description says nothing about them. It does not refuse `act` on a
   disabled node, but against the reference adapter there is nothing to send: the
   node advertises no actions, so its own validation refuses the act as
-  unadvertised. The 0.1.0 bridge handed the agent its own parse written out
-  again, not the app's line, so it drops every one of the fields.
+  unadvertised.
 - **An older app** sends none of them, so every node reads as stating
   nothing, which is what absent means.
 - **Leniently read.** A field added later fails the node when it is read
@@ -1828,7 +1829,7 @@ input since it went out.
   resend of an identical tree is, to it, the same snapshot twice: `seq` and
   every field it knows are unchanged, so a reader that compares whole
   snapshots reads no change, and a reader that compares `seq` none either.
-- **An older reference bridge** from 0.2.0 to 0.3.3 hands the agent the app's
+- **An older reference bridge** from 0.1.0 to 0.3.3 hands the agent the app's
   own line (section 16.6), so its JSON tree shows `"after_input":N` once the
   app has dequeued an input, and its outline, in 0.3.0 to 0.3.3, shows
   `after_input=N` among the header's fields. Its answers do not move: it

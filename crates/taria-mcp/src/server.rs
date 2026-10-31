@@ -1,7 +1,7 @@
 //! The MCP tool surface: `read_tree`, `act`, `key`, and `type_text`.
 //!
-//! [`TariaMcpServer::builder`] sets a server up, and its finalizers pick the
-//! bridge. [`TariaMcpServerBuilder::on_demand`], which the `taria-mcp` binary
+//! [`TariaMcpServer::builder`] sets a server up, and its `on_demand()` or
+//! `connected()` picks the bridge. [`TariaMcpServerBuilder::on_demand`], which the `taria-mcp` binary
 //! uses, spawns a bridge that connects on the first tool call and lets go of
 //! the app after an idle window, and every tool call then counts as activity
 //! and gives a bridge it woke a bounded moment to reach the app.
@@ -360,11 +360,10 @@ impl ServerHandler for TariaMcpServer {
 /// How a [`TariaMcpServer`] is set up, from [`TariaMcpServer::builder`].
 ///
 /// Each setting starts at its default and is changed by the method named
-/// after it. A finalizer then spawns the bridge and returns the server:
-/// [`on_demand`](Self::on_demand), which is how the `taria-mcp` binary
-/// serves, or [`connected`](Self::connected). Settings added later get a
-/// method of their own here, so a caller that sets only what it needs keeps
-/// compiling.
+/// after it. Then [`on_demand()`](Self::on_demand), which is how the
+/// `taria-mcp` binary serves, or [`connected()`](Self::connected) spawns the
+/// bridge and returns the server. Settings added later get a method of their
+/// own here, so a caller that sets only what it needs keeps compiling.
 #[derive(Clone, Debug)]
 #[must_use = "a builder serves nothing until on_demand() or connected() builds the server"]
 pub struct TariaMcpServerBuilder {

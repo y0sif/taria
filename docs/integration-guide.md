@@ -371,6 +371,9 @@ What each one promises:
   them, so you do not have to, and `taria-mcp` refuses `act` on it with an
   answer that says it is disabled, so the agent waits for the tree to change
   instead of trying other names. `key` and `type_text` are not affected.
+  It covers that node alone, not its children: a child of a disabled node
+  keeps its actions and is not read as disabled, so mark each node you
+  disable.
   `disabled(false)` clears the mark, and only `true` is ever sent. The
   reverse does not hold: an empty action list does not mean disabled, so
   do not mark a node disabled because a modal is in front of it. The demo's

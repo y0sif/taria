@@ -38,22 +38,21 @@ The typed state, added in 0.4.0, is the same case again: `description`,
 6.5](protocol.md#65-typed-state)). With them a node's fields are, in the
 order the reference `Node` writes them: `id`, `role`, `label`, `value`,
 `description`, `focused`, `relayed`, the state from `selected` to
-`column_count`, `actions`, `children`. A taria-mcp from 0.2.0 to 0.3.3
+`column_count`, `actions`, `children`. A taria-mcp from 0.1.0 to 0.3.3
 passes the state on in the JSON tree, because it hands the agent the app's
 own line, and its outline (0.3.0 on) shows it among the fields at the end of
 the line, `checked=false selected=true`, rather than as marks such as
 `*checked=false *selected`. It does not refuse `act` on a disabled node
 itself, but the 0.4.0 adapter publishes a disabled node with no actions, so
-the older bridge refuses the act as unadvertised. taria-mcp 0.1.0 hands the
-agent its own parse instead, so it drops the state. An app built before 0.4.0
+the older bridge refuses the act as unadvertised. An app built before 0.4.0
 states nothing, which reads as not stated, never as `false`. A state field in
 a shape a 0.4.0 peer cannot read costs only that field, not the node. Two
 things to know as a sender: a number outside the double range, such as
-`1e999`, is no wrong shape but fails the whole line in the reference reader,
-which reports "number out of range"; and an integer field written with a
-fraction or an exponent, `"row":3.0` or `"row":3e0`, reads as not stated,
-though its value is whole. Python's `json` writes a float as `3.0`, so
-convert with `int()` first.
+`1e999`, does not count as a wrong shape, which would cost only the field: it
+fails the whole line in the reference reader, which reports "number out of
+range"; and an integer field written with a fraction or an exponent,
+`"row":3.0` or `"row":3e0`, reads as not stated, though its value is whole.
+Python's `json` writes a float as `3.0`, so convert with `int()` first.
 
 The stamps, added in 0.4.0 for issue #17, are the third case: `after_input`
 on a snapshot, the newest input the app had dequeued when it published, and
@@ -67,7 +66,7 @@ with only the stamp moved. Measured against the demo, with and without
 | Bridge | App | What the agent gets |
 | --- | --- | --- |
 | taria-mcp 0.4.0 | taria-ratatui 0.4.0 | Each input's own tree: an act the demo held 800 ms answered with its effect in 0.81 s, three in a row each with its own. An input that changes nothing reads "The app received this input, and its tree did not change." within a frame (50 ms against 503 ms), and an ignored one is answered as fast. Up to 3 s for a tree, then "published no tree after it within 3000ms". The stamp is stripped from both formats. |
-| taria-mcp 0.2.0 to 0.3.3 | taria-ratatui 0.4.0 | Works as with a 0.3.3 app: the 500 ms window and its texts, and the resend reads as no change. The stamp shows: `"after_input":N` in the JSON tree, and `after_input=N` at the head of the outline (0.3.0 on). Issue #17 stays: the 800 ms act read "did not change within 500ms", and the acts after it read as unacknowledged while the demo worked through them. taria-mcp 0.1.0 hands the agent its own parse, so the stamp never shows. |
+| taria-mcp 0.1.0 to 0.3.3 | taria-ratatui 0.4.0 | Works as with a 0.3.3 app: the 500 ms window and its texts, and the resend reads as no change. The stamp shows: `"after_input":N` in the JSON tree, and `after_input=N` at the head of the outline (0.3.0 on). Issue #17 stays: the 800 ms act read "did not change within 500ms", and the acts after it read as unacknowledged while the demo worked through them. |
 | taria-mcp 0.4.0 | taria-ratatui 0.3.3 or older, or any app whose hello does not say `stamps` | Answered exactly as 0.3.3 answered it: the 500 ms window and every text, byte for byte. A stamp from an app that did not say it stamps is stripped and ignored. |
 
 A Rust peer that compares whole `Snapshot`s now compares the stamp too, so

@@ -48,10 +48,11 @@
 //!   part left empty (`*num=42`, `*num=42[0..]`, `*num=[..100]`); `*pos=` from
 //!   `pos_in_set`; `*size=` from `set_size`; `*row=` and `*col=`; `*rows=`
 //!   and `*cols=` from `row_count` and `column_count`. A number prints as
-//!   the bridge's copy of the line spells it: as the app wrote it when that
-//!   is a 64-bit integer or a double's shortest round-trip form, digit for
-//!   digit, and respelled otherwise (`1e3` as `1000.0`). `null` or absent prints
-//!   nothing, and so does `"disabled":false`. A value in a shape the bridge's parse reads as
+//!   the bridge's copy of the line spells it: an integer in the 64-bit range,
+//!   `-0` aside, as the app wrote it, and any other number as serde_json
+//!   writes the double nearest it (`1e3` as `1000.0`, `-0` as `-0.0`, `1e21`
+//!   as `1e+21`, `1e-07` as `1e-7`). `null` or absent prints nothing, and so
+//!   does `"disabled":false`. A value in a shape the bridge's parse reads as
 //!   not stated, `"selected":"yes"` or a `row` of 0, goes to the tail, so the
 //!   marks show exactly what the parse holds.
 //! - `description`, a string, opens the tail as `description="<text>"`.
@@ -721,10 +722,10 @@ x progress_bar {mark}"
         }
     }
 
-    /// A number the app wrote in its shortest round-trip form reaches the
+    /// A number the app wrote as serde_json writes that double reaches the
     /// agent digit for digit in both formats, through the bridge's envelope
     /// strip and the outline renderer: `serde_json` reads it exactly
-    /// (`float_roundtrip`) and writes it back in that same shortest form.
+    /// (`float_roundtrip`) and writes it back the same way.
     /// Without the feature, `1.4000000000000001` read as `1.4`. The parse
     /// holds the same double the app sent.
     #[test]

@@ -21,26 +21,28 @@ Options:
 The bridge opens no connection to the app until its first tool call, whatever
 `--idle-release` says: starting it, and the harness's `initialize` and
 `tools/list`, or its `server/discover` under the stateless MCP lifecycle,
-connect to nothing. That first call waits briefly, at most
-about a second, for the connection, the app's `hello` and its tree, so it
-still answers with the live tree. A bridge locked out of the app says the app
-is held by another bridge, and when the holder lets go, so a retry is the way
-in. It names its own `--idle-release` as the holder's, which is right for a
-holder started the same way: "retry in a minute" on the default, "retry in N
-s" for a window of N, and for `0` that such a holder keeps the app until its
-session ends. A bridge that let go of the app itself adds, to every answer it
-gives once it has reconnected (the app held by another bridge, stopped,
-greeted but with no tree yet, not greeted yet, or sending a line it cannot
-read), that its own disconnect was that release and not a fault: after its
-window with no tool calls, or up to 30 s later while an input awaited its ack.
-On Linux, an app stopped by a signal or a debugger is named as stopped, with
-its pid, rather than as held, and with how to resume it: from the debugger,
-with `kill -CONT`, or, for a TUI suspended as a job in its terminal (which
-`kill -CONT` resumes only in the background, where its next use of the
-terminal stops it again), with the user's `fg` there. An input sent to an app
-that stops while the bridge is driving it gets the same diagnosis in place of
-"neither acknowledged", and the app applies it only if it resumes before the
-bridge lets go: within the window plus 30 s of the last tool call (90 s on the
+connect to nothing. That lifecycle is the 2026-07-28 MCP revision, where each
+request carries its protocol version and capabilities in `_meta` and there is
+no `initialize` handshake. The first tool call waits briefly, at most about a
+second, for the connection, the app's `hello` and its tree, so it still
+answers with the live tree. A bridge locked out of the app says the app is
+held by another bridge, and when the holder lets go, so a retry is the way in.
+It names its own `--idle-release` as the holder's, which is right for a holder
+started the same way: "retry in a minute" on the default, "retry in N s" for a
+window of N, and for `0` that such a holder keeps the app until its session
+ends. A bridge that let go of the app itself adds, to every answer it gives
+once it has reconnected (the app held by another bridge, stopped, greeted but
+with no tree yet, not greeted yet, or sending a line it cannot read), that its
+own disconnect was that release and not a fault: after its window with no tool
+calls, or up to 30 s later while an input awaited its ack. On Linux, an app
+stopped by a signal or a debugger is named as stopped, with its pid, rather
+than as held, and with how to resume it: from the debugger, with `kill -CONT`,
+or, for a TUI suspended as a job in its terminal (which `kill -CONT` resumes
+only in the background, where its next use of the terminal stops it again),
+with the user's `fg` there. An input sent to an app that stops while the
+bridge is driving it gets the same diagnosis in place of "neither
+acknowledged", and the app applies it only if it resumes before the bridge
+lets go: within the window plus 30 s of the last tool call (90 s on the
 default), or at any time with `0`.
 
 Environment variables:
@@ -131,9 +133,11 @@ indented two spaces per level, the root at zero:
   | `row`, `column` | `*row=2 *col=3` |
   | `row_count`, `column_count` | `*rows=50 *cols=4` |
 
-  A number prints as the app wrote it, digit for digit, when the app wrote
-  a 64-bit integer or a double's shortest round-trip form, and respelled
-  otherwise (`1e3` reads `1000.0`; protocol section 16.6 lists the cases).
+  A number prints as the app wrote it when it is an integer in the 64-bit
+  range, `-0` aside, and otherwise as serde_json writes the double nearest
+  it, which need not be the app's spelling: `1e3` reads `1000.0`, `-0`
+  `-0.0`, `1e21` `1e+21` and `1e-07` `1e-7` (protocol section 16.6 lists
+  the cases).
   `null`, absent and `"disabled":false` print nothing. A state field in a
   shape the bridge reads as not stated, such as `"selected":"yes"` or a
   `row` of 0, prints in the tail instead, as `selected="yes"`, so a mark

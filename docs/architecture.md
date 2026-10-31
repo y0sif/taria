@@ -298,22 +298,28 @@ fields. So a new optional field, or a whole new message variant, reaches an
 older peer as something it quietly ignores.
 
 Neither property covers a value nested inside a message the peer does want,
-so the open vocabularies carry their own fallbacks. An unknown `Role`
-reads as `Role::Other`. An unknown `Action` name reads as `Action::Custom`
-keeping that name, so an agent can still advertise it, echo it back, and
-have the app recognize it. Without those, one leaf node using a role added
-later makes the whole snapshot unparseable, the reader skips every line, and
-the app looks frozen with no error anywhere.
+so the open vocabularies and the typed state carry their own fallbacks, four
+in all. An unknown `Role` reads as `Role::Other`. An unknown `Action` name
+reads as `Action::Custom` keeping that name, so an agent can still advertise
+it, echo it back, and have the app recognize it. Without those, one leaf node
+using a role added later makes the whole snapshot unparseable, the reader
+skips every line, and the app looks frozen with no error anywhere.
 
 An `AgentInput` whose `kind` this build does not know is the third, and it
-degrades for a sharper reason than the other two. The `InputId` sits on the
-message rather than inside the input, so a `kind` that failed the line would
-take the id with it, and an agent would wait out the bridge's window for an
-ack that was never possible. `AgentInput::Unknown` is a `#[serde(other)]`
-fallback carrying nothing at all, which is enough: the input arrives with its
-id intact, the adapter answers it `ignored` on the app's behalf without
-queueing it, and the agent learns in one round trip that this app can do
-nothing with what it asked for. An app never sees the variant.
+degrades for a sharper reason than the role and the action. The `InputId`
+sits on the message rather than inside the input, so a `kind` that failed the
+line would take the id with it, and an agent would wait out the bridge's
+window for an ack that was never possible. `AgentInput::Unknown` is a
+`#[serde(other)]` fallback carrying nothing at all, which is enough: the
+input arrives with its id intact, the adapter answers it `ignored` on the
+app's behalf without queueing it, and the agent learns in one round trip that
+this app can do nothing with what it asked for. An app never sees the
+variant.
+
+The typed state is the fourth: a state field in a shape this build cannot
+read, such as a `checked` of `"partial"`, reads as not stated, and the node
+keeps the rest. Read strictly, the field would fail its node, the node its
+line, and the agent would be left on a stale tree over one field.
 
 `InputStatus` has no fallback. A status this build does not know fails its
 ack and the reader skips that line, which leaves the input reading as
@@ -348,9 +354,9 @@ type a version-1 addition can reach is `#[non_exhaustive]`. Twelve of them:
 was done before the first release rather than at the first addition. Each
 costs an outside peer one wildcard arm, or one `..` in a pattern, and buys
 back that a new variant, field, role, action or key is a recompile rather
-than a repair. `Modifiers`
-gains `NONE` and a const `new` in exchange for the struct literal it closes,
-and `KeyPress` already had the const `new` its own marking needs.
+than a repair. `Modifiers` gains `NONE` and a const `new` in exchange for the
+struct literal it closes, and `KeyPress` already had the const `new` its own
+marking needs.
 
 The same reasoning reaches one level in, to the variants. A new optional
 field on an existing message is the format's cheapest additive change and
@@ -747,17 +753,18 @@ The binary now does two things:
 
 - **It connects on demand.** Starting it, and the MCP `initialize` and
   `tools/list` that follow, or the `server/discover` of the stateless MCP
-  lifecycle, open nothing. The first tool call opens the
-  connection and waits for the app's `hello` and its tree, so that call
-  still answers with the live tree. The wait is normally milliseconds,
-  because the adapter's listener thread writes the `hello` and the latest
-  snapshot the moment it accepts a bridge, so an app sitting idle answers as
-  fast as a busy one. It runs longer only on a connection that stays silent,
-  until that connection is 500 ms old, the age at which silence means
-  another bridge holds the app, so the first call gives that answer. The
-  500 ms is counted from when the connection opened, so a connect that ran
-  late still gets all of it, and the whole wait never runs past 1.2 s from
-  the start of the call.
+  lifecycle (the 2026-07-28 MCP revision, where each request carries its
+  version and capabilities in `_meta` and there is no `initialize` handshake),
+  open nothing. The first tool call opens the connection and waits for the
+  app's `hello` and its tree, so that call still answers with the live tree.
+  The wait is normally milliseconds, because the adapter's listener thread
+  writes the `hello` and the latest snapshot the moment it accepts a bridge,
+  so an app sitting idle answers as fast as a busy one. It runs longer only on
+  a connection that stays silent, until that connection is 500 ms old, the age
+  at which silence means another bridge holds the app, so the first call gives
+  that answer. The 500 ms is counted from when the connection opened, so a
+  connect that ran late still gets all of it, and the whole wait never runs
+  past 1.2 s from the start of the call.
 - **It lets go when idle.** After 60 s with no tool calls, the bridge closes
   its connection, or leaves the listen backlog if it was waiting there, and
   stops reconnecting. A bridge waiting in the backlog is then accepted at
@@ -911,7 +918,7 @@ fit, marked so below, a judgment rather than a certainty, and `select`,
 | `row_count`, `column_count` | `set_row_count`, `set_column_count` |
 | `relayed` | nothing: AccessKit has no mark for text from outside the app |
 | `activate`, `focus`, `set_value`, custom | `Action::Click`, `Action::Focus`, `Action::SetValue`, `set_custom_actions` |
-| `toggle` | `Action::Click`: AccessKit has no toggle action, and a checkbox toggles on a click |
+| `toggle` | on a checkbox or a switch, `Action::Click` as a best fit: AccessKit has no toggle action, and a checkbox toggles on a click; on a disclosure, `Action::Expand` or `Action::Collapse`, chosen by its `expanded` |
 | `select` | none: AccessKit has no select action; `Action::Click` on the item is a best fit |
 | `dismiss` | none: AccessKit has no dismiss action |
 | `scroll` | none single: AccessKit's scrolling is directional (`ScrollUp`, `ScrollDown`, `ScrollLeft`, `ScrollRight`) or aimed (`ScrollIntoView`, `ScrollToPoint`, `SetScrollOffset`), while taria's `scroll` names neither |
