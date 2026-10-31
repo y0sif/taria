@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::env;
+use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -187,6 +188,11 @@ pub struct LayerStats {
     /// that which is an input is counted here, a kind this build cannot read
     /// included. None of it is acked: the session it would be answered on had
     /// not begun. Clients waiting back to back are each treated so.
+    ///
+    /// The second kind is Unix only. A Windows named pipe has no listen
+    /// backlog: a client that finds the one instance taken is refused with
+    /// `ERROR_PIPE_BUSY` and has nowhere to write, so on Windows this counts
+    /// only inputs whose connection ended before the app dequeued them.
     ///
     /// A client that waited behind nobody keeps what it wrote before reading
     /// its hello: the first connection of a process, and one that connects
@@ -384,6 +390,15 @@ impl TariaLayer {
     /// only that user in. A name another instance is serving, or that
     /// something else holds, is refused with
     /// [`AddrInUse`](io::ErrorKind::AddrInUse), as on Unix.
+    ///
+    /// So a bind can wait, where on Unix it never does: a name found in use
+    /// is tried again for up to 500 ms before it is refused. An app restarted
+    /// at once can find its name still held by a lingering client, the
+    /// bridge of the instance before it, which has not closed its end yet;
+    /// the wait gives that client time to let go, rather than starting the
+    /// new instance with taria off. A name another instance is serving is
+    /// refused all the same, that much later. [`bind_at`](Self::bind_at) and
+    /// both `bind_or_disabled` forms wait the same way.
     pub fn bind(app_label: &str) -> io::Result<Self> {
         let socket_path = resolve_socket_path(app_label).map_err(invalid_label)?;
         Self::bind_at(app_label, socket_path)
@@ -1027,6 +1042,22 @@ impl TariaLayer {
     }
 }
 
+impl fmt::Debug for TariaLayer {
+    /// The label, the endpoint, whether the layer is serving and why not,
+    /// and the newest snapshot's `seq`: what the app thread owns. State the
+    /// connection threads share is left out rather than locked, so printing
+    /// a layer never waits on, or deadlocks against, a thread holding it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TariaLayer")
+            .field("app_label", &self.app_label)
+            .field("socket_path", &self.socket_path)
+            .field("enabled", &self.is_enabled())
+            .field("bind_error", &self.bind_error)
+            .field("seq", &self.inner.as_ref().map(|inner| inner.seq))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for TariaLayer {
     /// Stop the threads and unlink the socket. A disabled layer has neither,
     /// so it touches no filesystem at all.
@@ -1352,7 +1383,7 @@ fn focused_below(root: &Node) -> bool {
 fn strip_disabled_actions(root: &mut Node) {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
-        if node.disabled == Some(true) {
+        if node.disabled {
             node.actions.clear();
         }
         pending.extend(node.children.iter_mut());
@@ -2270,6 +2301,12 @@ mod tests {
         assert_eq!(layer.socket_path(), socket_path);
         assert_eq!(layer.app_label(), "disabled");
         assert_eq!(layer.stats(), LayerStats::default());
+        let printed = format!("{layer:?}");
+        assert!(
+            printed.contains("enabled: false, bind_error: Some("),
+            "{printed}"
+        );
+        assert!(printed.ends_with(", seq: None, .. }"), "{printed}");
 
         assert_eq!(layer.try_recv(), None);
         assert_eq!(layer.recv_timeout(Duration::from_millis(1)), None);
@@ -2834,13 +2871,13 @@ mod tests {
         let root = &snapshot.root;
         let saved = &root.children[0];
         assert!(saved.actions.is_empty(), "{saved:?}");
-        assert_eq!(saved.disabled, Some(true));
+        assert!(saved.disabled);
         assert!(saved.focused && saved.label.as_deref() == Some("Save"));
         assert!(root.children[1].actions.is_empty());
         assert!(root.children[1].children[0].actions.is_empty());
         assert_eq!(root.children[2], quit);
         assert_eq!(root.children[3], empty);
-        assert_eq!(root.children[3].disabled, None);
+        assert!(!root.children[3].disabled);
 
         // The same frame again is the snapshot already sent, and enabling
         // the node brings its actions back.

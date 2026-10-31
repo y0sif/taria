@@ -1,6 +1,7 @@
 //! Per-frame recording of the semantic tree.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::mem;
 
 use taria::Node;
@@ -40,6 +41,23 @@ impl Drop for Recorded {
         mem::take(self.0.get_mut())
             .into_iter()
             .for_each(drop_iteratively);
+    }
+}
+
+impl fmt::Debug for FrameRecorder<'_> {
+    /// The layer it records for, and how many top-level nodes it holds so
+    /// far, never the nodes themselves: a recorded tree can be deeper than
+    /// the stack a derived `Debug` would recurse through. The count is read
+    /// without waiting, so a recorder printed while a node is being recorded
+    /// says so instead.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = f.debug_struct("FrameRecorder");
+        out.field("layer", &*self.layer);
+        match self.nodes.0.try_borrow() {
+            Ok(nodes) => out.field("recorded", &nodes.len()),
+            Err(_) => out.field("recorded", &format_args!("<being recorded>")),
+        };
+        out.finish_non_exhaustive()
     }
 }
 

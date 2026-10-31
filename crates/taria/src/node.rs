@@ -361,9 +361,10 @@ pub struct Node {
     /// cursor sits on a row whether or not the list holds the keyboard.
     ///
     /// This field and every one after it, up to `actions`, came in 0.4.0. Each
-    /// is omitted when unset, absence means not stated, never `false`, and a
-    /// value of the wrong type or shape reads as not stated rather than
-    /// failing the node.
+    /// is omitted when unset, absence means not stated, never `false` (but for
+    /// [`disabled`](Self::disabled), where the two say the same), and a value
+    /// of the wrong type or shape reads as not stated rather than failing the
+    /// node.
     #[serde(
         default,
         deserialize_with = "state::lenient_bool",
@@ -387,8 +388,10 @@ pub struct Node {
     )]
     pub expanded: Option<bool>,
     /// Whether the node is disabled: shown, but accepting no action until the
-    /// app enables it. Only `Some(true)` is ever sent, and a parsed `false`
-    /// reads as `None`.
+    /// app enables it. Only `true` is a statement, so only `true` is ever
+    /// sent, and absence, `false`, `null` and a value of any other shape all
+    /// read as `false`, which says the node is not marked, without failing
+    /// the node.
     ///
     /// It covers this node alone, as [`relayed`](Self::relayed) does:
     /// children do not inherit it. The reference adapter strips every action
@@ -396,10 +399,10 @@ pub struct Node {
     /// refuses `act` on one. An empty action list alone never means disabled.
     #[serde(
         default,
-        deserialize_with = "state::lenient_disabled",
-        skip_serializing_if = "state::not_disabled"
+        deserialize_with = "state::lenient_flag",
+        skip_serializing_if = "std::ops::Not::not"
     )]
-    pub disabled: Option<bool>,
+    pub disabled: bool,
     /// A numeric value: a progress bar's, a slider's, a gauge's.
     #[serde(
         default,
@@ -488,7 +491,7 @@ impl Node {
             selected: None,
             checked: None,
             expanded: None,
-            disabled: None,
+            disabled: false,
             value_now: None,
             value_min: None,
             value_max: None,
@@ -547,7 +550,7 @@ impl Node {
 
     /// Mark this node disabled, or with `false` clear the mark.
     pub fn disabled(mut self, disabled: bool) -> Self {
-        self.disabled = disabled.then_some(true);
+        self.disabled = disabled;
         self
     }
 
@@ -970,28 +973,32 @@ mod tests {
         );
     }
 
-    /// Only `true` is a statement for `disabled`: a parsed `false` is
-    /// `None`, and a `Some(false)` set on the field directly stays off the
-    /// wire, so no peer ever reads `"disabled":false`.
+    /// Only `true` is a statement for `disabled`: it is the only value sent,
+    /// so no peer ever reads `"disabled":false`, and on the way in `false`,
+    /// `null`, absence and any other shape all read as `false` without
+    /// failing the node.
     #[test]
     fn disabled_is_only_ever_true() {
-        let node: Node =
-            serde_json::from_str(r#"{"id":"n","role":"button","disabled":false}"#).unwrap();
-        assert_eq!(node.disabled, None);
-        let node: Node =
-            serde_json::from_str(r#"{"id":"n","role":"button","disabled":true}"#).unwrap();
-        assert_eq!(node.disabled, Some(true));
-
-        let mut node = Node::new("n", Role::Button);
-        node.disabled = Some(false);
         assert_eq!(
-            serde_json::to_string(&node).unwrap(),
+            serde_json::to_string(&Node::new("n", Role::Button).disabled(true)).unwrap(),
+            r#"{"id":"n","role":"button","focused":false,"disabled":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Node::new("n", Role::Button).disabled(false)).unwrap(),
             r#"{"id":"n","role":"button","focused":false}"#
         );
-        assert_eq!(
-            Node::new("n", Role::Button).disabled(true).disabled,
-            Some(true)
-        );
+
+        let node: Node =
+            serde_json::from_str(r#"{"id":"n","role":"button","disabled":true}"#).unwrap();
+        assert!(node.disabled);
+        for value in ["false", "null", r#""true""#, "1", "[true]", "{}"] {
+            let json = format!(r#"{{"id":"n","role":"button","label":"kept","disabled":{value}}}"#);
+            let node: Node = serde_json::from_str(&json)
+                .unwrap_or_else(|err| panic!("{json} must parse: {err}"));
+            assert_eq!(node, Node::new("n", Role::Button).label("kept"), "{json}");
+        }
+        let node: Node = serde_json::from_str(r#"{"id":"n","role":"button"}"#).unwrap();
+        assert!(!node.disabled);
     }
 
     /// A number that is not finite is never stored, so it can never reach

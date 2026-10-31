@@ -397,6 +397,12 @@ impl TariaMcpServerBuilder {
     /// app with no tool calls before it lets go. [`DEFAULT_IDLE_RELEASE`]
     /// unless set, and [`Duration::ZERO`] never lets go once connected.
     ///
+    /// Taken as it is, with no upper bound. A window too long for its end to
+    /// be a point on the clock, [`Duration::MAX`] for one, never lets go
+    /// either, just as zero does, and nothing says so. The `taria-mcp` binary
+    /// refuses an `--idle-release` over 86400 s, a day, for that reason; a
+    /// caller that builds the window from user input may want the same bound.
+    ///
     /// [`connected`](Self::connected) ignores it: that bridge never lets go.
     pub fn idle_release(mut self, idle_release: Duration) -> Self {
         self.idle_release = idle_release;
@@ -909,7 +915,7 @@ impl Tools {
         // a disabled node's actions, and the name list would read as a node
         // with no actions at all. Only the mark decides it; an empty action
         // list alone never does.
-        if target.disabled == Some(true) {
+        if target.disabled {
             return Err(McpError::invalid_params(
                 format!(
                     "node `{node}` is disabled and accepts no actions until the app enables it; \

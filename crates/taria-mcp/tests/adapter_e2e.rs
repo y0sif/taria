@@ -584,6 +584,41 @@ fn every_tool_reaches_the_app_and_answers_with_its_tree() {
     assert_eq!(value(&tree, "draft"), "hello", "{tree}");
 }
 
+/// An input the app takes and that changes nothing is answered as such at
+/// once. The adapter sends the unchanged tree again, stamped with the input,
+/// and that stamp is what ends the bridge's wait; without it the wait would
+/// run its whole 3 s and say the app published nothing after the input. The
+/// `stamps` suite holds the bridge's side against fake apps on Unix only, so
+/// this is the real adapter's restamp, on every platform.
+#[test]
+fn an_input_that_changes_nothing_is_answered_at_once() {
+    let endpoint = Endpoint::new("unchanged");
+    let _app = AppProcess::start(&endpoint);
+    let mut bridge = Bridge::start(&endpoint, "60");
+    let before = tree_in(&bridge.read_tree().expect("read_tree serves the app"));
+    assert_eq!(node(&before, "item-a")["selected"], json!(true), "{before}");
+
+    // Selecting the row that is already selected: delivered, and nothing in
+    // the tree to show for it.
+    let sent = Instant::now();
+    let answer = bridge.act("item-a", "select").expect("act on item-a");
+    let took = sent.elapsed();
+    assert_eq!(
+        answer,
+        "The app received this input, and its tree did not change.",
+        "log:\n{}",
+        bridge.log()
+    );
+    // Half the stamped wait: an answer inside it did not wait the wait out.
+    assert!(
+        took < Duration::from_millis(1_500),
+        "answered after {took:?}, not at once"
+    );
+
+    let after = tree_in(&bridge.read_tree().expect("read_tree after the act"));
+    assert_eq!(after["root"], before["root"], "the tree is as it was");
+}
+
 /// The adapter serves one bridge at a time. A second `taria-mcp` against an
 /// app the first holds is told the app is held by another bridge, and gets in
 /// once the first lets go after its idle window.

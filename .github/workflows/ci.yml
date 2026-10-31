@@ -24,17 +24,17 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Clippy (Windows target)
-        run: cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets -- -D warnings
+        run: cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets --locked -- -D warnings
       - name: Docs
-        run: cargo doc --no-deps --workspace
+        run: cargo doc --no-deps --workspace --locked
         env:
           RUSTDOCFLAGS: -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
       # The two scripts are where agent-contract breakage shows up: the tool
       # results an agent actually reads, the acknowledgement shapes, and the
       # edge cases (a peer on another protocol version, a burst half dropped,
@@ -65,11 +65,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       # Built before the scripts, which build what they test with a time
       # limit of their own, so a cold macOS build is never what times out.
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
       - name: End-to-end scenario
         run: python3 scripts/e2e.py
         timeout-minutes: 10

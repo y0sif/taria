@@ -281,12 +281,6 @@ pub(crate) fn lenient_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<boo
     Ok(Shape::read(d)?.bool())
 }
 
-/// `disabled`: only `true` is a statement. `false` reads as not stated,
-/// which is what it means, so a parsed node never holds `Some(false)`.
-pub(crate) fn lenient_disabled<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
-    Ok(Shape::read(d)?.bool().filter(|disabled| *disabled))
-}
-
 /// `checked`: `true`, `false` or `"mixed"`, or not stated.
 pub(crate) fn lenient_checked<'de, D: Deserializer<'de>>(
     d: D,
@@ -315,11 +309,6 @@ pub(crate) fn lenient_text<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Str
     Ok(Shape::read(d)?.text())
 }
 
-/// Whether `disabled` stays off the wire: it is sent only as `true`.
-pub(crate) fn not_disabled(disabled: &Option<bool>) -> bool {
-    *disabled != Some(true)
-}
-
 /// A snapshot's `after_input`: an unsigned 64-bit integer, or not stated.
 ///
 /// Read like the node's state, for the same reason: the field was added
@@ -336,8 +325,10 @@ pub(crate) fn lenient_input_id<'de, D: Deserializer<'de>>(
     })
 }
 
-/// A hello's `stamps`: only `true` is a statement, and anything else reads
-/// as a peer that does not stamp, which is what an older peer is.
+/// A hello's `stamps` and a node's `disabled`: only `true` is a statement,
+/// and anything else reads as `false`. For `stamps` that is a peer that does
+/// not stamp, which is what an older peer is; for `disabled` it is a node
+/// not marked, which is what `false` means.
 pub(crate) fn lenient_flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     Ok(Shape::read(d)?.bool() == Some(true))
 }

@@ -775,9 +775,10 @@ x progress_bar {mark}"
         .expect("a wrong shape costs the field, not the snapshot");
         let root = parsed.root;
         assert_eq!(
-            (root.selected, root.checked, root.disabled, root.value_now),
-            (None, None, None, None)
+            (root.selected, root.checked, root.value_now),
+            (None, None, None)
         );
+        assert!(!root.disabled);
         assert_eq!(
             (root.pos_in_set, root.set_size, root.row, root.column),
             (None, None, None, None)

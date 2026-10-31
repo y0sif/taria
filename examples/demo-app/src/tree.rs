@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(task.label.as_deref(), Some(app.tasks[0].title.as_str()));
         assert_eq!(task.checked, Some(Checked::False));
         assert_eq!(task.selected, Some(true));
-        assert_eq!(task.disabled, None, "inert behind the modal, not disabled");
+        assert!(!task.disabled, "inert behind the modal, not disabled");
 
         // The dialog keeps its own actions.
         assert_eq!(
