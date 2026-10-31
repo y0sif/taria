@@ -1,11 +1,11 @@
 //! Message contract for the taria transport.
 //!
-//! Apps and the bridge exchange these messages over a Unix domain socket as
-//! newline-delimited JSON: each message is one JSON object serialized on a
-//! single line, terminated by `\n`. `serde_json` never emits raw newlines
-//! inside a compact object, so `serde_json::to_string` plus a trailing `\n`
-//! is a valid frame. This module defines only the types; transports own the
-//! actual I/O.
+//! Apps and the bridge exchange these messages over a Unix domain socket, or
+//! a named pipe on Windows, as newline-delimited JSON: each message is one
+//! JSON object serialized on a single line, terminated by `\n`. `serde_json`
+//! never emits raw newlines inside a compact object, so
+//! `serde_json::to_string` plus a trailing `\n` is a valid frame. This
+//! module defines only the types; transports own the actual I/O.
 //!
 //! Handshake: the first message an app sends after connecting is
 //! [`AppToBridge::Hello`], carrying its label and

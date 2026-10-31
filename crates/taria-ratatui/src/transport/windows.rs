@@ -1286,7 +1286,8 @@ mod tests {
     /// name in use until it closes, so the bind waits for it; Wine frees the
     /// name with the server's handles, so there the bind succeeds at once,
     /// and a test that also runs under Wine cannot require the wait. The wait
-    /// itself is exercised only on real Windows (the windows-latest CI job).
+    /// itself is exercised only on real Windows (the windows-latest CI job),
+    /// and a bind that did not wait says so in the test's output.
     #[test]
     fn a_bind_succeeds_in_time_while_a_bridge_holds_the_last_instance() {
         let (listener, connection, client) = session("lingering");
@@ -1303,6 +1304,12 @@ mod tests {
         let took = tried.elapsed();
         bridge.join().expect("the bridge thread");
         assert!(took < BIND_RETRY, "bound only after {took:?}");
+        if took < Duration::from_millis(100) {
+            eprintln!(
+                "bound in {took:?}, before the bridge closed its end: this system freed the name \
+                 with the app's handles, so the wait was not exercised"
+            );
+        }
 
         let (_next, _connection, _client) = next_session(next);
     }

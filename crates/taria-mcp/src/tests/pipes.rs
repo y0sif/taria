@@ -13,7 +13,7 @@ use rmcp::model::CallToolResult;
 use taria::wire::{AppToBridge, BridgeToApp, InputStatus};
 use taria::{AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer};
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer};
 use tokio::sync::watch;
 use tokio::time::timeout;
 use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
@@ -26,12 +26,65 @@ use crate::transport::testing::{app_pipe, pipe_owned_by, unique_pipe_name};
 /// Far longer than anything here takes on a healthy machine.
 const STEP: Duration = Duration::from_secs(10);
 
+/// How the answer to a pipe another account owns opens, before any tree.
+const FOREIGN: &str = "no snapshot from the app yet: the pipe at this name is owned by another \
+                       account than this bridge's user, so it is not the app's";
+
+/// How the held answer to a busy pipe opens, before any tree.
+const HELD: &str = "no snapshot from the app yet: the app is held by another bridge. The pipe \
+                    name is right: the app's pipe refused this bridge as busy";
+
 /// The tool layer of a server built the way the binary builds it.
 fn on_demand(name: &str) -> Tools {
     TariaMcpServer::builder(PathBuf::from(name))
         .on_demand()
         .expect("a tokio test runs inside a runtime, and the name is a pipe's")
         .tools
+}
+
+/// [`on_demand`], letting go of the app after `idle_release` with no calls.
+fn on_demand_releasing(name: &str, idle_release: Duration) -> Tools {
+    TariaMcpServer::builder(PathBuf::from(name))
+        .idle_release(idle_release)
+        .on_demand()
+        .expect("a tokio test runs inside a runtime, and the name is a pipe's")
+        .tools
+}
+
+/// The app's pipe made again under `name` once the last pipe of that name
+/// has gone. The old instance closes once the runtime has seen its pending
+/// read cancelled, so the name is taken for a moment after the drop.
+async fn remake_app_pipe(name: &str) -> NamedPipeServer {
+    for _ in 0..100 {
+        match app_pipe(name) {
+            Ok(pipe) => return pipe,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    panic!("the name never came free");
+}
+
+/// Read the tree until the app's pipe serves one.
+async fn first_tree(tools: &Tools) -> CallToolResult {
+    for _ in 0..40 {
+        if let Ok(tree) = tools.read_tree().await {
+            return tree;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("never got in");
+}
+
+/// A client of the test's own holding a foreign pipe's one instance, where
+/// the bridge's closed open does not: on Windows that open keeps the
+/// instance taken until the server disconnects it, which an impostor never
+/// does, and Wine frees it.
+fn squat(name: &str) -> Option<NamedPipeClient> {
+    match ClientOptions::new().open(name) {
+        Ok(client) => Some(client),
+        Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => None,
+        Err(err) => panic!("neither opened nor busy: {err}"),
+    }
 }
 
 fn result_text(result: &CallToolResult) -> &str {
@@ -186,44 +239,14 @@ async fn a_busy_pipe_is_held_and_the_bridge_gets_in_once_it_is_free() {
 
     let tools = on_demand(&name);
     let held = tools.read_tree().await.expect_err("held by the other");
-    assert!(
-        held.message.starts_with(
-            "no snapshot from the app yet: the app is held by another bridge. The pipe name is \
-             right: the app's pipe refused this bridge as busy"
-        ),
-        "{}",
-        held.message
-    );
+    assert!(held.message.starts_with(HELD), "{}", held.message);
 
     // The holder lets go, and the app makes its pipe again for the next
     // bridge, the way an adapter does between bridges.
     drop(holder);
     drop(pipe);
-    // The old instance closes once the runtime has seen its pending read
-    // cancelled, so the name is busy for a moment after the drop.
-    let mut remade = None;
-    for _ in 0..100 {
-        match app_pipe(&name) {
-            Ok(pipe) => {
-                remade = Some(pipe);
-                break;
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-        }
-    }
-    let mut pipe = remade.expect("make the pipe again");
-    let (tree, ()) = tokio::join!(
-        async {
-            for _ in 0..40 {
-                if let Ok(tree) = tools.read_tree().await {
-                    return tree;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            panic!("never got in");
-        },
-        greet(&mut pipe, 2)
-    );
+    let mut pipe = remake_app_pipe(&name).await;
+    let (tree, ()) = tokio::join!(first_tree(&tools), greet(&mut pipe, 2));
     assert!(result_text(&tree).contains("pipe demo"));
 }
 
@@ -270,14 +293,7 @@ async fn a_pipe_another_account_owns_is_closed_unwritten_and_named() {
     };
     let tools = on_demand(&name);
     let refused = tools.read_tree().await.expect_err("not the app");
-    assert!(
-        refused.message.starts_with(
-            "no snapshot from the app yet: the pipe at this name is owned by another account \
-             than this bridge's user, or refused this user access"
-        ),
-        "{}",
-        refused.message
-    );
+    assert!(refused.message.starts_with(FOREIGN), "{}", refused.message);
     // The bridge opened it and closed it, and sent nothing in between.
     timeout(STEP, pipe.connect())
         .await
@@ -296,12 +312,10 @@ async fn a_pipe_another_account_owns_is_closed_unwritten_and_named() {
 /// and then stays busy is still not the app: the busy refusals after the
 /// first open keep the foreign answer, and never read as the app held by
 /// another bridge. Only a connect that passes the owner check, or finds
-/// nothing listening, retires it. Only where the test can make such a pipe,
-/// as above.
+/// nothing listening, retires it, or the bridge letting go of it (below).
+/// Only where the test can make such a pipe, as above.
 #[tokio::test]
 async fn a_foreign_pipe_that_then_stays_busy_is_still_not_the_app() {
-    const FOREIGN: &str = "no snapshot from the app yet: the pipe at this name is owned by \
-                           another account than this bridge's user";
     let name = unique_pipe_name("foreignbusy");
     let _pipe = match pipe_owned_by(&name, "BA") {
         Ok(pipe) => pipe,
@@ -317,11 +331,7 @@ async fn a_foreign_pipe_that_then_stays_busy_is_still_not_the_app() {
     // The pipe's one instance stays taken: on Windows by the bridge's closed
     // open until the server disconnects it, which this one never does, and
     // here by a client of the test's own where the instance came free.
-    let _squatter = match ClientOptions::new().open(&name) {
-        Ok(client) => Some(client),
-        Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => None,
-        Err(err) => panic!("neither opened nor busy: {err}"),
-    };
+    let _squatter = squat(&name);
     let busy = ClientOptions::new()
         .open(&name)
         .expect_err("the pipe stays busy");
@@ -335,6 +345,66 @@ async fn a_foreign_pipe_that_then_stays_busy_is_still_not_the_app() {
         assert!(answer.message.starts_with(FOREIGN), "{}", answer.message);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// A bridge that met a pipe another account owns, and let go after its idle
+/// window, reads the next busy refusal afresh. A released bridge stops
+/// trying, so the impostor can exit and the app come back meanwhile, held by
+/// another session: that refusal is the app held, and gets the held answer,
+/// not the impostor's. Once the holder leaves, the bridge gets in. Only where
+/// the test can make such a pipe, as above.
+#[tokio::test]
+async fn a_bridge_that_let_go_of_a_foreign_pipe_finds_the_app_afresh() {
+    const WINDOW: Duration = Duration::from_secs(1);
+    let name = unique_pipe_name("foreigngone");
+    let impostor = match pipe_owned_by(&name, "BA") {
+        Ok(pipe) => pipe,
+        Err(err) => {
+            eprintln!("no pipe another account owns here ({err}); nothing to refuse");
+            return;
+        }
+    };
+    let tools = on_demand_releasing(&name, WINDOW);
+    let refused = tools.read_tree().await.expect_err("not the app");
+    assert!(refused.message.starts_with(FOREIGN), "{}", refused.message);
+
+    // The impostor's one instance stays taken, as above, so until the window
+    // closes the bridge's reconnects are refused as busy and keep the
+    // foreign answer. Then it lets go, and the refusal with it.
+    let squatter = squat(&name);
+    let mut link = tools.link_rx();
+    assert!(
+        !matches!(*link.borrow(), LinkState::Down),
+        "the refusal stands until the release"
+    );
+    timeout(
+        WINDOW + STEP,
+        link.wait_for(|link| matches!(link, LinkState::Down)),
+    )
+    .await
+    .expect("let go within the window and the step")
+    .expect("the manager is alive");
+
+    // The impostor exits, and the app comes back under its name, taken by
+    // another session's bridge while this one is not trying.
+    drop(squatter);
+    drop(impostor);
+    let app = remake_app_pipe(&name).await;
+    let holder = ClientOptions::new().open(&name).expect("another bridge");
+    timeout(STEP, app.connect())
+        .await
+        .expect("the other bridge connects")
+        .expect("the app takes it");
+    let held = tools.read_tree().await.expect_err("held by the other");
+    assert!(held.message.starts_with(HELD), "{}", held.message);
+
+    // The holder leaves, and the app makes its pipe again for the next
+    // bridge, which is this one.
+    drop(holder);
+    drop(app);
+    let mut app = remake_app_pipe(&name).await;
+    let (tree, ()) = tokio::join!(first_tree(&tools), greet(&mut app, 1));
+    assert!(result_text(&tree).contains("pipe demo"));
 }
 
 /// The pid at the other end of the pipe is the process serving it, here

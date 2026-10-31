@@ -285,9 +285,10 @@ pub(crate) enum LinkState {
     /// No connection is open because the last connect was turned away by
     /// something listening at the path, for this reason. Only the Windows
     /// transport refuses a connect this way: a pipe busy with another bridge
-    /// is the app held, as an open, silent connection is on Unix, and a pipe
-    /// another account owns, or one that refuses this user, is not the app
-    /// at all.
+    /// is the app held, as an open, silent connection is on Unix, a pipe
+    /// another account owns is not the app at all, and a pipe that refuses
+    /// this bridge access is not the app's, or one this bridge lacks the
+    /// rights to open.
     Refused(Refusal),
 }
 
@@ -1030,6 +1031,13 @@ async fn manager_loop(
     let mut backoff = RETRY_MIN;
     'asleep: loop {
         if let Some(idle) = idle.as_mut() {
+            // Asleep, the manager holds nothing and tries nothing, so a
+            // refusal its last connect met is no longer what the link is, and
+            // the next connect is judged afresh: a pipe that barred this
+            // bridge stands over busy refusals only while the bridge keeps
+            // trying (see `note_refusal`). Done before the manager wakes, so a
+            // call that finds it awake never reads the refusal it let go of.
+            forget_refusal(&link_tx);
             if !idle.until_wanted(&mut input_rx).await {
                 tracing::debug!("session ended while the bridge was idle; bridge task exiting");
                 return;
@@ -1203,12 +1211,11 @@ async fn manager_loop(
                         // about the next instance must not say it. Cleared
                         // before the outcome is counted, which is what a
                         // waiting call reads it after. A pipe at the path
-                        // that is not the app's says the same: the app is
-                        // not what is there, for as long as the link says
-                        // so (see `note_refusal`).
-                        if transport::nothing_listens(&err)
-                            || *link_tx.borrow() == LinkState::Refused(Refusal::Foreign)
-                        {
+                        // that barred this bridge says much the same: what
+                        // is there is not the app it let go of, or is out of
+                        // its reach, for as long as the link says so (see
+                        // `note_refusal`).
+                        if transport::nothing_listens(&err) || bars(*link_tx.borrow()) {
                             idle.note(|activity| activity.released = false);
                         }
                         idle.settled();
@@ -1350,29 +1357,36 @@ fn forget_oversized_if_nothing_listens(
 /// A busy pipe is the Windows form of a connect into the backlog, the app
 /// there and serving another bridge, so what the last connection's lines
 /// failed on is forgotten, as a connect forgets it, oversized tree aside. A
-/// pipe that is not the app's (another account owns it, or it refused this
-/// user) is not the app, so everything the app's lines failed on goes, the
-/// oversized tree included, and the refusal is logged as a warning when it
-/// is new, with what the error names: the owner, or the refusal.
+/// pipe another account owns is not the app, and one that refused this
+/// bridge access is not the app's or not one this bridge can open, so
+/// everything the app's lines failed on goes, the oversized tree included,
+/// and the refusal is logged as a warning when it is new, with what the
+/// error names: the owner, or the refusal.
 ///
-/// A foreign refusal stands until a connect passes the owner check or finds
-/// nothing listening, whatever fails in between. A pipe that takes one open
-/// and fails the check stays busy until its server disconnects that open,
-/// which an impostor need never do. Read as busy, those refusals turned "not
-/// the app" into the app held by another bridge, about a pipe the app never
-/// made.
+/// Either of those two stands, as it was, until a connect passes the owner
+/// check or finds nothing listening, whatever fails in between, or the
+/// manager releases (see [`forget_refusal`]). A pipe that takes one open and
+/// fails the check stays busy until its server disconnects that open, which
+/// an impostor need never do. Read as busy, those refusals turned "not the
+/// app" into the app held by another bridge, about a pipe the app never
+/// made. A refusal of either kind that is new replaces the one standing.
+///
+/// What it stands over is only what this manager tried since, which is why a
+/// release ends it: a released manager stops trying, so the impostor it met
+/// may exit and the app come back meanwhile, held by another session, and a
+/// busy refusal then is the app's. Kept past the release, the answer went on
+/// sending the agent after an impostor that had gone.
 fn note_refusal(
     path: &std::path::Path,
     err: &io::Error,
     link_tx: &watch::Sender<LinkState>,
     rejected_tx: &watch::Sender<Option<String>>,
 ) {
-    let was_foreign = *link_tx.borrow() == LinkState::Refused(Refusal::Foreign);
-    let refusal = if was_foreign && !transport::nothing_listens(err) {
-        Some(Refusal::Foreign)
-    } else {
-        transport::refusal(err)
-    };
+    let refusal = standing_refusal(
+        *link_tx.borrow(),
+        transport::refusal(err),
+        transport::nothing_listens(err),
+    );
     let now = refusal.map_or(LinkState::Down, LinkState::Refused);
     let changed = link_tx.send_if_modified(|link| {
         if *link == now {
@@ -1384,7 +1398,7 @@ fn note_refusal(
     });
     match refusal {
         Some(Refusal::Busy) => forget_rejected_except_oversized(rejected_tx),
-        Some(Refusal::Foreign) => {
+        Some(Refusal::Foreign | Refusal::Denied) => {
             if changed {
                 tracing::warn!(path = %path.display(), %err, "refused the app's endpoint");
             }
@@ -1392,6 +1406,44 @@ fn note_refusal(
         }
         None => {}
     }
+}
+
+/// What a failed connect reads as, from what the link read as before it
+/// (`link`), what the failure itself says (`fresh`, [`transport::refusal`]'s
+/// reading of it), and whether it found nothing listening: the refusal that
+/// barred this bridge, while one stands and the failure is not a new one or
+/// nothing listening, and otherwise the failure's own. See [`note_refusal`].
+fn standing_refusal(
+    link: LinkState,
+    fresh: Option<Refusal>,
+    nothing_listens: bool,
+) -> Option<Refusal> {
+    match (link, fresh) {
+        (_, Some(fresh)) if fresh.bars() => Some(fresh),
+        (LinkState::Refused(standing), _) if standing.bars() && !nothing_listens => Some(standing),
+        _ => fresh,
+    }
+}
+
+/// True when `link` is a refusal that barred this bridge (see
+/// [`Refusal::bars`]).
+fn bars(link: LinkState) -> bool {
+    matches!(link, LinkState::Refused(refusal) if refusal.bars())
+}
+
+/// Let go of whatever refusal the link holds, for a manager that has just
+/// released: it is down, as a link with nothing open and nothing tried is.
+/// Where connects are never refused (Unix) the link is down already, and is
+/// left unsent.
+fn forget_refusal(link_tx: &watch::Sender<LinkState>) {
+    link_tx.send_if_modified(|link| {
+        if matches!(link, LinkState::Refused(_)) {
+            *link = LinkState::Down;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// Retire every reason but [`OVERSIZED_LINE`], the counterpart of
@@ -2047,6 +2099,53 @@ mod tests {
         forget_rejected_except_oversized(&rejected_tx);
         assert_eq!(rejected_rx.borrow().as_deref(), Some(OVERSIZED_LINE));
         assert!(!rejected_rx.has_changed().expect("the sender is alive"));
+    }
+
+    /// A pipe that barred this bridge, by its owner or by denying it access,
+    /// stands over every failure after it that is not a new refusal of
+    /// either kind or nothing listening, a busy pipe included; a busy pipe
+    /// with nothing standing is the app held, as it is once the link that
+    /// held the refusal is down again.
+    #[test]
+    fn a_barring_refusal_stands_until_something_says_otherwise() {
+        use Refusal::{Busy, Denied, Foreign};
+        let refused = LinkState::Refused;
+        for standing in [Foreign, Denied] {
+            let link = refused(standing);
+            assert_eq!(standing_refusal(link, Some(Busy), false), Some(standing));
+            assert_eq!(standing_refusal(link, None, false), Some(standing));
+            assert_eq!(standing_refusal(link, None, true), None);
+            assert_eq!(standing_refusal(link, Some(Foreign), false), Some(Foreign));
+            assert_eq!(standing_refusal(link, Some(Denied), false), Some(Denied));
+        }
+        for link in [LinkState::Down, refused(Busy)] {
+            assert_eq!(standing_refusal(link, Some(Busy), false), Some(Busy));
+            assert_eq!(standing_refusal(link, None, false), None);
+            assert_eq!(standing_refusal(link, Some(Foreign), false), Some(Foreign));
+            assert_eq!(standing_refusal(link, Some(Denied), false), Some(Denied));
+        }
+    }
+
+    /// A release puts any refusal down, so the next connect is read afresh,
+    /// and sends nothing for a link that is down already, which is every
+    /// link on Unix.
+    #[test]
+    fn a_release_forgets_the_refusal_and_nothing_else() {
+        let (link_tx, mut link_rx) = watch::channel(LinkState::Refused(Refusal::Foreign));
+        link_rx.borrow_and_update();
+        forget_refusal(&link_tx);
+        assert_eq!(*link_rx.borrow_and_update(), LinkState::Down);
+        forget_refusal(&link_tx);
+        assert!(!link_rx.has_changed().expect("the sender is alive"));
+
+        let open = LinkState::Open {
+            since: Instant::now(),
+        };
+        link_tx.send_replace(open);
+        link_rx.borrow_and_update();
+        forget_refusal(&link_tx);
+        assert_eq!(*link_rx.borrow(), open);
+        assert!(!link_rx.has_changed().expect("the sender is alive"));
     }
 
     /// A peer that publishes before it greets is taken at the version its

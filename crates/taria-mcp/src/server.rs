@@ -279,7 +279,8 @@ pub(crate) struct TypeTextParams {
 }
 
 /// The MCP server: four tools, `read_tree`, `act`, `key` and `type_text`,
-/// served against a running taria-enabled app over its Unix socket.
+/// served against a running taria-enabled app over its Unix socket, or its
+/// named pipe on Windows.
 ///
 /// Build one with [`builder`](Self::builder), finished with
 /// [`on_demand`](TariaMcpServerBuilder::on_demand), which connects on the
@@ -555,6 +556,13 @@ impl Tools {
     #[cfg(test)]
     pub(crate) fn new(handle: BridgeHandle) -> Self {
         Self::with_tree_format(handle, TreeFormat::Json)
+    }
+
+    /// The bridge's link, for a test that waits on what the manager does
+    /// between calls, a release among them.
+    #[cfg(all(test, windows))]
+    pub(crate) fn link_rx(&self) -> watch::Receiver<LinkState> {
+        self.bridge.link_rx.clone()
     }
 
     /// Build the tool layer on top of a spawned bridge, serving the tree in
@@ -1155,11 +1163,12 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
                 "app '{}' disconnected (last snapshot seq {last_seq})",
                 app_label.as_deref().unwrap_or("unknown")
             );
-            // A pipe that is not the app's comes first, and a busy one after
-            // an open connection: only the Windows transport refuses a
-            // connect, so on Unix neither is ever the answer.
-            let message = if report.link == LinkState::Refused(Refusal::Foreign) {
-                format!("{gone}, and {FOREIGN_PIPE}")
+            // A pipe this bridge refused, or that refused it, comes first,
+            // and a busy one after an open connection: only the Windows
+            // transport refuses a connect, so on Unix none is ever the
+            // answer.
+            let message = if let Some(barred) = barred_pipe(report.link) {
+                format!("{gone}, and {barred}")
             } else if is_oversized(report.rejected.as_deref()) {
                 format!(
                     "{gone}; its latest snapshot was over 1 MiB ({MAX_LINE_BYTES} bytes), this \
@@ -1363,12 +1372,12 @@ fn is_oversized(rejected: Option<&str>) -> bool {
 /// - Nothing is connected. Here, and only here, the path and whether the app
 ///   is running are the questions.
 ///
-/// A pipe that another account owns, or that refuses this user, which the
-/// Windows transport refuses in turn, is none of these, and outranks them
-/// all: it is not the app.
+/// A pipe that another account owns, or that denies this bridge access,
+/// which the Windows transport refuses in turn, is none of these, and
+/// outranks them all: it is not the app, or not one this bridge can open.
 fn no_snapshot_reason(report: LinkReport) -> String {
-    if report.link == LinkState::Refused(Refusal::Foreign) {
-        return format!("no snapshot from the app yet: {FOREIGN_PIPE}");
+    if let Some(barred) = barred_pipe(report.link) {
+        return format!("no snapshot from the app yet: {barred}");
     }
     // An oversized line outranks everything, the rejected-line answer below
     // included: that one's depth and version hints are about a line that
@@ -1504,28 +1513,60 @@ fn silent_pipe(open_for: Duration) -> String {
     )
 }
 
-/// What a pipe at the app's name that another account owns, or that refuses
-/// this user access, is, after the answer's opening: not the app, and
-/// refused for that.
+/// What the answers say, after their opening, about a pipe at the app's
+/// name that this bridge refused, or that refused this bridge:
+/// [`FOREIGN_PIPE`] or [`DENIED_PIPE`]. `None` for any other link, a busy
+/// pipe's included, which is the app held.
+fn barred_pipe(link: LinkState) -> Option<&'static str> {
+    match link {
+        LinkState::Refused(Refusal::Foreign) => Some(FOREIGN_PIPE),
+        LinkState::Refused(Refusal::Denied) => Some(DENIED_PIPE),
+        LinkState::Refused(Refusal::Busy) | LinkState::Down | LinkState::Open { .. } => None,
+    }
+}
+
+/// What a pipe at the app's name that another account owns is, after the
+/// answer's opening: not the app, and refused for that.
 ///
 /// Pipe names are machine-wide, so any process can create a pipe under the
 /// app's name before the app does, or after it exits, and an agent that read
-/// it would take its tree for the app's and send it input. The app's own
-/// pipe lets its user in, so one that refuses this user access is not the
-/// app's either. The bridge parses nothing such a pipe sent and writes
-/// nothing to it, and says so; its log names the owner, where the pipe let it
-/// read one.
+/// it would take its tree for the app's and send it input. The app's pipe is
+/// owned by its user, so one another account owns is not the app's, whatever
+/// this bridge's rights: that is why this answer says so outright, where
+/// [`DENIED_PIPE`] cannot. The bridge parses nothing such a pipe sent and
+/// writes nothing to it, and says so; its log names the owner.
 ///
 /// Parses, not reads: registering a pipe with the runtime starts a read into
 /// the runtime's own buffer before the owner check, and what that read took
 /// is dropped with the pipe, never read out of the buffer.
 const FOREIGN_PIPE: &str = "the pipe at this name is owned by another account than this \
-bridge's user, or refused this user access, which the app's own pipe never does, so it is not the \
-app's; this bridge parsed nothing it sent and wrote nothing to it. Pipe names are shared by every \
-user on the machine, so something else created this one, before the app or after it exited, \
-perhaps to pose as it. Ask the user to find what serves it (this bridge's log names the owner, \
-where it could read one) and to restart the app once it is gone; this bridge keeps trying and \
+bridge's user, so it is not the app's; this bridge parsed nothing it sent and wrote nothing to it. \
+Pipe names are shared by every user on the machine, so something else created this one, before \
+the app or after it exited, perhaps to pose as it. Ask the user to find what serves it (this \
+bridge's log names the owner) and to restart the app once it is gone; this bridge keeps trying and \
 connects to the app's own pipe with no restart.";
+
+/// What a pipe at the app's name that denied this bridge access is, after
+/// the answer's opening: either not the app's, or the app's and out of this
+/// bridge's reach, and what to check to tell which.
+///
+/// The app's pipe grants its own user alone, but a token of that user is
+/// still refused it in a sandbox (a restricted token, or an AppContainer, as
+/// an agent harness may run its tools in), or at low integrity, and another
+/// account is refused it outright when given the name with `--socket`. So
+/// access denied does not say the pipe is not the app's, as an owner does,
+/// and the answer names both readings, the bridge's rights first, since those
+/// are the user's to check. A bridge refused for its rights has to be
+/// started again with the right ones; the impostor reading is the one in
+/// which it connects with no restart.
+const DENIED_PIPE: &str = "the pipe at this name denied this bridge access, so either it is not \
+the app's, or this bridge runs with fewer rights than the app's user: in a sandbox (a restricted \
+token or an AppContainer), at low integrity, or as another account. This bridge parsed nothing it \
+sent and wrote nothing to it. Ask the user to check that this bridge runs as the user who runs the \
+app, outside any sandbox and at the app's integrity level; if it does not, it has to be started \
+again that way. If it does, something else created this pipe, before the app or after it exited, \
+perhaps to pose as it: ask the user to find what serves it and to restart the app once it is gone; \
+this bridge keeps trying and then connects to the app's own pipe with no restart.";
 
 /// What follows "held by another bridge" for a bridge whose own departure was
 /// letting go after its idle window: that the disconnect the answer opens
@@ -3722,9 +3763,11 @@ mod tests {
     }
 
     /// On Windows the answers that name the endpoint name a pipe and its
-    /// name, pinned here whole: nothing connected, a line over the limit, a
-    /// line that does not parse, a reconnected app that greeted and has not
-    /// drawn, and a connection younger than the grace.
+    /// name: nothing connected, a line over the limit and a reconnected app
+    /// that greeted and has not drawn, pinned here whole, and two pinned in
+    /// part, a line that does not parse up to the hints that follow its
+    /// reason, and a connection younger than the grace by its opening and
+    /// the phrase after its age, which varies.
     #[cfg(windows)]
     #[test]
     fn on_windows_the_answers_name_a_pipe_and_its_name() {
@@ -3971,30 +4014,56 @@ mod tests {
     }
 
     /// A pipe at the app's name that another account owns is not the app,
-    /// and is named as that ahead of everything else, whether or not this
-    /// bridge had the app before. The reasons a refusal clears in the bridge
-    /// cannot outrank it either.
+    /// and is named as that, outright, ahead of everything else, whether or
+    /// not this bridge had the app before. The reasons a refusal clears in
+    /// the bridge cannot outrank it either.
     #[test]
     fn a_pipe_another_account_owns_is_named_as_not_the_app() {
         let pinned = "the pipe at this name is owned by another account than this bridge's user, \
-                      or refused this user access, which the app's own pipe never does, so it is \
-                      not the app's; this bridge parsed nothing it sent and wrote nothing to it. \
-                      Pipe names are shared by every user on the machine, so something else \
-                      created this one, before the app or after it exited, perhaps to pose as \
-                      it. Ask the user to find what serves it (this bridge's log names the owner, \
-                      where it could read one) and to restart the app once it is gone; this \
-                      bridge keeps trying and connects to the app's own pipe with no restart.";
+                      so it is not the app's; this bridge parsed nothing it sent and wrote nothing \
+                      to it. Pipe names are shared by every user on the machine, so something \
+                      else created this one, before the app or after it exited, perhaps to pose \
+                      as it. Ask the user to find what serves it (this bridge's log names the \
+                      owner) and to restart the app once it is gone; this bridge keeps trying and \
+                      connects to the app's own pipe with no restart.";
+        assert_barred_first(Refusal::Foreign, pinned);
+    }
+
+    /// A pipe at the app's name that denied this bridge access is named
+    /// with both of its readings, not as an impostor alone: the app's pipe
+    /// also denies its own user's token in a sandbox or at low integrity,
+    /// and another account given the name. It outranks everything else as
+    /// the owner's refusal does.
+    #[test]
+    fn a_pipe_that_denied_this_bridge_names_both_readings() {
+        let pinned = "the pipe at this name denied this bridge access, so either it is not the \
+                      app's, or this bridge runs with fewer rights than the app's user: in a \
+                      sandbox (a restricted token or an AppContainer), at low integrity, or as \
+                      another account. This bridge parsed nothing it sent and wrote nothing to \
+                      it. Ask the user to check that this bridge runs as the user who runs the \
+                      app, outside any sandbox and at the app's integrity level; if it does not, \
+                      it has to be started again that way. If it does, something else created \
+                      this pipe, before the app or after it exited, perhaps to pose as it: ask \
+                      the user to find what serves it and to restart the app once it is gone; \
+                      this bridge keeps trying and then connects to the app's own pipe with no \
+                      restart.";
+        assert_barred_first(Refusal::Denied, pinned);
+    }
+
+    /// `refusal` is answered with `pinned` after either opening, ahead of
+    /// an oversized tree.
+    fn assert_barred_first(refusal: Refusal, pinned: &str) {
         for rejected in [None, Some(OVERSIZED_LINE.to_string())] {
-            let foreign = LinkReport {
+            let barred = LinkReport {
                 rejected,
-                ..pipe_link(LinkState::Refused(Refusal::Foreign))
+                ..pipe_link(LinkState::Refused(refusal))
             };
             assert_eq!(
-                no_snapshot_reason(foreign.clone()),
+                no_snapshot_reason(barred.clone()),
                 format!("no snapshot from the app yet: {pinned}")
             );
             assert_eq!(
-                available_snapshot(gone_demo(), foreign)
+                available_snapshot(gone_demo(), barred)
                     .expect_err("no tree")
                     .message,
                 format!("app 'demo' disconnected (last snapshot seq 7), and {pinned}")

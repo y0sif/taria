@@ -51,10 +51,10 @@ its sha256. Then point your harness at it, with the app's label:
 claude mcp add taria -- taria-mcp --app <label>
 ```
 
-On Windows both sides work the same way, from the same commands: the app
-and the bridge meet over a named pipe instead of a Unix socket, and neither
-needs a `cfg` or a flag of its own. Put `taria-mcp.exe` somewhere on your
-`PATH`, or give the harness its full path.
+On Windows both sides work the same way, from the same commands: the app and
+the bridge meet over a named pipe (Windows' local IPC channel) instead of a
+Unix socket, and neither needs a `cfg` or a flag of its own. Put
+`taria-mcp.exe` somewhere on your `PATH`, or give the harness its full path.
 
 The quick start below uses the demo app in this repository instead, which
 needs nothing installed.
@@ -104,13 +104,13 @@ tmux kill-session -t taria-demo      # stop it when you are done
 
 The app publishes a semantic snapshot of its widget tree over a Unix domain
 socket, or a named pipe on Windows, one JSON object per line (ndjson), on
-every meaningful change. The
-bridge holds the latest snapshot and exposes it, plus input back into the
-app, as MCP tools. Agent input reaches the app's event loop like any other
-input source, and the app acknowledges each input by id, so the bridge can
-tell an input the app acted on from one it never saw. The bridge connects on
-its first tool call and lets the app go after 60 s with no tool calls by
-default, so an idle agent session does not keep the app from another.
+every meaningful change. The bridge holds the latest snapshot and exposes it,
+plus input back into the app, as MCP tools. Agent input reaches the app's
+event loop like any other input source, and the app acknowledges each input by
+id, so the bridge can tell an input the app acted on from one it never saw.
+The bridge connects on its first tool call and lets the app go after 60 s with
+no tool calls by default, so an idle agent session does not keep the app from
+another.
 
 ```text
 +---------------+   Unix socket  +-----------+  MCP over stdio  +---------------+

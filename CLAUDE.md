@@ -200,19 +200,24 @@ Windows CI job is the word that counts.
   bridge that lets go leaves the adapter to discard it. An app that never
   sends `hello` is held to the `protocol_version` its first snapshot states.
   On Windows (`transport/windows.rs`) it opens the pipe with tokio's client
-  and refuses one whose owner is not its own token's SID, or whose open is
-  denied (`Refusal::Foreign`: nothing it sent parsed, nothing written,
-  logged with the owner where one was read); `--app` derives the name from
-  that SID (`transport/windows_sid.rs`, compiled into the binary too by
-  `#[path]`, so the SID is not a public item), and `--socket` takes only a
-  local pipe name. A pipe has no backlog (`BACKLOG` false): a busy open is
-  retried for 250 ms (`BUSY_RETRY`, the gap between two sessions), then a
-  held app's refusal (`Refusal::Busy`) is answered "held by another bridge"
-  with "the app's pipe refused this bridge as busy" as the evidence, and a
-  connection silent past the grace is the app "suspended or stuck", not
-  held. A foreign pipe outranks every answer. The answers shared with Unix
-  say "pipe" and "pipe name" where Unix says "socket" and "socket path"
-  (`ENDPOINT`/`ENDPOINT_ADDRESS`). The pid comes from
+  and refuses one whose owner is not its own token's SID
+  (`Refusal::Foreign`: "not the app's", the owner logged) or whose open is
+  denied (`Refusal::Denied`: not the app's, or a bridge with fewer rights
+  than the app's user, sandboxed, low integrity or another account; the
+  answer names both and what to check); nothing such a pipe sent is parsed
+  and nothing written. Either stands over later busy refusals until a
+  connect passes the owner check, finds nothing listening, or the bridge
+  releases (`forget_refusal`). `--app` derives the name from that SID
+  (`transport/windows_sid.rs`, compiled into the binary too by `#[path]`,
+  so the SID is not a public item), and `--socket` takes only a local pipe
+  name. A pipe has no backlog (`BACKLOG` false): a busy open is retried for
+  250 ms (`BUSY_RETRY`, the gap between two sessions), then a held app's
+  refusal (`Refusal::Busy`) is answered "held by another bridge" with "the
+  app's pipe refused this bridge as busy" as the evidence, and a connection
+  silent past the grace is the app "suspended or stuck", not held. A
+  foreign or denied pipe outranks every answer. The answers shared with
+  Unix say "pipe" and "pipe name" where Unix says "socket" and "socket
+  path" (`ENDPOINT`/`ENDPOINT_ADDRESS`). The pid comes from
   `GetNamedPipeServerProcessId`; stopped-app detection stays Linux only.
   Linux and macOS texts are unchanged.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text

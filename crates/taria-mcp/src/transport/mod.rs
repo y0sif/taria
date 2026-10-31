@@ -65,9 +65,28 @@ pub(crate) enum Refusal {
     /// gets in on a later retry, once the holder lets go.
     Busy,
     /// The endpoint at the path is not the app's: on Windows a pipe whose
-    /// owner is not this user's SID, or one that refused this user access,
-    /// which the app's own pipe never does. Pipe names are machine-wide, and
-    /// any process can create one under the app's name first. The bridge
-    /// parsed nothing it sent and wrote nothing to it.
+    /// owner is not this user's SID. Pipe names are machine-wide, and any
+    /// process can create one under the app's name first. The bridge parsed
+    /// nothing it sent and wrote nothing to it.
     Foreign,
+    /// The endpoint at the path refused this bridge access: on Windows an
+    /// open the pipe refused as access denied. Either the pipe is not the
+    /// app's, or this bridge runs with fewer rights than the app's user: in a
+    /// sandbox (a restricted token or an AppContainer), at low integrity, or
+    /// as another account, through a name given whole. The app's pipe grants
+    /// its own user alone, which a sandboxed or low-integrity token of that
+    /// user can still fail. Nothing was opened, so nothing was read or
+    /// written.
+    Denied,
+}
+
+impl Refusal {
+    /// True when the endpoint turned this bridge away over who the bridge
+    /// is, or who made the endpoint, and not over a session in progress:
+    /// [`Foreign`](Self::Foreign) and [`Denied`](Self::Denied). Neither is
+    /// the app held, and both stand over the busy refusals that follow them
+    /// (see `bridge::note_refusal`).
+    pub(crate) fn bars(self) -> bool {
+        matches!(self, Self::Foreign | Self::Denied)
+    }
 }

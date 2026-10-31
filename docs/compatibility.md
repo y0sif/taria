@@ -109,7 +109,7 @@ has a lint that catches it.
   | --- | --- | --- | --- |
   | Linux | Unix domain socket | Rust suites, `scripts/e2e.py`, `scripts/adversarial.py` | nothing |
   | macOS | Unix domain socket | Rust suites, both scripts (the one probe that reads `/proc` is skipped) | stopped-app detection: a stopped app reads as held |
-  | Windows | named pipe, `\\.\pipe\taria-<SID>-<label>` | Rust suites, among them a real adapter driven by the real `taria-mcp` | stopped-app detection: a suspended app reads as suspended or stuck, with no pid, or, suspended after a session, as held (the answer allows it may be suspended); the two Python scripts, which need a pseudo-terminal, `/proc` and `AF_UNIX` |
+  | Windows | named pipe, `\\.\pipe\taria-<SID>-<label>`, where the SID is the account's security id | Rust suites, among them a real adapter driven by the real `taria-mcp` | stopped-app detection: a suspended app reads as suspended or stuck, with no pid, or, suspended after a session, as held (the answer allows it may be suspended); the two Python scripts, which need a pseudo-terminal, `/proc` and `AF_UNIX` |
 
   The release page carries a `taria-mcp` build for each: tarballs for
   x86_64 and aarch64 Linux and both macOS architectures, and a `.zip` for

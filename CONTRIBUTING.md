@@ -64,9 +64,10 @@ scripts/wine-test.sh -p taria-mcp --test adapter_e2e
 Wine is a stand-in, not Windows: its named pipes, process ids and timing are
 its own, so a pass there is a strong hint and the Windows CI job is the final
 word. A test that needs something Wine allows and Windows may not, such as a
-pipe owned by another account, or something Windows enforces and Wine may
-not, such as a DACL that shuts out the pipe's own user, says in its output
-when it fell back.
+pipe owned by another account, or something Windows does and Wine may not,
+such as a DACL (the pipe's access list) that shuts out the pipe's own user,
+or a bridge's open handle keeping the name of an app that exited in use,
+says in its output when it fell back.
 
 ## Ground rules
 

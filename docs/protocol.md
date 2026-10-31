@@ -65,8 +65,11 @@ the app is the one that speaks first (section 3).
 ### 1.3 What a conforming app MUST do
 
 1. Bind an `AF_UNIX` `SOCK_STREAM` socket at a path a bridge can find
-   (section 14), or on Windows create a named pipe a bridge can find, owned
-   by its user and open to that user alone (section 14.8).
+   (section 14), or on Windows create a named pipe a bridge can find: in
+   byte mode (section 2.1), as the first instance of its name
+   (`FILE_FLAG_FIRST_PIPE_INSTANCE`), rejecting remote clients
+   (`PIPE_REJECT_REMOTE_CLIENTS`), owned by its user and open to that user
+   alone (section 14.8).
 2. Send exactly one `hello` as the first message on every accepted connection,
    before any other message (section 3).
 3. Publish `snapshot` messages whose `protocol_version` is 1, whose `seq`
@@ -1449,9 +1452,10 @@ On Windows, length is counted the way Windows counts the name, in UTF-16 code
 units (a character outside the Basic Multilingual Plane, such as most emoji,
 counts two). The 256 covers the prefix, so the default name
 `\\.\pipe\taria-<SID>-<label>` spends 16 units on its fixed parts and the
-SID's own length on the user: a typical account's SID is around 45
-characters, which leaves a label about 190. A label that holds `\` is refused
-before the length is counted (section 14.8).
+SID's own length on the user (a SID is the account's security id, section
+14.8): a typical account's SID is around 45 characters, which leaves a label
+about 190. A label that holds `\` is refused before the length is counted
+(section 14.8).
 
 Both peers **SHOULD** check this before binding or connecting rather than
 letting the kernel refuse. The kernel's own refusal names neither the path,
@@ -1654,13 +1658,14 @@ the app held, not as a wrong pipe name or an app that has gone, and
 answer, in the same words and the same retry advice as on a unix, with the
 pipe's refusal as the evidence in place of the silent connection's age, and
 last that the app may instead be suspended or stuck: an app stopped after a
-session cannot listen again, so its pipe stays busy. It answers the silent
-pipe with the app suspended or stuck, the pipe name right, and a retry once
-the app responds. Stopped-app detection needs
-`/proc`, so on Windows a suspended app is named only as possibly suspended,
-never with its pid's state. Every answer that names the endpoint names the
-pipe and the pipe name where a unix answer names the socket and the socket
-path, and is otherwise the same text.
+session cannot listen again, so its pipe stays busy. The exception is a busy
+refusal while a pipe it refused still stands (section 14.8), which keeps that
+pipe's answer instead. It answers the silent pipe with the app suspended or
+stuck, the pipe name right, and a retry once the app responds. Stopped-app
+detection needs `/proc`, so on Windows a suspended app is named only as
+possibly suspended, never with its pid's state. Every answer that names the
+endpoint names the pipe and the pipe name where a unix answer names the
+socket and the socket path, and is otherwise the same text.
 
 ### 14.6 Shutdown
 
@@ -1818,9 +1823,15 @@ it contains `\`. The whole name is limited to 256 UTF-16 code units (section
   registers the pipe, as tokio's does, still conforms, provided what that
   read took is dropped with the pipe and never parsed.
 - **SHOULD** read an open refused as access denied (`ERROR_ACCESS_DENIED`)
-  as a pipe that is not the app's, as it reads one another account owns,
-  and not as no app there: the app's pipe grants its user access (above),
-  so a pipe at the name that denies that user is not one the app created.
+  as a pipe it cannot use, not as no app there, and **SHOULD NOT** report it
+  as surely not the app's, as it may a pipe another account owns. The app's
+  pipe grants its user access (above), but a bridge running as that user is
+  still denied it in a sandbox (a restricted token or an AppContainer) or at
+  low integrity, and a bridge running as another account, given the name
+  whole, is denied it too. So access denied means either a pipe the app did
+  not create, or a bridge with fewer rights than the app's user, and a
+  report of it names both, and what to check: that the bridge runs as the
+  app's user, outside any sandbox and at the app's integrity level.
 - **SHOULD** open it at the `SECURITY_IDENTIFICATION` impersonation level, so
   that what serves the pipe can learn who the bridge is but cannot act as it.
 - **SHOULD** retry an open refused as busy (`ERROR_PIPE_BUSY`) for a short
@@ -1830,8 +1841,20 @@ it contains `\`. The whole name is limited to 256 UTF-16 code units (section
   listen again. Refused at once, a bridge arriving in that moment would
   report a free app as held.
 - **SHOULD** read a refusal as busy that outlasts the retry as the app held
-  by another bridge, and a missing name (`ERROR_FILE_NOT_FOUND`) as no app
-  there (section 14.5).
+  by another bridge, unless a refusal of the pipe stands (below), and a
+  missing name (`ERROR_FILE_NOT_FOUND`) as no app there (section 14.5).
+- **SHOULD** keep reporting a pipe it refused, one another account owns or
+  one that denied it access, on the busy refusals that follow, until a
+  connect passes the owner check, finds nothing listening, or the bridge
+  stops trying, as the reference bridge does when it lets go of the app
+  after its idle window (section 14.7). A pipe that takes one open, fails
+  the owner check and is closed stays busy until its server disconnects that
+  open, which an impostor need never do, and read as the app held, its busy
+  refusals would send the agent to wait for an app that is not there. The
+  rule ends with the trying because what it stands over is what the bridge
+  has tried since: a bridge that stops trying cannot see the impostor exit
+  and the app come back, held by another bridge, and its next busy refusal
+  is read afresh.
 
 **The pipe's lifetime.** A pipe, and its name with it, lives while any handle
 to it is open, on either end. An app that exits while a bridge still holds
@@ -1864,8 +1887,11 @@ first-instance and reject-remote flags, and a DACL granting the user
 `GENERIC_READ | GENERIC_WRITE`, and retries a create that finds the name in
 use for 500 ms, 20 ms between tries, before it reports `AddrInUse`. The
 bridge opens it with tokio's named-pipe client, retries a busy open for
-250 ms, 10 ms between tries, reads an open refused as access denied as a
-pipe that is not the app's, and checks the owner with `GetSecurityInfo`.
+250 ms, 10 ms between tries, checks the owner with `GetSecurityInfo`, and
+answers an open refused as access denied with both readings, the bridge's
+rights first. It keeps a refused pipe's answer over every failed connect
+after it but nothing listening, a busy refusal included, and drops it when
+it lets go of the app after its idle window, the one way it stops trying.
 
 ## 15. Focus contract
 

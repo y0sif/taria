@@ -35,9 +35,9 @@ reading a taria tree for one app and capturing a tmux pane for another.
 **Do I have to use MCP, or can I speak the taria protocol directly?**
 
 MCP is a convenience. `taria-mcp` is one client of a plain protocol: ndjson
-over a Unix domain socket, or a named pipe on Windows, one JSON object per
-line. Anything that can open one can read snapshots and send input without
-MCP in the picture.
+over a Unix domain socket, or a named pipe (Windows' local IPC channel) on
+Windows, one JSON object per line. Anything that can open one can read
+snapshots and send input without MCP in the picture.
 `docs/protocol.md` specifies every message, so an MCP TUI bridge of your own,
 in another language, is a matter of writing one.
 

@@ -14,9 +14,11 @@
 //! Pipe names are machine-wide, so any process can create a pipe under the
 //! app's name before the app does. Every connection is checked to be to a
 //! pipe owned by this bridge's own user, and refused otherwise, with nothing
-//! written to it and nothing it sent parsed ([`Refusal::Foreign`]); so is an
-//! open the pipe refuses as access denied, which the app's own pipe never
-//! answers its user. The open itself asks for `SECURITY_IDENTIFICATION`,
+//! written to it and nothing it sent parsed ([`Refusal::Foreign`]). An open
+//! the pipe refuses as access denied is refused too ([`Refusal::Denied`]),
+//! and means less: the pipe may not be the app's, or this bridge may run
+//! with fewer rights than the app's user (in a sandbox, at low integrity, or
+//! as another account). The open itself asks for `SECURITY_IDENTIFICATION`,
 //! tokio's default, so whatever serves the pipe can learn who this bridge is
 //! and cannot act as it.
 //!
@@ -89,10 +91,10 @@ const BUSY_NAP: Duration = Duration::from_millis(10);
 ///
 /// A name that is not a pipe on this machine is refused before it is opened:
 /// a file path would open the file, and `\\host\pipe\...` goes over SMB. A
-/// pipe owned by anyone else is closed again, and a pipe that refuses the
-/// open as access denied is not opened at all; both fail with an error that
-/// [`refusal`] reads as [`Refusal::Foreign`]. A busy pipe is retried for
-/// [`BUSY_RETRY`] first.
+/// pipe owned by anyone else is closed again, failing with an error that
+/// [`refusal`] reads as [`Refusal::Foreign`], and a pipe that refuses the
+/// open as access denied is not opened at all, failing with one it reads as
+/// [`Refusal::Denied`]. A busy pipe is retried for [`BUSY_RETRY`] first.
 pub(crate) async fn connect(path: &Path) -> io::Result<Stream> {
     let name = pipe_name(path)?;
     let pipe = open(name).await?;
@@ -104,7 +106,7 @@ pub(crate) async fn connect(path: &Path) -> io::Result<Stream> {
 
 /// Open the pipe `name`, retrying for [`BUSY_RETRY`] while it is busy, and
 /// with an open refused as access denied turned into the error [`refusal`]
-/// reads as [`Refusal::Foreign`].
+/// reads as [`Refusal::Denied`], which names the pipe.
 async fn open(name: &str) -> io::Result<NamedPipeClient> {
     let until = Instant::now() + BUSY_RETRY;
     loop {
@@ -149,22 +151,28 @@ pub(crate) fn nothing_listens(err: &io::Error) -> bool {
 }
 
 /// What a failed [`connect`] says about who turned it away: the app's pipe
-/// busy with another client, or a pipe at its name that is not the app's,
-/// because another account owns it or it refused this user access.
+/// busy with another client, a pipe at its name that another account owns,
+/// so not the app's, or a pipe at its name that refused this user access.
 ///
-/// Access denied is read as foreign whether [`connect`] wrapped it or not:
-/// the adapter's pipe grants its user read and write access, so a pipe at the
-/// name that denies this user is not one the adapter made for it.
+/// Access denied is read as [`Refusal::Denied`] whether [`connect`] wrapped
+/// it or not, and not as foreign: the adapter's pipe grants its user read and
+/// write access, but a token of that user can still be refused it, in a
+/// sandbox (a restricted token or an AppContainer) or at low integrity, and
+/// so is another account given the name whole. Only the owner says the pipe
+/// is not the app's.
 pub(crate) fn refusal(err: &io::Error) -> Option<Refusal> {
     if is_busy(err) {
         return Some(Refusal::Busy);
     }
     if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
-        return Some(Refusal::Foreign);
+        return Some(Refusal::Denied);
     }
     err.get_ref()
-        .is_some_and(|inner| inner.is::<NotOurPipe>())
-        .then_some(Refusal::Foreign)
+        .and_then(|inner| inner.downcast_ref::<Barred>())
+        .map(|barred| match barred {
+            Barred::Owned { .. } => Refusal::Foreign,
+            Barred::Denied { .. } => Refusal::Denied,
+        })
 }
 
 /// Refuse a path that is not a pipe on this machine, by the rules of
@@ -209,7 +217,7 @@ fn check_owner(owner: PSID, user: PSID, name: &str) -> io::Result<()> {
     let unreadable = |_| "a SID that cannot be written out".to_string();
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
-        NotOurPipe::Owned {
+        Barred::Owned {
             name: name.to_string(),
             owner: sid_string(owner).unwrap_or_else(unreadable),
             user: sid_string(user).unwrap_or_else(unreadable),
@@ -221,26 +229,29 @@ fn check_owner(owner: PSID, user: PSID, name: &str) -> io::Result<()> {
 fn denied(name: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        NotOurPipe::Denied {
+        Barred::Denied {
             name: name.to_string(),
         },
     )
 }
 
-/// A pipe at the app's name that is not the app's, refused unused.
+/// A pipe at the app's name that this bridge refused, or that refused this
+/// bridge, unused either way.
 #[derive(Debug)]
-enum NotOurPipe {
-    /// Opened, and owned by another account than this user: closed again.
+enum Barred {
+    /// Opened, and owned by another account than this user, so not the
+    /// app's: closed again.
     Owned {
         name: String,
         owner: String,
         user: String,
     },
-    /// Refused as access denied at the open, so never opened.
+    /// Refused as access denied at the open, so never opened: not the
+    /// app's, or this bridge has fewer rights than the app's user.
     Denied { name: String },
 }
 
-impl fmt::Display for NotOurPipe {
+impl fmt::Display for Barred {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Owned { name, owner, user } => write!(
@@ -252,16 +263,17 @@ impl fmt::Display for NotOurPipe {
             ),
             Self::Denied { name } => write!(
                 f,
-                "the pipe {name} refused this user access, which the app's own pipe never does, \
-                 so it is not the app's: pipe names are machine-wide, and any process can create \
-                 one under the app's name first. This bridge never opened it, so nothing was read \
-                 from it or written to it"
+                "the pipe {name} denied this bridge access, so either it is not the app's (pipe \
+                 names are machine-wide, and any process can create one under the app's name \
+                 first), or this bridge runs with fewer rights than the app's user (in a \
+                 sandbox, at low integrity, or as another account). This bridge never opened \
+                 it, so nothing was read from it or written to it"
             ),
         }
     }
 }
 
-impl Error for NotOurPipe {}
+impl Error for Barred {}
 
 /// The owner of a kernel object, with the security descriptor it lives in,
 /// freed on drop.
@@ -552,24 +564,25 @@ mod tests {
         drop(next);
     }
 
-    /// An open the pipe refuses as access denied is a pipe that is not the
-    /// app's, since the adapter's pipe lets its own user in: refused as
-    /// foreign, never as an app that is not running. Wine may let the open
-    /// through a DACL that Windows enforces, and then the mapping alone is
-    /// what is tested.
+    /// An open the pipe refuses as access denied is refused as denied: the
+    /// pipe may not be the app's, or this bridge may have fewer rights than
+    /// the app's user, and it is never read as an app that is not running,
+    /// nor as the pipe another account owns. Wine may let the open through a
+    /// DACL that Windows enforces, and then the mapping alone is what is
+    /// tested.
     #[tokio::test]
-    async fn a_pipe_that_refuses_this_user_is_foreign() {
+    async fn a_pipe_that_refuses_this_user_is_denied() {
         let name = unique_pipe_name("denied");
         let server = pipe_denying_this_user(&name).expect("create the pipe");
         match connect(Path::new(&name)).await {
             Ok(_) => eprintln!("this system let the open through an empty DACL; the mapping alone"),
             Err(err) => {
                 assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
-                assert_eq!(refusal(&err), Some(Refusal::Foreign), "{err}");
+                assert_eq!(refusal(&err), Some(Refusal::Denied), "{err}");
                 assert!(!nothing_listens(&err));
                 assert!(
                     err.to_string()
-                        .starts_with(&format!("the pipe {name} refused this user access")),
+                        .starts_with(&format!("the pipe {name} denied this bridge access")),
                     "{err}"
                 );
             }
@@ -577,16 +590,17 @@ mod tests {
         drop(server);
 
         let raw = io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
-        assert_eq!(refusal(&raw), Some(Refusal::Foreign));
+        assert_eq!(refusal(&raw), Some(Refusal::Denied));
         assert!(!nothing_listens(&raw));
         let wrapped = denied(r"\\.\pipe\x");
-        assert_eq!(refusal(&wrapped), Some(Refusal::Foreign));
+        assert_eq!(refusal(&wrapped), Some(Refusal::Denied));
         assert_eq!(
             wrapped.to_string(),
-            "the pipe \\\\.\\pipe\\x refused this user access, which the app's own pipe \
-             never does, so it is not the app's: pipe names are machine-wide, and any process \
-             can create one under the app's name first. This bridge never opened it, so nothing \
-             was read from it or written to it"
+            "the pipe \\\\.\\pipe\\x denied this bridge access, so either it is not the app's \
+             (pipe names are machine-wide, and any process can create one under the app's name \
+             first), or this bridge runs with fewer rights than the app's user (in a sandbox, at \
+             low integrity, or as another account). This bridge never opened it, so nothing was \
+             read from it or written to it"
         );
     }
 

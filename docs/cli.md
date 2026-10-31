@@ -100,7 +100,7 @@ contain `\` either. Windows trims trailing dots and spaces from a name, so
 
 The bridge checks that the pipe it opened is owned by your own account before
 it writes anything to it or parses anything it sent, and a pipe has no listen
-backlog, so three answers exist only on Windows. Each is quoted as `read_tree`
+backlog, so four answers exist only on Windows. Each is quoted as `read_tree`
 gives it before any tree has arrived, and every tool that needs a tree gives
 the same. After a disconnect each keeps the opening callers match on,
 `app '<label>' disconnected (last snapshot seq N)`, as noted under it.
@@ -134,29 +134,43 @@ the same. After a disconnect each keeps the opening callers match on,
   `app '<label>' disconnected (last snapshot seq N), and this bridge has
   reconnected: `.
 - **The pipe is not the app's.** Pipe names are machine-wide, so anything
-  can create one under the app's name. A pipe another account owns is not
-  the app's, and neither is one that refuses your account access when the
-  bridge opens it, which the app's own pipe never does. The bridge parses
-  nothing such a pipe sent and writes nothing to it, and logs the owner's SID
-  when it could read one:
+  can create one under the app's name, and a pipe another account owns is
+  not the app's. The bridge parses nothing such a pipe sent and writes
+  nothing to it, and logs the owner's SID:
 
   ```text
-  no snapshot from the app yet: the pipe at this name is owned by another account than this bridge's user, or refused this user access, which the app's own pipe never does, so it is not the app's; this bridge parsed nothing it sent and wrote nothing to it. Pipe names are shared by every user on the machine, so something else created this one, before the app or after it exited, perhaps to pose as it. Ask the user to find what serves it (this bridge's log names the owner, where it could read one) and to restart the app once it is gone; this bridge keeps trying and connects to the app's own pipe with no restart.
+  no snapshot from the app yet: the pipe at this name is owned by another account than this bridge's user, so it is not the app's; this bridge parsed nothing it sent and wrote nothing to it. Pipe names are shared by every user on the machine, so something else created this one, before the app or after it exited, perhaps to pose as it. Ask the user to find what serves it (this bridge's log names the owner) and to restart the app once it is gone; this bridge keeps trying and connects to the app's own pipe with no restart.
   ```
 
   After a disconnect the text from `the pipe at this name` on follows
-  `app '<label>' disconnected (last snapshot seq N), and `. It outranks every
-  other answer, and stands until a connect passes the owner check or finds
-  nothing listening, so a pipe that then stays busy does not read as held.
+  `app '<label>' disconnected (last snapshot seq N), and `.
+- **The pipe denied the bridge access.** The app's pipe lets in your account
+  alone, but a bridge running as your account is still denied it in a
+  sandbox (a restricted token, or an AppContainer, as an agent harness may
+  run its tools in) or at low integrity, and so is a bridge running as
+  another account that was given the pipe's name with `--socket`. So the
+  answer gives both readings, and what to check:
+
+  ```text
+  no snapshot from the app yet: the pipe at this name denied this bridge access, so either it is not the app's, or this bridge runs with fewer rights than the app's user: in a sandbox (a restricted token or an AppContainer), at low integrity, or as another account. This bridge parsed nothing it sent and wrote nothing to it. Ask the user to check that this bridge runs as the user who runs the app, outside any sandbox and at the app's integrity level; if it does not, it has to be started again that way. If it does, something else created this pipe, before the app or after it exited, perhaps to pose as it: ask the user to find what serves it and to restart the app once it is gone; this bridge keeps trying and then connects to the app's own pipe with no restart.
+  ```
+
+  After a disconnect the text from `the pipe at this name` on follows the
+  same opening as above. These two outrank every other answer. Each stands
+  until a connect passes the owner check, finds nothing listening, or the
+  bridge lets go of the app after its `--idle-release` window, so a pipe
+  that then stays busy does not read as held. A bridge that let go reads its
+  next busy refusal afresh, as the app held: it stopped trying, so the pipe
+  it refused may have gone and the app come back, held by another bridge.
 
 The answers Windows shares with Linux and macOS keep their texts, except
 that each one naming the app's endpoint says "pipe" where those say
 "socket", and "pipe name" where they say "socket path" (or "path", in the
-answer to a connection younger than the grace). Those are the
-answers to nothing connected, a line over 1 MiB, a line the bridge could not
-read, an app that greeted the bridge and has not published, a connection
-younger than the 500 ms grace, and an input the bridge's queue to the app
-could not take. With nothing connected:
+answer to a connection younger than the grace). Those are the answers to
+nothing connected, a line over 1 MiB, a line the bridge could not read, an
+app that greeted the bridge and has not published, a connection younger than
+the 500 ms grace, and an input the bridge's queue to the app could not take.
+With nothing connected:
 
 ```text
 no snapshot from the app yet, and this bridge holds no connection to the pipe: is the taria-enabled app running, and is the pipe name correct? The bridge reconnects automatically; retry once the app is up.

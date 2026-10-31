@@ -29,14 +29,13 @@ every removed name to what replaces it. The cut moves nothing on the wire:
 binary's command line on Linux and macOS is unchanged (Windows is new), and
 so is every text an agent reads through `taria-mcp`, from the instructions
 to each answer, byte for byte, but for the exceptions under "For whoever
-drives an app". The typed state
-changes the outline's `read_tree` description and adds the answer to `act`
-on a disabled node. Against an app that stamps, the stamps reword the no-ack
-answer and its rejected-line variant, which now name 3000ms, and add
-answers for a tree that did not change, no tree after the input, a burst's
-acknowledged count, a stopped app's unread rest of a burst, and an app
-whose claim to stamp broke. Against an app that does not stamp, the stamps
-move no answer.
+drives an app". The typed state changes the outline's `read_tree`
+description and adds the answer to `act` on a disabled node. Against an app
+that stamps, the stamps reword the no-ack answer and its rejected-line
+variant, which now name 3000ms, and add answers for a tree that did not
+change, no tree after the input, a burst's acknowledged count, a stopped
+app's unread rest of a burst, and an app whose claim to stamp broke. Against
+an app that does not stamp, the stamps move no answer.
 
 **A node can say what state it is in.** Which row is selected, whether a box
 is checked, whether a branch is open, whether a button can be pressed yet,
@@ -254,7 +253,7 @@ be answered well by a 0.4.0 `taria-mcp`:
   machine included, because opening one goes over SMB (Windows file sharing)
   and hands that machine the user's credentials. `--help` describes the pipe
   on Windows.
-- **Three answers exist only on Windows**, each with the usual opening
+- **Four answers exist only on Windows**, each with the usual opening
   (`no snapshot from the app yet: `, or after a disconnect
   `app '<label>' disconnected (last snapshot seq N)`):
   - A pipe has no listen backlog, so a held app refuses a second bridge as
@@ -271,16 +270,29 @@ be answered well by a 0.4.0 `taria-mcp`:
     bridge's connection N.Ns ago but has sent nothing, not even the taria
     handshake; it may be suspended or stuck.`, then that this is not another
     bridge holding the app and to check that the app is responsive.
-  - A pipe at the app's name that another account owns, or that refuses
-    this user access at the open, is refused ahead of every other answer,
-    with nothing it sent parsed and nothing written to it: `the pipe at this
-    name is owned by another account than this bridge's user, or refused
-    this user access, which the app's own pipe never does, so it is not the
-    app's; this bridge parsed nothing it sent and wrote nothing to it.`,
-    then why that can happen and what the user should do. The log names the
-    owner, when the pipe let the bridge read one. It stands until a connect
-    passes the owner check or finds nothing listening, so a pipe that then
-    stays busy does not read as held. `docs/cli.md` quotes all three whole.
+  - A pipe at the app's name that another account owns is refused ahead of
+    every other answer, with nothing it sent parsed and nothing written to
+    it: `the pipe at this name is owned by another account than this
+    bridge's user, so it is not the app's; this bridge parsed nothing it
+    sent and wrote nothing to it.`, then why that can happen and what the
+    user should do. The log names the owner.
+  - A pipe that denies the bridge access at the open is refused the same
+    way, ahead of every other answer, but not called an impostor: the app's
+    own pipe denies a bridge running in a sandbox (a restricted token or an
+    AppContainer), at low integrity, or as another account given the name
+    with `--socket`. `the pipe at this name denied this bridge access, so
+    either it is not the app's, or this bridge runs with fewer rights than
+    the app's user: in a sandbox (a restricted token or an AppContainer), at
+    low integrity, or as another account.`, then that it parsed and wrote
+    nothing, to check that the bridge runs as the app's user, outside any
+    sandbox and at the app's integrity level, and failing that to find what
+    serves the pipe. This and the answer above stand until a connect passes
+    the owner check, finds nothing listening, or the bridge lets go of the
+    app after its idle window, so a pipe that then stays busy does not read
+    as held. A bridge that let go reads its next busy refusal afresh, as the
+    app held: it stopped trying, so the pipe it refused may have gone and
+    the app come back, held by another session, which a kept refusal went
+    on blaming on an impostor. `docs/cli.md` quotes all four whole.
 - **On Windows the other answers name the pipe.** Each answer shared with
   Linux and macOS that names the app's endpoint says "pipe" where they say
   "socket", and "pipe name" where they say "socket path" (or "path", in the
@@ -403,20 +415,23 @@ be answered well by a 0.4.0 `taria-mcp`:
   cannot put a higher id on the wire first, which crediting by stamp relies
   on.
 - **`docs/protocol.md` gains the Windows transport.** Section 2.1 adds the
-  named pipe in byte mode beside the socket, section 13.3 its 256-unit
-  limit on the whole name, sections 14.5 and 14.7 what a busy refusal and a
-  silent connection mean with no backlog, and new section 14.8 the rules:
-  the name and the SID in it, `$TARIA_SOCK` honoured only for a local
-  `\\.\pipe\` name in any case, the first-instance and reject-remote flags,
-  a DACL that grants only the user, the bridge's owner check before it
-  writes or parses anything, an open refused as access denied read as a
-  pipe that is not the app's, one instance reused across sessions, and a
+  named pipe in byte mode beside the socket, section 13.3 its 256-unit limit
+  on the whole name, sections 14.5 and 14.7 what a busy refusal and a silent
+  connection mean with no backlog, and new section 14.8 the rules: the name
+  and the SID in it, `$TARIA_SOCK` honoured only for a local `\\.\pipe\`
+  name in any case, the first-instance and reject-remote flags, a DACL that
+  grants only the user, the bridge's owner check before it writes or parses
+  anything, an open refused as access denied read as a pipe the bridge
+  cannot use and reported as either not the app's or a bridge with fewer
+  rights than the app's user, a refused pipe reported on the busy refusals
+  after it until a connect passes the owner check, finds nothing listening,
+  or the bridge stops trying, one instance reused across sessions, and a
   pipe that lives while any handle to it is open. Two retries are SHOULDs:
   the bridge retries a busy open for a moment (the reference bridge for
-  250 ms) before it reads the app as held, and the app retries a create
-  that finds its name in use (the reference adapter for 500 ms) before it
-  reports `AddrInUse`.
-  The conformance lists in sections 1.3 and 1.4 name the pipe and the owner
+  250 ms) before it reads the app as held, and the app retries a create that
+  finds its name in use (the reference adapter for 500 ms) before it reports
+  `AddrInUse`. The conformance lists in sections 1.3 and 1.4 name the pipe,
+  its byte mode, the first-instance and reject-remote flags, and the owner
   check. `docs/architecture.md` gains Transports: the seam, the overlapped
   I/O design and its invariants, the two retries, and why the pipe is
   written on `windows-sys` rather than `interprocess`.
@@ -483,7 +498,8 @@ be answered well by a 0.4.0 `taria-mcp`:
   a bridge that never reads, a shutdown waking a blocked reader, the
   instance reused session after session, the last ack surviving the app's
   exit, a pipe another account owns refused, a pipe that refuses this user
-  read as foreign, a busy open waited out between two sessions, a bind that
+  read as denied, a bridge that let go of a foreign pipe answering the app
+  held afresh, a busy open waited out between two sessions, a bind that
   waits for a name in use to come free, among them one a bridge still
   holds after its app exited, and each Windows answer pinned byte for byte.
   The Windows CI job builds, lints and tests with `--locked`.

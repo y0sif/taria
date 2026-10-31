@@ -740,9 +740,9 @@ hits: in every row but the last, the bridge reached something listening at
 that path. The input tools ask for a tree before they send anything, so they
 carry whichever of these applies rather than a second vocabulary for it.
 
-On Windows the table has two more rows and one row means something else: a
-pipe that is not the app's (another account owns it, or it refused this
-user access), an open refused as busy, and a silent connection that is the
+On Windows the table has three more rows and one row means something else:
+a pipe another account owns, so not the app's, a pipe that denied this
+bridge access, an open refused as busy, and a silent connection that is the
 app rather than another bridge. What the bridge says to each is under
 Transports, What the bridge says on Windows. The rows above get the same
 answers on Windows, except that each names the pipe and the pipe name where
@@ -1026,12 +1026,15 @@ that fails it is dropped with them. Pipe names are machine-wide and any
 process can create one under the app's name first, so a pipe another
 account owns is closed with nothing parsed or written, refused as
 `Foreign`, and logged as a warning, when the refusal is new, that names the
-owner. An open refused as access denied is `Foreign` too, and never opened:
-the adapter's DACL lets its own user in, so a pipe that denies that user is
-not the app's. With `--app` the binary derives the name from the same token
-SID, read by `transport/windows_sid.rs`, which the library compiles as part
-of its Windows transport and the binary compiles again through `#[path]`,
-so the SID is not a public item of the library.
+owner. An open refused as access denied is never opened, and is refused as
+`Denied`, not `Foreign`: the adapter's DACL lets its own user in, but a
+token of that user is still refused in a sandbox (a restricted token or an
+AppContainer) or at low integrity, and so is another account given the name
+whole, so access denied does not say the pipe is not the app's. With
+`--app` the binary derives the name from the same token SID, read by
+`transport/windows_sid.rs`, which the library compiles as part of its
+Windows transport and the binary compiles again through `#[path]`, so the
+SID is not a public item of the library.
 
 ### Overlapped I/O
 
@@ -1055,9 +1058,13 @@ which is the whole of the design's risk, and these invariants contain it:
   to finish, and only then is its memory reused or freed. An `Op` dropped
   with an operation still in flight, which only a panic can cause, does the
   same, and leaks its memory rather than free it if even that fails.
-- **The handle is closed once, and never under an operation.** The listener
-  and the session share it through an `Arc`, and every operation runs inside
-  a call on an owner that holds that `Arc`.
+- **The handle is closed once, and never under a live operation.** The
+  listener and the session share it through an `Arc`, and every operation
+  runs inside a call on an owner that holds that `Arc`. The one operation
+  that can still be in flight at the close is the leaked one above: an `Op`
+  dropped with an operation it could not see finish keeps its memory and
+  lets go of its `Arc`, so closing the handle cancels that operation, and
+  what the kernel writes as it ends lands in memory never freed or reused.
 - **A shutdown stays shut.** Each session has a closed event, set once by
   `Writer::shutdown` and never reset. Every read and write checks it before
   it starts and waits on it beside its own event. Cancelling the read in
@@ -1109,21 +1116,23 @@ owner and the DACL read back, a second client told the pipe is busy, the
 write deadline against a bridge that never reads, a shutdown waking a
 blocked reader and every later read, the instance reused session after
 session, and what was written before shutdown surviving the pipe's close.
-On the bridge's side, a busy open between two sessions is waited out, and a
-pipe that refuses this user is read as foreign.
+On the bridge's side, a busy open between two sessions is waited out, a
+pipe that refuses this user is read as denied, and a bridge that let go
+after meeting a foreign pipe reads the app held by another bridge afresh.
 `crates/taria-mcp/tests/adapter_e2e.rs` then drives a real `TariaLayer` in
 a child process from the real `taria-mcp` binary on every platform, Windows
 included.
 
 ### What the bridge says on Windows
 
-Three answers exist only on Windows, because only the Windows transport
+Four answers exist only on Windows, because only the Windows transport
 refuses a connect, and only there does a silent connection mean the app.
 The answers Windows shares with Linux and macOS name the pipe and the pipe
-name where those name the socket and the socket path (`ENDPOINT`,
-`ENDPOINT_ADDRESS`), or the path, in the answer to a connection inside the
-grace, so nothing connected asks whether the pipe name is correct. Linux
-and macOS answers are unchanged, byte for byte.
+name where those name the socket and the socket path, or the path in the
+answer to a connection inside the grace (`ENDPOINT`, `ENDPOINT_ADDRESS`,
+`GRACE_ADDRESS`): the answer to nothing connected, for one, asks whether
+the pipe name is correct. Linux and macOS answers are unchanged, byte for
+byte.
 
 - **Busy.** The open was refused with `ERROR_PIPE_BUSY` for the whole of
   the 250 ms retry: another bridge has the one instance. The answer is the
@@ -1140,22 +1149,35 @@ and macOS answers are unchanged, byte for byte.
   or stuck before its `hello`, or something that is not a taria adapter, and
   the answer says so and that it is not another bridge. It replaces the held
   answer that the same silence gets on Unix.
-- **Foreign.** The pipe at the name belongs to another account, or refused
-  this user access at the open. The answer says it is not the app, that the
-  bridge parsed nothing it sent and wrote nothing to it, and that the user
-  should find what serves it; the log names the owner, where the pipe let
-  the bridge read one. It outranks every other answer, an oversized tree
-  included, since it is not the app whose tree or lines those would be
-  about, and it clears the bridge's record of having let go, as finding
-  nothing listening does. It stands until a connect passes the owner check
-  or finds nothing listening: a pipe that takes one open, fails the check
-  and then stays busy is still not the app, not the app held.
+- **Foreign.** The pipe at the name belongs to another account. The answer
+  says it is not the app, that the bridge parsed nothing it sent and wrote
+  nothing to it, and that the user should find what serves it; the log
+  names the owner.
+- **Denied.** The pipe refused this bridge access at the open. That is not
+  proof of an impostor: the app's own pipe denies a bridge in a sandbox, at
+  low integrity, or running as another account. The answer names both
+  readings, says the bridge parsed nothing and wrote nothing, and asks the
+  user to check that the bridge runs as the app's user, outside any sandbox
+  and at the app's integrity level, and failing that to find what serves
+  the pipe.
+
+  Both outrank every other answer, an oversized tree included, since the
+  pipe is not one whose tree or lines those would be about, and both clear
+  the bridge's record of having let go, as finding nothing listening does.
+  Each stands until a connect passes the owner check, finds nothing
+  listening, or the bridge releases: a pipe that takes one open, fails the
+  check and then stays busy is still not the app, not the app held. A
+  release ends it because a released bridge stops trying, and meanwhile the
+  impostor can exit and the app come back, held by another session; kept,
+  the answer sent the agent after an impostor that had gone. So the manager
+  puts the link down when it lets go (`forget_refusal`), and the next busy
+  refusal gets the held answer.
 
 Stopped-app detection reads `/proc`, so it stays Linux only. On Windows an
 app suspended while its pipe listens gets the silent-pipe answer, and one
 suspended after a session, which cannot listen again, gets the busy answer,
 which allows for it; the no-ack answer never names a stopped app.
-`docs/cli.md` quotes the three texts.
+`docs/cli.md` quotes the four texts.
 
 ## Focus contract
 
