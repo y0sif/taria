@@ -142,10 +142,10 @@ refuses a `target/debug` older than the sources.
   3 s (`SETTLE_WAIT`), `Ignored` at the first credited tree, or 500 ms past
   its ack, within the 3 s. A disconnect mid-wait is answered within 500 ms
   of it, inside the cap; a peer that says `stamps` but sends unstamped
-  snapshots is read by the unstamped rules for that call (a changed tree is
-  credited), with a warning logged. Any other peer keeps the 500 ms window
-  (`UPDATE_WAIT`) and 0.3.3's texts byte for byte. The stamp is stripped
-  like `type`. A protocol mismatch keeps `read_tree` for as long as
+  snapshots is read by the unstamped rules for the rest of the connection (a
+  changed tree is credited), with a warning logged. Any other peer keeps
+  the 500 ms window (`UPDATE_WAIT`) and 0.3.3's texts byte for byte. The stamp
+  is stripped like `type`. A protocol mismatch keeps `read_tree` for as long as
   the peer's snapshots parse, and refuses every input tool. When lines from
   the app were rejected, `read_tree` says the socket path is right and quotes
   the reason rather than sending an adopter back to check the path. A line

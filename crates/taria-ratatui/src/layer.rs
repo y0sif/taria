@@ -635,7 +635,9 @@ impl TariaLayer {
     /// ```no_run
     /// # use taria_ratatui::{InputId, InputStatus, TariaLayer};
     /// # enum Outcome { Applied, Refused, Started }
-    /// # fn apply(_input: taria_ratatui::taria::AgentInput) -> Outcome { Outcome::Applied }
+    /// # fn apply(_input: taria_ratatui::taria::AgentInput) -> Outcome {
+    /// #     Outcome::Applied
+    /// # }
     /// # let layer = TariaLayer::bind_or_disabled("my-app");
     /// let mut jobs: Vec<InputId> = Vec::new();
     /// while let Some((id, input)) = layer.try_recv() {

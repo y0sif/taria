@@ -494,6 +494,14 @@ these rules on that connection:
 - **No skipped stamp.** Once the app has dequeued an input, it **MUST** send
   a stamped snapshot for the next tree it builds, even when that tree is
   identical to the last one (section 5.1).
+- **One unstamped tree after the first dequeue.** The trees the app
+  published before its first dequeue on the connection are unstamped, and
+  section 10.4 lets one go out after that dequeue's `delivered` ack. The app
+  **MUST NOT** send more than one unstamped snapshot after that ack, nor any
+  after a stamped one. An adapter that keeps only its newest unsent
+  snapshot, as the reference adapter does, keeps this rule for free; one
+  that queues snapshots can keep it by dropping all but the newest of them
+  at the dequeue.
 - **Acks first.** An app that answers an input `ignored` **SHOULD** send that
   ack before the first snapshot it publishes after dequeuing the input. That
   snapshot is the one a bridge credits to the input, and an `ignored` behind
@@ -536,12 +544,12 @@ reference bridge does against a peer whose `hello` said `stamps`:
   baseline.
 - Strip `after_input` from what it hands an agent, as it strips `type`
   (section 16.6).
-- Answer a call by the rules for a peer that does not stamp when the peer's
-  hello said `stamps` but its snapshots go out unstamped where these rules
-  require a stamp: a tree that differs from the one before the input is then
-  credited, as it was before stamps existed. Its claim and its snapshots
-  disagree, and believing the claim would leave every input waiting for a
-  stamp that never comes.
+- Answer by the rules for a peer that does not stamp, from the call that
+  shows it for the rest of the connection, when the peer's hello said
+  `stamps` but its snapshots break the rules above: a tree that differs from
+  the one before the input is then credited, as it was before stamps
+  existed. Its claim and its snapshots disagree, and believing the claim
+  would leave every input waiting for a stamp that never comes.
 
 **Reference implementation.** The reference bridge waits up to 3 s for a
 credited tree from a peer that stamps, against 500 ms for one that does not,
@@ -553,12 +561,18 @@ within 3000ms; it may still be working. Call read_tree to see its effect." An
 500 ms after the ack when none comes; a `dropped` ack ends it at once. A
 disconnect mid-wait is answered within 500 ms of the disconnect, inside the
 3 s cap. Its no-ack and rejected-line answers to a peer that stamps name the
-3000ms window, not the 500ms one. A peer that said `stamps` and sends
-unstamped snapshots is degraded for that call as above, and the bridge logs
-a warning. Its snapshot channel keeps only the newest tree, so a tree stamped
-below the input and the credited one arriving back to back can be read as
-the credited one alone, compared with the tree before both: the one gap it
-leaves.
+3000ms window, not the 500ms one. A peer that said `stamps` is taken to
+break the rules at an unstamped snapshot read after one of the call's
+`delivered` acks, once the connection has carried a stamped snapshot or one
+that surely followed a `delivered` ack, so the one unstamped tree the rules
+allow after the first dequeue's ack is never taken for a break. It is
+degraded as above for the rest of the connection: the call that shows it
+keeps its 3 s window, later calls get the 500 ms one and the texts for a
+peer that does not stamp, and the bridge logs a warning once per
+connection. The bridge's snapshot channel keeps only the newest tree, so a
+tree stamped below the input and the credited one arriving back to back can
+be read as the credited one alone, compared with the tree before both: the
+one gap it leaves.
 
 ## 6. Node
 
@@ -1162,10 +1176,11 @@ newest received is the app's current answer.
 
 ### 10.4 Ordering against snapshots
 
-An app **MUST NOT** let an ack be overtaken by a snapshot published after it.
-An agent that saw the snapshot first could not tell whether it reflects its own
-input yet. The reference adapter enforces this by giving one thread the stream
-and flushing every pending ack before the pending snapshot in each pass.
+An app **MUST NOT** let an ack be overtaken by a snapshot sent after it, a
+newly published tree or a resend (section 5.1) alike. An agent that saw the
+snapshot first could not tell whether it reflects its own input yet. The
+reference adapter enforces this by giving one thread the stream and
+flushing every pending ack before the pending snapshot in each pass.
 
 The converse is not guaranteed. An ack **MAY** arrive before a snapshot that
 was published earlier, because the reference adapter batches: a pass that
@@ -1177,8 +1192,7 @@ What it may read instead is the stamp. A snapshot from a peer that stamps
 (section 5.3) says in `after_input` which inputs it post-dates, whatever
 order it arrived in, and the rule above holds for stamped snapshots too: a
 resend of an identical tree with its stamp moved is not a publish (section
-5.1), but it is sent after the acks queued before it, and goes out behind
-them.
+5.1), but it is sent, so it goes out behind the acks queued before it.
 
 ### 10.5 No fallback for an unknown status
 
@@ -1855,12 +1869,14 @@ input since it went out.
 
 That resend moves what `seq` promises, from one number per snapshot sent to
 one per tree published, and section 16.7 makes a change of meaning the one
-that forces a bump. It does not force one here, because nothing an older
-reader could infer from `seq` stops being true. Within one run `seq` still
-never decreases, so a higher one is still the newer tree, and an equal one
-still means the same tree: the resend differs only in `after_input`, which
-such a reader never reads. Across runs `seq` promised nothing before and
-promises nothing now (section 5.1).
+that forces a bump. It does not force one here. Within one run `seq` still
+never decreases, so a higher one is still the newer tree. One inference
+does stop being true: until 0.4.0, item 3 of section 1.3 said `seq`
+"increases within one run", which let a reader assume no two snapshots
+share a `seq`. Such a reader, meeting the repeat, at worst drops it as a
+duplicate, which is harmless, because the tree is unchanged: the resend
+differs only in `after_input`, which an older reader never reads. Across
+runs `seq` promised nothing before and promises nothing now (section 5.1).
 
 - **An older reader** ignores both fields as unknown (section 2.7). It reads
   the hello it always read, and every snapshot as the snapshot it was. The
@@ -1880,11 +1896,16 @@ promises nothing now (section 5.1).
   as it answered every peer before stamps existed, window and texts
   included: the reference bridge does so byte for byte.
 - **An app that claims stamps and does not stamp** says `"stamps":true` and
-  sends unstamped snapshots where section 5.3 requires a stamp. A bridge that
-  reads stamps degrades that call to the rules for a peer that does not
-  stamp, so a tree that differs is credited as it was before stamps existed,
-  rather than leaving every input waiting for a stamp that never comes. The
+  sends unstamped snapshots section 5.3 does not allow: one after a stamped
+  snapshot, or more than one after its first dequeue's `delivered` ack,
+  which an adapter that queues snapshots can do without meaning to. A
+  bridge that reads stamps degrades the rest of the connection, from the
+  call that shows it, to the rules for a peer that does not stamp, so a
+  tree that differs is credited as it was before stamps existed, rather
+  than leaving every input waiting for a stamp that never comes. The
   reference bridge also logs a warning, since the claim is the app's bug.
+  Both rules bind only an app that says `stamps`, which no app before 0.4.0
+  does.
 - **Leniently read.** A `stamps` that is not `true`, and an `after_input`
   that is not an unsigned 64-bit integer, read as absent rather than failing
   the line: the hello would otherwise take the version and label with it,

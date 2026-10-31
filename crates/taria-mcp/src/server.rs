@@ -1896,11 +1896,14 @@ pub(crate) struct Observed {
 /// An `Ignored` ack still ends the wait early: at once when the credited tree
 /// is already in, and otherwise at the first one to come, or [`UPDATE_WAIT`]
 /// after the ack if none does. So does the app going away: the first
-/// departure brings the deadline forward to [`UPDATE_WAIT`] after it, which
-/// is time for a restarted app's tree and no more, so an acknowledged quit or
-/// a crash is answered within half a second of it rather than at the cap. A
-/// `Dropped` ack ends it at once, as for any peer. Neither moves the deadline
-/// later than it was.
+/// departure brings the deadline forward to [`UPDATE_WAIT`] after it, so an
+/// acknowledged quit or a crash is answered within half a second of it
+/// rather than at the cap. That is too short to wait out a restart: the
+/// bridge reconnects at once, and after a failed connect tries again 250 ms
+/// later and then 500 ms after that, so only an app listening again within
+/// about 250 ms of going can have its tree in the answer. A `Dropped` ack
+/// ends it at once, as for any peer. Neither moves the deadline later than it
+/// was.
 ///
 /// One gap is left, and it is the watch channel's: it keeps only the newest
 /// tree, so a tree stamped below the burst and the credited one arriving back
@@ -1935,6 +1938,12 @@ pub(crate) struct Observed {
 /// not.
 ///
 /// # Either way
+///
+/// The `biased` select reads an ack ahead of a tree that is waiting with it,
+/// but a tree can still be read first, when both land between its polls of
+/// the two channels. So before it returns on a tree it reads the acks
+/// already queued ([`read_queued_acks`]), and an `Ignored` the app sent in
+/// time still wins.
 ///
 /// Watching the state pass through a non-`Connected` value (the bridge's
 /// disconnect marker) counts as a change, because the next snapshot then
@@ -1995,19 +2004,9 @@ pub(crate) async fn observe(
                 Ok((acked, status)) => {
                     // An ack for another call's input says nothing about this
                     // burst, and needs no bookkeeping beyond being skipped.
-                    let Some(pos) = ids.iter().position(|id| *id == acked) else {
+                    if !record_ack(&mut seen, &mut fates, ids, acked, status) {
                         continue;
-                    };
-                    // Record this input's newest fate and recount, rather than
-                    // adding to a tally: the wire format permits a second ack
-                    // for the same input, so a running count is a count of
-                    // acks, not of inputs, and can outgrow the burst.
-                    fates[pos] = Some(status);
-                    seen.dropped = fates
-                        .iter()
-                        .filter(|fate| **fate == Some(InputStatus::Dropped))
-                        .count();
-                    seen.acked = fates.iter().filter(|fate| fate.is_some()).count();
+                    }
                     // Only `Delivered` says the app dequeued the input, which
                     // is what obliges it to stamp: `Ignored` alone is also the
                     // answer to a kind it cannot read, which never stamps.
@@ -2020,7 +2019,6 @@ pub(crate) async fn observe(
                     if Some(acked) != last {
                         continue;
                     }
-                    seen.status = Some(status);
                     // A dropped input carries no tree and nothing later can
                     // undo the drop: the verdict is final.
                     if status == InputStatus::Dropped {
@@ -2036,6 +2034,7 @@ pub(crate) async fn observe(
                     // so an unreadable status cannot fall into the arm that
                     // declares a verdict final.
                     if seen.changed.is_some() || seen.credited {
+                        read_queued_acks(&mut acks, &mut seen, &mut fates, ids);
                         return seen;
                     }
                     // A peer that stamps tells which tree follows the ignore,
@@ -2128,10 +2127,73 @@ pub(crate) async fn observe(
                             seen.changed = Some(snapshot);
                         }
                         if (answers || seen.credited) && seen.status.is_some() {
+                            read_queued_acks(&mut acks, &mut seen, &mut fates, ids);
                             return seen;
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Record one ack in `seen` if it is for an input of the burst `ids`: that
+/// input's newest fate, the tallies recounted from every fate, and, for the
+/// burst's last input, the status. Returns whether the ack was this burst's.
+///
+/// Recounted rather than added to a tally: the wire format permits a second
+/// ack for the same input, so a running count is a count of acks, not of
+/// inputs, and can outgrow the burst.
+fn record_ack(
+    seen: &mut Observed,
+    fates: &mut [Option<InputStatus>],
+    ids: &[InputId],
+    acked: InputId,
+    status: InputStatus,
+) -> bool {
+    let Some(fate) = ids
+        .iter()
+        .position(|id| *id == acked)
+        .and_then(|pos| fates.get_mut(pos))
+    else {
+        return false;
+    };
+    *fate = Some(status);
+    seen.dropped = fates
+        .iter()
+        .filter(|fate| **fate == Some(InputStatus::Dropped))
+        .count();
+    seen.acked = fates.iter().filter(|fate| fate.is_some()).count();
+    if ids.last() == Some(&acked) {
+        seen.status = Some(status);
+    }
+    true
+}
+
+/// Apply the acks already queued for [`observe`], just before it returns on
+/// a tree.
+///
+/// The `biased` select reads an ack ahead of a tree when both are waiting,
+/// but it polls the two channels one after the other, and the socket task
+/// can publish an ack and the tree behind it between the two polls. The tree
+/// is then read ahead of acks that came before it on the wire: an `Ignored`
+/// refining the last input's `Delivered`, which the app sent in time, would
+/// otherwise lose to the tree. Only what is queued now is read, so an app
+/// that keeps acking cannot hold the answer back.
+fn read_queued_acks(
+    acks: &mut broadcast::Receiver<(InputId, InputStatus)>,
+    seen: &mut Observed,
+    fates: &mut [Option<InputStatus>],
+    ids: &[InputId],
+) {
+    for _ in 0..acks.len() {
+        match acks.try_recv() {
+            Ok((acked, status)) => {
+                record_ack(seen, fates, ids, acked, status);
+            }
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => seen.lost += skipped,
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                break;
             }
         }
     }

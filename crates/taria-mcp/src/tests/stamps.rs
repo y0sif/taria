@@ -12,8 +12,9 @@
 //!
 //! Then every other way a stamped wait can end: a departure, a restart, a
 //! drop, lost acks, silence, a line the bridge could not read, a burst
-//! answered only in part, another call's input landing inside a burst, and a
-//! peer whose claim to stamp is false.
+//! answered only in part, another call's input landing inside a burst, an
+//! `Ignored` read behind the tree it refines, and a peer whose claim to stamp
+//! is false.
 //!
 //! # Timing
 //!
@@ -1301,4 +1302,48 @@ async fn a_peer_that_stops_stamping_is_caught_on_its_first_unstamped_tree() {
     assert_eq!(root_label(text(&result)), "moved", "{}", text(&result));
     assert!(took < SETTLE_WAIT, "{took:?}");
     assert_eq!(log.broken_claims(), 1);
+}
+
+/// A tree can be read ahead of acks that came before it on the wire: the
+/// observer polls the ack channel and then the tree channel, and the socket
+/// task can publish both in between. Here the credited tree is read first,
+/// and the `Delivered` and the `Ignored` that refines it are queued back to
+/// back behind it. Returning on the `Delivered`, with the credited tree in
+/// hand, would answer "did not change" to an input the app said in time it
+/// ignored; the queued `Ignored` is read first, and wins. Driven on the
+/// observer directly, since no socket places a tree between two polls on
+/// demand.
+#[tokio::test]
+async fn an_ignored_queued_behind_the_credited_tree_still_wins() {
+    let pre = stored(snapshot(1, "static", None));
+    let id = InputId::new(1);
+    let (ack_tx, acks) = broadcast::channel(8);
+    let (state_tx, rx) = watch::channel(BridgeState::Connected(pre.clone()));
+    let baseline = pre.clone();
+    let observer =
+        tokio::spawn(async move { observe(acks, rx, &baseline, &[id], true, false).await });
+    // The credited tree, read before any ack: nothing to answer with yet.
+    state_tx.send_replace(BridgeState::Connected(stored(snapshot(
+        1,
+        "static",
+        Some(id),
+    ))));
+    sleep(APART).await;
+    // Then both acks at once, as the socket task can publish them.
+    let _ = ack_tx.send((id, InputStatus::Delivered));
+    let _ = ack_tx.send((id, InputStatus::Ignored));
+    let seen = timeout(WAIT, observer)
+        .await
+        .expect("the observer answers")
+        .expect("the observer task");
+    let result = report(seen, pre, 1, TreeFormat::Json).expect("an ignored input is answered");
+    assert!(
+        text(&result).starts_with("The app received this input and deliberately did nothing"),
+        "{}",
+        text(&result)
+    );
+    assert_eq!(
+        root_label(text(&result).split_once('\n').expect("a tree").1),
+        "static"
+    );
 }

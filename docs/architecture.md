@@ -419,7 +419,7 @@ input is under way instead.
 
 Acks share the connection's writer with snapshots and are flushed first in
 every pass, so an ack always reaches the bridge before the snapshot
-published after it, the stamped resend of an unchanged tree included. An
+sent after it, the stamped resend of an unchanged tree included. An
 agent that saw the snapshot first could not tell whether it reflects its own
 input yet.
 
@@ -451,10 +451,11 @@ tree is no longer credited to the input after it, but for one race
 last press, and the baseline is the tree before the first. An `ignored` ends
 the wait at the first credited tree, or 500 ms after the ack; a `dropped` at
 once; a disconnect within 500 ms of it, inside the 3 s cap. A peer whose
-hello says `stamps` but whose snapshots go out unstamped where a stamp is
-due is read, for that call, as a peer that does not stamp (a tree that
-differs is credited), and the bridge logs a warning. For the comparison to
-be sound, the bridge claims each id and queues its input under one lock, so
+hello says `stamps` but whose snapshots go out unstamped where protocol
+section 5.3 does not allow it is read, from the call that shows it for the
+rest of the connection, as a peer that does not stamp (a tree that differs
+is credited), and the bridge logs a warning. For the comparison to be
+sound, the bridge claims each id and queues its input under one lock, so
 ids reach the app in the order they were claimed even when tool calls
 overlap. The one gap is the snapshot watch, which keeps only the newest
 tree: a tree stamped before the input and the credited one arriving back to
@@ -474,7 +475,7 @@ back are read as the credited one alone.
 | `delivered`, tree unchanged | Text: received, no change within 500 ms, from a peer that does not stamp. From one that does: received, no change, once a tree stamped at the input arrives unchanged. |
 | `delivered`, no stamped tree within 3 s (a peer that stamps) | Text: received, but no tree published after it within 3000 ms; it may still be working, call `read_tree`. |
 | No ack, tree changed | The new tree. |
-| No ack, no change | Text: neither acknowledged nor changed within the window (500 ms, or 3 s from a peer that stamps); it may be an adapter that sends no acks. If a line was rejected inside the window, that line is quoted instead, because it may have been this input's ack. Otherwise, on Linux, if the app is stopped, the text says so instead, with its pid. The input waits in the socket, and the app applies it only if it resumes while the bridge still holds the connection: the window plus 30 s from the last tool call, since the input awaits its ack, and for good with `--idle-release 0`. A bridge that lets go first leaves the adapter to discard it. So the agent is told that deadline and how to resume the app (as for a stopped app below), then to call `read_tree` and resend the input if its effect is missing. A burst is spoken of as one: "these 3 inputs". |
+| No ack, no change | Text: neither acknowledged nor changed within 500 ms; it may not report acks, or may not have reacted yet. From a peer that stamps, which acks every input it dequeues: neither acknowledged nor published a tree after it within 3000 ms (nor changed its tree, once its claim to stamp broke in the call); it may be stuck, busy or stopped. A tree stamped at the input that arrived unchanged answers "did not change" instead, ack or not. If a line was rejected inside the window, that line is quoted instead, because it may have been this input's ack. Otherwise, on Linux, if the app is stopped, the text says so instead, with its pid. The input waits in the socket, and the app applies it only if it resumes while the bridge still holds the connection: the window plus 30 s from the last tool call, since the input awaits its ack, and for good with `--idle-release 0`. A bridge that lets go first leaves the adapter to discard it. So the agent is told that deadline and how to resume the app (as for a stopped app below), then to call `read_tree` and resend the input if its effect is missing. A burst is spoken of as one, "these 3 inputs", unless a peer that stamps acknowledged part of it: then each of these answers says how many ("acknowledged 2 of the 3 inputs this call sent"), and the stopped-app one names only the rest as unread ("the other one"). |
 
 The order matters. The two send failures come first: an input that never left
 the bridge has no ack to wait for, and a burst cut short still waits out the

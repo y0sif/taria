@@ -28,11 +28,14 @@ every removed name to what replaces it. The cut moves nothing on the wire:
 `InputId`, a newtype in Rust now, is still a bare integer in the JSON. The
 binary's command line is unchanged, and so is every text an agent reads
 through `taria-mcp`, from the instructions to each answer, byte for byte,
-with six exceptions, all under "For whoever drives an app": the typed state
+but for the exceptions under "For whoever drives an app". The typed state
 changes the outline's `read_tree` description and adds the answer to `act`
-on a disabled node, and against an app that stamps, the stamps add two
-answers to an input and move the no-ack answer and its rejected-line
-variant to "within 3000ms".
+on a disabled node. Against an app that stamps, the stamps reword the no-ack
+answer and its rejected-line variant, which now name 3000ms, and add
+answers for a tree that did not change, no tree after the input, a burst's
+acknowledged count, a stopped app's unread rest of a burst, and an app
+whose claim to stamp broke. Against an app that does not stamp, the stamps
+move no answer.
 
 **A node can say what state it is in.** Which row is selected, whether a box
 is checked, whether a branch is open, whether a button can be pressed yet,
@@ -209,11 +212,14 @@ be answered well by a 0.4.0 `taria-mcp`:
   3000ms; ...`), and the answer that quotes a line the bridge could not
   read opens the same way. The stopped-app answer counts the inputs the
   app has not read yet. An app whose hello says `stamps` but whose
-  snapshots are unstamped is answered by the 0.3.3 rules from then on,
-  within the 3 s for the call that shows it, a changed tree credited, and
-  `taria-mcp` logs a warning once per connection. Against an app that does
-  not stamp, every answer and the 500 ms window are as in 0.3.3, word for
-  word.
+  snapshots go out unstamped where protocol section 5.3 does not allow it
+  is answered by the 0.3.3 rules for the rest of the connection: in the call
+  that shows it, within its 3 s, a changed tree is credited, an unchanged
+  one gets 0.3.3's text naming 3000ms, and silence reads `The app neither
+  acknowledged this input nor changed its tree within 3000ms; it may be
+  stuck, busy or stopped. Call read_tree to check.`, and `taria-mcp` logs a
+  warning once per connection. Against an app that does not stamp, every
+  answer and the 500 ms window are as in 0.3.3, word for word.
 - **The stamp never reaches the agent.** `taria-mcp` strips `after_input`
   from the tree in both formats, as it strips `type`. A 0.3.3 `taria-mcp`
   does not: its JSON tree shows `"after_input":N` and its outline header
@@ -294,7 +300,8 @@ be answered well by a 0.4.0 `taria-mcp`:
 - **`docs/protocol.md` gains the stamps.** Section 3.1 adds `stamps` to the
   hello, section 5 `after_input` to the snapshot, and new section 5.3 states
   what a stamping app must do (stamp only inputs it dequeued, start each
-  connection unstamped, never skip a stamp) and should do (send an
+  connection unstamped, never skip a stamp, send at most one unstamped
+  snapshot after the first dequeue's ack) and should do (send an
   `ignored` before the first snapshot after the dequeue), and how a bridge
   should read one: credit a tree to an input only at or after its id in the
   bridge's own send order, compare on `root` and never `seq`, take an
@@ -338,9 +345,9 @@ be answered well by a 0.4.0 `taria-mcp`:
   act, an unchanged tree answered in under 500 ms, the 3 s cap, a late tree
   rebased rather than credited to the next input, a burst answered on its
   last stamp with a partial drop still reported, an `Ignored` ending the
-  wait early, ids kept in order across eight racing senders, and the stamp
-  stripped in both formats; and against one that does not, 0.3.3's answers
-  byte for byte.
+  wait early and winning when read behind the credited tree, ids kept in
+  order across eight racing senders, and the stamp stripped in both
+  formats; and against one that does not, 0.3.3's answers byte for byte.
 - New tests pin a node without state to its 0.3.3 bytes, read every state
   field in a wrong shape as not stated, strip a disabled node's actions and
   refuse `act` on it, keep `NaN` and infinities out of the tree and out of
