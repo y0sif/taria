@@ -48,20 +48,33 @@ pub const KEY_GRAMMAR: &str = "a single character (`a`, `Q`, `?`, `+`), or a nam
 pub enum Key {
     /// A literal character, including `Char(' ')` for the space bar.
     Char(char),
+    /// Enter, spelled `enter` or `return`.
     Enter,
+    /// Escape, spelled `esc` or `escape`.
     Esc,
+    /// Tab, spelled `tab`; shift+tab parses as [`BackTab`](Self::BackTab).
     Tab,
     /// Backwards tab, what a terminal delivers for shift+tab.
     BackTab,
+    /// Backspace, spelled `backspace`.
     Backspace,
+    /// Delete, spelled `delete` or `del`.
     Delete,
+    /// Arrow up, spelled `up`.
     Up,
+    /// Arrow down, spelled `down`.
     Down,
+    /// Arrow left, spelled `left`.
     Left,
+    /// Arrow right, spelled `right`.
     Right,
+    /// Home, spelled `home`.
     Home,
+    /// End, spelled `end`.
     End,
+    /// Page up, spelled `pageup`.
     PageUp,
+    /// Page down, spelled `pagedown`.
     PageDown,
     /// Function key, `F(1)` through `F(12)`.
     F(u8),
@@ -77,8 +90,12 @@ pub enum Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Modifiers {
+    /// Control held, spelled `ctrl+` or `control+`.
     pub ctrl: bool,
+    /// Alt held, spelled `alt+`.
     pub alt: bool,
+    /// Shift held, spelled `shift+`; always set on a parsed
+    /// [`BackTab`](Key::BackTab).
     pub shift: bool,
 }
 
@@ -117,7 +134,9 @@ impl Modifiers {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KeyPress {
+    /// The base key.
     pub key: Key,
+    /// The modifiers held with it.
     pub modifiers: Modifiers,
 }
 

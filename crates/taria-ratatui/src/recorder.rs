@@ -1,6 +1,7 @@
 //! Per-frame recording of the semantic tree.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::mem;
 
 use taria::Node;
@@ -43,6 +44,23 @@ impl Drop for Recorded {
     }
 }
 
+impl fmt::Debug for FrameRecorder<'_> {
+    /// The layer it records for, and how many top-level nodes it holds so
+    /// far, never the nodes themselves: a recorded tree can be deeper than
+    /// the stack a derived `Debug` would recurse through. The count is read
+    /// without waiting, so a recorder printed while a node is being recorded
+    /// says so instead.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = f.debug_struct("FrameRecorder");
+        out.field("layer", &*self.layer);
+        match self.nodes.0.try_borrow() {
+            Ok(nodes) => out.field("recorded", &nodes.len()),
+            Err(_) => out.field("recorded", &format_args!("<being recorded>")),
+        };
+        out.finish_non_exhaustive()
+    }
+}
+
 impl<'a> FrameRecorder<'a> {
     pub(crate) fn new(layer: &'a mut TariaLayer) -> Self {
         Self {
@@ -71,8 +89,11 @@ impl<'a> FrameRecorder<'a> {
     /// snapshot always carries focus somewhere. `seq` increments per
     /// published snapshot. A frame whose tree is the one the previous frame
     /// built is skipped before anything is cut or measured, and one that is
-    /// cut to the snapshot already sent is not sent again. This never blocks
-    /// the render path.
+    /// cut to the snapshot already sent is not sent again, unless the app
+    /// has dequeued an input since that snapshot went out: then it is sent
+    /// again as it is, stamped with the input (see
+    /// [`TariaLayer::publish`](crate::TariaLayer::publish), under Stamps).
+    /// This never blocks the render path.
     ///
     /// A tree deeper than [`taria::MAX_NODE_DEPTH`] is cut rather than sent
     /// or skipped, because a snapshot past that depth does not arrive at the
@@ -80,9 +101,8 @@ impl<'a> FrameRecorder<'a> {
     /// [`taria::wire::MAX_LINE_BYTES`] is then trimmed to fit, because a
     /// longer line costs the app its bridge on every reconnect. See
     /// [`TariaLayer::publish`](crate::TariaLayer::publish) for why, and
-    /// [`TariaLayer::last_truncation`](crate::TariaLayer::last_truncation)
-    /// and [`TariaLayer::last_oversize`](crate::TariaLayer::last_oversize)
-    /// for how an app finds out.
+    /// [`TariaLayer::stats`](crate::TariaLayer::stats) for how an app finds
+    /// out.
     pub fn publish(mut self) {
         let nodes = mem::take(self.nodes.0.get_mut());
         self.layer.publish_nodes(nodes);
@@ -199,7 +219,7 @@ mod tests {
             let mut rec = layer.frame();
             rec.push(node);
             if paused {
-                layer.dropped_inputs();
+                layer.stats();
                 continue;
             }
             rec.publish();

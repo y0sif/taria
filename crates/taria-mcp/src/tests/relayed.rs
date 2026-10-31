@@ -9,14 +9,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::bridge::{self, AppSnapshot, BridgeState};
+use crate::server::{ActParams, Tools};
+use crate::tree_format::TreeFormat;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 use taria::wire::{AppToBridge, BridgeToApp, InputStatus};
 use taria::{Action, AgentInput, Node, NodeId, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::bridge::{self, AppSnapshot, BridgeState};
-use taria_mcp::server::{ActParams, TariaMcpServer};
-use taria_mcp::tree_format::TreeFormat;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -191,7 +191,7 @@ async fn json_mode_hands_the_mark_on_by_name() {
     let (_dir, path) = test_socket_path("relayed-json");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
     let app = FakeApp::accept(&listener, Snapshot::new(1, first_tree())).await;
     let held = wait_for_snapshot(&mut handle.state_rx, 1).await;
     let forged = &held.parsed.root.children[0].children[1];
@@ -228,7 +228,7 @@ async fn outline_mode_prints_the_mark_for_every_tool() {
     let (_dir, path) = test_socket_path("relayed-outline");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path);
-    let server = TariaMcpServer::with_tree_format(handle.clone(), TreeFormat::Outline);
+    let server = Tools::with_tree_format(handle.clone(), TreeFormat::Outline);
     let app = FakeApp::accept(&listener, Snapshot::new(1, first_tree())).await;
     wait_for_snapshot(&mut handle.state_rx, 1).await;
 

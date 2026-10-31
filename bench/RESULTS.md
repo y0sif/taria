@@ -3,8 +3,14 @@
 What an AI agent pays to drive a terminal app through taria, against the
 same agent scraping the screen through tmux. This file leads with cycle 2:
 two batches run on 2026-10-12 at one commit, all three arms' totals
-measured under the same conditions, none estimated. The first round, run on 2026-10-11, is
-under History.
+measured under the same conditions, none estimated. The first round, run
+on 2026-10-11, is under History.
+
+The cycle-2 token and character figures predate the 0.4.0 demo and are not
+a baseline for a batch run against 0.4.0. That demo's task rows carry
+`"selected"` and `"checked"` instead of `"value":"todo"`, its first tree
+grew from 1132 to 1199 characters as JSON and from 546 to 619 as an
+outline, and the outline's `read_tree` legend grew by 15 characters.
 
 ## Setup
 

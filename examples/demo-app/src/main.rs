@@ -8,6 +8,12 @@
 //! With `TARIA_DEMO_STATE=<path>` set, the demo also keeps its state as JSON
 //! at that path (see [`mod@state`]), for harnesses that grade what an agent
 //! did. Unset, nothing is written.
+//!
+//! With `TARIA_DEMO_SLOW_MS=<n>` set, the demo holds each agent input for `n`
+//! milliseconds after dequeueing it and before applying it, the way an app
+//! whose handler does real work does. That is the app issue #17 was about:
+//! its input is acknowledged at once and its tree comes later. Unset, empty,
+//! `0` or not a number, inputs are applied at once.
 
 mod app;
 mod events;
@@ -20,6 +26,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use taria_ratatui::TariaLayer;
@@ -38,10 +46,16 @@ fn main() -> io::Result<()> {
     // frame, and disappears with the alternate screen on exit. Printed to the
     // primary buffer it is still there when the demo quits, which is where an
     // agent operator goes looking for the socket path.
+    // A pipe on Windows. Named apart there only, so the Linux and macOS line
+    // keeps its bytes.
+    #[cfg(windows)]
+    const ENDPOINT: &str = "pipe";
+    #[cfg(not(windows))]
+    const ENDPOINT: &str = "socket";
     match layer.bind_error() {
         Some(err) => eprintln!("taria-demo: taria disabled: {err}"),
         None => eprintln!(
-            "taria-demo: taria socket at {}",
+            "taria-demo: taria {ENDPOINT} at {}",
             layer.socket_path().display()
         ),
     }
@@ -52,7 +66,8 @@ fn main() -> io::Result<()> {
 
     // Safe to print again only now the alternate screen is gone. A nonzero
     // count means agent inputs arrived faster than this loop drained them.
-    let dropped = layer.dropped_inputs();
+    let stats = layer.stats();
+    let dropped = stats.dropped_inputs;
     if dropped > 0 {
         eprintln!("taria-demo: dropped {dropped} agent input(s): the app could not keep up");
     }
@@ -61,7 +76,7 @@ fn main() -> io::Result<()> {
     // them, or because a bridge waiting for the socket wrote them before its
     // hello. Nothing on the agent side hears about those, so the person
     // running the demo is the only one who can.
-    let stale = layer.stale_inputs();
+    let stale = stats.stale_inputs;
     if stale > 0 {
         eprintln!(
             "taria-demo: discarded {stale} agent input(s): their bridge connection ended first, \
@@ -72,7 +87,7 @@ fn main() -> io::Result<()> {
     // because their kind is one this build of taria cannot read. The agent
     // was told, so nothing is lost on that side, but the reason is a taria
     // version gap that only whoever runs the app can close.
-    let unknown = layer.unknown_inputs();
+    let unknown = stats.unknown_inputs;
     if unknown > 0 {
         eprintln!(
             "taria-demo: could not read {unknown} agent input(s): the bridge speaks a newer \
@@ -87,7 +102,7 @@ fn main() -> io::Result<()> {
     //
     // Worded to start differently from the three above, because the e2e gate
     // recognizes each of those lines by its opening words.
-    let acks = layer.dropped_acks();
+    let acks = stats.dropped_acks;
     if acks > 0 {
         eprintln!(
             "taria-demo: lost the answer to {acks} agent input(s): the bridge read them slower \
@@ -105,18 +120,18 @@ fn main() -> io::Result<()> {
     // because the draft is published whole on purpose: it is the case the
     // bound exists for. Both open with words of their own, like the four
     // above, so a gate can tell each line from the rest.
-    let truncated = layer.truncated_snapshots();
+    let truncated = stats.truncated_snapshots;
     if truncated > 0 {
-        let last = layer
-            .last_truncation()
+        let last = stats
+            .last_truncation
             .map(|err| format!("; the last: {err}"))
             .unwrap_or_default();
         eprintln!("taria-demo: cut {truncated} snapshot(s) to the depth limit{last}");
     }
-    let oversized = layer.oversized_snapshots();
+    let oversized = stats.oversized_snapshots;
     if oversized > 0 {
-        let last = layer
-            .last_oversize()
+        let last = stats
+            .last_oversize
             .map(|err| format!("; the last: {err}"))
             .unwrap_or_default();
         eprintln!("taria-demo: trimmed {oversized} snapshot(s) to fit one line{last}");
@@ -132,7 +147,8 @@ fn run(terminal: &mut DefaultTerminal, layer: &mut TariaLayer) -> io::Result<()>
         "taria disabled".to_string()
     };
     let mut state_file = StateFile::from_env();
-    let result = event_loop(terminal, layer, &mut app, &mut state_file);
+    let slow = slow_from_env();
+    let result = event_loop(terminal, layer, &mut app, &mut state_file, slow);
     // On exit, however the loop ended, so the file holds the final state.
     sync_state(&mut state_file, &app);
     result
@@ -143,13 +159,14 @@ fn event_loop(
     layer: &mut TariaLayer,
     app: &mut App,
     state_file: &mut Option<StateFile>,
+    slow: Option<Duration>,
 ) -> io::Result<()> {
     let rx = setup_event_channel();
 
     while app.running {
         // Agent inputs are drained around the blocking recv below; the 50ms
         // tick bounds the latency between an agent act and its effect.
-        drain_agent_input(app, layer);
+        drain_agent_input(app, layer, slow);
         // Before the draw and the publish, so a harness that sees the effect
         // on screen or in the tree finds it in the file too.
         sync_state(state_file, app);
@@ -158,13 +175,15 @@ fn event_loop(
 
         // Publish the semantic tree for the exact state just drawn; the
         // layer dedups identical trees, so publishing every frame is free.
+        // After the drain above and never before it, so the first tree the
+        // layer stamps with an input's id carries that input's effect.
         layer.publish(tree::build_nodes(app));
 
         match rx.recv() {
             Ok(event) => update(app, event),
             Err(_) => break,
         }
-        drain_agent_input(app, layer);
+        drain_agent_input(app, layer, slow);
         sync_state(state_file, app);
     }
     Ok(())
@@ -219,8 +238,29 @@ fn sync_state(state_file: &mut Option<StateFile>, app: &App) {
 /// The layer acks `Delivered` as it hands an input over, which only says the
 /// event loop dequeued it. `Ignored` is the follow-up that tells an agent
 /// waiting on an effect that no effect is coming, and last ack wins.
-/// `apply_agent_input` returns the status and `drain_acking` sends the ones
-/// that refine it, so no input id passes through this app at all.
-fn drain_agent_input(app: &mut App, layer: &TariaLayer) {
-    layer.drain_acking(|input| apply_agent_input(app, input));
+/// `apply_agent_input` returns the status and `drain` sends the ones that
+/// refine it, so no input id passes through this app at all.
+///
+/// With `slow` set, each input is held that long between its dequeue and
+/// its effect (see `TARIA_DEMO_SLOW_MS`).
+fn drain_agent_input(app: &mut App, layer: &TariaLayer, slow: Option<Duration>) {
+    layer.drain(|input| {
+        if let Some(slow) = slow {
+            thread::sleep(slow);
+        }
+        apply_agent_input(app, input)
+    });
+}
+
+/// How long `TARIA_DEMO_SLOW_MS` asks the demo to hold each agent input, or
+/// `None` when it is unset, empty, zero or not a whole number of
+/// milliseconds.
+fn slow_from_env() -> Option<Duration> {
+    std::env::var("TARIA_DEMO_SLOW_MS")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
 }

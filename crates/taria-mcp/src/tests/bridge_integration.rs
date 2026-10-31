@@ -5,13 +5,14 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::TariaMcpServer;
+use crate::bridge::{self, AppSnapshot, BridgeHandle, BridgeState, LinkState};
+use crate::server::{ActParams, KeyParams, Tools, TypeTextParams};
+use crate::tree_format::TreeFormat;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ContentBlock;
 use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{Action, AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
-use taria_mcp::bridge::{self, AppSnapshot, BridgeHandle, BridgeState, LinkState};
-use taria_mcp::server::{ActParams, KeyParams, TariaMcpServer, TypeTextParams};
-use taria_mcp::tree_format::TreeFormat;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -264,18 +265,11 @@ fn result_text(result: &rmcp::model::CallToolResult) -> &str {
 
 /// Spin up listener + bridge + server for one test. The first element is the
 /// socket directory guard; hold it (as `_dir`, not `_`) until the test ends.
-async fn setup(
-    name: &str,
-) -> (
-    tempfile::TempDir,
-    UnixListener,
-    BridgeHandle,
-    TariaMcpServer,
-) {
+async fn setup(name: &str) -> (tempfile::TempDir, UnixListener, BridgeHandle, Tools) {
     let (dir, path) = test_socket_path(name);
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
     (dir, listener, handle, server)
 }
 
@@ -284,7 +278,7 @@ async fn read_tree_errors_before_any_connection() {
     // Nothing listens on this path; the manager retries in the background.
     let (_dir, path) = test_socket_path("never-connects");
     let handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle);
+    let server = Tools::new(handle);
     let err = server.read_tree().await.expect_err("no app, no snapshot");
     assert!(
         err.message.contains("no snapshot") && err.message.contains("running"),
@@ -311,7 +305,7 @@ async fn read_tree_names_the_parse_failure_rather_than_the_socket_path() {
     let (_dir, path) = test_socket_path("unreadable");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle);
+    let server = Tools::new(handle);
 
     let (stream, _addr) = timeout(WAIT, listener.accept())
         .await
@@ -403,7 +397,7 @@ async fn read_tree_names_an_oversized_first_snapshot_on_every_reconnect() {
     let (_dir, path) = test_socket_path("oversized-first");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle);
+    let server = Tools::new(handle);
 
     let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = accepts.clone();
@@ -488,7 +482,7 @@ async fn forgets_the_size_once_the_app_is_gone(name: &str, unlink: bool) {
     let (_dir, path) = test_socket_path(name);
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("before-paste"))).await;
     wait_for_snapshot(&mut handle.state_rx, 1).await;
@@ -562,7 +556,7 @@ async fn read_tree_ignores_an_unknown_future_message_type() {
     let (_dir, path) = test_socket_path("future-msg");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle);
+    let server = Tools::new(handle);
 
     let (stream, _addr) = timeout(WAIT, listener.accept())
         .await
@@ -637,7 +631,7 @@ async fn read_tree_names_a_connection_the_app_never_accepted() {
     // it would close the socket and turn this into an ordinary disconnect.
     let _listener = UnixListener::bind(&path).expect("bind fake app socket");
     let handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle);
+    let server = Tools::new(handle);
 
     // Polled: the connection has to be open past the bridge's grace before
     // its silence means anything, and the manager opens it on its own
@@ -789,7 +783,7 @@ async fn act_reports_an_app_that_went_away_after_taking_the_input() {
     let (_dir, path) = test_socket_path("act-then-exit");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     let app = FakeApp::accept(&listener, Snapshot::new(4, demo_root("about-to-exit"))).await;
     wait_for_snapshot(&mut handle.state_rx, 4).await;
@@ -838,7 +832,7 @@ async fn act_names_the_oversized_tree_that_followed_the_input() {
     let (_dir, path) = test_socket_path("act-then-oversized");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     let app = FakeApp::accept(&listener, Snapshot::new(4, demo_root("before-paste"))).await;
     wait_for_snapshot(&mut handle.state_rx, 4).await;
@@ -1087,7 +1081,11 @@ async fn acks_for_other_inputs_are_ignored() {
     let echo = tokio::spawn(async move {
         let mut app = app;
         let (id, _input) = app.recv_input().await;
-        app.ack(id.wrapping_add(1000), InputStatus::Dropped).await;
+        app.ack(
+            InputId::new(id.get().wrapping_add(1000)),
+            InputStatus::Dropped,
+        )
+        .await;
         app.send(&AppToBridge::Snapshot(Snapshot::new(
             2,
             demo_root("after-stray-ack"),
@@ -1502,14 +1500,15 @@ async fn a_full_input_queue_fails_the_call_instead_of_hanging() {
         protocol_rx,
         rejected_rx,
         link_rx,
+        stamps_rx: watch::channel(false).1,
+        send_order: Default::default(),
     };
     // Occupy the only slot, so the tool's own send has nowhere to go.
     handle
-        .input_tx
-        .send((handle.next_input_id(), AgentInput::key("x")))
+        .send(AgentInput::key("x"), WAIT)
         .await
         .expect("fill the queue");
-    let server = TariaMcpServer::new(handle);
+    let server = Tools::new(handle);
 
     let err = timeout(
         WAIT,
@@ -1554,13 +1553,15 @@ async fn a_burst_cut_short_reports_how_much_of_it_was_sent() {
     let (_link_tx, link_rx) = watch::channel(LinkState::Open {
         since: Instant::now(),
     });
-    let server = TariaMcpServer::new(BridgeHandle {
+    let server = Tools::new(BridgeHandle {
         state_rx,
         input_tx,
         ack_tx,
         protocol_rx,
         rejected_rx,
         link_rx,
+        stamps_rx: watch::channel(false).1,
+        send_order: Default::default(),
     });
 
     let err = timeout(
@@ -1676,7 +1677,7 @@ async fn key_errors_before_any_connection() {
     // queueing input that would replay into the next app instance.
     let (_dir, path) = test_socket_path("key-never-connects");
     let handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle);
+    let server = Tools::new(handle);
     let err = server
         .key(Parameters(KeyParams {
             key: "q".to_string(),
@@ -1726,7 +1727,7 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
     let (_dir, path) = test_socket_path("stale-inputs");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     // First instance comes up, then dies.
     let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("gen-one"))).await;
@@ -1749,10 +1750,8 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
     // ...so queue stale inputs directly; the listener is still unbound, so
     // these sit in the channel until the next successful connect.
     for key in ["q", "y"] {
-        let id = handle.next_input_id();
         handle
-            .input_tx
-            .send((id, AgentInput::key(key)))
+            .send(AgentInput::key(key), WAIT)
             .await
             .expect("queue input while down");
     }
@@ -1823,7 +1822,7 @@ async fn a_tree_that_outgrows_the_cap_is_named_by_every_tool() {
     let (_dir, path) = test_socket_path("outgrown");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     let mut app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("small"))).await;
     wait_for_snapshot(&mut handle.state_rx, 3).await;
@@ -1884,7 +1883,7 @@ async fn a_tree_that_fits_again_clears_the_size_from_the_next_disconnect() {
     let (_dir, path) = test_socket_path("refits");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path);
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     let mut app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("small"))).await;
     wait_for_snapshot(&mut handle.state_rx, 3).await;
@@ -1945,7 +1944,7 @@ async fn act_returns_fresh_tree_after_app_restart() {
     let (_dir, path) = test_socket_path("restart-act");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     // The old instance is at seq 5; the restarted one starts over at seq 1.
     let app = FakeApp::accept(&listener, Snapshot::new(5, demo_root("before-restart"))).await;
@@ -1981,7 +1980,7 @@ async fn act_detects_restart_even_when_seq_matches() {
     let (_dir, path) = test_socket_path("restart-act-same-seq");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     // Both instances publish seq 1, but the trees differ.
     let app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("generation-one"))).await;
@@ -2019,7 +2018,7 @@ async fn disconnect_reports_app_label_and_last_seq_then_recovers() {
     let (_dir, path) = test_socket_path("disconnect");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
 
     let app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("alive"))).await;
     wait_for_snapshot(&mut handle.state_rx, 3).await;
@@ -2273,7 +2272,7 @@ async fn outline_mode_renders_the_relayed_tree_for_every_tool() {
     let (_dir, path) = test_socket_path("outline-relay");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path);
-    let server = TariaMcpServer::with_tree_format(handle.clone(), TreeFormat::Outline);
+    let server = Tools::with_tree_format(handle.clone(), TreeFormat::Outline);
     let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("first"))).await;
     wait_for_snapshot(&mut handle.state_rx, 1).await;
     app.send_raw(NEWER_APP_LINE).await;
@@ -2362,8 +2361,14 @@ const HELD_ON_30_S: &str = "A taria-mcp started like this one lets go of the app
 no tool calls (one on the default, after 60 s), and this bridge takes over as soon as the holder \
 does, with no restart; retry in 30 s.";
 
-fn on_demand(path: PathBuf, idle_release: Duration) -> TariaMcpServer {
-    TariaMcpServer::on_demand(path, TreeFormat::Json, idle_release)
+/// The tool layer of a server built the way the binary builds it, with
+/// `idle_release` as its window.
+fn on_demand(path: PathBuf, idle_release: Duration) -> Tools {
+    TariaMcpServer::builder(path)
+        .idle_release(idle_release)
+        .on_demand()
+        .expect("a tokio test runs inside a runtime")
+        .tools
 }
 
 /// An app that serves one bridge at a time, the way the adapter does, for as
@@ -2455,6 +2460,136 @@ async fn on_demand_connects_on_the_first_tool_call_and_not_before() {
         result_text(&result)
     );
     drop(app.await.expect("fake app task"));
+}
+
+/// One JSON-RPC exchange with a server served over an in-memory transport:
+/// the request goes out as one line, and the response to it comes back.
+async fn mcp_call(
+    write: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    lines: &mut Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let request =
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    mcp_send(write, &request).await;
+    timeout(WAIT, async {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .expect("read from the server")
+                .expect("the server is still serving");
+            let message: serde_json::Value =
+                serde_json::from_str(&line).expect("the server writes JSON-RPC");
+            if message["id"] == serde_json::json!(id) {
+                return message;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no response to {method}"))
+}
+
+/// Write one JSON-RPC message to a server served over an in-memory transport.
+async fn mcp_send(
+    write: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    message: &serde_json::Value,
+) {
+    let mut line = message.to_string();
+    line.push('\n');
+    write
+        .write_all(line.as_bytes())
+        .await
+        .expect("write to the server");
+}
+
+/// A server built through the builder's `connected` finalizer, driven the way
+/// a harness drives one: over an rmcp transport, through `ServerHandler`, not
+/// by calling the tool layer. It connects at once, before any MCP traffic,
+/// serves the tree the app published, and ignores `idle_release`: it still
+/// holds the app well past the window an on-demand bridge lets go after.
+#[tokio::test]
+async fn a_connected_server_connects_at_once_serves_the_tree_and_never_lets_go() {
+    use rmcp::ServiceExt;
+
+    let (_dir, path) = test_socket_path("connected");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    let server = TariaMcpServer::builder(path)
+        .idle_release(SHORT_IDLE)
+        .connected()
+        .expect("a tokio test runs inside a runtime");
+    // No MCP request has been made yet: the bridge connects on its own.
+    let mut app = FakeApp::accept(&listener, Snapshot::new(1, demo_root("held-at-once"))).await;
+
+    let (client, server_end) = tokio::io::duplex(64 * 1024);
+    let serving = tokio::spawn(async move {
+        let service = server.serve(server_end).await.expect("the session starts");
+        service.waiting().await
+    });
+    let (read, mut write) = tokio::io::split(client);
+    let mut lines = BufReader::new(read).lines();
+
+    let init = mcp_call(
+        &mut write,
+        &mut lines,
+        1,
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "connected-test", "version": "0"},
+        }),
+    )
+    .await;
+    assert_eq!(
+        init["result"]["serverInfo"]["name"],
+        serde_json::json!("taria-mcp"),
+        "{init}"
+    );
+    mcp_send(
+        &mut write,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+
+    // The bridge may not have read the app's first lines yet, and until it
+    // has, `read_tree` answers with an error rather than waiting.
+    let read_tree = serde_json::json!({"name": "read_tree", "arguments": {}});
+    let mut id = 2;
+    let tree = timeout(WAIT, async {
+        loop {
+            let response =
+                mcp_call(&mut write, &mut lines, id, "tools/call", read_tree.clone()).await;
+            id += 1;
+            match response["result"]["content"][0]["text"].as_str() {
+                Some(text) => return text.to_string(),
+                None => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("read_tree answers with the tree once the bridge has it");
+    assert!(tree.contains("held-at-once"), "{tree}");
+
+    // Three on-demand windows with no tool call: the connection stays open
+    // (a close would end this wait at once) and nothing is sent on it.
+    app.expect_no_input(SHORT_IDLE * 3).await;
+    let response = mcp_call(&mut write, &mut lines, id, "tools/call", read_tree).await;
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("held-at-once")),
+        "still served from the same connection: {response}"
+    );
+
+    drop((write, lines));
+    timeout(WAIT, serving)
+        .await
+        .expect("the session ends with its transport")
+        .expect("the serving task")
+        .expect("the session ends cleanly");
 }
 
 /// Issue #13 end to end. Two sessions share one app, which serves one bridge
@@ -2740,7 +2875,7 @@ async fn the_bridge_that_loses_a_restart_race_says_the_app_is_held() {
     let (_dir, path) = test_socket_path("restart-race");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
     let app = FakeApp::accept(&listener, Snapshot::new(3, demo_root("before-restart"))).await;
     wait_for_snapshot(&mut handle.state_rx, 3).await;
 
@@ -2893,7 +3028,7 @@ async fn a_reconnect_the_app_accepts_late_is_never_reported_gone() {
     let (_dir, path) = test_socket_path("late-accept");
     let listener = UnixListener::bind(&path).expect("bind fake app socket");
     let mut handle = bridge::spawn(path.clone());
-    let server = TariaMcpServer::new(handle.clone());
+    let server = Tools::new(handle.clone());
     let app = FakeApp::accept(&listener, Snapshot::new(4, demo_root("first-life"))).await;
     wait_for_snapshot(&mut handle.state_rx, 4).await;
 

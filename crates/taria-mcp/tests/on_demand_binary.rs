@@ -5,6 +5,9 @@
 //!
 //! Plain threads and blocking sockets: the binary is a separate process, and
 //! nothing here needs a runtime.
+//!
+//! Unix only: the fake app listens on a Unix socket.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -134,6 +137,69 @@ fn write_message(stream: &mut UnixStream, message: &AppToBridge) {
     let mut line = serde_json::to_string(message).expect("serialize app message");
     line.push('\n');
     stream.write_all(line.as_bytes()).expect("write to bridge");
+}
+
+/// The `_meta` a request carries in the 2026-07-28 lifecycle, which has no
+/// `initialize`: the protocol version, client info and capabilities travel
+/// with every request instead of once per session.
+fn stateless_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "on-demand-test", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    })
+}
+
+/// A client on the 2026-07-28 lifecycle opens with `server/discover` where an
+/// older one sends `initialize`, then lists the tools with the metadata
+/// inline. Neither may connect to the app, for the reason `initialize` and
+/// `tools/list` may not: a harness does both for every session it starts,
+/// and an app serves one bridge at a time.
+#[test]
+fn server_discover_and_a_stateless_tools_list_connect_to_nothing() {
+    let dir = tempfile::Builder::new()
+        .prefix("taria-mcp-bin-")
+        .tempdir()
+        .expect("create test socket dir");
+    let path = dir.path().join("discover.sock");
+    let listener = UnixListener::bind(&path).expect("bind fake app socket");
+    listener
+        .set_nonblocking(true)
+        .expect("non-blocking listener");
+    let mut bridge = Bridge::start(&path, "60");
+
+    let discover = bridge.call(1, "server/discover", json!({"_meta": stateless_meta()}));
+    let result = &discover["result"];
+    let versions = result["supportedVersions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a discover result: {discover}"));
+    assert!(versions.contains(&json!("2026-07-28")), "{discover}");
+    assert!(result["capabilities"]["tools"].is_object(), "{discover}");
+    assert!(
+        result["instructions"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Bridge to a live terminal (TUI) app.")),
+        "discover carries the server's instructions: {discover}"
+    );
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        json!("taria-mcp"),
+        "{discover}"
+    );
+
+    let tools = bridge.call(2, "tools/list", json!({"_meta": stateless_meta()}));
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a tool list: {tools}"))
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert_eq!(names, ["act", "key", "read_tree", "type_text"], "{tools}");
+
+    assert!(
+        accept_within(&listener, Duration::from_millis(500)).is_none(),
+        "taria-mcp connected on server/discover or tools/list, before any tool call"
+    );
 }
 
 #[test]

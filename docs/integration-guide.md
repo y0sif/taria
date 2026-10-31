@@ -34,7 +34,7 @@ has the details and a lint that catches it.
 
 ## Add the dependency
 
-Both crates are on crates.io, at version `0.3.3`.
+Both crates are on crates.io, at version `0.4.0`.
 
 ```bash
 cargo add taria-ratatui
@@ -49,6 +49,15 @@ spelled here:
 ```bash
 cargo add taria
 ```
+
+The same line works on every platform taria supports. On Linux and macOS
+the layer serves a Unix domain socket; on Windows, since 0.4.0, a named pipe
+(a kernel object named under `\\.\pipe\`, which two processes open like a
+file). Your code is the same on all three, so there is nothing to fence: an
+app that kept taria behind `#[cfg(unix)]`, with the dependency under
+`[target.'cfg(unix)'.dependencies]`, because 0.3 did not build on Windows,
+can drop both and take the one dependency everywhere. On Windows it pulls in
+`windows-sys`, the raw Win32 bindings, and nothing else.
 
 To track `main` instead of a release, take either crate from the repository.
 A git dependency resolves to whatever the branch holds the day you build it,
@@ -73,8 +82,8 @@ the bridge from the same checkout is how you stop having to think about it.
 use taria_ratatui::TariaLayer;
 
 fn main() -> std::io::Result<()> {
-    // Never fails. If the socket cannot be bound the layer is inert and the
-    // app runs exactly as it would without taria.
+    // Never fails. If the socket (a named pipe on Windows) cannot be bound,
+    // the layer is inert and the app runs exactly as it would without taria.
     let mut layer = TariaLayer::bind_or_disabled("my-app");
 
     // Print here, before `ratatui::init()` takes the alternate screen. A
@@ -99,7 +108,8 @@ fn main() -> std::io::Result<()> {
 
 `bind` returns an error; `bind_or_disabled` returns a disabled layer instead.
 Prefer the second. A user whose `$XDG_RUNTIME_DIR` is not writable should get
-their app, not a failure to launch over a feature they did not ask for.
+their app, not a failure to launch over a feature they did not ask for. At a
+path of your own the pair is `bind_at` and `bind_or_disabled_at`.
 
 Every method stays callable on a disabled layer: publishing does nothing, no
 input ever arrives, `frame()` still hands back a recorder. The render path
@@ -316,6 +326,97 @@ something. Say so rather than inventing a role name of your own: a role added
 to taria is additive and every peer learns it, while a role each app names for
 itself is one vocabulary per app.
 
+## Say what state a node is in
+
+The role says what a widget is. Its state, which row is selected, whether a
+box is ticked, whether a branch is open, whether a button can be pressed
+yet, has its own fields since 0.4.0, so an agent reads it instead of parsing
+it out of a `value` string you made up. Each is a chainable setter beside
+`label` and `value`:
+
+```rust
+use taria::{Checked, Node, Role};
+
+// A task row: done is `checked`, the cursor row is `selected`, and its place
+// in the whole list, not only the rows on screen.
+Node::new(TASK_IDS.id(task.id), Role::ListItem)
+    .label(task.title.clone())
+    .checked(task.done)
+    .selected(pos == app.cursor)
+    .pos_in_set(pos as u32 + 1);
+
+// The list says how many rows it holds, published or not.
+Node::new("tasks", Role::List).set_size(app.tasks.len() as u32);
+
+// A parent whose children are partly ticked, a branch that is open, a
+// button that cannot be pressed yet and why.
+Node::new("all", Role::Checkbox).checked(Checked::Mixed);
+Node::new("src", Role::TreeItem).expanded(true);
+Node::new("save", Role::Button)
+    .label("Save")
+    .description("Writes the open file to disk")
+    .disabled(!app.dirty);
+
+// A gauge, a reading with no range, and a table cell and its table, rows
+// and columns from 1.
+Node::new("cpu", Role::ProgressBar).range(app.cpu, 0.0, 100.0);
+Node::new("temp", Role::Text).label("CPU temperature").value_now(app.celsius);
+Node::new(format!("r{row}c{col}"), Role::Cell).cell(row, col);
+Node::new("results", Role::Table).table_size(app.rows.len() as u32, 4);
+```
+
+What each one promises:
+
+- **Absent means you said nothing**, never `false`. So set `selected` on
+  every row of a list, `false` on all but the cursor's, and `expanded` on
+  every branch that can open: a row with no `selected` says nothing about
+  whether it is the cursor's. Leave a field unset only where it does not
+  apply.
+- **Selection is not focus.** `focused` is where a raw key lands; `selected`
+  is where the cursor sits, which stays true while the keyboard is
+  elsewhere. Publish both.
+- **`disabled` takes the actions with it.** A node you mark disabled is
+  published with no actions, whatever you built it with: the adapter strips
+  them, so you do not have to, and `taria-mcp` refuses `act` on it with an
+  answer that says it is disabled, so the agent waits for the tree to change
+  instead of trying other names. `key` and `type_text` are not affected.
+  It covers that node alone, not its children: a child of a disabled node
+  keeps its actions and is not read as disabled, so mark each node you
+  disable.
+  `disabled(false)` clears the mark, and only `true` is ever sent. The
+  reverse does not hold: an empty action list does not mean disabled, so
+  do not mark a node disabled because a modal is in front of it. The demo's
+  rows behind its confirm dialog advertise nothing and are not disabled.
+- **`description` is your own words.** `relayed` covers a node's label and
+  value only. Text from outside your app, a file's contents or a model's
+  reply, goes in a child marked relayed (see "Mark relayed text"), never in
+  a description.
+- **Positions count from 1**, as a person counts rows: `pos_in_set`, `row`
+  and `column`. A 0 passed to `pos_in_set` or `cell` leaves that field
+  unset, so a `row` node passes 0 for its column. Counts, `set_size`,
+  `row_count` and `column_count`, may be 0.
+- **Numbers are finite.** `range(now, min, max)` leaves any argument that is not
+  finite unstated, so an open-ended bound is `f64::INFINITY`:
+  `.range(bytes, 0.0, f64::INFINITY)` states a value and a floor and no ceiling.
+  `value_now(now)` states the value alone, leaving the bounds as they are, and a
+  value that is not finite clears it. A `NaN` never reaches the wire, which
+  could not spell it, and never stops the adapter from noticing that a frame is
+  unchanged.
+
+**Hidden is not a field: do not publish it.** A collapsed branch's children,
+a closed panel, the rows scrolled out of view are simply left out of the
+tree. That is also why the counts say "published or not": a branch with
+`expanded(true)` and `set_size(40)` that publishes 12 children tells an
+agent the other 28 exist and are not on screen, not that the set has 12.
+Publish what the widget draws, and state the size of what it draws from.
+
+A reader that predates 0.4.0 ignores all of this and sees the node it always
+saw, so publishing state never costs an older agent anything. It does cost
+the reader you replace it with, though: the demo moved a task's done state
+from `value("todo")` to `checked`, and anything that matched the old value
+had to move too. Keep a `value` an existing reader relies on, as the demo
+keeps its list's selected id, until you know nothing reads it.
+
 ## Mark relayed text
 
 Most strings in a tree are the app's own words: a button's text, a tab's
@@ -417,24 +518,61 @@ arrived while the previous pass was drawing, before the frame that will be
 published is built. Publishing a tree that does not include an input you are
 already holding is how an agent gets told nothing happened.
 
+**The first tree you publish after a drain is the answer.** From 0.4.0 the
+layer stamps every snapshot with the newest input it has handed you
+(`after_input`), and `taria-mcp` credits a tree to an input only once it is
+stamped at that input. So an act your handler takes a second over is still
+answered with its own tree, an act that changes nothing is answered "did not
+change" within a frame, and a tree that lands late is no longer credited to
+the input after it, but for one race (protocol section 5.3). The stamp says
+when you took the input, though, not when you applied it. Whatever tree you
+publish first after the drain is the one the agent is handed, so it has to
+carry the effect, or a status saying the effect is under way.
+
+The loop to avoid publishes at the top and applies at the bottom:
+
+```rust
+// Wrong: the tree published here can be stamped with an input that is
+// dequeued above it but applied only further down.
+while app.running {
+    drain_agent_input(&mut app, layer); // queues the work
+    terminal.draw(|frame| view(&app, frame))?;
+    layer.publish(tree::build_nodes(&app)); // stamped, without the effect
+    app.apply_pending(); // the effect lands here, a frame too late
+    // ...
+}
+```
+
+Apply what you drained before the next publish, as the first loop in this
+section does. If the work takes long enough to show, set a status first (a
+`Role::Status` node reading "Switching language", or a `disabled` control)
+and publish that, so the agent's answer says the input is being worked on
+rather than that it changed nothing, then publish the result when it is
+done.
+
+Publish every frame, not only when you think the tree changed. The layer
+skips a frame identical to the last one, but right after a dequeue it sends
+the last snapshot again with only its stamp moved, which is how an input
+that changed nothing gets its answer at once. An app that publishes only on
+change publishes nothing after such an input, and the bridge waits out its
+3 s window before saying it got no tree.
+
 The assumption underneath is that the loop wakes up on its own. An event loop
 that blocks on terminal input alone never returns while the keyboard is idle,
 and agent input then sits in the queue until a human touches a key. The demo
 runs a tick thread that sends an event every 50 ms, which bounds the latency
 between an act and its effect.
 
-If you have no tick, `layer.recv_timeout_with_id(Duration::from_millis(50))`
-is a blocking wait on agent input with a deadline, usable as the loop's clock.
-It waits out the timeout even on a disabled layer, so an app that paces itself
+If you have no tick, `layer.recv_timeout(Duration::from_millis(50))` is a
+blocking wait on agent input with a deadline, usable as the loop's clock. It
+waits out the timeout even on a disabled layer, so an app that paces itself
 on it keeps its timing whether or not taria bound.
 
-Pace on that variant rather than `recv_timeout`. The plain one drops the
-`InputId`, and without the id you cannot ack `Ignored`, which
+It hands back the input with its `InputId`, as `try_recv` does. Keep the id:
+without it you cannot ack `Ignored`, which
 [Acknowledge what you ignore](#acknowledge-what-you-ignore) makes mandatory.
-The same pairing runs through the rest of the API: `try_recv_with_id` to
-`try_recv`, and `drain_with_ids` to `drain`, which is that loop already
-written for you. A loop that drains needs no id at all: `drain_acking` takes
-the status your handler returns and sends the ack itself.
+A loop that drains needs no id at all: `drain` takes the status your handler
+returns and sends the ack itself.
 
 ## Give things identities, not positions
 
@@ -492,20 +630,18 @@ not change, which reads as "it may not have reacted yet".
 use taria_ratatui::TariaLayer;
 
 fn drain_agent_input(app: &mut App, layer: &TariaLayer) {
-    layer.drain_acking(|input| apply_agent_input(app, input));
+    layer.drain(|input| apply_agent_input(app, input));
 }
 ```
 
 `apply_agent_input` returns an `InputStatus`: `Ignored` for an input it
-deliberately did nothing with, `Delivered` for the rest. `drain_acking` sends
-the `Ignored` ones, and last ack wins, so each refines the `Delivered` the
-dequeue already sent. A returned `Delivered` sends nothing, since it would only
-repeat that. That is why `apply_agent_input` returns a verdict instead of `()`,
-and the verdict is taria's own type rather than one you define: the demo and
-the typing tutor each wrote the same two-variant enum, and the same loop around
-`drain_with_ids` and `ack`, before `drain_acking` existed. Keep those two for
-an input you need the id of for something else, such as one you can only
-answer a frame later.
+deliberately did nothing with, `Delivered` for the rest. `drain` sends the
+`Ignored` ones, and last ack wins, so each refines the `Delivered` the dequeue
+already sent. A returned `Delivered` sends nothing, since it would only repeat
+that. That is why `apply_agent_input` returns a verdict instead of `()`, and
+the verdict is taria's own type rather than one you define: the demo and the
+typing tutor each wrote the same two-variant enum, and the same
+dequeue-and-`ack` loop, before the layer did it for them.
 
 An act on a node that has since gone is one of these. The demo publishes
 `dialog`, `dialog-confirm` and `dialog-cancel` only while the confirm-delete
@@ -520,7 +656,36 @@ Acks are flushed ahead of the pending snapshot in every writer pass, so an
 ack queued first arrives first, and the bridge reports the refinement. Publish
 first and the bridge sees a changed tree behind a plain `Delivered`, returns
 that tree, and the `Ignored` arrives after the answer has already gone out.
-Draining before drawing, as above, gives you this for free.
+Against a layer that stamps, the same goes for an unchanged tree: the first
+tree stamped at the input answers it, and a `Delivered` in front of an
+unchanged one reads as "did not change". Draining before drawing, as above,
+gives you this for free.
+
+So there is no acking `Ignored` a frame or more later. The first tree you
+publish after dequeuing an input is stamped at it and answers it, and an
+`Ignored` sent behind that tree arrives after the agent has been answered
+(protocol section 5.3). If you need the `InputId` in hand, loop on
+`try_recv` and ack in the same pass, before you publish:
+
+```rust
+use taria_ratatui::InputStatus;
+
+while let Some((id, input)) = layer.try_recv() {
+    if apply_agent_input(app, input) == InputStatus::Ignored {
+        layer.ack(id, InputStatus::Ignored);
+    }
+}
+// Publish only after the loop: every Ignored is already queued ahead.
+layer.publish(tree::build_nodes(app));
+```
+
+An input whose verdict comes only later, once some work has run, cannot be
+acked in time. Do not hold its id for a late `Ignored`; instead, publish a
+status node in the first tree after the drain saying the input is under way
+(a `Role::Status` node, as in the drain section above), so the answer it is
+credited with says so, and publish the outcome, a status saying nothing
+came of it included, when the work is done. The agent's next `read_tree`
+shows it.
 
 ## Advertise a way out of every state
 
@@ -619,7 +784,10 @@ snapshot, the agent has been told a truth it cannot check.
 Identical trees are deduped: a frame whose nodes match the previous frame's
 is skipped before anything is cut or measured, and `seq` does not move.
 Publishing every frame therefore costs one comparison, but only for as long
-as the tree actually holds still.
+as the tree actually holds still. The exception is the first frame after you
+dequeue an input: the snapshot already published goes out again, neither cut
+nor measured again, with its stamp moved to that input and under the same
+`seq`, as the drain section above explains.
 
 A live metric defeats it. A words-per-minute counter carried to four
 decimals puts a new string in the tree on every frame, so every frame
@@ -665,10 +833,11 @@ agent on the stale tree either way.
 You are told, because you are the only one who can fix it:
 
 ```rust
-let cut = layer.truncated_snapshots();
-if let Some(branch) = layer.last_truncation() {
+let stats = layer.stats();
+if let Some(branch) = stats.last_truncation {
     // Names the depth measured and a node found at it, which in a tree
     // generated from data is the only way to find the branch that ran away.
+    let cut = stats.truncated_snapshots;
     eprintln!("my-app: {cut} snapshot(s) published with a branch cut: {branch}");
 }
 ```
@@ -699,18 +868,18 @@ newline. Both peers enforce it.
 The adapter trims every snapshot to fit at publish, after the depth cut, and
 stops as soon as the tree fits. A node that could never fit goes first, with
 everything under it; its siblings are not dropped with it. Then the longest
-values are cut to one shared length, then labels with them; a string of 256
-bytes of JSON or less is never cut. A cut is marked with `…`: a `Role::Log` or
-`Role::Terminal` value keeps its end, because that is where those grow, and
-every other string keeps its start. When more nodes have to go, a list keeps
-its first rows with no gap, and the strings left are cut only as far as the
-smaller tree needs. Rows are chosen as if every string were at the floor, so a
-draft beside a list that had to lose rows ends up near the floor too; it stays
-whole only when the nodes that went were what ran over.
-Ids and custom action names are never touched, so an agent can still act on
-whatever it reads. The stages are in `architecture.md` (Snapshot size). The
-tree is trimmed rather than withheld for the reason it is cut for depth: a
-publish that does not happen leaves the agent on a stale tree.
+values and descriptions are cut to one shared length, then labels with them; a
+string of 256 bytes of JSON or less is never cut. A cut is marked with `…`: a
+`Role::Log` or `Role::Terminal` value keeps its end, because that is where those
+grow, and every other string keeps its start. When more nodes have to go, a list
+keeps its first rows with no gap, and the strings left are cut only as far as
+the smaller tree needs. Rows are chosen as if every string were at the floor, so
+a draft beside a list that had to lose rows ends up near the floor too; it stays
+whole only when the nodes that went were what ran over. Ids and custom action
+names are never touched, so an agent can still act on whatever it reads. The
+stages are in `architecture.md` (Snapshot size). The tree is trimmed rather than
+withheld for the reason it is cut for depth: a publish that does not happen
+leaves the agent on a stale tree.
 
 A frame identical to the one before it is skipped before the trim. A changed
 tree is compared again after it, so an edit past the cut of a trimmed value
@@ -719,15 +888,16 @@ sends nothing new: the agent already has that tree.
 You are told, because you are the only one who can fix it:
 
 ```rust
-let trimmed = layer.oversized_snapshots();
-if let Some(last) = layer.last_oversize() {
+let stats = layer.stats();
+if let Some(last) = stats.last_oversize {
     // Names the line's size and the node holding the longest string,
     // which is where to look.
+    let trimmed = stats.oversized_snapshots;
     eprintln!("my-app: {trimmed} snapshot(s) trimmed to fit one line: {last}");
 }
 ```
 
-Both `oversized_snapshots()` and `truncated_snapshots()` count snapshots, not
+Both `oversized_snapshots` and `truncated_snapshots` count snapshots, not
 frames, so a tree that stays too large while the app redraws it counts once.
 
 Nothing laid out by hand comes near this; the demo's whole tree is under
@@ -798,10 +968,10 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) -> InputStatus {
 ```
 
 Neither the `..` nor the wildcard arm is boilerplate to skip, and they answer
-different additions. Eleven types in `taria` are `#[non_exhaustive]`:
-`AgentInput`, `Action`, `Role`, `Node`, `Snapshot`, `InputStatus`, the two
-wire message enums, `key::Key`, `key::Modifiers` and `key::KeyPress`. So are
-six struct-like variants inside them: `AppToBridge::Hello` and `Ack`,
+different additions. Twelve types in `taria` are `#[non_exhaustive]`:
+`AgentInput`, `Action`, `Role`, `Node`, `Checked`, `Snapshot`, `InputStatus`,
+the two wire message enums, `key::Key`, `key::Modifiers` and `key::KeyPress`.
+So are six struct-like variants inside them: `AppToBridge::Hello` and `Ack`,
 `BridgeToApp::Input`, and `AgentInput`'s `Act`, `Key` and `Text`. The enums
 are where a new variant lands and the variants are where a new field lands,
 and both are things an adapter matches on. Without the attributes, one new
@@ -815,7 +985,7 @@ each marked variant's literal: `AgentInput::act`, `key` and `text`,
 Through this adapter, the wildcard arm is not where an input kind you cannot
 read arrives. That is `AgentInput::Unknown`, the fallback a kind added after
 your build parses as, and the layer answers it `Ignored` on your behalf and
-never queues it, counting it in `unknown_inputs()`. The fallback exists
+never queues it, counting it in `stats().unknown_inputs`. The fallback exists
 because the `InputId` sits on the message rather than inside the input, so
 degrading the input is what keeps the id and makes an ack possible at all;
 without it the line fails whole and the agent waits out a timeout for an ack
@@ -996,16 +1166,18 @@ primary path.
 
 ## Report what the layer threw away
 
-Four counters record agent traffic that went nowhere. Read them after the
-terminal is restored, never while the alternate screen or a pinned panel is
-up ([Apps that draw only a panel](#apps-that-draw-only-a-panel)).
+`layer.stats()` returns a `LayerStats`, and four of its counts record agent
+traffic that went nowhere. Read it after the terminal is restored, never while
+the alternate screen or a pinned panel is up
+([Apps that draw only a panel](#apps-that-draw-only-a-panel)).
 
 ```rust
 ratatui::restore();
+let stats = layer.stats();
 
 // The agent sent input faster than the loop drained it. Each drop was
 // acked `Dropped`, so the agent knows; this is the app-side tally.
-let dropped = layer.dropped_inputs();
+let dropped = stats.dropped_inputs;
 if dropped > 0 {
     eprintln!("my-app: dropped {dropped} agent input(s): could not keep up");
 }
@@ -1013,34 +1185,35 @@ if dropped > 0 {
 // bridge connection they arrived on ended first, or a waiting client wrote
 // them before its session began. Nothing on the agent side is left to hear
 // about these, so the person running the app is the only one who can.
-let stale = layer.stale_inputs();
+let stale = stats.stale_inputs;
 if stale > 0 {
     eprintln!("my-app: discarded {stale} agent input(s): no live session");
 }
 // Inputs whose kind this build of taria cannot read. The layer acked each
 // one `Ignored` for you, so the agent was told; the version gap is yours.
-let unknown = layer.unknown_inputs();
+let unknown = stats.unknown_inputs;
 if unknown > 0 {
     eprintln!("my-app: could not read {unknown} agent input(s): raise the taria dependency");
 }
 // Answers the bridge was too slow to collect. These inputs were applied;
 // it is the acks that were dropped, so the agent calls waiting on them
 // timed out instead of hearing what happened.
-let acks = layer.dropped_acks();
+let acks = stats.dropped_acks;
 if acks > 0 {
     eprintln!("my-app: lost the answer to {acks} agent input(s): the bridge read too slowly");
 }
 ```
 
 All four are monotonic across reconnects and all four are 0 on a disabled
-layer. The input queue holds 256, so a nonzero `dropped_inputs` means an agent
-outpaced the loop by a lot; a loop that only wakes on keyboard events gets
-there first. A nonzero `stale_inputs` means one of two things. A bridge
-session ended with input still queued, which a harness restart mid-call will
-do. Or a second client wrote input while it waited for the first to leave,
-before the app's `hello` reached it; that input was thrown away unacked,
-because its writer had seen no tree. taria-mcp never does this: its input
-tools refuse to send before the app's first snapshot. A nonzero
+layer. `LayerStats` is `#[non_exhaustive]`, so a later release can add a count
+without breaking this code. The input queue holds 256, so a nonzero
+`dropped_inputs` means an agent outpaced the loop by a lot; a loop that only
+wakes on keyboard events gets there first. A nonzero `stale_inputs` means one
+of two things. A bridge session ended with input still queued, which a harness
+restart mid-call will do. Or a second client wrote input while it waited for
+the first to leave, before the app's `hello` reached it; that input was thrown
+away unacked, because its writer had seen no tree. taria-mcp never does this:
+its input tools refuse to send before the app's first snapshot. A nonzero
 `unknown_inputs` means the bridge is built against a newer taria than the app,
 and the agent is asking for something this build has no way to do.
 
@@ -1053,6 +1226,9 @@ app out of memory. So a nonzero value is a report about the bridge, not about
 the app: the input landed and the caller was answered nowhere.
 
 ## Socket paths
+
+This section is about Linux and macOS; Windows, which serves a named pipe
+instead of a socket file, is [at its end](#on-windows).
 
 By default the socket is `$XDG_RUNTIME_DIR/taria/<label>.sock`, falling back
 to `<temp dir>/taria-<user>/<label>.sock`, where `<user>` is the effective uid
@@ -1071,7 +1247,8 @@ it is that the layer binds *and unlinks* whatever the label resolves to, and
 absolute path. `bind` returns the error and `bind_or_disabled` comes back
 disabled with an empty `socket_path()`, because a refused label resolves to no
 path at all. If you want a path of your own, pass the path: `$TARIA_SOCK`, or
-`TariaLayer::bind_at`.
+`TariaLayer::bind_or_disabled_at` (`bind_at` if you would rather have the
+error).
 
 Unix domain socket paths are capped at the platform's `sun_path` minus the
 terminating NUL, and the buffer is not the same size everywhere: 108 bytes on
@@ -1118,6 +1295,52 @@ a shutdown flag rather than waiting to be woken by a connection to its own
 path, which is what used to hang the first copy: by the time the wake-up was
 sent, the path held the second copy's socket, whose listener took it while the
 first stayed parked.
+
+### On Windows
+
+There is no socket file. The layer creates the named pipe
+`\\.\pipe\taria-<SID>-<label>`, where `<SID>` is your account's security
+identifier (`S-1-5-21-...`, read from the process token), so two users' apps
+with the same label never share a name. `socket_path()` is that pipe name,
+which is what to print. The pipe is owned by you and open to nobody else, it
+refuses clients on other machines, and the bridge checks its owner before it
+writes anything to it or parses anything it sent, so none of the directory
+rules above has anything to vet.
+
+The label is held to the same rule, and may not contain `\` either.
+`$TARIA_SOCK`, and a name passed to `bind_at` or `bind_or_disabled_at`, must
+be a pipe on this machine, `\\.\pipe\<name>` with one name after the prefix.
+A file path, or a pipe on another machine (`\\host\pipe\<name>`, reached
+over SMB, Windows file sharing), is refused rather than opened. The whole
+name is limited to 256 characters, counted in UTF-16 code units.
+
+The failures come back from `bind_error()` in words of their own:
+
+- Another copy of the app is serving the name, or something else holds it:
+  `AddrInUse`, as on Unix. The message opens `another instance is already
+  serving the taria pipe`, names the pipe, and ends with the way out for a
+  second copy, a `TARIA_SOCK` of the form `\\.\pipe\<name>`. A pipe lives
+  while any handle to it is open, the bridge's end included, so an app
+  restarted while a bridge still holds its old end finds the name taken for
+  a moment. The bind waits that out: it retries for 500 ms before it reports
+  `AddrInUse`, and taria-mcp lets go as soon as it reads the end of the
+  stream. A bridge that holds the old end longer than that leaves the error
+  standing, and the message names that case too. So a second copy is
+  refused half a second after it starts, not at once.
+- A name that is not a local pipe, or a label that cannot end one:
+  `InvalidInput`, naming the value and what a pipe name may be. For a label
+  `a/b`: ``app label "a/b" cannot end a pipe name; it must be a single name,
+  so no `/` or `\`, and not `.`, `..` or empty.``, then how to use a name of
+  your own.
+- Your SID could not be read from the process token, which does not happen
+  to a process running normally: `cannot read this user's SID from the
+  process token, which names the default taria pipe`, the reason, and how to
+  bind without it, a `TARIA_SOCK` naming the pipe.
+- Anything else the system refuses: `cannot create the taria pipe`, the
+  name, and the system's own error.
+
+As everywhere, `bind_or_disabled` turns each of these into a disabled layer,
+and the app starts.
 
 ## Checking your work
 

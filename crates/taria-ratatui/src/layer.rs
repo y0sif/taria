@@ -3,15 +3,9 @@
 
 use std::collections::VecDeque;
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::fmt;
+use std::io::{self, BufRead, BufReader, Read};
 use std::mem;
-use std::net::Shutdown;
-use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -24,13 +18,15 @@ use taria::{AgentInput, MAX_NODE_DEPTH, Node, PROTOCOL_VERSION, Role, Snapshot, 
 
 use crate::FrameRecorder;
 use crate::bound::{self, ROOT_BUDGET, SnapshotTooLarge};
+use crate::transport::{self, Accepted, Connection, Listener, Reader, Writer};
 
 /// How long the writer may spend on any one line before the connection is
 /// dropped. Protects the app from a peer that stops reading, or reads too
 /// slowly to take a whole line in that time.
 ///
 /// The bound is on the line, not on each wait for room in the socket, which
-/// is all a socket's own write timeout bounds (see [`write_all_before`]).
+/// is all a socket's own write timeout bounds (see
+/// [`Writer::write_all_before`]).
 /// Bounded that way, a line far larger than the socket buffers could stall
 /// for one timeout per wait: a bridge that had stopped reading held a 900 KB
 /// snapshot for two timeouts, and one taking 64 KB every 3 s, which freed
@@ -41,34 +37,11 @@ use crate::bound::{self, ROOT_BUDGET, SnapshotTooLarge};
 /// afresh.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The most one `write` call is handed, so that the kernel waits for room in
-/// the socket at most once inside it, and the write timeout, which bounds
-/// each such wait rather than the call, bounds the call too. See
-/// [`write_all_before`].
-///
-/// One buffer on Linux, and within the send low-water mark that macOS and the
-/// BSDs wait for before they copy anything. A typical line is one or a few
-/// calls, and a snapshot at [`MAX_LINE_BYTES`] about five hundred, measured at
-/// under a millisecond more than one call for the lot.
-const WRITE_CHUNK: usize = 2 * 1024;
-
-/// The longest one wait for room in the socket runs before the writer looks
-/// at the clock again. See [`write_all_before`].
-///
-/// The kernel keeps a socket's write timeout on a timer wheel that files a
-/// long timeout coarsely and fires it late: on Linux at 1000 Hz, a 5 s
-/// timeout fired up to 430 ms past its time when measured, more than the
-/// whole [`SHUTDOWN_FLUSH`]. A timeout this short is filed to the
-/// millisecond, so waiting in slices of it holds a deadline to within a few
-/// milliseconds, and a writer stalled on a stuck bridge wakes 20 times a
-/// second to find it still stuck.
-const WRITE_WAIT: Duration = Duration::from_millis(50);
-
 /// How long the writer may spend, in total, on the acks still queued when the
 /// layer shuts down.
 ///
 /// A common exit drains input, answers it and drops the layer in one frame:
-/// a `q` acted on as quit, a `drain_acking` that returns
+/// a `q` acted on as quit, a `drain` that returns
 /// [`Ignored`](InputStatus::Ignored) on the way out. Nothing gives the writer
 /// a turn between those calls, so every one of those answers can still be
 /// queued, the [`Delivered`](InputStatus::Delivered) of the dequeue included,
@@ -88,7 +61,7 @@ const SHUTDOWN_FLUSH: Duration = Duration::from_millis(250);
 
 /// Capacity of the agent-input queue between the socket thread and the app.
 /// When the app is not draining inputs, the newest input is dropped, counted
-/// (see [`TariaLayer::dropped_inputs`]) and acked
+/// (see [`LayerStats::dropped_inputs`]) and acked
 /// [`Dropped`](InputStatus::Dropped), instead of blocking the socket thread
 /// or queueing without bound.
 const INPUT_QUEUE: usize = 256;
@@ -104,7 +77,7 @@ const INPUT_QUEUE: usize = 256;
 /// The *oldest* ack is the one dropped, the opposite end from the input queue:
 /// an ack answers one specific input, and the answers an agent is still
 /// waiting on are the newest, while the oldest name inputs whose waiter has
-/// long since timed out. Drops are counted (see [`TariaLayer::dropped_acks`]).
+/// long since timed out. Drops are counted (see [`LayerStats::dropped_acks`]).
 const ACK_QUEUE: usize = 1024;
 
 /// How many delivered inputs stay answerable with [`TariaLayer::ack`].
@@ -118,32 +91,11 @@ const ACK_QUEUE: usize = 1024;
 /// would be a leak in an app that runs for days.
 const ACKABLE_INPUTS: usize = INPUT_QUEUE;
 
-/// How long the listener naps between accept attempts.
-///
-/// The listener socket is non-blocking, so the thread is never parked in
-/// `accept()` and shutdown is noticed without anything connecting: [`Drop`]
-/// sets the flag and the thread returns within one nap. Waking a blocking
-/// `accept()` by connecting to the socket path cannot do that, because the
-/// path may by then hold a socket another process bound, whose listener would
-/// take the wake-up while this one stayed parked forever.
-const ACCEPT_POLL: Duration = Duration::from_millis(50);
-
-/// How long to wait for the "is anything listening there?" probe that runs
-/// before an existing socket file is replaced.
-///
-/// `connect` is the only liveness probe the standard library offers, and it
-/// blocks with no timeout: a socket whose owner stopped accepting with a full
-/// backlog would park the app inside `bind`, during startup, which is the one
-/// thing taria promises never to do. So the probe runs on a thread of its own
-/// and its answer is waited for only this long; no answer in time means
-/// "cannot tell", which refuses the bind rather than unlinking a socket that
-/// may still be serving.
-const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// The embeddable taria endpoint for a ratatui app.
 ///
-/// Binding a layer opens a Unix domain socket and spawns a listener thread
-/// that serves one bridge client at a time: on connect it sends an
+/// Binding a layer opens the app's endpoint, a Unix domain socket on Linux and
+/// macOS or a named pipe on Windows, and spawns a listener thread that serves
+/// one bridge client at a time: on connect it sends an
 /// [`AppToBridge::Hello`] handshake plus the latest snapshot, then streams
 /// every newly published snapshot and forwards incoming [`AgentInput`]
 /// messages to the app via [`try_recv`](Self::try_recv) /
@@ -153,7 +105,7 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 /// on: one whose bridge disconnected before the app dequeued it is discarded
 /// rather than applied, because it was aimed at a session that is gone, and
 /// so is one a client wrote while it waited its turn, before the handshake
-/// that opens its session (see [`stale_inputs`](Self::stale_inputs)).
+/// that opens its session (see [`LayerStats::stale_inputs`]).
 ///
 /// A layer may also be *disabled*: [`bind_or_disabled`](Self::bind_or_disabled)
 /// hands back an inert layer rather than an error, so taria failing to bind
@@ -163,7 +115,9 @@ const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Dropping the layer shuts the threads down and removes the socket file, but
 /// only while that file is still the one this layer bound: a second instance
 /// that took the path over is serving a socket of its own there, and unlinking
-/// it would leave that instance running and unreachable.
+/// it would leave that instance running and unreachable. A pipe leaves no
+/// file: on Windows the layer closes its end, and the pipe and its name go
+/// once no bridge holds the other end either.
 pub struct TariaLayer {
     app_label: String,
     socket_path: PathBuf,
@@ -174,15 +128,162 @@ pub struct TariaLayer {
     bind_error: Option<io::Error>,
 }
 
+/// What a [`TariaLayer`] has lost or cut so far, from
+/// [`TariaLayer::stats`].
+///
+/// The layer never prints, because a print while the app owns the alternate
+/// screen garbles the display. These counts are the app-facing tally instead.
+/// Every count is monotonic for the lifetime of the layer and accumulates
+/// across reconnects. On a disabled layer every count is 0 and both `last_*`
+/// fields are `None`.
+///
+/// Read it after the terminal is restored, never while the app owns the
+/// alternate screen, and report what is nonzero:
+///
+/// ```no_run
+/// # let layer = taria_ratatui::TariaLayer::bind_or_disabled("my-app");
+/// // After `ratatui::restore()`.
+/// let stats = layer.stats();
+/// if stats.dropped_inputs > 0 {
+///     eprintln!("dropped {} agent input(s)", stats.dropped_inputs);
+/// }
+/// ```
+///
+/// The struct is `#[non_exhaustive]`, so a later release can add a count
+/// without breaking an app that reads these. Outside this crate it cannot be
+/// built with a struct literal; [`LayerStats::default`] is the all-zero one.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct LayerStats {
+    /// Agent inputs dropped because the input queue was full.
+    ///
+    /// When an agent floods inputs faster than the app drains them, the layer
+    /// drops the newest input rather than blocking the socket thread. The
+    /// agent learns of each drop from its [`Dropped`](InputStatus::Dropped)
+    /// ack; this is the app-facing tally of the same event.
+    pub dropped_inputs: u64,
+
+    /// Agent inputs discarded, rather than handed to the app, because they
+    /// were not aimed at the session that was live when they were read.
+    ///
+    /// Two things put an input here. The first is a bridge connection that
+    /// ended before the app dequeued what arrived on it. Such an input was
+    /// aimed at a bridge session that no longer exists: applying it would act
+    /// on an agent's intent minutes or milliseconds after the agent that
+    /// formed it is gone, with nobody left to receive the result. A `key q`
+    /// that arrives just before the bridge restarts would otherwise quit the
+    /// app on the next frame. The bridge drops its own queue on reconnect for
+    /// the mirror-image reason, so both sides agree that an input belongs to
+    /// one connection.
+    ///
+    /// The second is input a client wrote while it waited behind another.
+    /// Only one bridge is served at a time, so a client that connects while
+    /// another is attached waits in the listen backlog, and whatever it writes
+    /// meanwhile sits unread in the kernel's socket buffer until its turn
+    /// comes. That client has seen no tree, so its inputs name nodes and keys
+    /// it guessed at, and applying them once the first client leaves would
+    /// act on a UI it never looked at. So a connection that was already
+    /// waiting when the previous session ended has what it wrote read off and
+    /// thrown away just before its hello goes out, and every complete line of
+    /// that which is an input is counted here, a kind this build cannot read
+    /// included. None of it is acked: the session it would be answered on had
+    /// not begun. Clients waiting back to back are each treated so.
+    ///
+    /// The second kind is Unix only. A Windows named pipe has no listen
+    /// backlog: a client that finds the one instance taken is refused with
+    /// `ERROR_PIPE_BUSY` and has nowhere to write, so on Windows this counts
+    /// only inputs whose connection ended before the app dequeued them.
+    ///
+    /// A client that waited behind nobody keeps what it wrote before reading
+    /// its hello: the first connection of a process, and one that connects
+    /// after the listener last found nobody waiting. A script that connects
+    /// to an idle app and writes at once is such a client, and its input is
+    /// its session's, as it was in 0.3.0. A client that waits for the hello
+    /// before writing is never affected either way, and taria-mcp is one,
+    /// whose input tools refuse to send until the app's first snapshot has
+    /// arrived.
+    pub stale_inputs: u64,
+
+    /// Agent inputs answered without reaching the app because their `kind`
+    /// is one this build cannot read.
+    ///
+    /// An input like that parses as [`AgentInput::Unknown`], which carries
+    /// neither the kind it arrived under nor what it asked for, so there is
+    /// nothing for the app to apply. The layer acks it
+    /// [`Ignored`](InputStatus::Ignored) itself and never queues it; see
+    /// [`TariaLayer::try_recv`], which is why an app never has to think about
+    /// the variant.
+    ///
+    /// A nonzero count means the bridge on the other end is built against a
+    /// newer taria than this app, and the agent is asking for things this app
+    /// cannot do yet. Raising the app's taria dependency is the fix.
+    pub unknown_inputs: u64,
+
+    /// Acks dropped because more answers were waiting for the bridge than the
+    /// queue holds.
+    ///
+    /// Acks queue for the writer thread, and a bridge that reads steadily but
+    /// far slower than an agent sends input never stalls long enough for the
+    /// write timeout to disconnect it. The queue is bounded so the app cannot
+    /// be grown out of memory by such a peer; the oldest answers go first,
+    /// because the ones an agent is still waiting on are the newest.
+    ///
+    /// A nonzero count means some agent requests were answered nowhere and
+    /// their callers waited out a timeout instead. The slow end is the bridge,
+    /// not the app.
+    pub dropped_acks: u64,
+
+    /// Published snapshots that had a branch cut for being deeper than
+    /// [`taria::MAX_NODE_DEPTH`].
+    ///
+    /// It counts snapshots, not frames. A frame whose tree, once cut, is the
+    /// snapshot already published is not sent again and is not counted
+    /// again, so a deep tree that sits still while the app redraws it sixty
+    /// times a second counts once, and a deep tree that changes counts once
+    /// per change. The number says how many trees the agent was handed cut,
+    /// which is the thing worth knowing, rather than how often the app drew
+    /// one.
+    ///
+    /// See [`TariaLayer::publish`] for what the cut does and why.
+    /// [`last_truncation`](Self::last_truncation) names the branch.
+    pub truncated_snapshots: u64,
+
+    /// The depth failure behind the most recent truncation, or `None` if no
+    /// published tree has been cut.
+    ///
+    /// [`TreeTooDeep`] carries the depth measured and the id of a node found
+    /// at it. An app whose tree is generated from data has no other way to
+    /// tell which branch ran away, which is the whole reason the count alone
+    /// is not enough here.
+    pub last_truncation: Option<TreeTooDeep>,
+
+    /// Published snapshots that had something cut to fit in one line of
+    /// [`taria::wire::MAX_LINE_BYTES`].
+    ///
+    /// Counted like [`truncated_snapshots`](Self::truncated_snapshots):
+    /// snapshots, not frames, so a tree that stays too large while the app
+    /// redraws it counts once, and one that changes counts once per change.
+    ///
+    /// See [`TariaLayer::publish`] for what is cut and why.
+    /// [`last_oversize`](Self::last_oversize) says how large the line would
+    /// have been and where the bytes were.
+    pub oversized_snapshots: u64,
+
+    /// What was cut from the most recent oversized snapshot, or `None` if no
+    /// published tree has had to be cut to fit.
+    ///
+    /// [`SnapshotTooLarge`] carries the size the line would have had and the
+    /// id of the node holding the longest string. A tree that runs over has
+    /// usually run away in one place, a draft, a log, a list holding every
+    /// row, and the count alone cannot say which.
+    pub last_oversize: Option<SnapshotTooLarge>,
+}
+
 /// The parts of a layer that exist only while its socket is bound.
 struct Inner {
     shared: Arc<Shared>,
     input_rx: Receiver<QueuedInput>,
     listener: Option<JoinHandle<()>>,
-    /// Device and inode of the socket file as bound, so [`Drop`] can tell it
-    /// from a file that replaced it. `None` when it could not be read, which
-    /// makes every comparison fail and leaves the path alone.
-    socket_ident: Option<(u64, u64)>,
     seq: u64,
     /// The root of the newest snapshot published.
     last_root: Option<Node>,
@@ -274,6 +375,30 @@ impl TariaLayer {
     ///
     /// Apps that would rather run without taria than not run at all should
     /// use [`bind_or_disabled`](Self::bind_or_disabled).
+    ///
+    /// # On Windows
+    ///
+    /// The endpoint is a named pipe, and its name is resolved by
+    /// [`taria::socket::resolve_pipe_name`]: `$TARIA_SOCK` if set and
+    /// non-empty, which must then be a pipe on this machine
+    /// (`\\.\pipe\<name>`) or the bind is refused, else
+    /// `\\.\pipe\taria-<SID>-<app_label>`, with the SID of the user the
+    /// process runs as, read from its token. The label may not contain `\`
+    /// either. There is no directory to vet and no file to clear: the pipe is
+    /// created as the first and only instance of its name, refuses clients on
+    /// other machines, and is owned by the current user with a DACL that lets
+    /// only that user in. A name another instance is serving, or that
+    /// something else holds, is refused with
+    /// [`AddrInUse`](io::ErrorKind::AddrInUse), as on Unix.
+    ///
+    /// So a bind can wait, where on Unix it never does: a name found in use
+    /// is tried again for up to 500 ms before it is refused. An app restarted
+    /// at once can find its name still held by a lingering client, the
+    /// bridge of the instance before it, which has not closed its end yet;
+    /// the wait gives that client time to let go, rather than starting the
+    /// new instance with taria off. A name another instance is serving is
+    /// refused all the same, that much later. [`bind_at`](Self::bind_at) and
+    /// both `bind_or_disabled` forms wait the same way.
     pub fn bind(app_label: &str) -> io::Result<Self> {
         let socket_path = resolve_socket_path(app_label).map_err(invalid_label)?;
         Self::bind_at(app_label, socket_path)
@@ -285,6 +410,9 @@ impl TariaLayer {
     /// [`bind`](Self::bind) apply: a relative path (including a bare
     /// filename) is resolved against the current directory first, so the
     /// parent directory that would hold the socket is always vetted.
+    ///
+    /// Apps that would rather run without taria than not run at all should
+    /// use [`bind_or_disabled_at`](Self::bind_or_disabled_at).
     ///
     /// # What is already at the path
     ///
@@ -302,38 +430,25 @@ impl TariaLayer {
     ///   [`AlreadyExists`](io::ErrorKind::AlreadyExists), the file untouched.
     ///   The path can come verbatim from `$TARIA_SOCK`, and a typo there is
     ///   not a reason to delete a file the user meant to keep.
+    ///
+    /// # On Windows
+    ///
+    /// `socket_path` is a pipe name, and must be a pipe on this machine,
+    /// `\\.\pipe\<name>` in any letter case with one name after the prefix,
+    /// as [`taria::socket::check_pipe_name`] holds it; anything else, a file
+    /// path or a pipe on another machine included, is refused with
+    /// [`InvalidInput`](io::ErrorKind::InvalidInput) before anything is
+    /// opened. Nothing is ever cleared from a name: one another instance is
+    /// serving, or that something else holds, is refused with
+    /// [`AddrInUse`](io::ErrorKind::AddrInUse). See [`bind`](Self::bind) for
+    /// how the pipe is protected.
     pub fn bind_at(app_label: &str, socket_path: impl Into<PathBuf>) -> io::Result<Self> {
-        // Absolutize before looking at the parent: a bare filename like
-        // "app.sock" has an empty parent, which must not bypass the privacy
-        // check by silently binding in an unvetted current directory.
-        let socket_path = absolutize(socket_path.into())?;
-
-        // Check the length here, before anything is created: over the limit,
-        // `bind` below would fail with `InvalidInput: path must be shorter
-        // than SUN_LEN`, which names neither the path, its length, the limit,
-        // nor a way out. `SocketPathTooLong` names all four.
-        taria::socket::check_path_len(&socket_path)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-
-        if let Some(parent) = socket_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_private_dir(parent)?;
-        }
-        // Free the path if a dead socket is holding it, and refuse the bind
-        // if anything else is.
-        clear_socket_path(&socket_path)?;
-
-        let listener = UnixListener::bind(&socket_path)?;
-        // Polled rather than parked in `accept()`, so shutdown needs no
-        // connection to be noticed; see `ACCEPT_POLL`.
-        if let Err(err) = listener.set_nonblocking(true) {
-            drop(listener);
-            let _ = fs::remove_file(&socket_path);
-            return Err(err);
-        }
-        // Identify the socket just bound, before anyone else can replace it.
-        let socket_ident = socket_ident(&socket_path);
+        // The transport vets the path, frees it of a dead socket and binds
+        // there, or says why it will not. It cleans up after itself when
+        // dropped, which is why a failure below needs no unlink here: the
+        // listener goes down with whatever failed to take it.
+        let listener = Listener::bind(socket_path.into())?;
+        let socket_path = listener.path().to_path_buf();
         let shared = Arc::new(Shared {
             app_label: app_label.to_string(),
             state: Mutex::new(State::default()),
@@ -348,14 +463,7 @@ impl TariaLayer {
         let thread_shared = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("taria-listener".into())
-            .spawn(move || accept_loop(listener, thread_shared, input_tx));
-        let handle = match handle {
-            Ok(handle) => handle,
-            Err(err) => {
-                let _ = fs::remove_file(&socket_path);
-                return Err(err);
-            }
-        };
+            .spawn(move || accept_loop(listener, thread_shared, input_tx))?;
 
         Ok(Self {
             app_label: app_label.to_string(),
@@ -364,7 +472,6 @@ impl TariaLayer {
                 shared,
                 input_rx,
                 listener: Some(handle),
-                socket_ident,
                 seq: 0,
                 last_root: None,
                 last_raw: None,
@@ -402,10 +509,17 @@ impl TariaLayer {
         }
     }
 
-    /// [`bind_or_disabled`](Self::bind_or_disabled) at an explicit path, so
-    /// the disabled branch can be exercised without mutating the process
-    /// environment (which no test can do safely while other tests run).
-    fn bind_or_disabled_at(app_label: &str, socket_path: PathBuf) -> Self {
+    /// Bind like [`bind_at`](Self::bind_at), or return a disabled layer when
+    /// that fails: [`bind_or_disabled`](Self::bind_or_disabled) at an
+    /// explicit socket path, skipping resolution.
+    ///
+    /// For an app that manages its own runtime directory and would still
+    /// rather run without taria than not run at all. A disabled layer keeps
+    /// the path it tried in [`socket_path`](Self::socket_path) and why binding
+    /// failed in [`bind_error`](Self::bind_error), and prints nothing, for the
+    /// reason [`bind_or_disabled`](Self::bind_or_disabled) gives.
+    pub fn bind_or_disabled_at(app_label: &str, socket_path: impl Into<PathBuf>) -> Self {
+        let socket_path = socket_path.into();
         match Self::bind_at(app_label, socket_path.clone()) {
             Ok(layer) => layer,
             Err(err) => Self::disabled(app_label, socket_path, err),
@@ -441,8 +555,9 @@ impl TariaLayer {
         self.bind_error.as_ref()
     }
 
-    /// The path of the Unix socket this layer is serving on, or the path it
-    /// tried to bind if it is disabled, so an app can print either.
+    /// The endpoint this layer is serving on, or the one it tried to bind if
+    /// it is disabled, so an app can print either: the Unix socket's path on
+    /// Linux and macOS, the named pipe's name (`\\.\pipe\...`) on Windows.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
@@ -463,30 +578,73 @@ impl TariaLayer {
         FrameRecorder::new(self)
     }
 
-    /// Non-blocking poll for the next agent input, if one has arrived.
+    /// Non-blocking poll for the next agent input, if one has arrived, with
+    /// the [`InputId`] that answers it again through [`ack`](Self::ack).
     ///
-    /// Acks the input [`Delivered`](InputStatus::Delivered) on its way out.
-    /// Delivered means the app's event loop dequeued it, nothing more; an app
-    /// that then decides to do nothing with it should say so with
-    /// [`ack`](Self::ack), whose id comes from
-    /// [`try_recv_with_id`](Self::try_recv_with_id).
+    /// Acks the input [`Delivered`](InputStatus::Delivered) on its way out,
+    /// so an app can never leave an input unacknowledged by forgetting to
+    /// call something. Delivered means the app's event loop dequeued it,
+    /// nothing more; an app that then decides to do nothing with it should
+    /// say so with [`ack`](Self::ack).
+    ///
+    /// Reach for [`drain`](Self::drain) first: it loops this and sends those
+    /// acks itself. Loop this by hand when the app needs the id for something
+    /// else, such as remembering which input started a job:
+    ///
+    /// ```no_run
+    /// # use taria_ratatui::{InputId, InputStatus, TariaLayer};
+    /// # enum Outcome { Applied, Refused, Started }
+    /// # fn apply(_input: taria_ratatui::taria::AgentInput) -> Outcome {
+    /// #     Outcome::Applied
+    /// # }
+    /// # let layer = TariaLayer::bind_or_disabled("my-app");
+    /// let mut jobs: Vec<InputId> = Vec::new();
+    /// while let Some((id, input)) = layer.try_recv() {
+    ///     match apply(input) {
+    ///         Outcome::Applied => {}
+    ///         // Now, before the frame that follows publishes: the layer
+    ///         // sends every queued ack ahead of the next snapshot.
+    ///         Outcome::Refused => layer.ack(id, InputStatus::Ignored),
+    ///         // Under way: the next frame publishes a node saying so, and
+    ///         // the job's result lands in a later one.
+    ///         Outcome::Started => jobs.push(id),
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// An [`Ignored`](InputStatus::Ignored) ack belongs before the first
+    /// snapshot the app publishes after dequeuing the input. A bridge that
+    /// reads stamps (section 5.3 of `docs/protocol.md`) answers on that
+    /// snapshot, so an `Ignored` sent a frame later arrives after the agent
+    /// has been told the input changed nothing. The layer writes queued acks
+    /// ahead of the next snapshot, so an ack sent before the frame that
+    /// follows the dequeue is always in time. An app that can only decide
+    /// later should not hold the ack back: it publishes a status node saying
+    /// the input is under way, and the tree carries the outcome when it comes.
     ///
     /// Inputs left over from a bridge connection that has since ended are
     /// discarded here rather than handed over, and input a client wrote before
     /// its handshake never reaches the queue at all; see
-    /// [`stale_inputs`](Self::stale_inputs).
+    /// [`LayerStats::stale_inputs`].
     ///
     /// [`AgentInput::Unknown`] never arrives here either. An input whose
     /// `kind` this build cannot read carries nothing to apply, so the layer
     /// acks it [`Ignored`](InputStatus::Ignored) where it is parsed and never
-    /// queues it; see [`unknown_inputs`](Self::unknown_inputs).
+    /// queues it; see [`LayerStats::unknown_inputs`].
     ///
     /// Always `None` on a disabled layer.
-    pub fn try_recv(&self) -> Option<AgentInput> {
-        self.try_recv_with_id().map(|(_, input)| input)
+    pub fn try_recv(&self) -> Option<(InputId, AgentInput)> {
+        let inner = self.inner.as_ref()?;
+        loop {
+            let queued = inner.input_rx.try_recv().ok()?;
+            if inner.shared.deliver(queued.generation, queued.id) {
+                return Some((queued.id, queued.input));
+            }
+        }
     }
 
-    /// Wait up to `timeout` for the next agent input.
+    /// Wait up to `timeout` for the next agent input, with the [`InputId`]
+    /// that answers it again through [`ack`](Self::ack).
     ///
     /// Acks [`Delivered`](InputStatus::Delivered) and discards stale inputs
     /// exactly like [`try_recv`](Self::try_recv); a discard consumes none of
@@ -501,28 +659,7 @@ impl TariaLayer {
     /// disabled layer that is no time at all: its queue can never deliver, so
     /// the call returns at once rather than parking the app forever on a wait
     /// with no end.
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<AgentInput> {
-        self.recv_timeout_with_id(timeout).map(|(_, input)| input)
-    }
-
-    /// [`try_recv`](Self::try_recv), keeping the [`InputId`] so the app can
-    /// answer the input again later with [`ack`](Self::ack).
-    ///
-    /// The ack still happens here, so an app can never leave an input
-    /// unacknowledged by forgetting to call something.
-    pub fn try_recv_with_id(&self) -> Option<(InputId, AgentInput)> {
-        let inner = self.inner.as_ref()?;
-        loop {
-            let queued = inner.input_rx.try_recv().ok()?;
-            if inner.shared.deliver(queued.generation, queued.id) {
-                return Some((queued.id, queued.input));
-            }
-        }
-    }
-
-    /// [`recv_timeout`](Self::recv_timeout), keeping the [`InputId`] so the
-    /// app can answer the input again later with [`ack`](Self::ack).
-    pub fn recv_timeout_with_id(&self, timeout: Duration) -> Option<(InputId, AgentInput)> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<(InputId, AgentInput)> {
         let Some(inner) = self.inner.as_ref() else {
             // No socket, so no input will ever arrive. Sleep the timeout out
             // anyway: a caller using this as its clock must not spin because
@@ -565,50 +702,34 @@ impl TariaLayer {
         }
     }
 
-    /// Hand every queued agent input to `f`, in arrival order.
+    /// Hand every queued agent input to `f`, in arrival order, and send the
+    /// ack each returned status adds.
     ///
     /// The drain loop an app otherwise writes by hand, once per place it
     /// polls for input, with nothing keeping the copies in step.
-    pub fn drain(&self, mut f: impl FnMut(AgentInput)) {
-        while let Some(input) = self.try_recv() {
-            f(input);
-        }
-    }
-
-    /// [`drain`](Self::drain), passing each input's [`InputId`] alongside it
-    /// so the handler can [`ack`](Self::ack) whatever it chose to ignore.
     ///
-    /// Reach for [`drain_acking`](Self::drain_acking) first: an app that only
-    /// wants to refine an ack needs the id for nothing else, and every
-    /// integration that wrote this loop by hand wrote the same four lines
-    /// around it.
-    pub fn drain_with_ids(&self, mut f: impl FnMut(InputId, AgentInput)) {
-        while let Some((id, input)) = self.try_recv_with_id() {
-            f(id, input);
-        }
-    }
-
-    /// [`drain`](Self::drain) where the handler returns each input's status
-    /// and the layer sends the ones that say something new.
-    ///
-    /// Answering an input the app looked at and deliberately did nothing with
-    /// is the whole reason [`drain_with_ids`](Self::drain_with_ids) hands out
-    /// an [`InputId`], and two independent apps wrote the same
-    /// dequeue-compare-[`ack`](Self::ack) loop around it, each with its own
-    /// two-variant verdict enum in front. Returning
-    /// [`Ignored`](InputStatus::Ignored) says the same thing with no id in the
-    /// app's hands and no enum of its own.
+    /// Return [`Ignored`](InputStatus::Ignored) for an input the app looked at
+    /// and deliberately did nothing with, and the layer sends it, so no
+    /// [`InputId`] passes through the app. Two independent apps wrote the
+    /// same dequeue-compare-[`ack`](Self::ack) loop by hand, each with its own
+    /// two-variant verdict enum in front, and this is that loop.
     ///
     /// Return [`Delivered`](InputStatus::Delivered) for an input the app
     /// acted on. It sends nothing: the dequeue already acked it, and
     /// re-sending would double this layer's ack traffic, which on a bridge
     /// reading slower than the app answers costs the refinements queued
-    /// behind it (see [`dropped_acks`](Self::dropped_acks)).
+    /// behind it (see [`LayerStats::dropped_acks`]).
     ///
-    /// `drain_with_ids` stays for an app that needs the id for something
-    /// else, such as an input it can only answer after a later frame.
-    pub fn drain_acking(&self, mut f: impl FnMut(AgentInput) -> InputStatus) {
-        while let Some((id, input)) = self.try_recv_with_id() {
+    /// The statuses go out before the snapshot of the frame that follows, the
+    /// order a bridge that reads stamps needs: an `Ignored` it reads after the
+    /// first tree published after the input comes too late to change its
+    /// answer (see [`try_recv`](Self::try_recv)).
+    ///
+    /// An app that needs the id for something else, such as remembering which
+    /// input started a job, loops [`try_recv`](Self::try_recv) instead and
+    /// calls [`ack`](Self::ack) itself, before that frame publishes.
+    pub fn drain(&self, mut f: impl FnMut(AgentInput) -> InputStatus) {
+        while let Some((id, input)) = self.try_recv() {
             let status = f(input);
             if status != InputStatus::Delivered {
                 self.ack(id, status);
@@ -629,8 +750,13 @@ impl TariaLayer {
     /// kind this build has never heard of. [`InputStatus::Ignored`] draws the
     /// line, including why a key bound to nothing is still delivered.
     ///
-    /// The ack travels the same path as snapshots, so it can never overtake
-    /// the snapshot published after it. Does nothing on a disabled layer.
+    /// The ack travels the same path as snapshots and goes out ahead of the
+    /// next one, so the snapshot published after it can never overtake it.
+    /// Send it before the app publishes its first snapshot after dequeuing
+    /// the input: a bridge that reads stamps answers on that snapshot, and an
+    /// `Ignored` that follows it arrives after the agent was told the input
+    /// changed nothing (see [`try_recv`](Self::try_recv)). Does nothing on a
+    /// disabled layer.
     ///
     /// An id whose bridge connection has since ended is answered nowhere.
     /// Ids are unique only within a bridge process and a fresh bridge counts
@@ -648,171 +774,30 @@ impl TariaLayer {
         }
     }
 
-    /// How many agent inputs have been dropped so far because the input
-    /// queue was full. Always 0 on a disabled layer.
-    ///
-    /// When an agent floods inputs faster than the app drains them, the layer
-    /// drops the newest input rather than blocking the socket thread. The
-    /// agent learns of each drop from its [`Dropped`](InputStatus::Dropped)
-    /// ack; this counter is the app-facing tally of the same event, kept
-    /// because the layer must not print while the app owns the alternate
-    /// screen. It is monotonic and accumulates across reconnects for the
-    /// lifetime of the layer.
-    ///
-    /// Apps should read it after restoring the terminal (for example right
-    /// before exit, once the alternate screen has been left) and report a
-    /// nonzero value on stderr or in a log.
-    pub fn dropped_inputs(&self) -> u64 {
-        self.inner.as_ref().map_or(0, |inner| {
-            inner.shared.dropped_inputs.load(Ordering::Relaxed)
-        })
-    }
-
-    /// How many agent inputs have been discarded so far, rather than handed to
-    /// the app, because they were not aimed at the session that was live when
-    /// they were read. Always 0 on a disabled layer.
-    ///
-    /// Two things put an input here. The first is a bridge connection that
-    /// ended before the app dequeued what arrived on it. Such an input was
-    /// aimed at a bridge session that no longer exists: applying it would act
-    /// on an agent's intent minutes or milliseconds after the agent that
-    /// formed it is gone, with nobody left to receive the result. A `key q`
-    /// that arrives just before the bridge restarts would otherwise quit the
-    /// app on the next frame. The bridge drops its own queue on reconnect for
-    /// the mirror-image reason, so both sides agree that an input belongs to
-    /// one connection.
-    ///
-    /// The second is input a client wrote while it waited behind another.
-    /// Only one bridge is served at a time, so a client that connects while
-    /// another is attached waits in the listen backlog, and whatever it writes
-    /// meanwhile sits unread in the kernel's socket buffer until its turn
-    /// comes. That client has seen no tree, so its inputs name nodes and keys
-    /// it guessed at, and applying them once the first client leaves would
-    /// act on a UI it never looked at. So a connection that was already
-    /// waiting when the previous session ended has what it wrote read off and
-    /// thrown away just before its hello goes out, and every complete line of
-    /// that which is an input is counted here, a kind this build cannot read
-    /// included. None of it is acked: the session it would be answered on had
-    /// not begun. Clients waiting back to back are each treated so.
-    ///
-    /// A client that waited behind nobody keeps what it wrote before reading
-    /// its hello: the first connection of a process, and one that connects
-    /// after the listener last found nobody waiting. A script that connects
-    /// to an idle app and writes at once is such a client, and its input is
-    /// its session's, as it was in 0.3.0. A client that waits for the hello
-    /// before writing is never affected either way, and taria-mcp is one,
-    /// whose input tools refuse to send until the app's first snapshot has
-    /// arrived.
-    ///
-    /// Monotonic across reconnects, and read like
-    /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
-    /// restored, never while the app owns the alternate screen.
-    pub fn stale_inputs(&self) -> u64 {
-        self.inner
-            .as_ref()
-            .map_or(0, |inner| inner.shared.stale_inputs.load(Ordering::Relaxed))
-    }
-
-    /// How many agent inputs have been answered without reaching the app
-    /// because their `kind` is one this build cannot read. Always 0 on a
+    /// What this layer has lost or cut so far: agent inputs it dropped,
+    /// discarded or could not read, acks it could not send, and snapshots it
+    /// had to cut. [`LayerStats`] says what each count means. All zero on a
     /// disabled layer.
     ///
-    /// An input like that parses as [`AgentInput::Unknown`], which carries
-    /// neither the kind it arrived under nor what it asked for, so there is
-    /// nothing for the app to apply. The layer acks it
-    /// [`Ignored`](InputStatus::Ignored) itself and never queues it; see
-    /// [`try_recv`](Self::try_recv), which is why an app never has to think
-    /// about the variant.
-    ///
-    /// A nonzero value means the bridge on the other end is built against a
-    /// newer taria than this app, and the agent is asking for things this app
-    /// cannot do yet. Raising the app's taria dependency is the fix. Read it
-    /// like [`dropped_inputs`](Self::dropped_inputs): after the terminal is
-    /// restored, never while the app owns the alternate screen.
-    pub fn unknown_inputs(&self) -> u64 {
-        self.inner.as_ref().map_or(0, |inner| {
-            inner.shared.unknown_inputs.load(Ordering::Relaxed)
-        })
-    }
-
-    /// How many acks have been dropped so far because more answers were
-    /// waiting for the bridge than the queue holds. Always 0 on a disabled
-    /// layer.
-    ///
-    /// Acks queue for the writer thread, and a bridge that reads steadily but
-    /// far slower than an agent sends input never stalls long enough for the
-    /// write timeout to disconnect it. The queue is bounded so the app cannot
-    /// be grown out of memory by such a peer; the oldest answers go first,
-    /// because the ones an agent is still waiting on are the newest.
-    ///
-    /// A nonzero value means some agent requests were answered nowhere and
-    /// their callers waited out a timeout instead. The slow end is the bridge,
-    /// not the app. Monotonic across reconnects, and read like
-    /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
-    /// restored, never while the app owns the alternate screen.
-    pub fn dropped_acks(&self) -> u64 {
-        self.inner
-            .as_ref()
-            .map_or(0, |inner| inner.shared.dropped_acks.load(Ordering::Relaxed))
-    }
-
-    /// How many published snapshots have had a branch cut for being deeper
-    /// than [`taria::MAX_NODE_DEPTH`]. Always 0 on a disabled layer.
-    ///
-    /// It counts snapshots, not frames. A frame whose tree, once cut, is the
-    /// snapshot already published is not sent again and is not counted
-    /// again, so a deep tree that sits still while the app redraws it sixty
-    /// times a second counts once, and a deep tree that changes counts once
-    /// per change. The number says how many trees the agent was handed cut,
-    /// which is the thing worth knowing, rather than how often the app drew
-    /// one.
-    ///
-    /// See [`publish`](Self::publish) for what the cut does and why.
-    /// [`last_truncation`](Self::last_truncation) names the branch. Monotonic
-    /// for the lifetime of the layer, and read like
-    /// [`dropped_inputs`](Self::dropped_inputs): after the terminal is
-    /// restored, never while the app owns the alternate screen.
-    pub fn truncated_snapshots(&self) -> u64 {
-        self.inner.as_ref().map_or(0, |inner| inner.truncated)
-    }
-
-    /// The depth failure behind the most recent truncation, or `None` if no
-    /// published tree has been cut.
-    ///
-    /// [`TreeTooDeep`](taria::TreeTooDeep) carries the depth measured and the
-    /// id of a node found at it. An app whose tree is generated from data has
-    /// no other way to tell which branch ran away, which is the whole reason
-    /// the counter alone is not enough here.
-    pub fn last_truncation(&self) -> Option<TreeTooDeep> {
-        self.inner.as_ref()?.last_truncation.clone()
-    }
-
-    /// How many published snapshots have had something cut to fit in one
-    /// line of [`taria::wire::MAX_LINE_BYTES`]. Always 0 on a disabled layer.
-    ///
-    /// Counted like [`truncated_snapshots`](Self::truncated_snapshots):
-    /// snapshots, not frames, so a tree that stays too large while the app
-    /// redraws it counts once, and one that changes counts once per change.
-    ///
-    /// See [`publish`](Self::publish) for what is cut and why.
-    /// [`last_oversize`](Self::last_oversize) says how large the line would
-    /// have been and where the bytes were. Monotonic for the lifetime of the
-    /// layer, and read like [`dropped_inputs`](Self::dropped_inputs): after
-    /// the terminal is restored, never while the app owns the alternate
-    /// screen.
-    pub fn oversized_snapshots(&self) -> u64 {
-        self.inner.as_ref().map_or(0, |inner| inner.oversized)
-    }
-
-    /// What was cut from the most recent oversized snapshot, or `None` if no
-    /// published tree has had to be cut to fit.
-    ///
-    /// [`SnapshotTooLarge`] carries the size the line would have had and the
-    /// id of the node holding the longest string. A tree that runs over has
-    /// usually run away in one place, a draft, a log, a list holding every
-    /// row, and the counter alone cannot say which.
-    pub fn last_oversize(&self) -> Option<SnapshotTooLarge> {
-        self.inner.as_ref()?.last_oversize.clone()
+    /// The layer keeps these because it must not print while the app owns
+    /// the alternate screen. Read them after restoring the terminal (for
+    /// example right before exit, once the alternate screen has been left)
+    /// and report a nonzero count on stderr or in a log.
+    pub fn stats(&self) -> LayerStats {
+        let Some(inner) = self.inner.as_ref() else {
+            return LayerStats::default();
+        };
+        let shared = &inner.shared;
+        LayerStats {
+            dropped_inputs: shared.dropped_inputs.load(Ordering::Relaxed),
+            stale_inputs: shared.stale_inputs.load(Ordering::Relaxed),
+            unknown_inputs: shared.unknown_inputs.load(Ordering::Relaxed),
+            dropped_acks: shared.dropped_acks.load(Ordering::Relaxed),
+            truncated_snapshots: inner.truncated,
+            last_truncation: inner.last_truncation.clone(),
+            oversized_snapshots: inner.oversized,
+            last_oversize: inner.last_oversize.clone(),
+        }
     }
 
     /// Publish `nodes` as a snapshot, without going through a
@@ -822,6 +807,15 @@ impl TariaLayer {
     /// recorder's frame, push-loop and publish triplet is three lines saying
     /// one thing. The nodes are wrapped in the same auto-generated root, so
     /// both paths produce the same tree.
+    ///
+    /// # Disabled nodes
+    ///
+    /// A node marked [`disabled`](Node::disabled) is published with no
+    /// actions, whatever it was built with: the mark says the app takes none
+    /// until it enables the node again, so an advertised action there would
+    /// be a promise the app has already said it will not keep. Nothing counts
+    /// this, because it is the app saying what it means, not something lost.
+    /// The node keeps everything else, its focus and its children included.
     ///
     /// # Trees too deep to send
     ///
@@ -839,12 +833,12 @@ impl TariaLayer {
     /// publish is that same stale tree, chosen deliberately.
     ///
     /// The app is told instead of the agent, because the app is the only one
-    /// that can fix it: see
-    /// [`truncated_snapshots`](Self::truncated_snapshots) for the count and
-    /// [`last_truncation`](Self::last_truncation) for the branch. The fix is
-    /// almost always to publish what the widget draws rather than the data
-    /// behind it, which for a deep tree view is the expanded path and the
-    /// rows currently on screen.
+    /// that can fix it: see [`stats`](Self::stats), whose
+    /// [`truncated_snapshots`](LayerStats::truncated_snapshots) is the count
+    /// and [`last_truncation`](LayerStats::last_truncation) the branch. The
+    /// fix is almost always to publish what the widget draws rather than the
+    /// data behind it, which for a deep tree view is the expanded path and
+    /// the rows currently on screen.
     ///
     /// # Trees too large to send
     ///
@@ -865,10 +859,10 @@ impl TariaLayer {
     ///    its strings at the floor, cannot fit beside its ancestors, are
     ///    dropped with everything under them before any string is cut, so
     ///    that they cost their siblings nothing;
-    /// 2. strings are cut: the longest values first, all down to one shared
-    ///    length, so the biggest shrink first and shorter ones are untouched,
-    ///    then values and labels together, the same way, when values alone
-    ///    are not enough. A cut value ends in `…`, except that a
+    /// 2. strings are cut: the longest values and descriptions first, all
+    ///    down to one shared length, so the biggest shrink first and shorter
+    ///    ones are untouched, then labels with them, the same way, when those
+    ///    alone are not enough. A cut value ends in `…`, except that a
     ///    [`Role::Log`] or [`Role::Terminal`] value keeps its end and starts
     ///    with `…` instead, because the end is where those grow. A string of
     ///    256 bytes of JSON or less, the floor, is never cut;
@@ -896,11 +890,33 @@ impl TariaLayer {
     /// A tree that changed is measured exactly, by serializing it into a
     /// counter that keeps nothing, and one that does not fit is cut again on
     /// every frame it changes, so the bound is a guard, not a way to publish:
-    /// see [`oversized_snapshots`](Self::oversized_snapshots) and
-    /// [`last_oversize`](Self::last_oversize) for what was cut and where.
+    /// see [`stats`](Self::stats), whose
+    /// [`oversized_snapshots`](LayerStats::oversized_snapshots) and
+    /// [`last_oversize`](LayerStats::last_oversize) say what was cut and where.
     /// The fix is the one for depth, to publish what the widget draws: the
     /// lines of a log the pane shows, the rows of a list on screen, the
     /// visible part of a draft.
+    ///
+    /// # Stamps
+    ///
+    /// Every snapshot carries the newest input the app has dequeued on the
+    /// live connection, through [`drain`](Self::drain),
+    /// [`try_recv`](Self::try_recv) or [`recv_timeout`](Self::recv_timeout)
+    /// ([`Snapshot::after_input`]). A bridge that reads the stamp credits a
+    /// tree to an input only once it is stamped at that input, and answers
+    /// "did not change" as soon as such a tree is unchanged, so an input the
+    /// app takes a second over is still answered with its own tree.
+    ///
+    /// That makes one frame after a drain special: the first tree published
+    /// after an input is dequeued is the one credited to it, so it should
+    /// carry the effect, or a status saying it is under way. Publish after
+    /// applying what you drained, not between the two. A frame drawn
+    /// unchanged after a dequeue is not skipped: the snapshot already
+    /// published goes out again with its stamp moved, under the same `seq`,
+    /// neither measured nor cut again. An app that publishes only when its
+    /// tree changes leaves a bridge waiting out its window on every input
+    /// that changes nothing, so publish every frame and let the layer skip
+    /// the rest.
     pub fn publish(&mut self, nodes: impl IntoIterator<Item = Node>) {
         self.publish_nodes(nodes.into_iter().collect());
     }
@@ -911,8 +927,10 @@ impl TariaLayer {
     /// recorded node is), bumps `seq`, and hands the snapshot to the writer
     /// thread. Skipped when the tree is the one the previous frame built,
     /// before anything is cut or measured; when what is left once it is cut
-    /// is the previous snapshot; and on a disabled layer. Never blocks the
-    /// render path beyond a brief mutex hold.
+    /// is the previous snapshot; and on a disabled layer. In the first two
+    /// cases the previous snapshot is sent again, stamped, if the app has
+    /// dequeued an input since it went out. Never blocks the render path
+    /// beyond a brief mutex hold.
     ///
     /// A tree over [`MAX_NODE_DEPTH`] is cut before any of that, and then a
     /// tree too large for one line; see [`publish`](Self::publish).
@@ -927,6 +945,9 @@ impl TariaLayer {
         let mut root = Node::new("app", Role::App)
             .label(inner.shared.app_label.clone())
             .children(nodes);
+        // Before anything compares or measures the tree, so the tree kept to
+        // compare the next frame against is the one that goes out.
+        strip_disabled_actions(&mut root);
         // Focus is decided on the tree as built, so that a tree no cut
         // touches is already the snapshot it goes out as, and the next frame
         // can be compared against that snapshot with no second copy kept.
@@ -942,8 +963,13 @@ impl TariaLayer {
         // freed without recursing, here and wherever else the layer lets go
         // of one, because the depth cut below exists for trees deeper than
         // the call stack, and the drop glue `Node` derives recurses.
+        //
+        // What it may still do is send the snapshot already published again,
+        // as it is but for its stamp, when the app has dequeued an input
+        // since that snapshot went out. See `Shared::restamp`.
         if inner.is_newest_frame(&mut root) {
             drop_iteratively(root);
+            inner.shared.restamp();
             return;
         }
 
@@ -986,8 +1012,9 @@ impl TariaLayer {
 
         // Compared again once cut: a tree that changed only past a cut, a
         // draft typed into beyond what fits, is cut to the snapshot already
-        // sent.
+        // sent. Restamped like a frame drawn unchanged.
         if inner.last_root.as_ref() == Some(&tree) {
+            inner.shared.restamp();
             return;
         }
         inner.seq += 1;
@@ -1005,18 +1032,29 @@ impl TariaLayer {
         }
         let snapshot = Snapshot::new(inner.seq, tree.clone());
         inner.last_root = Some(tree);
-
-        let mut state = inner.shared.lock_state();
-        state.latest = Some(snapshot);
-        state.epoch += 1;
-        drop(state);
-        inner.shared.cv.notify_all();
+        inner.shared.publish(snapshot);
     }
 
     /// The most recently published snapshot, if any. Test-only introspection.
     #[cfg(test)]
     pub(crate) fn latest_snapshot(&self) -> Option<Snapshot> {
         self.inner.as_ref()?.shared.lock_state().latest.clone()
+    }
+}
+
+impl fmt::Debug for TariaLayer {
+    /// The label, the endpoint, whether the layer is serving and why not,
+    /// and the newest snapshot's `seq`: what the app thread owns. State the
+    /// connection threads share is left out rather than locked, so printing
+    /// a layer never waits on, or deadlocks against, a thread holding it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TariaLayer")
+            .field("app_label", &self.app_label)
+            .field("socket_path", &self.socket_path)
+            .field("enabled", &self.is_enabled())
+            .field("bind_error", &self.bind_error)
+            .field("seq", &self.inner.as_ref().map(|inner| inner.seq))
+            .finish_non_exhaustive()
     }
 }
 
@@ -1055,33 +1093,14 @@ impl Drop for TariaLayer {
             state.shutdown = true;
             inner.shared.cv.notify_all();
         }
+        // The listener thread owns the transport's listener, which unlinks
+        // the socket file as it is dropped on the way out, and only while the
+        // file is still the one it bound. So once the join returns, the
+        // socket is gone, or belongs to somebody else and is left alone.
         if let Some(handle) = inner.listener.take() {
             let _ = handle.join();
         }
-        remove_own_socket(&self.socket_path, inner.socket_ident);
     }
-}
-
-/// Unlink the socket file, but only while it is still the one this layer
-/// bound.
-///
-/// A second instance that started later has a socket of its own at the same
-/// path, and unlinking that on the way out would leave it running with no way
-/// for a bridge to reach it (the mirror of the takeover `clear_socket_path`
-/// refuses). Device and inode are what separate the file this layer created
-/// from a file that merely has the same name.
-fn remove_own_socket(path: &Path, bound: Option<(u64, u64)>) {
-    if bound.is_some() && socket_ident(path) == bound {
-        let _ = fs::remove_file(path);
-    }
-}
-
-/// Identify the file at `path` by device and inode, so a later look can tell
-/// the same file from a different one that took its place. `None` when it
-/// cannot be read, which fails every comparison and so leaves the path alone.
-fn socket_ident(path: &Path) -> Option<(u64, u64)> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    Some((meta.dev(), meta.ino()))
 }
 
 /// State shared between the app thread and the connection threads.
@@ -1090,22 +1109,22 @@ struct Shared {
     state: Mutex<State>,
     cv: Condvar,
     /// Agent inputs dropped because the input queue was full. Written by
-    /// reader threads, read via [`TariaLayer::dropped_inputs`].
+    /// reader threads, read via [`TariaLayer::stats`].
     dropped_inputs: AtomicU64,
     /// Agent inputs discarded rather than delivered: at dequeue because the
     /// connection they arrived on had ended, and before the handshake because
     /// the client wrote them while it waited its turn. Written by the app
     /// thread for the first and by the listener thread for the second, both
     /// with an atomic add, so neither can lose the other's count; read via
-    /// [`TariaLayer::stale_inputs`].
+    /// [`TariaLayer::stats`].
     stale_inputs: AtomicU64,
     /// Agent inputs answered [`Ignored`](InputStatus::Ignored) by the reader
     /// without reaching the app, because their `kind` did not parse. Written
-    /// by reader threads, read via [`TariaLayer::unknown_inputs`].
+    /// by reader threads, read via [`TariaLayer::stats`].
     unknown_inputs: AtomicU64,
     /// Acks dropped because [`ACK_QUEUE`] answers were already waiting for a
     /// bridge that is not reading them fast enough. Written by whichever
-    /// thread queues an ack, read via [`TariaLayer::dropped_acks`].
+    /// thread queues an ack, read via [`TariaLayer::stats`].
     dropped_acks: AtomicU64,
 }
 
@@ -1113,7 +1132,17 @@ struct Shared {
 struct State {
     /// Latest published snapshot; sent to newly connected clients and, via
     /// `epoch` bumps, streamed to the current client.
+    ///
+    /// It carries the stamp it was published with, which belongs to the
+    /// connection that was live then, so a new connection is sent it with
+    /// the stamp taken off (see [`serve_client`]).
     latest: Option<Snapshot>,
+    /// The stamp `latest` carries, with the generation it was taken on, or
+    /// `None` when it carries none. Compared with [`stamp`](State::stamp) to
+    /// tell whether the app has dequeued an input since `latest` went out:
+    /// ids restart with each bridge process, so the id alone could match one
+    /// a previous connection's bridge used.
+    latest_stamp: Option<(u64, InputId)>,
     /// Bumped on every publish so the writer knows something new exists.
     epoch: u64,
     /// Acks waiting to go out, oldest first. Queued for the writer rather
@@ -1211,13 +1240,58 @@ impl Shared {
         self.lock_state().acks.clear();
     }
 
+    /// Hand `snapshot` to the writer as the latest, stamped with the newest
+    /// input the app has dequeued on the live connection.
+    ///
+    /// The stamp is read in the same hold of the lock that publishes, so it
+    /// names an input dequeued before this publish and on the connection the
+    /// writer will send it to: a connection that starts or ends takes the
+    /// same lock.
+    fn publish(&self, mut snapshot: Snapshot) {
+        let mut guard = self.lock_state();
+        let state = &mut *guard;
+        let stamp = state.stamp();
+        snapshot.after_input = stamp.map(|(_, id)| id);
+        state.latest_stamp = stamp;
+        state.latest = Some(snapshot);
+        state.epoch += 1;
+        drop(guard);
+        self.cv.notify_all();
+    }
+
+    /// Send the latest snapshot again, under the same `seq`, if the app has
+    /// dequeued an input since it went out; otherwise do nothing.
+    ///
+    /// For a frame whose tree is the one already published. Skipping it
+    /// would leave the bridge with no tree stamped at that input, and a
+    /// bridge waiting on one could not tell an input that changed nothing
+    /// from one the app is still working on. The tree is not cut or measured
+    /// again: it is the snapshot already sent, with only `after_input`
+    /// moved, so a bridge that reads no stamp sees the same snapshot twice.
+    fn restamp(&self) {
+        let mut guard = self.lock_state();
+        let state = &mut *guard;
+        let stamp = state.stamp();
+        if stamp.is_none() || stamp == state.latest_stamp {
+            return;
+        }
+        let Some(latest) = state.latest.as_mut() else {
+            return;
+        };
+        latest.after_input = stamp.map(|(_, id)| id);
+        state.latest_stamp = stamp;
+        state.epoch += 1;
+        drop(guard);
+        self.cv.notify_all();
+    }
+
     /// Answer an input the app just dequeued, or refuse it as stale.
     ///
     /// Returns true after queueing the [`Delivered`](InputStatus::Delivered)
     /// ack for an input whose connection is still live. Returns false for an
     /// input from a retired generation: the caller must discard it instead of
     /// acting on it, because it was aimed at a bridge session that no longer
-    /// exists. A discard is counted (see [`TariaLayer::stale_inputs`]) and
+    /// exists. A discard is counted (see [`LayerStats::stale_inputs`]) and
     /// deliberately not acked, since the peer that would read the ack is the
     /// one that is gone.
     fn deliver(&self, generation: u64, id: InputId) -> bool {
@@ -1263,6 +1337,21 @@ impl State {
     fn was_delivered(&self, id: InputId) -> bool {
         self.delivered_generation == self.generation && self.delivered.contains(&id)
     }
+
+    /// The stamp a snapshot published now carries: the newest input the app
+    /// dequeued on the live connection, with that connection's generation,
+    /// or `None` when it has dequeued none there.
+    ///
+    /// Read from what [`record_delivered`](Self::record_delivered) keeps, so
+    /// only an input [`deliver`](Shared::deliver) handed over can stamp: one
+    /// dropped for want of room, one of a kind this build cannot read, one
+    /// discarded as stale, and one written before the hello never reach it.
+    fn stamp(&self) -> Option<(u64, InputId)> {
+        if self.delivered_generation != self.generation {
+            return None;
+        }
+        self.delivered.back().map(|&id| (self.generation, id))
+    }
 }
 
 /// Is any node below `root` focused?
@@ -1284,6 +1373,21 @@ fn focused_below(root: &Node) -> bool {
         }
     }
     false
+}
+
+/// Take every action off each node marked disabled, so the tree never
+/// advertises an action the app has said it will not take.
+///
+/// Iterative, like [`focused_below`], because it runs on the tree as built,
+/// which can be deeper than the call stack.
+fn strip_disabled_actions(root: &mut Node) {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.disabled {
+            node.actions.clear();
+        }
+        pending.extend(node.children.iter_mut());
+    }
 }
 
 /// Are `a` and `b` the same tree?
@@ -1407,59 +1511,15 @@ fn copy_within_depth(root: &mut Node) -> Node {
 
 /// Accept loop: serves one bridge client at a time until shutdown.
 ///
-/// The listener is non-blocking, so this thread is never parked in `accept()`
-/// and the shutdown flag is checked on its own schedule; see [`ACCEPT_POLL`]
-/// for why exit cannot be left to depend on a connection arriving.
-///
-/// It also tracks whether the next connection it accepts waited behind the
-/// last one, which is what decides if [`start_connection`] discards what that
-/// client wrote before its hello. A connection accepted after a session
-/// ended, before any accept has found the backlog empty, was waiting in the
-/// backlog while that session ran; a client that connects in the instant
-/// between the session's end and the next accept is taken for one too. One
-/// accepted after an accept found nothing connected after the session had
-/// ended, so it waited behind nobody, and neither did the first connection of
-/// the process.
-fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender<QueuedInput>) {
-    let mut waited = false;
-    loop {
-        if shared.is_shutdown() {
-            return;
-        }
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                if shared.is_shutdown() {
-                    return;
-                }
-                // Both halves of a session are read and written as blocking
-                // streams, and an accepted socket inherits the listener's
-                // non-blocking flag on some platforms. Say it outright rather
-                // than rely on which one this is.
-                if stream.set_nonblocking(false).is_err() {
-                    continue;
-                }
-                // Errors just drop this client; the loop keeps accepting.
-                let _ = serve_client(stream, &shared, &input_tx, waited);
-                // Whoever is in the backlog now connected while that client
-                // was served, so it waited behind it, however that ended.
-                waited = true;
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                // Nobody is waiting, so whoever connects next waited behind
-                // nobody.
-                waited = false;
-                // Nap instead of spinning, then back to the shutdown check at
-                // the top.
-                thread::sleep(ACCEPT_POLL);
-            }
-            Err(_) => {
-                if shared.is_shutdown() {
-                    return;
-                }
-                // Avoid a hot loop on a persistently failing listener.
-                thread::sleep(ACCEPT_POLL);
-            }
-        }
+/// The transport's [`Listener::accept`] returns once the shutdown flag is
+/// set, without waiting for a connection to wake it, and says whether each
+/// bridge it hands over waited behind the last one, which is what decides if
+/// [`start_connection`] discards what that client wrote before its hello. The
+/// listener is dropped as this returns, which unlinks the socket file.
+fn accept_loop(mut listener: Listener, shared: Arc<Shared>, input_tx: SyncSender<QueuedInput>) {
+    while let Some(Accepted { connection, waited }) = listener.accept(|| shared.is_shutdown()) {
+        // Errors just drop this client; the loop keeps accepting.
+        let _ = serve_client(connection, &shared, &input_tx, waited);
     }
 }
 
@@ -1467,19 +1527,16 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender
 /// until the client disconnects or the layer shuts down.
 ///
 /// `waited` says the client was in the listen backlog when the previous
-/// session ended; see [`accept_loop`] and [`start_connection`].
+/// session ended; see [`Listener::accept`] and [`start_connection`].
 fn serve_client(
-    stream: UnixStream,
+    connection: Connection,
     shared: &Arc<Shared>,
     input_tx: &SyncSender<QueuedInput>,
     waited: bool,
 ) -> io::Result<()> {
-    // SO_SNDTIMEO is shared across the duplicated fds; only writes block long
-    // enough to need it. Every line sets it again before each of its writes,
-    // from its own deadline (see `write_all_before`), so after the first line
-    // it stays at `WRITE_WAIT` or less, and this value governs no write: it
-    // only means the socket never starts out with no timeout at all.
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // Every line is bounded by its own deadline (see `write_line`); this only
+    // means the connection never starts out with no write timeout at all.
+    connection.set_write_timeout(WRITE_TIMEOUT)?;
 
     // Capture the snapshot and epoch atomically so the writer loop neither
     // misses nor duplicates a publish that races the handshake. Acks left
@@ -1487,15 +1544,24 @@ fn serve_client(
     // never used. The generation taken here tags every input this connection
     // queues, so an input that outlives it is discarded rather than applied
     // to the app on behalf of a bridge that is gone.
+    //
+    // The snapshot goes out unstamped. Its stamp, if it has one, names an
+    // input of the connection that was live when it was published, and ids
+    // restart with each bridge process, so on this one it could name an
+    // input this bridge has not sent yet.
     let (initial_snapshot, initial_epoch, generation) = {
         let mut state = shared.lock_state();
         state.acks.clear();
         state.generation += 1;
-        (state.latest.clone(), state.epoch, state.generation)
+        let initial = state.latest.clone().map(|mut snapshot| {
+            snapshot.after_input = None;
+            snapshot
+        });
+        (initial, state.epoch, state.generation)
     };
     let alive = Arc::new(AtomicBool::new(true));
-    let (mut write_stream, reader) = match start_connection(
-        stream,
+    let (mut writer, reader) = match start_connection(
+        connection,
         shared,
         input_tx,
         initial_snapshot,
@@ -1515,11 +1581,11 @@ fn serve_client(
         }
     };
 
-    writer_loop(&mut write_stream, shared, &alive, initial_epoch);
+    writer_loop(&mut writer, shared, &alive, initial_epoch);
 
     // Unblock the reader (it is parked in a blocking read) and reap it before
     // going back to accept the next client.
-    let _ = write_stream.shutdown(Shutdown::Both);
+    let _ = writer.shutdown();
     let _ = reader.join();
     // Whatever is still queued can no longer be delivered, and means nothing
     // to the next client. Queued inputs need no sweep here: the reader
@@ -1532,8 +1598,7 @@ fn serve_client(
 /// send the handshake (and the snapshot a new client is owed) and start the
 /// connection's reader thread, so every way of failing to get a connection
 /// off the ground funnels through one `Err` for the caller to clean up after.
-/// On success the writer's handle on the socket comes back beside the reader
-/// thread.
+/// On success the connection's writer comes back beside the reader thread.
 ///
 /// # Input written before the hello
 ///
@@ -1545,14 +1610,15 @@ fn serve_client(
 /// session's first lines, that is input the app applies on behalf of a client
 /// that wrote it blind, to a tree it never saw, and the hello is the boundary
 /// that tells the two apart: nothing written before it can have been written
-/// in reply to it. See [`TariaLayer::stale_inputs`], which counts what is
+/// in reply to it. See [`LayerStats::stale_inputs`], which counts what is
 /// thrown away here.
 ///
 /// Only a client that `waited` is drained: one the accept loop took from the
 /// backlog after a session ended, before it last found the backlog empty
-/// (see [`accept_loop`]). A client that connects to an idle app is accepted
-/// within one [`ACCEPT_POLL`], and one that writes at once without reading
-/// the hello, a script piping a line into the socket, waited behind nobody.
+/// (see [`Listener::accept`]). A client that connects to an idle app is
+/// accepted within one poll of the listener, and one that writes at once
+/// without reading the hello, a script piping a line into the socket, waited
+/// behind nobody.
 /// What it wrote is input for the session it is about to get, as it was in
 /// 0.3.0, and discarding it would lose it unacked, with nothing to tell the
 /// client. The protocol leaves the choice to the app; this keeps the discard
@@ -1578,56 +1644,57 @@ fn serve_client(
 /// The latest snapshot is skipped, not written, once the layer is shutting
 /// down, for the reason the writer skips one (see [`writer_loop`]).
 fn start_connection(
-    stream: UnixStream,
+    connection: Connection,
     shared: &Arc<Shared>,
     input_tx: &SyncSender<QueuedInput>,
     initial_snapshot: Option<Snapshot>,
     alive: &Arc<AtomicBool>,
     generation: u64,
     waited: bool,
-) -> io::Result<(UnixStream, JoinHandle<()>)> {
-    let mut write_stream = stream.try_clone()?;
+) -> io::Result<(Writer, JoinHandle<()>)> {
+    let (mut reader, mut writer) = connection.split()?;
     let starts_mid_line = if waited {
-        discard_unsolicited(&stream, shared)?
+        discard_unsolicited(&mut reader, shared)?
     } else {
         false
     };
 
     write_line(
-        &mut write_stream,
-        &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION),
+        &mut writer,
+        &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION).stamps(true),
     )?;
     if let Some(snapshot) = initial_snapshot
         && !shared.is_shutdown()
     {
-        write_line(&mut write_stream, &AppToBridge::Snapshot(snapshot))?;
+        write_line(&mut writer, &AppToBridge::Snapshot(snapshot))?;
     }
     let reader = thread::Builder::new().name("taria-reader".into()).spawn({
         let alive = Arc::clone(alive);
         let shared = Arc::clone(shared);
         let input_tx = input_tx.clone();
-        move || reader_loop(stream, input_tx, alive, shared, generation, starts_mid_line)
+        move || reader_loop(reader, input_tx, alive, shared, generation, starts_mid_line)
     })?;
-    Ok((write_stream, reader))
+    Ok((writer, reader))
 }
 
 /// Read off and count what a client that waited its turn wrote before its
 /// hello, for [`start_connection`]. Returns whether it stopped partway through
 /// a line, whose remainder the reader is then told to skip.
-fn discard_unsolicited(stream: &UnixStream, shared: &Shared) -> io::Result<bool> {
-    // The flag belongs to the open socket, not to this handle, so the
-    // `try_clone`d writer goes non-blocking with it. It is put back before
-    // anything is written: the hello and every later write rely on blocking
-    // until their deadline.
-    stream.set_nonblocking(true)?;
+fn discard_unsolicited(reader: &mut Reader, shared: &Shared) -> io::Result<bool> {
+    // Only what is already there is read: the reads stop rather than wait,
+    // and wait again before anything is written, since the hello and every
+    // later write rely on blocking until their deadline.
     let mut unsolicited = Vec::new();
-    let read = read_unsolicited(stream, &mut unsolicited);
-    // Counted whatever the read ended in: an input read off here was
-    // discarded either way, including when the next byte overflows the cap.
-    shared
-        .stale_inputs
-        .fetch_add(count_input_lines(&unsolicited), Ordering::Relaxed);
-    stream.set_nonblocking(false)?;
+    let read = reader.with_nonblocking_reads(|ready| {
+        let read = read_unsolicited(ready, &mut unsolicited);
+        // Counted whatever the read ended in: an input read off here was
+        // discarded either way, including when the next byte overflows the
+        // cap.
+        shared
+            .stale_inputs
+            .fetch_add(count_input_lines(&unsolicited), Ordering::Relaxed);
+        read
+    })?;
     read?;
     Ok(unsolicited.last().is_some_and(|&byte| byte != b'\n'))
 }
@@ -1704,7 +1771,7 @@ fn count_input_lines(bytes: &[u8]) -> u64 {
 /// client is disconnected) instead of buffering it. When the input queue is
 /// full the newest input is dropped, acked [`Dropped`](InputStatus::Dropped)
 /// so the agent learns of it, and counted for the app (see
-/// [`TariaLayer::dropped_inputs`]); a flood of inputs can never block this
+/// [`LayerStats::dropped_inputs`]); a flood of inputs can never block this
 /// thread.
 ///
 /// Every forwarded input carries `generation`, which this loop retires when
@@ -1718,7 +1785,7 @@ fn count_input_lines(bytes: &[u8]) -> u64 {
 /// It is still a line, so a remainder over [`MAX_LINE_BYTES`] breaks the
 /// connection like any other.
 fn reader_loop(
-    stream: UnixStream,
+    stream: Reader,
     input_tx: SyncSender<QueuedInput>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
@@ -1829,7 +1896,7 @@ fn reader_loop(
 /// under the lock, as it exits, so an `alive` read under the lock vouches
 /// for every ack taken in the same hold. Every shutdown check takes the acks
 /// in the same hold that read `alive`.
-fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut last_epoch: u64) {
+fn writer_loop(stream: &mut Writer, shared: &Shared, alive: &AtomicBool, mut last_epoch: u64) {
     loop {
         let (acks, snapshot) = {
             let mut state = shared.lock_state();
@@ -1900,7 +1967,7 @@ fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut
 /// queued acks are taken in the same hold of the lock that read `alive`,
 /// which is what vouches for them; see [`writer_loop`].
 fn stop_writing(
-    stream: &mut UnixStream,
+    stream: &mut Writer,
     shared: &Shared,
     alive: &AtomicBool,
     unwritten: impl IntoIterator<Item = (InputId, InputStatus)>,
@@ -1925,13 +1992,13 @@ fn stop_writing(
 /// [`WRITE_TIMEOUT`] for why. A line that misses it may be written in part,
 /// and every caller then drops the connection, which is the only thing that
 /// can follow a partial line.
-fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
+fn write_line(stream: &mut Writer, msg: &AppToBridge) -> io::Result<()> {
     let mut line = serde_json::to_vec(msg).map_err(io::Error::other)?;
     line.push(b'\n');
     let deadline = Instant::now()
         .checked_add(WRITE_TIMEOUT)
         .ok_or_else(|| io::Error::other("the write deadline is past what the clock can hold"))?;
-    write_all_before(stream, &line, deadline)
+    stream.write_all_before(&line, deadline)
 }
 
 /// Write the acks a shutdown found queued, oldest first, giving up once
@@ -1941,7 +2008,7 @@ fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
 /// misses the deadline costs its waiter the timeout it would have waited out
 /// with no flush at all. The connection is closed straight after, so the
 /// write timeout this leaves on the socket is never used again.
-fn flush_acks(stream: &mut UnixStream, acks: impl IntoIterator<Item = (InputId, InputStatus)>) {
+fn flush_acks(stream: &mut Writer, acks: impl IntoIterator<Item = (InputId, InputStatus)>) {
     let Some(deadline) = Instant::now().checked_add(SHUTDOWN_FLUSH) else {
         return;
     };
@@ -1955,284 +2022,7 @@ fn flush_acks(stream: &mut UnixStream, acks: impl IntoIterator<Item = (InputId, 
         lines.extend_from_slice(&line);
         lines.push(b'\n');
     }
-    let _ = write_all_before(stream, &lines, deadline);
-}
-
-/// `write_all`, finished by `deadline` or failed with
-/// [`TimedOut`](io::ErrorKind::TimedOut).
-///
-/// A socket's write timeout does not bound a `write` call, only each wait for
-/// room inside one, and a call waits again for every piece the kernel splits
-/// it into (Linux allocates a buffer of at most a few tens of KB at a time,
-/// and waits for room before each). So a large line, against a bridge that
-/// frees a little room before every wait can time out, never times out at
-/// all: a 900 KB snapshot to a bridge taking 64 KB every 3 s held the writer
-/// for forty seconds with a 5 s timeout. Setting the timeout to what is left
-/// of a deadline before each call does not help on its own, because a single
-/// call runs past the deadline.
-///
-/// So no call is handed more than [`WRITE_CHUNK`] bytes, few enough that the
-/// kernel waits for room at most once inside it, and that wait is given what
-/// is left of the deadline, or [`WRITE_WAIT`] if that is less, set before
-/// every call. A wait that times out short of the deadline is simply waited
-/// again. A timeout of zero means none at all to the socket and is refused,
-/// which is why nothing left ends the loop rather than reaching it.
-fn write_all_before(
-    stream: &mut UnixStream,
-    mut bytes: &[u8],
-    deadline: Instant,
-) -> io::Result<()> {
-    while !bytes.is_empty() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        stream.set_write_timeout(Some(left.min(WRITE_WAIT)))?;
-        let chunk = bytes.get(..WRITE_CHUNK).unwrap_or(bytes);
-        match stream.write(chunk) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-            // The socket is blocking, so this is the wait's timeout firing,
-            // and the clock at the top of the loop says whether that was the
-            // deadline.
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
-}
-
-/// Make `path` absolute, resolving a relative path (including a bare
-/// filename) against the current directory. Ensures the socket path always
-/// has a real parent directory for [`ensure_private_dir`] to vet.
-fn absolutize(path: PathBuf) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Ok(env::current_dir()?.join(path))
-    }
-}
-
-/// Make `path` free for `bind`, or say why it cannot be.
-///
-/// Binding needs the path to be absent, so a socket left behind by a run that
-/// was killed before it could clean up has to be unlinked first. That unlink
-/// has to be earned. The path can come verbatim from `$TARIA_SOCK`, and a
-/// private directory passes the vetting whatever else is in it (`~/.ssh` is
-/// 0700 and user-owned), so removing whatever happens to be there would let a
-/// typo delete a file the user meant to keep. A socket another instance is
-/// still serving must survive too: unlinking it and binding a fresh one in its
-/// place leaves that instance running, believing it is reachable, while every
-/// bridge connects to the newcomer instead.
-///
-/// So: only a socket is ever removed, and only once a connection to it has
-/// been refused.
-fn clear_socket_path(path: &Path) -> io::Result<()> {
-    // symlink_metadata so a symlink is seen as itself: following one would
-    // decide about a socket somewhere else and unlink the link.
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(io::Error::new(
-                err.kind(),
-                format!("cannot inspect {}: {err}", path.display()),
-            ));
-        }
-    };
-    if !meta.file_type().is_socket() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} already exists and is not a socket (it is {}); refusing to delete it to \
-                 bind there. Point $TARIA_SOCK at a path taria may create.",
-                path.display(),
-                describe_file_type(&meta)
-            ),
-        ));
-    }
-    match probe_socket(path) {
-        // Nothing is listening: the socket outlived whatever bound it.
-        SocketProbe::Stale => match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            // Someone else cleaned it up in the meantime, which is the state
-            // this call wanted anyway.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(io::Error::new(
-                err.kind(),
-                format!("cannot remove the stale socket {}: {err}", path.display()),
-            )),
-        },
-        SocketProbe::Live => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!(
-                "another instance is already serving the taria socket {}; refusing to take it \
-                 over, because that would leave it running with no way for a bridge to reach \
-                 it. To run a second instance alongside it, give it a socket of its own: set \
-                 TARIA_SOCK to a different path.",
-                path.display()
-            ),
-        )),
-        SocketProbe::Unknown(why) => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!(
-                "cannot tell whether another instance is serving the taria socket {} ({why}); \
-                 refusing to remove a socket that may still be in use. Set TARIA_SOCK to a \
-                 different path to bind elsewhere.",
-                path.display()
-            ),
-        )),
-    }
-}
-
-/// What is at a socket path that is not a socket, for the error that refuses
-/// to delete it.
-fn describe_file_type(meta: &fs::Metadata) -> &'static str {
-    let kind = meta.file_type();
-    if kind.is_symlink() {
-        "a symlink"
-    } else if kind.is_dir() {
-        "a directory"
-    } else if kind.is_file() {
-        "a regular file"
-    } else {
-        "another kind of file"
-    }
-}
-
-/// The answer to "is anything serving the socket at this path?".
-enum SocketProbe {
-    /// The connection was accepted: something is listening.
-    Live,
-    /// The connection was refused, or the file went away: nothing is.
-    Stale,
-    /// The probe could not answer, carrying the reason for the error that
-    /// reports it.
-    Unknown(String),
-}
-
-/// Try to connect to the socket at `path`, briefly, to find out whether
-/// anything is listening on it.
-///
-/// The connect runs on a thread of its own because it blocks with no timeout;
-/// see [`SOCKET_PROBE_TIMEOUT`]. An answer that does not arrive in time is
-/// [`Unknown`](SocketProbe::Unknown), never a guess: the whole point is to
-/// avoid unlinking a socket that is still being served.
-fn probe_socket(path: &Path) -> SocketProbe {
-    let (tx, rx) = mpsc::channel();
-    let probe_path = path.to_path_buf();
-    let spawned = thread::Builder::new()
-        .name("taria-socket-probe".into())
-        .spawn(move || {
-            let outcome = UnixStream::connect(&probe_path).map(|stream| {
-                // Nothing is ever sent on it. A peer serving this path sees a
-                // connection that opens and closes, which is what it does
-                // with any client that goes away.
-                let _ = stream.shutdown(Shutdown::Both);
-            });
-            // The receiver is gone once the wait above times out; that is the
-            // `Unknown` case, and there is nothing to report to.
-            let _ = tx.send(outcome);
-        });
-    if let Err(err) = spawned {
-        return SocketProbe::Unknown(format!("the probe thread could not start: {err}"));
-    }
-    match rx.recv_timeout(SOCKET_PROBE_TIMEOUT) {
-        Ok(Ok(())) => SocketProbe::Live,
-        // Refused is what a socket with no listener answers; a socket that
-        // vanished between the look and the connect leaves the path free too.
-        Ok(Err(err))
-            if matches!(
-                err.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-            ) =>
-        {
-            SocketProbe::Stale
-        }
-        Ok(Err(err)) => SocketProbe::Unknown(format!("connecting to it failed: {err}")),
-        Err(_) => SocketProbe::Unknown(format!(
-            "connecting to it did not finish within {SOCKET_PROBE_TIMEOUT:?}"
-        )),
-    }
-}
-
-/// Create (if needed) and vet the directory that will hold the socket.
-///
-/// The socket's parent directory decides who can replace or redirect the
-/// socket: if it is a symlink, owned by another user, or accessible to
-/// group/others, a local attacker can swap the socket for their own and
-/// impersonate the app (or intercept the bridge). The directory is created
-/// with mode `0700`, then verified via `symlink_metadata`: it must be a
-/// real directory (not a symlink), owned by the current user, with no
-/// group/other permission bits. Any violation is an error.
-fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    builder.mode(0o700);
-    // An existing directory is fine here; whether it is *acceptable* is
-    // decided by the checks below, which also surface real create failures.
-    let _ = builder.create(dir);
-
-    // symlink_metadata so a planted symlink is seen as itself, not followed.
-    let meta = fs::symlink_metadata(dir).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("socket directory {} is unusable: {err}", dir.display()),
-        )
-    })?;
-    if !meta.file_type().is_dir() {
-        return Err(io::Error::other(format!(
-            "socket directory {} is not a real directory (it may be a symlink planted by \
-             another user to hijack the socket); refusing to use it",
-            dir.display()
-        )));
-    }
-    let uid = current_uid()?;
-    if meta.uid() != uid {
-        return Err(io::Error::other(format!(
-            "socket directory {} is owned by uid {} instead of the current user (uid {}); \
-             its owner could replace the socket to hijack the connection; refusing to use it",
-            dir.display(),
-            meta.uid(),
-            uid
-        )));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(io::Error::other(format!(
-            "socket directory {} is group/world-accessible (mode {:03o}); other users could \
-             replace the socket to hijack the connection; re-create it with mode 0700",
-            dir.display(),
-            meta.mode() & 0o777
-        )));
-    }
-    Ok(())
-}
-
-/// The current effective uid, without `unsafe` or extra dependencies.
-///
-/// On Linux, `/proc/self` is owned by this process's effective uid. On other
-/// Unixes, fall back to creating a probe file in the system temp dir: a file
-/// this process creates is owned by its effective uid.
-fn current_uid() -> io::Result<u32> {
-    if let Ok(meta) = fs::metadata("/proc/self") {
-        return Ok(meta.uid());
-    }
-    let probe = env::temp_dir().join(format!("taria-uid-probe-{}", std::process::id()));
-    let _ = fs::remove_file(&probe);
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&probe)?;
-    let uid = file.metadata()?.uid();
-    drop(file);
-    let _ = fs::remove_file(&probe);
-    Ok(uid)
+    let _ = stream.write_all_before(&lines, deadline);
 }
 
 /// Resolve the default socket path for `app_label` from the environment.
@@ -2241,12 +2031,13 @@ fn current_uid() -> io::Result<u32> {
 /// bridge so the two sides cannot look for the socket in different places,
 /// including its refusal of a label that is not a plain file name. Reading the
 /// environment stays here, where the process actually is.
+#[cfg(not(windows))]
 fn resolve_socket_path(app_label: &str) -> Result<PathBuf, taria::socket::InvalidAppLabel> {
     taria::socket::resolve_path(
         env::var_os("TARIA_SOCK"),
         env::var_os("XDG_RUNTIME_DIR"),
         &env::temp_dir(),
-        &user_identity(),
+        &transport::user_identity(),
         app_label,
     )
 }
@@ -2256,29 +2047,69 @@ fn resolve_socket_path(app_label: &str) -> Result<PathBuf, taria::socket::Invali
 /// `InvalidInput` because the label is one: the same kind
 /// [`bind_at`](TariaLayer::bind_at) gives an over-long path, and the message
 /// is the label error's own, which names the label and what a label may be.
+#[cfg(not(windows))]
 fn invalid_label(err: taria::socket::InvalidAppLabel) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
 }
 
-/// Uid where available (via `/proc/self` on Linux), else `$USER`/`$LOGNAME`,
-/// else a fixed fallback. Only used to namespace the temp-dir fallback path.
-fn user_identity() -> String {
-    if let Ok(meta) = fs::metadata("/proc/self") {
-        return meta.uid().to_string();
+/// Resolve the default pipe name for `app_label` from the environment: the
+/// Windows counterpart of the function above, by
+/// [`taria::socket::resolve_pipe_name`], shared with the bridge, with the
+/// user's SID from the process token.
+///
+/// A refused label or `$TARIA_SOCK` is `InvalidInput`, with the refusal's own
+/// message, after `$TARIA_SOCK` when the name refused is the variable's,
+/// since the refusal does not say where its name came from. The SID is
+/// needed only when `$TARIA_SOCK` does not name the pipe, so a token that
+/// cannot be read is reported only then, in place of the refusal of the empty
+/// user it stands in for.
+#[cfg(windows)]
+fn resolve_socket_path(app_label: &str) -> io::Result<PathBuf> {
+    let user = transport::user_identity();
+    let taria_sock = env::var_os("TARIA_SOCK");
+    let overridden = taria_sock.as_ref().is_some_and(|name| !name.is_empty());
+    let resolved = taria::socket::resolve_pipe_name(
+        taria_sock,
+        user.as_deref().unwrap_or_default(),
+        app_label,
+    );
+    match (resolved, user) {
+        (Ok(name), _) => Ok(PathBuf::from(name)),
+        (Err(taria::socket::InvalidPipeName::User(_)), Err(err)) => Err(err),
+        (Err(err), _) => {
+            let message = match err {
+                taria::socket::InvalidPipeName::Label(_) => err.to_string(),
+                _ if overridden => format!("$TARIA_SOCK takes a pipe name on Windows: {err}"),
+                _ => err.to_string(),
+            };
+            Err(io::Error::new(io::ErrorKind::InvalidInput, message))
+        }
     }
-    env::var("USER")
-        .or_else(|_| env::var("LOGNAME"))
-        .unwrap_or_else(|_| "default".to_string())
+}
+
+/// On Windows the resolution's error is an `io::Error` already.
+#[cfg(windows)]
+fn invalid_label(err: io::Error) -> io::Error {
+    err
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    #[cfg(unix)]
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     use super::*;
     use crate::test_util::bind_test_layer;
+    #[cfg(unix)]
+    use crate::transport::{absolutize, ensure_private_dir};
 
     /// Unique, absent scratch path under the system temp dir.
+    #[cfg(unix)]
     fn scratch_path(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("taria-dirtest-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
@@ -2289,11 +2120,11 @@ mod tests {
     /// A private (0700) temp dir that removes itself when the test ends, so
     /// nothing is left in the system temp dir even on panic.
     fn private_temp_dir(prefix: &str) -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix(prefix)
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("create test dir")
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(prefix);
+        #[cfg(unix)]
+        builder.permissions(fs::Permissions::from_mode(0o700));
+        builder.tempdir().expect("create test dir")
     }
 
     /// The shared state a connection's threads work on, without a socket, for
@@ -2310,6 +2141,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_private_dir_accepts_fresh_0700_dir() {
         let dir = scratch_path("fresh");
@@ -2322,6 +2154,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_private_dir_rejects_symlinked_dir() {
         let target = scratch_path("symlink-target");
@@ -2337,6 +2170,7 @@ mod tests {
         let _ = fs::remove_dir_all(&target);
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_private_dir_rejects_world_accessible_dir() {
         let dir = scratch_path("world-writable");
@@ -2349,6 +2183,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn absolutize_joins_relative_paths_onto_cwd() {
         let cwd = env::current_dir().unwrap();
@@ -2371,6 +2206,7 @@ mod tests {
     /// itself passes [`ensure_private_dir`]. Tested without touching
     /// `set_current_dir` (racy across parallel tests) by comparing against
     /// vetting the cwd directly.
+    #[cfg(unix)]
     #[test]
     fn bind_at_bare_filename_vets_cwd() {
         let cwd = env::current_dir().unwrap();
@@ -2399,6 +2235,7 @@ mod tests {
     /// Over the kernel's limit, `bind` alone would say only
     /// `InvalidInput: path must be shorter than SUN_LEN`. The named error has
     /// to survive the trip through `io::Error`.
+    #[cfg(unix)]
     #[test]
     fn bind_at_refuses_an_over_long_socket_path() {
         let dir = private_temp_dir("taria-longpath-");
@@ -2463,24 +2300,20 @@ mod tests {
         assert!(layer.bind_error().is_some(), "a disabled layer says why");
         assert_eq!(layer.socket_path(), socket_path);
         assert_eq!(layer.app_label(), "disabled");
-        assert_eq!(layer.dropped_inputs(), 0);
-        assert_eq!(layer.stale_inputs(), 0);
-        assert_eq!(layer.unknown_inputs(), 0);
-        assert_eq!(layer.truncated_snapshots(), 0);
-        assert_eq!(layer.last_truncation(), None);
-        assert_eq!(layer.oversized_snapshots(), 0);
-        assert_eq!(layer.last_oversize(), None);
+        assert_eq!(layer.stats(), LayerStats::default());
+        let printed = format!("{layer:?}");
+        assert!(
+            printed.contains("enabled: false, bind_error: Some("),
+            "{printed}"
+        );
+        assert!(printed.ends_with(", seq: None, .. }"), "{printed}");
 
         assert_eq!(layer.try_recv(), None);
-        assert_eq!(layer.try_recv_with_id(), None);
         assert_eq!(layer.recv_timeout(Duration::from_millis(1)), None);
-        assert_eq!(layer.recv_timeout_with_id(Duration::from_millis(1)), None);
-        layer.ack(0, InputStatus::Ignored);
+        layer.ack(InputId::new(0), InputStatus::Ignored);
 
         let mut drained = 0;
-        layer.drain(|_| drained += 1);
-        layer.drain_with_ids(|_, _| drained += 1);
-        layer.drain_acking(|_| {
+        layer.drain(|_| {
             drained += 1;
             InputStatus::Ignored
         });
@@ -2522,8 +2355,8 @@ mod tests {
             .root;
         assert_eq!(root.depth(), MAX_NODE_DEPTH);
         assert!(root.check_depth().is_ok());
-        assert_eq!(layer.truncated_snapshots(), 0);
-        assert_eq!(layer.last_truncation(), None);
+        assert_eq!(layer.stats().truncated_snapshots, 0);
+        assert_eq!(layer.stats().last_truncation, None);
     }
 
     /// The failure this enforcement exists for: past the limit a snapshot
@@ -2556,8 +2389,8 @@ mod tests {
         assert!(node.children.is_empty(), "the node at the limit is a leaf");
 
         // And the app can find out, with the branch named.
-        assert_eq!(layer.truncated_snapshots(), 1);
-        let too_deep = layer.last_truncation().expect("the cut is recorded");
+        assert_eq!(layer.stats().truncated_snapshots, 1);
+        let too_deep = layer.stats().last_truncation.expect("the cut is recorded");
         assert_eq!(too_deep.depth(), MAX_NODE_DEPTH + 1);
         assert_eq!(too_deep.deepest().0, format!("n{MAX_NODE_DEPTH}"));
     }
@@ -2574,7 +2407,7 @@ mod tests {
         layer.publish([deep]);
 
         let root = layer.latest_snapshot().expect("published").root;
-        assert_eq!(layer.truncated_snapshots(), 1);
+        assert_eq!(layer.stats().truncated_snapshots, 1);
         assert!(
             root.focused,
             "the focused node was cut, so the root has to carry focus"
@@ -2656,7 +2489,7 @@ mod tests {
             // And one that is a new snapshot.
             layer.publish([chain(DEEP), Node::new("new", Role::Text)]);
             assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
-            assert_eq!(layer.truncated_snapshots(), 2);
+            assert_eq!(layer.stats().truncated_snapshots, 2);
             // A frame recorded and never published is freed with it.
             layer.frame().push(chain(DEEP));
             // And the layer frees the one it still holds.
@@ -2684,7 +2517,7 @@ mod tests {
         assert_eq!(root.children.len(), 2);
         assert_eq!(root.children[0].id.0, "shallow");
         assert_eq!(root.children[0].label.as_deref(), Some("kept"));
-        assert_eq!(layer.truncated_snapshots(), 1);
+        assert_eq!(layer.stats().truncated_snapshots, 1);
     }
 
     /// The counter counts snapshots the agent was sent, not frames the app
@@ -2697,12 +2530,12 @@ mod tests {
         layer.publish([chain(MAX_NODE_DEPTH * 2)]);
         layer.publish([chain(MAX_NODE_DEPTH * 2)]);
         assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
-        assert_eq!(layer.truncated_snapshots(), 1);
+        assert_eq!(layer.stats().truncated_snapshots, 1);
 
         // A deep tree that changed is a new snapshot, cut again.
         layer.publish([chain(MAX_NODE_DEPTH * 2), Node::new("new", Role::Text)]);
         assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
-        assert_eq!(layer.truncated_snapshots(), 2);
+        assert_eq!(layer.stats().truncated_snapshots, 2);
     }
 
     /// One focused text input holding `value`, as a draft would be published.
@@ -2741,8 +2574,8 @@ mod tests {
             .expect("a tree at the budget publishes");
         assert_eq!(snapshot.root, root_around_draft("atsize", at.clone()));
         assert!(line_len(snapshot) <= MAX_LINE_BYTES);
-        assert_eq!(layer.oversized_snapshots(), 0);
-        assert_eq!(layer.last_oversize(), None);
+        assert_eq!(layer.stats().oversized_snapshots, 0);
+        assert_eq!(layer.stats().last_oversize, None);
 
         let over = format!("{at}x");
         layer.publish([draft(over.clone())]);
@@ -2756,12 +2589,13 @@ mod tests {
         assert!(snapshot.root.children[0].focused, "focus is untouched");
         assert!(line_len(snapshot) <= MAX_LINE_BYTES);
 
-        assert_eq!(layer.oversized_snapshots(), 1);
-        let too_large = layer.last_oversize().expect("the cut is recorded");
-        // The line it would have been, counted at the largest seq the way
-        // the bound counts it: one byte over the root budget is one byte over
-        // the line.
-        let unbounded = Snapshot::new(u64::MAX, root_around_draft("atsize", over));
+        assert_eq!(layer.stats().oversized_snapshots, 1);
+        let too_large = layer.stats().last_oversize.expect("the cut is recorded");
+        // The line it would have been, counted at the largest seq and stamp
+        // the way the bound counts them: one byte over the root budget is one
+        // byte over the line.
+        let unbounded = Snapshot::new(u64::MAX, root_around_draft("atsize", over))
+            .after(InputId::new(u64::MAX));
         assert_eq!(too_large.bytes(), line_len(unbounded));
         assert_eq!(too_large.bytes(), MAX_LINE_BYTES + 1);
         assert_eq!(too_large.limit(), MAX_LINE_BYTES);
@@ -2782,18 +2616,18 @@ mod tests {
         layer.publish([draft(big.clone())]);
         layer.publish([draft(big.clone())]);
         assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
-        assert_eq!(layer.oversized_snapshots(), 1);
+        assert_eq!(layer.stats().oversized_snapshots, 1);
 
         // An edit past the cut changes nothing the agent would be sent, so
         // it is not a new snapshot either.
         layer.publish([draft(format!("{big}z"))]);
         assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
-        assert_eq!(layer.oversized_snapshots(), 1);
+        assert_eq!(layer.stats().oversized_snapshots, 1);
 
         // One the agent would see is.
         layer.publish([draft(format!("z{big}"))]);
         assert_eq!(layer.latest_snapshot().expect("published").seq, 2);
-        assert_eq!(layer.oversized_snapshots(), 2);
+        assert_eq!(layer.stats().oversized_snapshots, 2);
     }
 
     /// Focus is decided after the bound, as it is after the depth cut: the
@@ -2812,8 +2646,8 @@ mod tests {
         layer.publish([Node::new("list", Role::List).children(rows)]);
 
         let root = layer.latest_snapshot().expect("published").root;
-        assert_eq!(layer.oversized_snapshots(), 1);
-        let too_large = layer.last_oversize().expect("recorded");
+        assert_eq!(layer.stats().oversized_snapshots, 1);
+        let too_large = layer.stats().last_oversize.expect("recorded");
         assert!(too_large.nodes_dropped() > 0, "the last row went");
         assert!(
             root.focused,
@@ -2857,7 +2691,7 @@ mod tests {
         let alone = line_len(Snapshot::new(1, root_around_draft("unfit", value)));
         let line = line_len(snapshot);
         assert!(line > alone && line <= MAX_LINE_BYTES, "{line} of {alone}");
-        let too_large = layer.last_oversize().expect("recorded");
+        let too_large = layer.stats().last_oversize.expect("recorded");
         assert_eq!(too_large.strings_trimmed(), 0);
         assert_eq!(too_large.nodes_dropped(), 1);
     }
@@ -2904,7 +2738,7 @@ mod tests {
             "an unchanged frame is neither measured nor cut"
         );
         assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
-        assert_eq!(layer.oversized_snapshots(), 1);
+        assert_eq!(layer.stats().oversized_snapshots, 1);
         let per_frame = redrawn / 99;
         eprintln!("first frame {first:?}, each unchanged frame after it {per_frame:?}");
         assert!(
@@ -2921,7 +2755,7 @@ mod tests {
         let after = bound::runs();
         assert_eq!(after.cut - once.cut, 1);
         assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
-        assert_eq!(layer.oversized_snapshots(), 1);
+        assert_eq!(layer.stats().oversized_snapshots, 1);
     }
 
     /// The comparison costs a tree that fits nothing extra: it is measured
@@ -2980,8 +2814,8 @@ mod tests {
         layer.publish([branch]);
 
         let snapshot = layer.latest_snapshot().expect("published");
-        assert_eq!(layer.truncated_snapshots(), 1);
-        assert_eq!(layer.oversized_snapshots(), 1);
+        assert_eq!(layer.stats().truncated_snapshots, 1);
+        assert_eq!(layer.stats().oversized_snapshots, 1);
         assert_eq!(
             snapshot.root.children[0].children.len(),
             201,
@@ -3011,12 +2845,97 @@ mod tests {
         assert_eq!(ids, ["a", "b"]);
     }
 
+    /// A disabled node goes out with no actions, at any depth and whatever
+    /// it was built with, and keeps everything else; an enabled sibling keeps
+    /// its own. An empty action list alone marks nothing disabled.
+    #[test]
+    fn a_disabled_node_is_published_with_no_actions() {
+        let mut layer = bind_test_layer("taria-layer-", "disabled");
+        let save = |disabled: bool| {
+            Node::new("save", Role::Button)
+                .label("Save")
+                .disabled(disabled)
+                .focused(true)
+                .actions([taria::Action::Activate, taria::Action::Custom("x".into())])
+        };
+        let nested = Node::new("menu", Role::Menu).disabled(true).child(
+            Node::new("open", Role::MenuItem)
+                .disabled(true)
+                .action(taria::Action::Activate),
+        );
+        let quit = Node::new("quit", Role::Button).action(taria::Action::Activate);
+        let empty = Node::new("idle", Role::Button);
+        layer.publish([save(true), nested, quit.clone(), empty.clone()]);
+
+        let snapshot = layer.latest_snapshot().expect("published");
+        let root = &snapshot.root;
+        let saved = &root.children[0];
+        assert!(saved.actions.is_empty(), "{saved:?}");
+        assert!(saved.disabled);
+        assert!(saved.focused && saved.label.as_deref() == Some("Save"));
+        assert!(root.children[1].actions.is_empty());
+        assert!(root.children[1].children[0].actions.is_empty());
+        assert_eq!(root.children[2], quit);
+        assert_eq!(root.children[3], empty);
+        assert!(!root.children[3].disabled);
+
+        // The same frame again is the snapshot already sent, and enabling
+        // the node brings its actions back.
+        layer.publish([
+            save(true),
+            Node::new("menu", Role::Menu).disabled(true).child(
+                Node::new("open", Role::MenuItem)
+                    .disabled(true)
+                    .action(taria::Action::Activate),
+            ),
+            quit.clone(),
+            empty.clone(),
+        ]);
+        assert_eq!(layer.latest_snapshot().expect("published").seq, 1);
+        layer.publish([save(false)]);
+        let snapshot = layer.latest_snapshot().expect("published");
+        assert_eq!(snapshot.seq, 2);
+        assert_eq!(snapshot.root.children[0], save(false));
+    }
+
+    /// A number that is not finite cannot be stored on a node, so it never
+    /// reaches the line, which could not spell it, and never leaves a tree
+    /// unequal to itself, which would have defeated the comparison that skips
+    /// an unchanged frame: every frame would have gone out again.
+    #[test]
+    fn a_number_that_is_not_finite_never_ships_or_breaks_the_dedupe() {
+        let mut layer = bind_test_layer("taria-layer-", "nan");
+        let bar = || {
+            let mut bar = Node::new("bar", Role::ProgressBar).range(f64::NAN, 0.0, f64::INFINITY);
+            bar.value_max = taria::Number::new(f64::NEG_INFINITY);
+            bar
+        };
+        layer.publish([bar()]);
+        layer.publish([bar()]);
+        layer.publish([bar()]);
+        let snapshot = layer.latest_snapshot().expect("published");
+        assert_eq!(snapshot.seq, 1, "the same frame drawn again is not resent");
+        let published = &snapshot.root.children[0];
+        assert_eq!(
+            (published.value_now, published.value_max),
+            (None, None),
+            "{published:?}"
+        );
+        assert_eq!(published.value_min.map(taria::Number::get), Some(0.0));
+        let line = serde_json::to_string(&snapshot).expect("serializes");
+        assert!(
+            !line.contains("NaN") && !line.contains("inf") && !line.contains("null"),
+            "{line}"
+        );
+    }
+
     /// The ordering [`writer_loop`] promises, exercised where it actually
     /// bites: an ack and a newer snapshot pending in the *same* pass. Driving
     /// the loop directly over a socket pair is the only way to make that
     /// overlap certain; through a live connection the writer wakes on the
     /// first of the two and usually drains it before the second exists, so
     /// the socket tests only ever see the two in separate passes.
+    #[cfg(unix)]
     #[test]
     fn writer_sends_pending_acks_before_a_pending_snapshot() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3030,7 +2949,7 @@ mod tests {
             // order: the app acked an input and published a new tree in
             // response to it.
             let mut state = shared.lock_state();
-            state.acks.push_back((7, InputStatus::Delivered));
+            state.acks.push_back((7.into(), InputStatus::Delivered));
             state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
             state.epoch = 1;
         }
@@ -3040,7 +2959,7 @@ mod tests {
             let shared = Arc::clone(&shared);
             let alive = Arc::clone(&alive);
             move || {
-                let mut server = server;
+                let mut server = Writer::from(server);
                 writer_loop(&mut server, &shared, &alive, 0);
             }
         });
@@ -3054,7 +2973,7 @@ mod tests {
         };
         assert_eq!(
             read_message(),
-            AppToBridge::ack(7, InputStatus::Delivered),
+            AppToBridge::ack(InputId::new(7), InputStatus::Delivered),
             "an agent that saw the snapshot first could not tell whether it \
              already reflects its input"
         );
@@ -3071,6 +2990,7 @@ mod tests {
     /// Write junk into `stream` until the peer's side is full, so the next
     /// write blocks: a bridge that has stopped reading. Returns how many
     /// bytes it took, for a test that wants to read past them later.
+    #[cfg(unix)]
     fn fill_until_blocked(stream: &UnixStream) -> usize {
         stream.set_nonblocking(true).expect("non-blocking");
         let chunk = [b'x'; 4096];
@@ -3090,12 +3010,13 @@ mod tests {
     /// a writer that never does fails the test instead of hanging the suite.
     /// The stream is dropped as the loop returns, which is the EOF a test
     /// reads to know nothing else was written.
+    #[cfg(unix)]
     fn spawn_writer(server: UnixStream, shared: &Arc<Shared>) -> Receiver<()> {
         let (tx, rx) = mpsc::channel();
         thread::spawn({
             let shared = Arc::clone(shared);
             move || {
-                let mut server = server;
+                let mut server = Writer::from(server);
                 let alive = AtomicBool::new(true);
                 writer_loop(&mut server, &shared, &alive, 0);
                 drop(server);
@@ -3108,6 +3029,7 @@ mod tests {
     /// The exit the flush exists for: the app dequeued an input, refined its
     /// ack and dropped the layer, all before the writer ran again. Both acks
     /// are still queued, and so is the snapshot the app published last.
+    #[cfg(unix)]
     #[test]
     fn a_shutdown_writes_the_queued_acks_and_not_the_snapshot() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3118,8 +3040,8 @@ mod tests {
         let shared = test_shared("exitflush");
         {
             let mut state = shared.lock_state();
-            state.acks.push_back((4, InputStatus::Delivered));
-            state.acks.push_back((4, InputStatus::Ignored));
+            state.acks.push_back((4.into(), InputStatus::Delivered));
+            state.acks.push_back((4.into(), InputStatus::Ignored));
             state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
             state.epoch = 1;
             state.shutdown = true;
@@ -3138,8 +3060,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                AppToBridge::ack(4, InputStatus::Delivered),
-                AppToBridge::ack(4, InputStatus::Ignored),
+                AppToBridge::ack(InputId::new(4), InputStatus::Delivered),
+                AppToBridge::ack(InputId::new(4), InputStatus::Ignored),
             ],
             "every queued ack goes out, in order, and the snapshot behind them does not"
         );
@@ -3154,6 +3076,7 @@ mod tests {
     /// batch, blocked on a slow bridge. What it has not written of that batch
     /// goes out under the flush's bound, followed by anything queued since,
     /// and the snapshot that was due after the batch is skipped.
+    #[cfg(unix)]
     #[test]
     fn a_shutdown_mid_batch_writes_the_rest_of_it_and_what_queued_since() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3165,8 +3088,8 @@ mod tests {
         let shared = test_shared("midbatch");
         {
             let mut state = shared.lock_state();
-            state.acks.push_back((1, InputStatus::Delivered));
-            state.acks.push_back((2, InputStatus::Delivered));
+            state.acks.push_back((1.into(), InputStatus::Delivered));
+            state.acks.push_back((2.into(), InputStatus::Delivered));
             state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
             state.epoch = 1;
         }
@@ -3183,7 +3106,7 @@ mod tests {
         }
         {
             let mut state = shared.lock_state();
-            state.acks.push_back((3, InputStatus::Ignored));
+            state.acks.push_back((3.into(), InputStatus::Ignored));
             state.shutdown = true;
             shared.cv.notify_all();
         }
@@ -3204,9 +3127,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                AppToBridge::ack(1, InputStatus::Delivered),
-                AppToBridge::ack(2, InputStatus::Delivered),
-                AppToBridge::ack(3, InputStatus::Ignored),
+                AppToBridge::ack(InputId::new(1), InputStatus::Delivered),
+                AppToBridge::ack(InputId::new(2), InputStatus::Delivered),
+                AppToBridge::ack(InputId::new(3), InputStatus::Ignored),
             ],
             "the batch in hand first, then what was queued behind it, and no snapshot"
         );
@@ -3218,6 +3141,7 @@ mod tests {
     /// there is no ack after it whose check could notice, so the writer used
     /// to go straight on to the snapshot, the one line a shutdown skips and
     /// the one that can hold `Drop` for a whole `WRITE_TIMEOUT`.
+    #[cfg(unix)]
     #[test]
     fn a_shutdown_while_the_last_ack_is_written_never_writes_the_snapshot() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3229,7 +3153,7 @@ mod tests {
         let shared = test_shared("lastack");
         {
             let mut state = shared.lock_state();
-            state.acks.push_back((1, InputStatus::Delivered));
+            state.acks.push_back((1.into(), InputStatus::Delivered));
             state.latest = Some(Snapshot::new(1, Node::new("app", Role::App)));
             state.epoch = 1;
         }
@@ -3265,7 +3189,7 @@ mod tests {
         }
         assert_eq!(
             lines,
-            [AppToBridge::ack(1, InputStatus::Delivered)],
+            [AppToBridge::ack(InputId::new(1), InputStatus::Delivered)],
             "the ack in hand goes out, and the snapshot behind it does not"
         );
         assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
@@ -3275,6 +3199,7 @@ mod tests {
     /// stopped reading, a queue of acks each given the time left would still
     /// be one bound long, and a queue each given `WRITE_TIMEOUT` would hold
     /// the app's exit for minutes.
+    #[cfg(unix)]
     #[test]
     fn the_shutdown_flush_gives_up_on_a_bridge_that_stopped_reading() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3289,7 +3214,9 @@ mod tests {
         {
             let mut state = shared.lock_state();
             for id in 0..20 {
-                state.acks.push_back((id, InputStatus::Delivered));
+                state
+                    .acks
+                    .push_back((InputId::new(id), InputStatus::Delivered));
             }
             state.shutdown = true;
         }
@@ -3397,6 +3324,7 @@ mod tests {
     /// Exit must not depend on the wake-up connection succeeding: with the
     /// socket file gone, nothing can return the listener from `accept()`, and
     /// a join would hang the app forever.
+    #[cfg(unix)]
     #[test]
     fn drop_returns_even_when_the_listener_cannot_be_woken() {
         let layer = bind_test_layer("taria-drophang-", "unwakeable");
@@ -3424,6 +3352,7 @@ mod tests {
     ///
     /// Dropping must also leave that socket alone: it is the other instance's
     /// way of being reached.
+    #[cfg(unix)]
     #[test]
     fn drop_neither_hangs_nor_unlinks_when_the_socket_was_replaced() {
         let dir = private_temp_dir("taria-replaced-");
@@ -3461,6 +3390,7 @@ mod tests {
     /// vetting whatever else is inside it, so a typo in it (`~/.ssh/config`
     /// is 0700 and user-owned) used to mean startup silently deleted a file
     /// the user meant to keep.
+    #[cfg(unix)]
     #[test]
     fn binding_never_deletes_something_that_is_not_a_socket() {
         let dir = private_temp_dir("taria-notasocket-");
@@ -3495,6 +3425,7 @@ mod tests {
     /// that was killed before `Drop` could run. Nothing is listening on it,
     /// and refusing it would leave the app unable to start until somebody
     /// deleted the file by hand.
+    #[cfg(unix)]
     #[test]
     fn a_socket_nothing_is_listening_on_is_replaced() {
         let dir = private_temp_dir("taria-stalesock-");
@@ -3516,6 +3447,7 @@ mod tests {
     /// testing a TUI. The second used to unlink the first's socket and bind
     /// its own there, leaving the first running, reporting itself enabled,
     /// and reachable by nobody.
+    #[cfg(unix)]
     #[test]
     fn binding_over_a_live_socket_is_refused_and_leaves_it_serving() {
         let dir = private_temp_dir("taria-twice-");
@@ -3561,28 +3493,32 @@ mod tests {
     /// disconnect it while answers pile up behind it.
     #[test]
     fn the_ack_queue_is_bounded_and_drops_the_oldest_answers() {
-        let shared = test_shared("ackbound");
+        // A bound layer rather than bare shared state, so the count is read
+        // the way an app reads it, through `stats()`. Nothing connects, so
+        // the writer never takes an ack off the queue.
+        let layer = bind_test_layer("taria-layer-", "ackbound");
+        let shared = &layer.inner.as_ref().expect("a bound layer").shared;
         let overflow = 10;
-        for id in 0..(ACK_QUEUE + overflow) as InputId {
-            shared.queue_ack(id, InputStatus::Dropped);
+        for id in 0..(ACK_QUEUE + overflow) as u64 {
+            shared.queue_ack(InputId::new(id), InputStatus::Dropped);
         }
 
         let state = shared.lock_state();
         assert_eq!(state.acks.len(), ACK_QUEUE, "the queue must stay bounded");
         assert_eq!(
             state.acks.front().map(|(id, _)| *id),
-            Some(overflow as InputId),
+            Some(InputId::new(overflow as u64)),
             "the oldest answers are the ones given up; a waiter on those has \
              long since timed out"
         );
         assert_eq!(
             state.acks.back().map(|(id, _)| *id),
-            Some((ACK_QUEUE + overflow - 1) as InputId),
+            Some(InputId::new((ACK_QUEUE + overflow - 1) as u64)),
             "the newest answer is the one an agent is still waiting on"
         );
         drop(state);
         assert_eq!(
-            shared.dropped_acks.load(Ordering::Relaxed),
+            layer.stats().dropped_acks,
             overflow as u64,
             "each dropped answer must be counted once"
         );
@@ -3597,20 +3533,23 @@ mod tests {
     fn an_app_ack_is_dropped_unless_its_input_belongs_to_the_live_connection() {
         let shared = test_shared("appack");
         shared.lock_state().generation = 7;
-        assert!(shared.deliver(7, 5), "the live connection's input delivers");
+        assert!(
+            shared.deliver(7, InputId::new(5)),
+            "the live connection's input delivers"
+        );
         shared.lock_state().acks.clear();
 
-        shared.queue_app_ack(5, InputStatus::Ignored);
+        shared.queue_app_ack(InputId::new(5), InputStatus::Ignored);
         assert_eq!(
             shared.lock_state().acks.pop_front(),
-            Some((5, InputStatus::Ignored)),
+            Some((InputId::new(5), InputStatus::Ignored)),
             "refining the ack of a live input is the whole point of `ack`"
         );
 
         // The connection ends and the next one starts; its ids start over.
         shared.retire_generation();
         shared.lock_state().generation += 1;
-        shared.queue_app_ack(5, InputStatus::Ignored);
+        shared.queue_app_ack(InputId::new(5), InputStatus::Ignored);
         assert!(
             shared.lock_state().acks.is_empty(),
             "an id from a bridge that is gone must answer nobody"
@@ -3622,16 +3561,16 @@ mod tests {
         // One delivery past what the layer remembers, so exactly the oldest
         // id falls out.
         let generation = shared.lock_state().generation;
-        for id in 100..=(100 + ACKABLE_INPUTS as InputId) {
-            assert!(shared.deliver(generation, id));
+        for id in 100..=(100 + ACKABLE_INPUTS as u64) {
+            assert!(shared.deliver(generation, InputId::new(id)));
         }
         shared.lock_state().acks.clear();
-        shared.queue_app_ack(100, InputStatus::Ignored);
+        shared.queue_app_ack(InputId::new(100), InputStatus::Ignored);
         assert!(shared.lock_state().acks.is_empty(), "id 100 was forgotten");
-        shared.queue_app_ack(101, InputStatus::Ignored);
+        shared.queue_app_ack(InputId::new(101), InputStatus::Ignored);
         assert_eq!(
             shared.lock_state().acks.pop_front(),
-            Some((101, InputStatus::Ignored)),
+            Some((InputId::new(101), InputStatus::Ignored)),
             "everything still remembered stays answerable"
         );
     }
@@ -3651,7 +3590,6 @@ mod tests {
 
         let started = Instant::now();
         assert_eq!(layer.recv_timeout(Duration::MAX), None);
-        assert_eq!(layer.recv_timeout_with_id(Duration::MAX), None);
         let waited = started.elapsed();
         assert!(
             waited < Duration::from_secs(1),

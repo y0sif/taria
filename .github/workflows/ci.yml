@@ -13,26 +13,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The Windows target is for the cross clippy below: a check needs only
+      # the target's std, not a linker, so it runs here in seconds, where the
+      # windows-latest job takes minutes to say the same thing.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy (Windows target)
+        run: cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets --locked -- -D warnings
+      - name: Docs
+        run: cargo doc --no-deps --workspace --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
       # The two scripts are where agent-contract breakage shows up: the tool
       # results an agent actually reads, the acknowledgement shapes, and the
       # edge cases (a peer on another protocol version, a burst half dropped,
-      # an app that stops reading). Nothing in the Rust suites covers a real
-      # bridge against a real app, so a change can pass everything above and
-      # still break every agent driving a TUI. Both build what they test, so
-      # they cannot score a stale target/debug; both exit non-zero on any
-      # failed step or probe, which fails the job.
+      # an app that stops reading). The Rust suites run one real bridge
+      # against a real app (taria-mcp's adapter_e2e), over a handful of
+      # scenarios; the scripts drive the demo app through the whole agent
+      # contract, so a change can pass everything above and still break
+      # every agent driving a TUI. Both build what they test, so they cannot
+      # score a stale target/debug; both exit non-zero on any failed step or
+      # probe, which fails the job.
       - name: End-to-end scenario
         run: python3 scripts/e2e.py
         timeout-minutes: 10
@@ -40,19 +52,86 @@ jobs:
         run: python3 scripts/adversarial.py
         timeout-minutes: 10
 
+  # The Unix transport on another kernel: a different AF_UNIX path limit (103
+  # bytes), LOCAL_PEERPID in place of SO_PEERCRED, a temp dir under
+  # /var/folders, and no /proc. The scripts run here too, since they are the
+  # only place a real bridge drives the real demo through a pty; the one probe
+  # that needs /proc says it was skipped.
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+      # Built before the scripts, which build what they test with a time
+      # limit of their own, so a cold macOS build is never what times out.
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: End-to-end scenario
+        run: python3 scripts/e2e.py
+        timeout-minutes: 10
+      - name: Adversarial probes
+        run: python3 scripts/adversarial.py
+        timeout-minutes: 10
+
+  # The named-pipe transport, on the platform it is for. The Rust suites are
+  # the whole gate here: crates/taria-mcp/tests/adapter_e2e.rs runs a real
+  # adapter in a child process against the real taria-mcp binary over stdio,
+  # with no TUI, pty or Python. The two scripts cannot run on Windows: they
+  # drive the demo through a pty, read /proc, and talk to the app over
+  # AF_UNIX, and Windows has none of the three (taria's endpoint there is a
+  # named pipe).
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build
+        run: cargo build --workspace --locked
+
   # The MSRV is a promise on the crates.io page, not a comment: `rust-version
   # = "1.88"` is what tells cargo to refuse the crate on an older toolchain,
   # and nothing here checked it until the crates were published. A check is
   # enough, since what an older compiler rejects is syntax and library items,
-  # not test outcomes, and the stable job above already runs the suites.
+  # not test outcomes, and the stable job above already runs the suites. The
+  # Windows target is checked too, from here, because the code behind
+  # `cfg(windows)` is compiled by no other job on 1.88.
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
       - name: Check
         run: cargo check --workspace --all-targets --locked
+      - name: Check (Windows target)
+        run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
+
+  # Fails a release that breaks the public Rust API without the version
+  # saying so. It compares each published crate with its newest release on
+  # crates.io; a 0.x minor (0.3 to 0.4) counts as major, so the intended
+  # breaks of 0.4.0 pass, and from 0.4.0 on a break needs 0.5.
+  semver:
+    name: Semver checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: taria, taria-ratatui, taria-mcp

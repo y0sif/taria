@@ -2,9 +2,9 @@
 //!
 //! Embed a [`TariaLayer`] in your ratatui app and each rendered frame can also
 //! publish a semantic [`taria::Snapshot`] over the taria transport (one JSON
-//! message per line over a Unix domain socket). Agent inputs come back as
-//! [`taria::AgentInput`] values your event loop handles like any other input
-//! source.
+//! message per line over a Unix domain socket on Linux and macOS, or a named
+//! pipe on Windows). Agent inputs come back as [`taria::AgentInput`] values
+//! your event loop handles like any other input source.
 //!
 //! [`taria::AgentInput::Text`] is the one that needs aiming rather than
 //! handling: typed text belongs wherever your app puts typing, not in your key
@@ -20,8 +20,9 @@
 //! use taria_ratatui::{InputStatus, TariaLayer, sem};
 //!
 //! fn main() -> std::io::Result<()> {
-//!     // Never fails: if the socket cannot be bound the layer is inert and
-//!     // the app runs exactly as it would without taria.
+//!     // Never fails: if the socket (a named pipe on Windows) cannot be
+//!     // bound, the layer is inert and the app runs exactly as it would
+//!     // without taria.
 //!     let mut layer = TariaLayer::bind_or_disabled("my-app");
 //!     let mut terminal = ratatui::init();
 //!
@@ -37,7 +38,7 @@
 //!     // Drain agent input alongside terminal events. Each input is acked
 //!     // `Delivered` as it is handed over; return `Ignored` for one you
 //!     // looked at and deliberately did nothing with, and the layer sends it.
-//!     layer.drain_acking(|_input| {
+//!     layer.drain(|_input| {
 //!         // Apply to app state exactly like a keyboard event.
 //!         InputStatus::Delivered
 //!     });
@@ -51,6 +52,9 @@
 //! }
 //! ```
 
+#![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
+
 mod bound;
 mod key;
 mod layer;
@@ -58,10 +62,11 @@ mod recorder;
 mod semantic;
 #[cfg(test)]
 mod test_util;
+mod transport;
 
 pub use bound::SnapshotTooLarge;
 pub use key::{text_to_keys, to_crossterm, to_crossterm_key};
-pub use layer::TariaLayer;
+pub use layer::{LayerStats, TariaLayer};
 pub use recorder::FrameRecorder;
 pub use semantic::{Semantic, sem};
 

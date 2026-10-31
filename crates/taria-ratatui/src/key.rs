@@ -2,9 +2,8 @@
 //!
 //! The grammar itself lives in [`taria::key`], shared with the bridge so that
 //! a key string the bridge accepts is exactly one this adapter can deliver.
-//! This module is only the last step: turning a parsed
-//! [`KeyPress`](taria::key::KeyPress) into the [`KeyEvent`] a ratatui app
-//! already handles.
+//! This module is only the last step: turning a parsed [`KeyPress`] into the
+//! [`KeyEvent`] a ratatui app already handles.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use taria::key::{Key, KeyPress, Modifiers};
@@ -16,8 +15,8 @@ use taria::key::{Key, KeyPress, Modifiers};
 /// the string does not match it, which is the same verdict the bridge reaches
 /// from the same parser, or that [`to_crossterm`] has no crossterm counterpart
 /// for the key it parsed to. A caller that already holds a parsed
-/// [`KeyPress`](taria::key::KeyPress) should use [`to_crossterm`] rather than
-/// render it back to a string to re-parse here.
+/// [`KeyPress`] should use [`to_crossterm`] rather than render it back to a
+/// string to re-parse here.
 pub fn to_crossterm_key(key: &str) -> Option<KeyEvent> {
     key.parse::<KeyPress>().ok().and_then(to_crossterm)
 }

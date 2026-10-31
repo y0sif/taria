@@ -13,6 +13,425 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
+## [0.4.0] - 2026-10-31
+
+0.4.0 is the first alpha. It reshapes the Rust API in one pass; later 0.x
+minors may still change it, each with an upgrade note. It brings four
+headline changes. The wire gains only optional fields, so
+`PROTOCOL_VERSION` stays 1, and peers of 0.3.3 and 0.4.0 read each other.
+All three crates move to 0.4.0 together.
+
+**The Rust API is cut to what a caller needs.** Each crate had grown entry
+points that did one thing several ways, or that exposed internals: a
+`TariaLayer` had seven ways to take input, and `taria-mcp` exported its
+bridge, its tool methods and its command-line parser. They are removed or
+folded together, and what is left can grow without a break: `LayerStats` is
+`#[non_exhaustive]`, and a `taria-mcp` server is built through a builder.
+The table under Upgrading maps every removed name to its replacement.
+
+**A node can say what state it is in.** Which row is selected, whether a box
+is checked or a branch open, whether a button can be pressed yet, how far a
+progress bar has got, where a row sits in a list longer than the screen:
+each was prose in a `value`, or nowhere. Fourteen optional node fields now
+carry it: `selected`, `checked` (`true`, `false` or `"mixed"`), `expanded`,
+`disabled`, `description`, `value_now`, `value_min`, `value_max`,
+`pos_in_set`, `set_size`, `row`, `column`, `row_count` and `column_count`.
+
+**A slow act is credited with its own tree** (closes #17). The bridge waited
+a fixed 500 ms for a tree that differed, so a handler slower than that read
+as "did not change", and its tree, when it came, was credited to the next
+input. Now the adapter stamps each snapshot with the newest input the app
+has dequeued (`after_input`) and says `"stamps":true` in its hello.
+`taria-mcp` credits a tree to an input only once it is stamped at that
+input, and waits up to 3 s for it. Against the demo with an 800 ms handler,
+each act came back with its own tree in 0.81 s, and an act that changed
+nothing was answered in 50 ms instead of 503 ms.
+
+**taria runs on Windows, over named pipes.** Neither crate built for Windows
+before. There the adapter serves a named pipe (a kernel object under
+`\\.\pipe\` that two processes open like a file) in place of the Unix
+socket, carrying the same bytes, and `taria-mcp` connects to it. CI now runs
+on Linux, macOS and Windows. On Linux and macOS the command line, every text
+and every behaviour are as they were.
+
+Every text an agent reads through `taria-mcp` is unchanged, byte for byte,
+but for the outline's `read_tree` description, `act` on a disabled node, the
+answers to an app that stamps, and the Windows answers, all under "For
+whoever drives an app". Against an app that does not stamp, every answer and
+the 500 ms window are as in 0.3.3.
+
+### For an app author adopting taria
+
+- **Set state with the new `Node` setters:** `selected(bool)`,
+  `checked(..)` (a `bool` or a `taria::Checked`), `expanded(bool)`,
+  `disabled(bool)`, `description(..)`, `range(now, min, max)`,
+  `value_now(f64)`, `pos_in_set(u32)`, `set_size(u32)`, `cell(row, column)`
+  and `table_size(rows, columns)`, each chainable beside `relayed`. A number
+  that is not finite is left unstated, so an infinite bound in `range` is an
+  open one; `value_now` sets a value that has no bounds. A 0 position leaves
+  the field unset. The integration guide's new section "Say what state a
+  node is in" covers them.
+- **A disabled node is published with no actions.** The adapter strips them
+  at publish, from `publish` and `FrameRecorder` alike, and counts nothing.
+  Do not mark a node disabled only because a modal is in front of it.
+- **Hidden is not a field.** Leave a hidden node out of the tree, and say how
+  many items there are with `set_size`, published or not.
+- **A description is trimmed with the values.** A snapshot over the 1 MiB
+  line limit loses the longest values and descriptions first, then labels,
+  and `SnapshotTooLarge::largest` can name a node for its description.
+- **The layer stamps for you.** Its hello says `stamps`, and each snapshot
+  carries the newest input `drain`, `try_recv` or `recv_timeout` handed you.
+  Whether that snapshot is a good answer depends on your loop: see the three
+  loop rules under Upgrading.
+- **`stats()` gathers what the layer lost.** One call returns a
+  `LayerStats`: the six counts, all zero on a disabled layer, and the two
+  `last_*` details, `None` until a cut. Read it once the terminal is
+  restored, as before. A count added later is a new field, not a break.
+- **`TariaLayer::bind_or_disabled_at(label, path)` is new.** It binds at a
+  path the app chose and returns a disabled layer when that fails, as
+  `bind_or_disabled` does at the resolved path.
+- **`taria-ratatui` builds and serves on Windows with no change to your
+  code.** One dependency works on Linux, macOS and Windows, so an app that
+  kept taria behind `#[cfg(unix)]` and `[target.'cfg(unix)'.dependencies]`
+  can drop both. On Windows it pulls in `windows-sys` (raw Win32 bindings)
+  and nothing else, and `socket_path()` is the pipe name. A second app on a
+  live name is refused with `AddrInUse`, as on Unix, after the bind has
+  retried for 500 ms. The retry is for a restart. When an app exits, its
+  pipe's name stays taken until the bridge that was connected to it closes
+  its end. An app restarted at once waits that out instead of running with
+  taria off. `bind_error()` says why a bind failed, and the integration
+  guide's "Socket paths" section gains "On Windows" with each reason.
+- **Binds made at once from several threads work on macOS and the BSDs.**
+  There the layer learns your uid from a probe file in the temp dir, and
+  since 0.1.0 every thread of a process used the same file name, so one of
+  two binds made at once could fail with a bare `File exists`. The uid is now
+  learned once per process, each probe has a name of its own, and a failed
+  probe names its path. Linux, which reads the uid from `/proc/self`, was not
+  affected.
+
+### For whoever drives an app
+
+- **Typed state in the tree.** In JSON a node carries `"selected":true`,
+  `"checked":false`, `"value_now":42` and the rest as plain fields. The
+  outline prints them as marks after `*focused`: `*selected` or
+  `*selected=false`; `*checked`, `*checked=false` or `*checked=mixed`;
+  `*expanded` or `*expanded=false`; `*disabled`; `*num=42[0..100]`;
+  `*pos=3`; `*size=7`; `*row=2 *col=3`; `*rows=50 *cols=4`; and a
+  `description="..."` opening the tail. A `*` is still never bare
+  otherwise, so no mark can be forged. Positions count from 1. A node with
+  `"expanded":true` and fewer children than its `set_size` has children
+  that were not published, not an empty set.
+- **The outline's `read_tree` description shows one mark.** Its legend
+  reads `id role *relayed "label" = "value" *focused *checked=false act:
+  a|b`, which teaches the `*name=value` shape, for 15 characters more than
+  0.3.3's. Nothing else in either mode's instructions or descriptions moves.
+- **`act` on a disabled node is refused before anything is sent**, with
+  ``node `<id>` is disabled and accepts no actions until the app enables it;
+  call read_tree to see when it does``. `key` and `type_text` are not
+  affected, and an empty action list alone never reads as disabled.
+- **A number reaches the agent as the double the app wrote.** `taria-mcp`
+  now reads JSON numbers exactly, so `1.4000000000000001` is no longer
+  shown as `1.4`, in JSON or in the outline. The spelling is still
+  serde_json's, not the app's: `1e3` reads `1000.0` (protocol section 16.6).
+- **The demo states its state.** A task's done state is `checked` instead
+  of the value `"todo"` or `"done"`, and the cursor row and the active tab
+  are `selected` instead of a tab's value `"selected"`. The list's value
+  (the selected task's id) and the tab bar's (the tab on screen) stay. Its
+  first tree is 1199 characters as JSON and 619 as an outline, where
+  0.3.3's was 1132 and 546. `TARIA_DEMO_SLOW_MS=<n>` holds each agent input
+  `n` ms between its dequeue and its effect, to reproduce #17.
+- **Against an app that stamps, each input is answered on its own tree.**
+  A taria-ratatui 0.4.0 app stamps. The input tools wait up to 3 s, not
+  500 ms, for a tree stamped at the input, and answer with it if it changed.
+  A tree published before the input, however late it arrives, is no longer
+  the answer, but for one race (protocol section 5.3). The other answers:
+  - Unchanged, as soon as that tree arrives, which against the demo is about
+    a frame: `The app received this input, and its tree did not change.`
+  - No stamped tree within 3 s: `The app received this input but published
+    no tree after it within 3000ms; it may still be working. Call read_tree
+    to see its effect.`
+  - No ack and no tree: `The app neither acknowledged this input nor
+    published a tree after it within 3000ms; it may be stuck, busy or
+    stopped. Call read_tree to check.` It no longer suggests the app may not
+    report acknowledgements, since an app that stamps always does. A burst
+    opens `The app acknowledged N of the M inputs this call sent, then
+    neither acknowledged the last nor published a tree after it within
+    3000ms`, and so does the answer that quotes a line the bridge could not
+    read. On Linux, the stopped-app answer counts the inputs not yet read.
+  - An `Ignored` ack ends the wait at the stamped tree, or 500 ms after the
+    ack when none comes, and its text is unchanged. An app that disconnects
+    mid-wait is answered within 500 ms of the disconnect. An app that has
+    stopped costs 3 s of silence instead of 500 ms.
+  - An app whose hello says `stamps` but whose snapshots break the stamp
+    rules is answered by the 0.3.3 rules for the rest of the connection, and
+    `taria-mcp` logs a warning once per connection. The call that shows it
+    credits a changed tree and keeps its 3 s window, so its other texts read
+    "did not change within 3000ms" or "nor changed its tree within 3000ms".
+- **The stamp never reaches the agent.** `taria-mcp` strips `after_input`
+  in both formats, as it strips `type`. A 0.3.3 `taria-mcp` does not: its
+  JSON tree shows `"after_input":N` and its outline header `after_input=N`.
+- **rmcp 3.8 answers a few requests differently; taria's own texts do not
+  move.** A request with `"id":null` now gets a `-32600` (invalid request)
+  reply, where 0.3.3 sent nothing. Requests before `initialize` no longer
+  end the session after the third: each is answered `-32602` (invalid
+  params), and `initialize` is still accepted after them. rmcp's stderr
+  report of a malformed `initialize` is worded differently.
+- **The stateless MCP lifecycle is accepted too.** The 2026-07-28 MCP
+  revision has no `initialize` handshake: each request carries its protocol
+  version and capabilities in `_meta`. Its `server/discover`, like
+  `initialize`, opens no connection to the app. In that mode
+  `resources/list` and `prompts/list` carry `"ttlMs":0` and
+  `"cacheScope":"private"`.
+- **`taria-mcp` runs on Windows.** Take `taria-mcp.exe` from the new
+  `taria-mcp-x86_64-pc-windows-msvc.zip` on the releases page (with the
+  README and both licences, and a `.sha256` beside it that `sha256sum -c`
+  reads), or run `cargo install taria-mcp`. `--app <label>` connects
+  to `\\.\pipe\taria-<SID>-<label>`, where the SID (security identifier) is
+  the string Windows names the user's account by, read from the process
+  token as the adapter reads it. `--socket` takes a pipe name. Both, and
+  `$TARIA_SOCK` under `--app`, take only a pipe on this machine:
+  `\\.\pipe\` in any letter case, then one name. Anything else is a usage
+  error, a pipe on another machine included, because opening one goes over
+  SMB (Windows file sharing) and hands that machine the user's credentials.
+  `--help` describes the pipe on Windows.
+- **Four answers exist only on Windows**, after the usual opening
+  (`no snapshot from the app yet: `, or after a disconnect
+  `app '<label>' disconnected (last snapshot seq N)`). `docs/cli.md` quotes
+  them whole.
+  - **Busy, read as held.** A pipe has no listen backlog, so a held app
+    refuses a second bridge as busy. Its one instance is also busy for a
+    moment between two sessions, so the bridge retries a busy open for
+    250 ms first. A refusal that outlasts that gets the held answer, with
+    the refusal as its evidence and the Unix retry advice. It ends by
+    allowing that the app may instead be suspended or stuck and unable to
+    reopen its pipe, or that something other than a taria bridge holds it.
+  - **Silent, read as the app.** With no backlog, a connection that opens
+    and says nothing past the 500 ms grace is the app itself: it accepted
+    the connection N.Ns ago but has sent nothing, not even the taria
+    handshake, and may be suspended or stuck. The answer says this is not
+    another bridge, to check that the app is responsive, and failing that,
+    that what serves the pipe is not a taria adapter.
+  - **Foreign.** A pipe at the app's name that another account owns is not
+    the app's. The answer says so, that the bridge parsed nothing it sent
+    and wrote nothing to it, and to find what serves it. The log names the
+    owner.
+  - **Access denied.** A pipe that denies the bridge at the open is either
+    not the app's, or the app's and out of reach of a bridge with fewer
+    rights than the app's user: in a sandbox (a restricted token or an
+    AppContainer), at low integrity, or as another account. The answer
+    names both readings, says the bridge parsed and wrote nothing, and says
+    what to check.
+
+  Foreign and access denied come ahead of every other answer. They stand
+  over later busy refusals until a connect passes the owner check, finds
+  nothing listening, or the bridge lets go of the app after its idle
+  window. A bridge that let go reads its next busy refusal afresh, as the
+  app held, since the pipe it refused may have gone meanwhile.
+- **The other Windows answers name the pipe.** Where a Linux or macOS answer
+  says "socket" or "socket path" (or "path", inside the grace), the Windows
+  one says "pipe" or "pipe name". The Linux and macOS texts are unchanged,
+  byte for byte.
+- **Stopped-app detection stays Linux only.** It reads `/proc`. On Windows
+  an app suspended while its pipe listens gets the silent answer, with no
+  pid, and one suspended after a session gets the busy answer, which allows
+  for it. On macOS a stopped app still reads as held.
+
+### For a second implementer
+
+Typed state is the second addition to the wire since version 1 froze and the
+stamps the third. Both are optional fields, and the pipe changes no byte on
+the connection, so `PROTOCOL_VERSION` stays 1. `docs/protocol.md` sections
+16.8 and 16.9 say what an older peer does with each addition.
+
+- **Typed state** (sections 6.1 and 6.5). Each field is omitted when unset,
+  so a node that states nothing is the line 0.3.3 wrote, byte for byte.
+  Absent means not stated, never `false`. A field of the wrong type or shape
+  reads as not stated rather than failing the node, unlike `focused` and
+  `relayed`, and section 16.3 counts this as a fourth degrade fallback. Only
+  `"disabled":true` is ever sent, and numbers are finite. One tolerance is
+  gone: a 0.4.0 reader fails a line whose node repeats one of the new keys,
+  `"checked"` twice, with "duplicate field", where a 0.3.3 reader skipped
+  both copies as unknown. Section 2.2 already forbade repeating a key.
+- **Stamps** (sections 3.1, 5.1 and 5.3). An app whose hello says
+  `"stamps":true` stamps only inputs it dequeued, starts each connection
+  unstamped, and never skips a stamp: after a dequeue it sends the next tree
+  it builds even when identical, as the last snapshot again under the same
+  `seq` with only `after_input` moved. It sends at most one unstamped
+  snapshot after its first dequeue's ack and none after a stamped one, and
+  should send an `ignored` ack before the first snapshot after the dequeue.
+  A bridge should credit a tree to an input only once it is stamped at or
+  after that input's id in its own send order, compare on `root` and never
+  `seq`, take an earlier or unstamped tree as the new baseline, strip the
+  field, and read a peer that claims stamps and breaks these rules as one
+  that does not. Both fields read leniently: a wrong shape reads as absent.
+  `taria-mcp` now claims an id and queues its input under one lock, so
+  overlapping tool calls cannot put a higher id on the wire first.
+- **The Windows transport** (sections 2.1, 13.3, 14.5, 14.7 and 14.8). The
+  pipe is in byte mode and named `\\.\pipe\taria-<SID>-<label>`, the SID
+  read from the process token. `$TARIA_SOCK` is honoured only as a local
+  `\\.\pipe\` name, in any letter case, with one name after the prefix. A
+  label may not hold `\`, and the whole name is at most 256 UTF-16 code
+  units. The app creates the pipe as the first and only instance of its
+  name, rejecting remote clients, owned by the user with a DACL (the list of
+  who may open it) that grants only that user. The bridge checks the owner
+  before it writes anything or parses anything the pipe sent. When the open
+  itself is refused as access denied, the bridge treats the pipe as one it
+  cannot use. It does not conclude that an impostor serves it. A refused
+  pipe stands over later busy refusals until a connect passes the owner
+  check, finds nothing listening, or the bridge stops trying. Two retries
+  are SHOULDs: of a busy open (250 ms in the reference bridge), and of a
+  create that finds the name in use (500 ms in the reference adapter). The
+  conformance lists in sections 1.3 and 1.4 name the pipe's MUSTs.
+- **New in `taria`.** `Number` is a finite-only `f64` with `Eq` and `Hash`,
+  so `Node` and `Snapshot` keep `Eq`; it writes a whole number within 2^53
+  as an integer. `Checked` is `#[non_exhaustive]`, the twelfth type marked
+  so because a version-1 addition can reach it (protocol section 17). Both
+  deserialize strictly on their own, and the node's fields read them
+  leniently. `Snapshot::after_input` is set with `Snapshot::after(id)`, and
+  the hello's `stamps` with `AppToBridge::hello(..).stamps(true)`.
+  `Action::from_wire`, now public, and the new `Action::wire_name` map
+  between an action and its wire name, so a bridge written in Rust keeps no
+  copy of the names.
+- **`taria::socket` gains the pipe naming**, pure and built on every
+  platform: `pipe_name(label, sid)`, `check_pipe_name(name)`,
+  `resolve_pipe_name(taria_sock, sid, label)`, `LOCAL_PIPE_PREFIX`
+  (`\\.\pipe\`), `MAX_PIPE_NAME_CHARS` (256), and the `#[non_exhaustive]`
+  error `InvalidPipeName`, whose `Label`, `User`, `NotLocal`, `Name` and
+  `TooLong` each carry the value refused. On Windows `MAX_SOCKET_PATH_BYTES`
+  is the pipe-name limit, and `check_path_len` and
+  `SocketPathTooLong::path_len` count UTF-16 code units there.
+- **`Debug` everywhere.** `TariaMcpServer` and its builder implement it
+  (the server prints the tree format and the idle window it was built
+  with), and so do `TariaLayer`, `FrameRecorder` and `Semantic`, none of
+  which takes a lock to print.
+- **The docs.** Section 18's captures are taken again from the 0.4.0 demo,
+  and Appendix B items 12 and 13 list what nobody checks of typed state and
+  of stamps. `docs/architecture.md` maps taria to AccessKit 0.25, role by
+  role and field by field (taria counts positions from 1, AccessKit from 0),
+  and gains Transports: the seam that keeps each platform's transport
+  apart from the shared code, the overlapped (asynchronous) I/O design, the
+  two retries, and why the pipe is built on `windows-sys` rather than
+  `interprocess`.
+
+### The gates
+
+- `scripts/e2e.py` grows from 26 steps to 27, and `scripts/adversarial.py`
+  keeps its 24 probes. New step aa runs the demo with
+  `TARIA_DEMO_SLOW_MS=800` and holds three acts to their own answers, the
+  second of them the stamped "did not change". Steps that read a task's
+  done state or the active tab read `checked` and `selected`, and step v
+  checks the outline's marks. The adversarial stand-in apps do not stamp, so
+  every probe there reads the 0.3.3 answers.
+- New Rust tests pin a node without state to its 0.3.3 bytes and read
+  every state field in a wrong shape as not stated. Against a fake app that
+  stamps they cover a slow act, the 3 s cap, a late tree, bursts, `Ignored`
+  and racing ids; against one that does not, 0.3.3's answers byte for byte.
+- CI runs on three platforms. New macOS and Windows jobs run the Rust suites.
+  The macOS job also runs both Python scripts (the one probe that needs
+  `/proc` says it was skipped), and the Windows job runs clippy, builds and
+  tests. Every job builds with `--locked`. The Linux job adds clippy for the
+  Windows target and a docs build with warnings denied, and the MSRV job (the
+  oldest Rust the crates support) checks the Windows target too. The scripts
+  cannot run on Windows, which has no pseudo-terminal for the demo, no `/proc`
+  and no `AF_UNIX`.
+- New `crates/taria-mcp/tests/adapter_e2e.rs` runs a real `TariaLayer` in a
+  child process against the real `taria-mcp` binary over stdio, on every
+  platform: tools and acks, an act that changes nothing, a held app, idle
+  release, an app restarted under a new pid, and a second app refused. It is
+  the end-to-end gate on Windows. Tests of the pipe itself cover its owner and
+  DACL, busy, silent, foreign and denied pipes, both retries, the write
+  deadline, and each Windows answer byte for byte.
+- `scripts/wine-test.sh` runs the Windows build of the tests under Wine from
+  Linux (`CONTRIBUTING.md` lists what it needs). Wine is a stand-in; the
+  Windows CI job is the gate.
+
+### Upgrading
+
+| Was | Now |
+| --- | --- |
+| `taria::wire::InputId`, an alias of `u64` | a newtype: `InputId::new(n)` or `n.into()`, read with `.get()` or `u64::from(id)` |
+| `TariaLayer::drain_acking(f)` | `TariaLayer::drain(f)` |
+| `TariaLayer::drain(f)`, `f` returning nothing | `drain(f)`, `f` returning `InputStatus::Delivered` |
+| `try_recv()` and `try_recv_with_id()` | `try_recv()`, returning `Option<(InputId, AgentInput)>` |
+| `recv_timeout(t)` and `recv_timeout_with_id(t)` | `recv_timeout(t)`, returning `Option<(InputId, AgentInput)>` |
+| `drain_with_ids(f)` | `while let Some((id, input)) = layer.try_recv() { .. }` |
+| `dropped_inputs()`, `stale_inputs()`, `unknown_inputs()`, `dropped_acks()` | fields of the same names on `stats()` |
+| `truncated_snapshots()`, `last_truncation()`, `oversized_snapshots()`, `last_oversize()` | fields of the same names on `stats()` |
+| `taria_mcp::server::TariaMcpServer`, `taria_mcp::tree_format::TreeFormat`, `taria_mcp::args::DEFAULT_IDLE_RELEASE` | `taria_mcp::{TariaMcpServer, TreeFormat, DEFAULT_IDLE_RELEASE}` |
+| `TariaMcpServer::on_demand(socket, format, idle)` | `TariaMcpServer::builder(socket).tree_format(format).idle_release(idle).on_demand()?` |
+| `TariaMcpServer::new(h)` or `with_tree_format(h, format)`, with `h` from `bridge::spawn(socket)` | `TariaMcpServer::builder(socket).tree_format(format).connected()?` |
+| `server::parse_action(name)`, `server::action_name(&action)` | `taria::Action::from_wire(name)`, `action.wire_name()` |
+| the tool methods `read_tree`, `act`, `key` and `type_text`, their `*_tool_attr()` functions, and `ActParams`, `KeyParams`, `TypeTextParams` | rmcp's `ServerHandler`, through a `tools/call` request |
+| `bridge::{spawn, BridgeHandle, AppSnapshot, BridgeState, LinkState}` | none: the builder's `on_demand()` or `connected()` spawns the bridge |
+| `tree_format::outline(line)`, `TreeFormat::render(&snapshot)` | none |
+| `args::{parse, Cli, HELP, MAX_IDLE_RELEASE_SECS, resolve_socket_path}` | none: they are the binary's own (see the socket path note below) |
+| rmcp 3 | rmcp 3.8 or later, where `get_info()` returns a `ServerConfig` |
+
+- **`drain` is a new method under an old name.** It is 0.3's
+  `drain_acking`, so a 0.3 `drain` call still finds a `drain` and fails on
+  its closure (expected `InputStatus`, found `()`), not on a missing method.
+  Return `InputStatus::Delivered` from the closure for 0.3's behaviour.
+- **An `InputId` is no longer a number in Rust.** The JSON is the same bare
+  integer. A `tracing` field that logged the id as a number needs
+  `id = id.get()`.
+- **`Node::disabled` is a plain `bool`, unlike the other state fields.**
+  They are `Option`s, because for them absent means not stated. For
+  `disabled`, absent and `false` say the same thing, so the field reads
+  `false` for both, and for a value of any other shape. It is written only
+  when `true`, so the wire is as protocol section 6.5 states it.
+- **`taria-mcp` is reached through its root, and its tools through rmcp.**
+  Its modules are private, and `TariaMcpServer::builder` is the only way to
+  build a server: it returns a `TariaMcpServerBuilder`, finished with
+  `on_demand()` or `connected()`.
+  In-process tool calls, watching the bridge's state and rendering a saved
+  line are no longer possible from outside the crate. Each can come back as
+  an addition if someone needs it: open an issue.
+- **`on_demand()` and `connected()` return `std::io::Result`.** Outside a
+  tokio runtime they return an error, where 0.3.3's `on_demand` and
+  `bridge::spawn` panicked. On Windows a path that is not a local pipe name
+  is an `InvalidInput` error. `connected()` ignores `idle_release`: that
+  bridge never lets go.
+- **A path from `taria::socket::resolve_path` can differ from the
+  adapter's.** With `resolve_socket_path` gone, it is the public way to
+  derive one, and it takes the `user` string from the caller. The adapter
+  and the binary derive theirs privately: the uid on Linux (from
+  `/proc/self`), else `$USER`, else `$LOGNAME`, else `default`. The string
+  names only the temp-dir fallback, used when `$TARIA_SOCK` and
+  `$XDG_RUNTIME_DIR` are both unset or empty, so a caller passing `$USER`
+  gets a different fallback path on Linux than the adapter binds.
+
+The stamps break no build, but a 0.4.0 `taria-mcp` answers an app well only
+if its loop keeps three rules:
+
+- **Publish every frame, or at least once after every drain.** An input that
+  changes nothing is answered at once only when a tree stamped at it
+  arrives. The layer sends that tree for you, the last snapshot again with
+  its stamp moved, but only from a `publish` (or a `FrameRecorder` frame)
+  after the drain: it never republishes on its own. An app that publishes
+  only when its tree changed leaves each such input waiting out the 3 s,
+  then answered "published no tree after it". Let the layer skip identical
+  trees.
+- **Apply what you drained before the next publish.** The stamp covers the
+  dequeue, not the effect, so a loop that drains at the top, publishes, and
+  applies at the bottom hands the agent the tree from before its input. The
+  integration guide's drain section shows the loop to avoid.
+- **Ack `Ignored` inside the drain.** The first tree published after an
+  input is dequeued answers it, so an `ack(id, Ignored)` sent a frame later
+  reaches the bridge after the agent was answered. Return it from `drain`,
+  or ack from `try_recv` in the same pass. Where the verdict comes only
+  later, publish a status node in that first tree saying the input is under
+  way.
+
+And two for Rust peers and harnesses:
+
+- **`Snapshot` equality covers `after_input`.** `==` on two `Snapshot`s now
+  compares the stamp too, so a peer comparing whole snapshots reads the
+  stamp-only resend of an unchanged tree as a change. Compare `root`, or
+  `seq` and `root` together.
+- **A harness matching `did not change within` misses the stamped answer**,
+  which names no window. Match `The app received this input, and its tree
+  did not change`, which both answers start with.
+
 ## [0.3.3] - 2026-10-25
 
 **A node can say that its text is not the app's.** A node's label and value
@@ -939,6 +1358,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
+[0.4.0]: https://github.com/y0sif/taria/releases/tag/v0.4.0
 [0.3.3]: https://github.com/y0sif/taria/releases/tag/v0.3.3
 [0.3.2]: https://github.com/y0sif/taria/releases/tag/v0.3.2
 [0.3.1]: https://github.com/y0sif/taria/releases/tag/v0.3.1

@@ -1,11 +1,11 @@
 //! Message contract for the taria transport.
 //!
-//! Apps and the bridge exchange these messages over a Unix domain socket as
-//! newline-delimited JSON: each message is one JSON object serialized on a
-//! single line, terminated by `\n`. `serde_json` never emits raw newlines
-//! inside a compact object, so `serde_json::to_string` plus a trailing `\n`
-//! is a valid frame. This module defines only the types; transports own the
-//! actual I/O.
+//! Apps and the bridge exchange these messages over a Unix domain socket, or
+//! a named pipe on Windows, as newline-delimited JSON: each message is one
+//! JSON object serialized on a single line, terminated by `\n`. `serde_json`
+//! never emits raw newlines inside a compact object, so
+//! `serde_json::to_string` plus a trailing `\n` is a valid frame. This
+//! module defines only the types; transports own the actual I/O.
 //!
 //! Handshake: the first message an app sends after connecting is
 //! [`AppToBridge::Hello`], carrying its label and
@@ -41,6 +41,15 @@
 //! `Delivered` until the tree changes or its window closes, reading acks and
 //! snapshots in wire order, because an app writes an ack ahead of the snapshot
 //! it publishes next. [`InputStatus`] states the rule in full.
+//!
+//! An ack says the app took an input, and a snapshot arriving after it says
+//! nothing about whether the tree was published before or after that. An app
+//! that says `stamps` in its [`AppToBridge::Hello`] fills the gap: each of its
+//! snapshots names, in [`Snapshot::after_input`], the newest input it had
+//! dequeued when it published, and it sends an unchanged tree again when
+//! that moves. A bridge can then credit a tree to the input it was published
+//! after, however slow the app, and answer "did not change" as soon as that
+//! tree is unchanged.
 //!
 //! # Compatibility
 //!
@@ -92,7 +101,8 @@
 //! addition can reach is `#[non_exhaustive]`: those three, [`AgentInput`],
 //! [`Action`](crate::Action), [`Key`](crate::key::Key),
 //! [`Modifiers`](crate::key::Modifiers), [`KeyPress`](crate::key::KeyPress),
-//! [`Role`](crate::Role), [`Node`](crate::Node) and [`Snapshot`]. The key types
+//! [`Role`](crate::Role), [`Node`](crate::Node), [`Checked`](crate::Checked)
+//! and [`Snapshot`]. The key types
 //! are on that list even though a key travels as a string, because the string
 //! is parsed into them and an adapter takes the result by value. Marking them
 //! is itself a breaking
@@ -138,6 +148,8 @@
 //! one, because an old peer parses the message successfully and acts on the old
 //! meaning.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentInput, Snapshot};
@@ -162,7 +174,46 @@ pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// to a live input, so a bridge that restarts its ids per connection can
 /// resolve a waiter with a dead app's verdict. A monotonic counter owned by the
 /// process satisfies this.
-pub type InputId = u64;
+///
+/// On the wire it is a bare JSON integer, an unsigned 64-bit one: the newtype
+/// is `#[serde(transparent)]`, so it exists only in Rust, where it keeps an id
+/// from being mistaken for a `seq` or a count. Build one with
+/// [`new`](Self::new) or `From<u64>`, and read the number back with
+/// [`get`](Self::get).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InputId(u64);
+
+impl InputId {
+    /// Wrap a number as an input id.
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    /// The number this id carries on the wire.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for InputId {
+    fn from(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+impl From<InputId> for u64 {
+    fn from(id: InputId) -> Self {
+        id.0
+    }
+}
+
+/// Prints the bare number, as it appears on the wire.
+impl fmt::Display for InputId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
 
 /// Message sent from a TUI app to the bridge.
 ///
@@ -170,6 +221,13 @@ pub type InputId = u64;
 /// message variant additive, and that is only true on the wire: a bridge
 /// matches on this enum to dispatch every line it reads, so without the
 /// attribute the additive change breaks its build.
+///
+/// The [`Snapshot`](Self::Snapshot) variant holds its root by value and is a
+/// few hundred bytes since [`Node`](crate::Node) gained its typed state,
+/// which clippy flags beside a small [`Hello`](Self::Hello). Allowed rather
+/// than boxed: a message is parsed and taken apart at once, never stored in
+/// bulk, and a `Box` would change the variant every peer matches on.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 #[non_exhaustive]
@@ -178,13 +236,28 @@ pub enum AppToBridge {
     ///
     /// `#[non_exhaustive]`: build it with [`hello`](Self::hello) and
     /// destructure it with `..`, so a field added later (a capability list, a
-    /// process id) does not break the peer reading it.
+    /// process id) does not break the peer reading it, as `stamps` did not.
     #[non_exhaustive]
     Hello {
         /// Human-readable app name shown to agents (typically the binary name).
         app_label: String,
         /// The app's [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION).
         protocol_version: u32,
+        /// Whether this app stamps its snapshots with the newest input it
+        /// dequeued ([`Snapshot::after_input`]).
+        ///
+        /// A bridge reads it to know whether a tree with no stamp is one
+        /// published before any input was dequeued, or one from a peer that
+        /// never stamps, which it has to answer the way it answered every
+        /// peer before stamps existed. Sent only when true, and set with
+        /// [`stamps`](AppToBridge::stamps). Read leniently: anything but
+        /// `true` reads as a peer that does not stamp.
+        #[serde(
+            default,
+            deserialize_with = "crate::state::lenient_flag",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        stamps: bool,
     },
     /// A newly published state of the app's semantic tree.
     Snapshot(Snapshot),
@@ -199,6 +272,7 @@ pub enum AppToBridge {
     Ack {
         /// The [`InputId`] of the input being answered.
         id: InputId,
+        /// What became of that input; the last ack for an id wins.
         status: InputStatus,
     },
 }
@@ -216,7 +290,21 @@ impl AppToBridge {
         Self::Hello {
             app_label: app_label.into(),
             protocol_version,
+            stamps: false,
         }
+    }
+
+    /// Say in a [`Hello`](Self::Hello) whether the app stamps its snapshots;
+    /// chained onto [`hello`](Self::hello), which leaves it false:
+    /// `AppToBridge::hello("my-app", PROTOCOL_VERSION).stamps(true)`.
+    ///
+    /// Any other message is returned as it is, since only a hello carries
+    /// the flag.
+    pub fn stamps(mut self, stamps: bool) -> Self {
+        if let Self::Hello { stamps: flag, .. } = &mut self {
+            *flag = stamps;
+        }
+        self
     }
 
     /// Build an [`Ack`](Self::Ack) answering one input.
@@ -233,6 +321,14 @@ impl AppToBridge {
 /// [`Ignored`](Self::Ignored) once it turns out to have done nothing. Acks for
 /// one input reach the bridge in the order the app sent them, so the newest
 /// one received is the app's current answer.
+///
+/// The follow-up has a deadline: the first snapshot the app publishes after
+/// the dequeue. A bridge that reads the stamp
+/// ([`Snapshot::after_input`](crate::Snapshot::after_input)) answers on that
+/// snapshot, so an `Ignored` sent a frame later arrives after the agent has
+/// been told the input changed nothing (`docs/protocol.md` section 5.3). An
+/// app that can only decide later publishes a node saying the input is under
+/// way instead.
 ///
 /// A status name this build does not know fails the [`AppToBridge::Ack`]
 /// carrying it, and the reader skips that line. There is no fallback variant
@@ -291,6 +387,7 @@ pub enum BridgeToApp {
     Input {
         /// Identifier the app echoes in its [`AppToBridge::Ack`].
         id: InputId,
+        /// The agent input to apply.
         input: AgentInput,
     },
 }
@@ -325,10 +422,49 @@ mod tests {
         let msg = AppToBridge::Hello {
             app_label: "demo-app".into(),
             protocol_version: PROTOCOL_VERSION,
+            stamps: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"hello""#), "json: {json}");
         assert_eq!(roundtrip_app(&msg), msg);
+    }
+
+    /// A hello that does not stamp is the line 0.3.3 wrote, byte for byte,
+    /// and one that does adds the flag at the end.
+    #[test]
+    fn the_stamps_flag_is_sent_only_when_true() {
+        let line = |msg: &AppToBridge| serde_json::to_string(msg).unwrap();
+        assert_eq!(
+            line(&AppToBridge::hello("demo-app", 1)),
+            r#"{"type":"hello","app_label":"demo-app","protocol_version":1}"#
+        );
+        let stamping = AppToBridge::hello("demo-app", 1).stamps(true);
+        assert_eq!(
+            line(&stamping),
+            r#"{"type":"hello","app_label":"demo-app","protocol_version":1,"stamps":true}"#
+        );
+        assert_eq!(roundtrip_app(&stamping), stamping);
+        assert_eq!(
+            stamping.stamps(false),
+            AppToBridge::hello("demo-app", 1),
+            "the flag can be turned off again"
+        );
+        // Only a hello carries it.
+        let ack = AppToBridge::ack(InputId::new(1), InputStatus::Delivered);
+        assert_eq!(ack.clone().stamps(true), ack);
+    }
+
+    /// A flag of the wrong shape reads as a peer that does not stamp, rather
+    /// than failing the hello and the version and label it carries.
+    #[test]
+    fn a_wrong_shaped_stamps_flag_reads_as_false() {
+        for flag in ["\"yes\"", "1", "null", "[true]", "{}", "false"] {
+            let line = format!(
+                r#"{{"type":"hello","app_label":"a","protocol_version":1,"stamps":{flag}}}"#
+            );
+            let msg: AppToBridge = serde_json::from_str(&line).expect(&line);
+            assert_eq!(msg, AppToBridge::hello("a", 1), "{flag}");
+        }
     }
 
     #[test]
@@ -364,7 +500,7 @@ mod tests {
         ];
         for (id, input) in inputs.into_iter().enumerate() {
             let msg = BridgeToApp::Input {
-                id: id as InputId,
+                id: InputId::new(id as u64),
                 input,
             };
             let json = serde_json::to_string(&msg).unwrap();
@@ -376,13 +512,38 @@ mod tests {
     #[test]
     fn input_message_json_shape_is_stable() {
         let msg = BridgeToApp::Input {
-            id: 7,
+            id: InputId::new(7),
             input: AgentInput::Key { key: "q".into() },
         };
         assert_eq!(
             serde_json::to_string(&msg).unwrap(),
             r#"{"type":"input","id":7,"input":{"kind":"key","key":"q"}}"#
         );
+    }
+
+    #[test]
+    fn input_id_is_a_bare_number_on_the_wire() {
+        // The newtype is Rust-only: the JSON must be the integer it was when
+        // `InputId` was a type alias for `u64`, in both directions and across
+        // the whole range.
+        for n in [0, 1, 41, u64::MAX] {
+            let id = InputId::new(n);
+            assert_eq!(serde_json::to_string(&id).unwrap(), n.to_string());
+            assert_eq!(serde_json::from_str::<InputId>(&n.to_string()).unwrap(), id);
+            assert_eq!(id.get(), n);
+            assert_eq!(u64::from(id), n);
+            assert_eq!(InputId::from(n), id);
+            assert_eq!(id.to_string(), n.to_string());
+        }
+        assert_eq!(
+            serde_json::to_string(&AppToBridge::ack(InputId::new(7), InputStatus::Delivered))
+                .unwrap(),
+            r#"{"type":"ack","id":7,"status":"delivered"}"#
+        );
+        // What the protocol rejects, the newtype rejects too.
+        for bad in [r#""7""#, "7.0", "-1", "null"] {
+            assert!(serde_json::from_str::<InputId>(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -393,7 +554,10 @@ mod tests {
             (InputStatus::Ignored, "ignored"),
         ];
         for (status, name) in cases {
-            let msg = AppToBridge::Ack { id: 7, status };
+            let msg = AppToBridge::Ack {
+                id: InputId::new(7),
+                status,
+            };
             let json = serde_json::to_string(&msg).unwrap();
             assert_eq!(
                 json,
@@ -412,7 +576,7 @@ mod tests {
         assert_eq!(
             msg,
             AppToBridge::Ack {
-                id: 7,
+                id: InputId::new(7),
                 status: InputStatus::Delivered,
             }
         );
@@ -461,19 +625,20 @@ mod tests {
             AppToBridge::Hello {
                 app_label: "demo-app".into(),
                 protocol_version: 7,
+                stamps: false,
             }
         );
         assert_eq!(
-            AppToBridge::ack(9, InputStatus::Dropped),
+            AppToBridge::ack(InputId::new(9), InputStatus::Dropped),
             AppToBridge::Ack {
-                id: 9,
+                id: InputId::new(9),
                 status: InputStatus::Dropped,
             }
         );
         assert_eq!(
-            BridgeToApp::input(9, AgentInput::key("q")),
+            BridgeToApp::input(InputId::new(9), AgentInput::key("q")),
             BridgeToApp::Input {
-                id: 9,
+                id: InputId::new(9),
                 input: AgentInput::Key { key: "q".into() },
             }
         );
@@ -488,7 +653,7 @@ mod tests {
         // survives, and an ack becomes possible.
         let line = r#"{"type":"input","id":41,"input":{"kind":"paste","text":"hi","from":"clip"}}"#;
         let BridgeToApp::Input { id, input, .. } = serde_json::from_str(line).unwrap();
-        assert_eq!(id, 41);
+        assert_eq!(id, InputId::new(41));
         assert_eq!(input, AgentInput::Unknown);
 
         // And that is the ack: the app truly did nothing with the input.

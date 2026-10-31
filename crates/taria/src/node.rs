@@ -5,6 +5,7 @@ use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::Action;
+use crate::state::{self, Checked, Number};
 
 /// Stable identifier for a node within one app run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -29,9 +30,13 @@ pub struct NodeId(pub String);
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Role {
+    /// The application root.
     App,
+    /// A region of the screen.
     Pane,
+    /// A flat collection of rows; it reports where a cursor sits.
     List,
+    /// One row of a [`List`](Self::List).
     ListItem,
     /// Hierarchical collection: a file browser, a repository's working tree, a
     /// database schema sidebar. Choose this over [`List`](Self::List) when an
@@ -43,11 +48,17 @@ pub enum Role {
     /// One entry in a [`Tree`](Self::Tree), with its own entries as children,
     /// so the shape of the node tree is the shape of the widget's.
     TreeItem,
+    /// A table of [`Row`](Self::Row)s.
     Table,
+    /// One row of a [`Table`](Self::Table).
     Row,
+    /// One cell of a [`Row`](Self::Row).
     Cell,
+    /// A field the app types into.
     TextInput,
+    /// A control whose primary action is to be pressed.
     Button,
+    /// A two-state control, whose state goes in [`Node::checked`].
     Checkbox,
     /// A control that holds one choice out of a fixed set: a dropdown, a radio
     /// group, a settings picker. Choose this over [`List`](Self::List) when
@@ -60,13 +71,16 @@ pub enum Role {
     /// [`ListItem`](Self::ListItem) because activating it sets the parent's
     /// value rather than moving a cursor within it.
     Option,
+    /// A tab bar holding [`Tab`](Self::Tab) children.
     Tabs,
+    /// One tab in a [`Tabs`](Self::Tabs) bar.
     Tab,
     /// A reference to somewhere else: an OSC 8 terminal hyperlink, or a path,
     /// URL or issue number the app opens when it is activated. Put the
     /// destination in the node's value, so an agent can read where it leads
     /// without following it.
     Link,
+    /// Static text.
     Text,
     /// Append-only stream of lines: command output, a journal tail, a model's
     /// streaming response. Distinct from [`Text`](Self::Text) because the
@@ -88,6 +102,8 @@ pub enum Role {
     /// rendering is unreadable to an agent, so put the numbers that carry the
     /// meaning (the latest sample, the peak, the unit) in the node's value.
     Chart,
+    /// Progress as a known fraction of a known total, stated with
+    /// [`Node::range`].
     ProgressBar,
     /// A transient notice: a spinner, a throbber, a toast, a "saving" line
     /// that appears and clears itself. Distinct from
@@ -103,9 +119,14 @@ pub enum Role {
     /// is the only thing telling an agent that the pane it just read has more
     /// content past the edge. Put the position in the node's value.
     Scrollbar,
+    /// A dialog, typically modal.
     Dialog,
+    /// A menu holding [`MenuItem`](Self::MenuItem) children.
     Menu,
+    /// One entry in a [`Menu`](Self::Menu).
     MenuItem,
+    /// Nothing in the vocabulary fits, or the reader does not know the role
+    /// name that was sent.
     Other,
 }
 
@@ -272,21 +293,40 @@ impl Error for TreeTooDeep {}
 /// One widget in the semantic tree.
 ///
 /// `#[non_exhaustive]` because a node is where new optional fields land, as
-/// `relayed` did, and an optional field is the cheapest additive change the
-/// format has. Nothing outside this crate loses anything to it:
-/// [`new`](Self::new) plus the chainable setters below already reach every
-/// field, so a struct literal was never the way to build one.
+/// `relayed` did in 0.3.3 and the typed state, `description` and `selected`
+/// through `column_count`, did in 0.4.0, and an optional field is the
+/// cheapest additive change the format has. Nothing outside this crate loses
+/// anything to it: [`new`](Self::new) plus the chainable setters below
+/// already reach every field, so a struct literal was never the way to build
+/// one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Node {
+    /// Identifier, unique within one snapshot and stable across snapshots
+    /// for as long as it names the same thing.
     pub id: NodeId,
+    /// What the widget is.
     pub role: Role,
     /// Human-readable label (list title, button text, input placeholder).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Current value (input contents, selected item, checkbox state).
+    /// Current value (input contents, a list's selected item, a select's
+    /// choice). A checkbox's state goes in [`checked`](Self::checked), and a
+    /// number in [`value_now`](Self::value_now).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Longer text than the label, in the app's own words: a hint, what a
+    /// setting does, why a button is disabled.
+    ///
+    /// Never relayed text: [`relayed`](Self::relayed) covers the label and
+    /// the value only, so text from outside the app goes in a child marked
+    /// relayed, never here.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_text",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<String>,
     /// Whether a raw key would land on this node.
     ///
     /// `#[serde(default)]` and still always serialized, so nothing on the
@@ -315,9 +355,123 @@ pub struct Node {
     /// fails the line as a malformed `focused` does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relayed: bool,
+    /// Whether this node is selected among its siblings: the row a list's
+    /// cursor sits on, the active tab, the chosen option, or each of the rows
+    /// picked in a list that allows more than one. Selection, not focus: a
+    /// cursor sits on a row whether or not the list holds the keyboard.
+    ///
+    /// This field and every one after it, up to `actions`, came in 0.4.0. Each
+    /// is omitted when unset, absence means not stated, never `false` (but for
+    /// [`disabled`](Self::disabled), where the two say the same), and a value
+    /// of the wrong type or shape reads as not stated rather than failing the
+    /// node.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub selected: Option<bool>,
+    /// Whether a checkable node is checked.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_checked",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub checked: Option<Checked>,
+    /// Whether an expandable node is expanded: `Some(false)` is collapsed.
+    /// `None` says nothing; an app that states expansion leaves it unset
+    /// only where a node cannot expand.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expanded: Option<bool>,
+    /// Whether the node is disabled: shown, but accepting no action until the
+    /// app enables it. Only `true` is a statement, so only `true` is ever
+    /// sent, and absence, `false`, `null` and a value of any other shape all
+    /// read as `false`, which says the node is not marked, without failing
+    /// the node.
+    ///
+    /// It covers this node alone, as [`relayed`](Self::relayed) does:
+    /// children do not inherit it. The reference adapter strips every action
+    /// from a disabled node when it publishes, and the reference bridge
+    /// refuses `act` on one. An empty action list alone never means disabled.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_flag",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub disabled: bool,
+    /// A numeric value: a progress bar's, a slider's, a gauge's.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_number",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub value_now: Option<Number>,
+    /// The least [`value_now`](Self::value_now) can be.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_number",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub value_min: Option<Number>,
+    /// The most [`value_now`](Self::value_now) can be.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_number",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub value_max: Option<Number>,
+    /// This item's position in its set, counting from 1, published or not:
+    /// row 40 of 1000 is 40 even when only rows 31 to 60 are published.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_position",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pos_in_set: Option<u32>,
+    /// How many items this container holds, published or not, on a list, a
+    /// tree, a tree item, tabs, a select or a menu.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_count",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub set_size: Option<u32>,
+    /// The row a table row or cell is in, counting from 1.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_position",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub row: Option<u32>,
+    /// The column a table cell is in, counting from 1.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_position",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub column: Option<u32>,
+    /// How many rows a table holds, published or not.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_count",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub row_count: Option<u32>,
+    /// How many columns a table holds, published or not.
+    #[serde(
+        default,
+        deserialize_with = "state::lenient_count",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub column_count: Option<u32>,
     /// Actions an agent may invoke on this node right now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<Action>,
+    /// Child nodes, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Node>,
 }
@@ -331,8 +485,22 @@ impl Node {
             role,
             label: None,
             value: None,
+            description: None,
             focused: false,
             relayed: false,
+            selected: None,
+            checked: None,
+            expanded: None,
+            disabled: false,
+            value_now: None,
+            value_min: None,
+            value_max: None,
+            pos_in_set: None,
+            set_size: None,
+            row: None,
+            column: None,
+            row_count: None,
+            column_count: None,
             actions: Vec::new(),
             children: Vec::new(),
         }
@@ -359,6 +527,81 @@ impl Node {
     /// Set whether this node's label and value come from outside the app.
     pub fn relayed(mut self, relayed: bool) -> Self {
         self.relayed = relayed;
+        self
+    }
+
+    /// Set whether this node is selected among its siblings.
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = Some(selected);
+        self
+    }
+
+    /// Set whether this node is checked; a `bool` converts.
+    pub fn checked(mut self, checked: impl Into<Checked>) -> Self {
+        self.checked = Some(checked.into());
+        self
+    }
+
+    /// Set whether this expandable node is expanded (`false` is collapsed).
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = Some(expanded);
+        self
+    }
+
+    /// Mark this node disabled, or with `false` clear the mark.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Set a description in the app's own words, never relayed text.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set a numeric value and its bounds; one that is not finite, such as
+    /// an infinite bound, is left unstated. A value with no bounds is
+    /// [`value_now`](Self::value_now()).
+    pub fn range(mut self, now: f64, min: f64, max: f64) -> Self {
+        self.value_now = Number::new(now);
+        self.value_min = Number::new(min);
+        self.value_max = Number::new(max);
+        self
+    }
+
+    /// Set a numeric value alone, leaving the bounds as they are; one that
+    /// is not finite clears it. For a count or a reading with no range, where
+    /// [`range`](Self::range) would have to invent bounds.
+    pub fn value_now(mut self, now: f64) -> Self {
+        self.value_now = Number::new(now);
+        self
+    }
+
+    /// Set this item's 1-based position in its set; 0 leaves it unstated.
+    pub fn pos_in_set(mut self, pos: u32) -> Self {
+        self.pos_in_set = (pos > 0).then_some(pos);
+        self
+    }
+
+    /// Set how many items this container holds, published or not.
+    pub fn set_size(mut self, size: u32) -> Self {
+        self.set_size = Some(size);
+        self
+    }
+
+    /// Set a table row's or cell's 1-based row and column; 0 leaves one
+    /// unstated, as a row passes for its column.
+    pub fn cell(mut self, row: u32, column: u32) -> Self {
+        self.row = (row > 0).then_some(row);
+        self.column = (column > 0).then_some(column);
+        self
+    }
+
+    /// Set how many rows and columns this table holds, published or not.
+    pub fn table_size(mut self, rows: u32, columns: u32) -> Self {
+        self.row_count = Some(rows);
+        self.column_count = Some(columns);
         self
     }
 
@@ -660,6 +903,222 @@ mod tests {
         }
         let json = r#"{"id":"n","role":"text","relayed":false}"#;
         assert!(!serde_json::from_str::<Node>(json).unwrap().relayed);
+    }
+
+    /// A node that sets none of the 0.4.0 fields is the line 0.3.3 wrote,
+    /// byte for byte: every one of them is omitted when unset, and the
+    /// fields before them keep their order. Pinned literally, since a field
+    /// that went out as `null` or `false` would change every snapshot an
+    /// older peer reads.
+    #[test]
+    fn a_node_without_state_serializes_exactly_as_before() {
+        let node = Node::new("tasks", Role::List)
+            .label("Active tasks")
+            .value("task-1")
+            .focused(true)
+            .actions([Action::Select, Action::Custom("archive".into())])
+            .child(Node::new("task-1", Role::ListItem).label("Buy milk"));
+        assert_eq!(
+            serde_json::to_string(&node).unwrap(),
+            r#"{"id":"tasks","role":"list","label":"Active tasks","value":"task-1","focused":true,"actions":["select",{"custom":"archive"}],"children":[{"id":"task-1","role":"list_item","label":"Buy milk","focused":false}]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Node::new("n", Role::Text)).unwrap(),
+            r#"{"id":"n","role":"text","focused":false}"#
+        );
+        // `disabled(false)` and a 0 position are unset, not spelled out.
+        let unset = Node::new("n", Role::Text)
+            .disabled(false)
+            .pos_in_set(0)
+            .cell(0, 0);
+        assert_eq!(unset, Node::new("n", Role::Text));
+    }
+
+    /// Every state field set, in the order they go out: the description with
+    /// the text, then the state after `relayed`, then the actions and the
+    /// children as before.
+    #[test]
+    fn every_state_field_goes_out_in_order_and_comes_back() {
+        let node = Node::new("n", Role::ListItem)
+            .label("Build")
+            .value("ok")
+            .description("Runs the build")
+            .selected(false)
+            .checked(Checked::Mixed)
+            .expanded(true)
+            .disabled(true)
+            .range(42.0, 0.0, 100.5)
+            .pos_in_set(3)
+            .set_size(7)
+            .cell(2, 3)
+            .table_size(50, 4)
+            .action(Action::Select);
+        let json = serde_json::to_string(&node).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"n","role":"list_item","label":"Build","value":"ok","description":"Runs the build","focused":false,"selected":false,"checked":"mixed","expanded":true,"disabled":true,"value_now":42,"value_min":0,"value_max":100.5,"pos_in_set":3,"set_size":7,"row":2,"column":3,"row_count":50,"column_count":4,"actions":["select"]}"#
+        );
+        let back: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, node);
+        assert_eq!(back.value_now.map(Number::get), Some(42.0));
+        assert_eq!(back.checked, Some(Checked::Mixed));
+
+        // Both booleans are statements, `false` included, and so is a
+        // checked `false`.
+        let unchecked = Node::new("n", Role::Checkbox).checked(false);
+        assert!(
+            serde_json::to_string(&unchecked)
+                .unwrap()
+                .contains(r#""checked":false"#)
+        );
+    }
+
+    /// Only `true` is a statement for `disabled`: it is the only value sent,
+    /// so no peer ever reads `"disabled":false`, and on the way in `false`,
+    /// `null`, absence and any other shape all read as `false` without
+    /// failing the node.
+    #[test]
+    fn disabled_is_only_ever_true() {
+        assert_eq!(
+            serde_json::to_string(&Node::new("n", Role::Button).disabled(true)).unwrap(),
+            r#"{"id":"n","role":"button","focused":false,"disabled":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Node::new("n", Role::Button).disabled(false)).unwrap(),
+            r#"{"id":"n","role":"button","focused":false}"#
+        );
+
+        let node: Node =
+            serde_json::from_str(r#"{"id":"n","role":"button","disabled":true}"#).unwrap();
+        assert!(node.disabled);
+        for value in ["false", "null", r#""true""#, "1", "[true]", "{}"] {
+            let json = format!(r#"{{"id":"n","role":"button","label":"kept","disabled":{value}}}"#);
+            let node: Node = serde_json::from_str(&json)
+                .unwrap_or_else(|err| panic!("{json} must parse: {err}"));
+            assert_eq!(node, Node::new("n", Role::Button).label("kept"), "{json}");
+        }
+        let node: Node = serde_json::from_str(r#"{"id":"n","role":"button"}"#).unwrap();
+        assert!(!node.disabled);
+    }
+
+    /// A number that is not finite is never stored, so it can never reach
+    /// the wire, which cannot spell it, and never sits in a tree that then
+    /// compares unequal to itself.
+    #[test]
+    fn range_leaves_a_number_that_is_not_finite_unstated() {
+        let node = Node::new("n", Role::ProgressBar).range(f64::NAN, 0.0, f64::INFINITY);
+        assert_eq!(node.value_now, None);
+        assert_eq!(node.value_min.map(Number::get), Some(0.0));
+        assert_eq!(node.value_max, None);
+        assert_eq!(node, node.clone(), "a tree with state still equals itself");
+        assert_eq!(
+            serde_json::to_string(&node).unwrap(),
+            r#"{"id":"n","role":"progress_bar","focused":false,"value_min":0}"#
+        );
+    }
+
+    /// `value_now` sets the value and nothing else: bounds already stated
+    /// stay, none are invented, and a value that is not finite clears the
+    /// one stated before it.
+    #[test]
+    fn value_now_sets_the_value_alone() {
+        let node = Node::new("n", Role::ProgressBar).value_now(42.5);
+        assert_eq!(node.value_now.map(Number::get), Some(42.5));
+        assert_eq!((node.value_min, node.value_max), (None, None));
+        assert_eq!(
+            serde_json::to_string(&node).unwrap(),
+            r#"{"id":"n","role":"progress_bar","focused":false,"value_now":42.5}"#
+        );
+
+        let node = Node::new("n", Role::ProgressBar)
+            .range(1.0, 0.0, 10.0)
+            .value_now(7.0);
+        assert_eq!(node.value_now.map(Number::get), Some(7.0));
+        assert_eq!(node.value_min.map(Number::get), Some(0.0));
+        assert_eq!(node.value_max.map(Number::get), Some(10.0));
+
+        for not_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let node = Node::new("n", Role::ProgressBar)
+                .value_now(3.0)
+                .value_now(not_finite);
+            assert_eq!(node.value_now, None, "{not_finite}");
+        }
+    }
+
+    /// The leniency the 0.4.0 fields get: a value of the wrong type or shape
+    /// reads as not stated, and the node, with everything else it says, is
+    /// kept. `null` reads as absent too.
+    #[test]
+    fn a_state_field_in_the_wrong_shape_reads_as_not_stated() {
+        let wrong: [(&str, &[&str]); 14] = [
+            ("selected", &[r#""yes""#, "1", "null", "[true]", "{}"]),
+            ("checked", &["2", r#""true""#, r#""Mixed""#, "null", "[]"]),
+            ("expanded", &[r#""no""#, "0", "null"]),
+            ("disabled", &[r#""true""#, "1", "null", "{}"]),
+            ("description", &["5", "true", "null", r#"["a"]"#]),
+            (
+                "value_now",
+                &[r#""42""#, "true", "null", "[1]", r#"{"n":1}"#],
+            ),
+            ("value_min", &[r#""0""#, "null"]),
+            ("value_max", &[r#""NaN""#, r#""inf""#, "null"]),
+            (
+                "pos_in_set",
+                &["-1", "0", "1.5", "3.0", r#""3""#, "4294967296"],
+            ),
+            ("set_size", &["-1", "2.5", r#""7""#, "4294967296"]),
+            ("row", &["-2", "0", "true"]),
+            ("column", &["0", "-3", "null"]),
+            ("row_count", &["-50", "1e3"]),
+            ("column_count", &["-4", r#"{"n":4}"#]),
+        ];
+        for (field, values) in wrong {
+            for value in values {
+                let json = format!(
+                    r#"{{"id":"n","role":"checkbox","label":"kept","{field}":{value},"focused":true}}"#
+                );
+                let node: Node = serde_json::from_str(&json)
+                    .unwrap_or_else(|err| panic!("{json} must parse: {err}"));
+                assert_eq!(
+                    node,
+                    Node::new("n", Role::Checkbox).label("kept").focused(true),
+                    "{json}"
+                );
+            }
+        }
+
+        // And inside a whole snapshot line, where the node is buffered
+        // before it is read: the snapshot survives, the field does not.
+        use crate::wire::AppToBridge;
+        let line = r#"{"type":"snapshot","protocol_version":1,"seq":2,"root":{"id":"app","role":"app","children":[{"id":"c","role":"checkbox","checked":2,"row":-1,"selected":"yes","value_now":"NaN"},{"id":"d","role":"checkbox","checked":"mixed","row":4,"selected":true,"value_now":-0.0}]}}"#;
+        let Ok(AppToBridge::Snapshot(snapshot)) = serde_json::from_str(line) else {
+            panic!("the line must parse");
+        };
+        let [bad, good] = snapshot.root.children.as_slice() else {
+            panic!("two children");
+        };
+        assert_eq!(*bad, Node::new("c", Role::Checkbox));
+        assert_eq!(good.checked, Some(Checked::Mixed));
+        assert_eq!(good.row, Some(4));
+        assert_eq!(good.selected, Some(true));
+        assert_eq!(good.value_now.map(Number::get), Some(0.0));
+    }
+
+    /// The widest values each field takes, so the leniency is not narrower
+    /// than the type.
+    #[test]
+    fn a_state_field_takes_its_whole_range() {
+        let node: Node = serde_json::from_str(
+            r#"{"id":"n","role":"table","set_size":0,"row_count":4294967295,"column_count":0,"pos_in_set":4294967295,"value_now":-1.5e300,"value_min":-9223372036854775808,"value_max":18446744073709551615}"#,
+        )
+        .unwrap();
+        assert_eq!(node.set_size, Some(0));
+        assert_eq!(node.row_count, Some(u32::MAX));
+        assert_eq!(node.column_count, Some(0));
+        assert_eq!(node.pos_in_set, Some(u32::MAX));
+        assert_eq!(node.value_now.map(Number::get), Some(-1.5e300));
+        assert_eq!(node.value_min.map(Number::get), Some(-9.223372036854776e18));
+        assert_eq!(node.value_max.map(Number::get), Some(1.8446744073709552e19));
     }
 
     /// A chain of `depth` nodes, one child each: the root is `n1` and the

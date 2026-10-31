@@ -6,16 +6,21 @@
 //! the app is let go of again once no tool call has run for the idle window
 //! (60 s by default), so a session that has gone quiet does not lock every
 //! other session out of the app. See
-//! [`TariaMcpServer::on_demand`](taria_mcp::server::TariaMcpServer::on_demand).
+//! [`TariaMcpServerBuilder::on_demand`](taria_mcp::TariaMcpServerBuilder::on_demand).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use rmcp::ServiceExt;
-use taria_mcp::args;
-use taria_mcp::server::TariaMcpServer;
-use taria_mcp::tree_format::TreeFormat;
+use taria_mcp::{TariaMcpServer, TreeFormat};
+
+mod args;
+// This user's SID, for `--app`: the library's own reader, compiled into the
+// binary as well, so the library need not export it.
+#[cfg(windows)]
+#[path = "transport/windows_sid.rs"]
+mod windows_sid;
 
 fn main() -> ExitCode {
     let cli = match args::parse(std::env::args().skip(1)) {
@@ -34,15 +39,7 @@ fn main() -> ExitCode {
             socket,
             tree_format,
             idle_release,
-            ..
         } => (socket, tree_format, idle_release),
-        // `Cli` is `#[non_exhaustive]` for the library's callers. This binary
-        // ships with the parser, so the arm is unreachable; a variant added
-        // without handling it here is a usage error rather than a panic.
-        other => {
-            eprintln!("taria-mcp: unsupported command line: {other:?}");
-            return ExitCode::from(2);
-        }
     };
 
     init_tracing();
@@ -80,7 +77,10 @@ async fn run(
         taria_protocol = taria::PROTOCOL_VERSION,
         "taria-mcp starting; connecting to the app on the first tool call"
     );
-    let service = TariaMcpServer::on_demand(socket, tree_format, idle_release)
+    let service = TariaMcpServer::builder(socket)
+        .tree_format(tree_format)
+        .idle_release(idle_release)
+        .on_demand()?
         .serve(rmcp::transport::stdio())
         .await?;
     service.waiting().await?;

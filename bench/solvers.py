@@ -152,9 +152,13 @@ class TariaSolver:
 # `key=<compact json>` fields, then one node per line, indented two spaces
 # per level,
 #
-#   <id> <role>[ "<label>"][ = "<value>"][ *focused][ <key>=<json> ...][ act: <action>|<action>...]
+#   <id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <marks>][ <key>=<json> ...][ act: <action>|<action>...]
 #
 # for example `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`.
+# The marks are the typed state 0.4.0 added: `*selected`, `*checked=false`,
+# `*checked=mixed`, `*expanded`, `*disabled`, `*num=42[0..100]`, `*pos=3`,
+# `*size=7`, `*row=2 *col=3`, `*rows=50 *cols=4`; a `*` is never bare
+# otherwise, so a token starting with one is a mark.
 # An id, role, action or key is bare when made only of [A-Za-z0-9_.:/@+-] and
 # not the marker `act:` itself, and JSON-quoted otherwise; label and value are
 # always JSON-quoted. The actions end the line, after the bare marker `act: `,
@@ -168,6 +172,11 @@ class TariaSolver:
 # of the current grammar starts with `[`, so the two cannot be confused.
 
 BARE_RE = re.compile(r"[A-Za-z0-9_.:/@+-]+")
+MARK_RE = re.compile(r"\*([a-z]+)(?:=([^ ]*))?")
+NUM_RE = re.compile(r"([^\[]*)(?:\[([^.\]]*)\.\.([^\]]*)\])?")
+# A mark that takes `=<whole number>`, and the field it is read into.
+WHOLE_MARKS = {"pos": "pos_in_set", "size": "set_size", "row": "row", "col": "column",
+               "rows": "row_count", "cols": "column_count"}
 ACT_MARKER = "act:"
 _DECODER = json.JSONDecoder()
 
@@ -227,6 +236,31 @@ def _action_list(line, pos):
         pos += 1
 
 
+def _mark(line, pos):
+    """({field: value} for one `*mark` at `pos`, the position after it), read
+    back into the JSON tree's fields."""
+    match = MARK_RE.match(line, pos)
+    if match is None:
+        raise SolverError(f"bad mark at column {pos} of outline line {line!r}")
+    name, arg = match.group(1), match.group(2)
+    try:
+        if name in ("focused", "relayed", "disabled") and arg is None:
+            return {name: True}, match.end()
+        if name in ("selected", "expanded", "checked") and arg in (None, "false"):
+            return {name: arg is None}, match.end()
+        if name == "checked" and arg == "mixed":
+            return {name: "mixed"}, match.end()
+        if name == "num" and arg is not None:
+            parts = NUM_RE.fullmatch(arg)
+            fields = dict(zip(("value_now", "value_min", "value_max"), parts.groups()))
+            return {k: json.loads(v) for k, v in fields.items() if v}, match.end()
+        if name in WHOLE_MARKS and arg is not None:
+            return {WHOLE_MARKS[name]: int(arg)}, match.end()
+    except (AttributeError, ValueError):
+        pass
+    raise SolverError(f"unknown mark {match.group(0)!r} in outline line {line!r}")
+
+
 def _node_line(line):
     """One node line, indent stripped, as the JSON tree's node dict (no children)."""
     node, pos = {}, 0
@@ -252,7 +286,7 @@ def _node_line(line):
             if line.startswith("=", end):
                 key, value, pos = _field(line, pos)
                 node[key] = value
-            elif len(node) == 2:
+            elif set(node) <= {"id", "role", "relayed"}:
                 node["label"], pos = text, end
             else:
                 raise SolverError(f"a quoted {text!r} at column {pos} of outline line {line!r} is "
@@ -272,8 +306,9 @@ def _node_line(line):
                 node["actions"], pos = actions, pos + 1
             else:
                 node["actions"], pos = _action_list(line, pos + len(ACT_MARKER) + 1), len(line)
-        elif line.startswith("*focused", pos) and line[pos + 8:pos + 9] in ("", " "):
-            node["focused"], pos = True, pos + 8
+        elif line.startswith("*", pos):
+            fields, pos = _mark(line, pos)
+            node.update(fields)
         else:
             key, value, pos = _field(line, pos)
             node[key] = value

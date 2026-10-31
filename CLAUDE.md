@@ -1,8 +1,9 @@
 # taria
 
 Agent accessibility layer for TUIs (ARIA for terminals): protocol + ratatui
-adapter + MCP bridge. Pre-alpha; the vertical slice (adapter + bridge +
-demo) works end to end. Wire format frozen at `PROTOCOL_VERSION` 1.
+adapter + MCP bridge. Alpha at 0.4.0: adapter, bridge and demo work end to
+end on Linux, macOS and Windows, but few apps use it yet and the Rust API
+may still change in a 0.x minor. Wire format frozen at `PROTOCOL_VERSION` 1.
 
 ## Commands
 
@@ -11,14 +12,23 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
-python3 scripts/e2e.py                      # end-to-end gate, 26 steps
+python3 scripts/e2e.py                      # end-to-end gate, 27 steps
 python3 scripts/adversarial.py              # edge-case probes, 24 of them
+scripts/wine-test.sh --workspace            # Windows build of the tests, Wine
 ```
 
-Run all six before pushing. CI runs the same gate with `cargo build
---workspace` in place of `cargo check`. Both scripts build the debug binaries
-they test; `--no-build` skips the build and keeps the freshness check, which
-refuses a `target/debug` older than the sources.
+Run the first six before pushing. CI runs the same gate with `cargo build
+--workspace` in place of `cargo check`, on Linux, plus clippy for the
+Windows target and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+--workspace`; macOS runs the tests and both scripts, and Windows clippy, the
+tests and the build (the scripts need a pty, `/proc` and `AF_UNIX`, so
+`crates/taria-mcp/tests/adapter_e2e.rs` is the Windows end-to-end gate).
+Both scripts build the debug binaries they test; `--no-build` skips the
+build and keeps the freshness check, which refuses a `target/debug` older
+than the sources. `scripts/wine-test.sh` cross-compiles for
+`x86_64-pc-windows-gnu` and runs each test binary under Wine; it needs
+`mingw-w64-gcc`, `wine` and that rustup target. Wine is a stand-in: the
+Windows CI job is the word that counts.
 
 ## Architecture
 
@@ -27,104 +37,152 @@ refuses a `target/debug` older than the sources.
   messages, `InputId`, `InputStatus`, and `MAX_LINE_BYTES`, the 1 MiB line
   limit both peers enforce), and three modules both peers share: `key` (the
   key-string grammar), `IdSpace` (prefixed node ids, re-exported at the root),
-  `socket` (path resolution, plus the per-platform AF_UNIX path limit: 107
-  bytes on Linux, 103 on macOS and the BSDs, and a label that is not a plain
-  file name is refused). No I/O, no framework deps, exactly one dependency
-  (serde); `serde_json` is dev-only. 29 roles, 7 actions plus `Custom`, whose
-  envelope folds back onto the built-ins on the way in. Version 1 is frozen:
-  additive changes only (new optional fields, new message variants, new roles
-  and actions, which peers degrade to `other` / `Custom` instead of failing
-  the snapshot). The eleven types such an addition can reach are
-  `#[non_exhaustive]`, and so are the six struct-like variants inside them
-  (`AppToBridge::Hello`/`Ack`, `BridgeToApp::Input`, `AgentInput::Act`/`Key`/
-  `Text`), which is why peers build through constructors and destructure with
-  `..`; `AgentInput::Unknown` is the `#[serde(other)]` fallback that keeps an
-  unreadable input's id, so it can still be acked. So additive on the wire is
-  additive in Rust too. `MAX_NODE_DEPTH` is 32, against a measured ceiling of
-  63 nested nodes before a JSON parser refuses; `Node::check_depth` reports a
-  violation and names a node at the offending depth. Anything else bumps
-  `PROTOCOL_VERSION`. The one field added since version 1 froze in 0.1.0 is
-  `relayed` (0.3.3, issue #6): a node marks its label and value as text from
-  outside the app, data and never instructions; strictly per node, never
-  inherited, and absent means not marked, not vouched for.
-- `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket, refuses a
-  label that is not a plain file name (it binds and unlinks what the label
-  resolves to), vets the socket directory, and serves one bridge client at a
-  time from background threads (listener plus per-connection reader/writer).
+  `socket` (path resolution and per-platform endpoint limits: the AF_UNIX
+  path limit, 107 bytes on Linux and 103 on macOS and the BSDs, and on
+  Windows the pipe name, `\\.\pipe\taria-<SID>-<label>` from `pipe_name`,
+  `resolve_pipe_name` for `$TARIA_SOCK` first, `check_pipe_name` refusing
+  anything but a local `\\.\pipe\` name in any case, 256 UTF-16 units in
+  all, which is what `MAX_SOCKET_PATH_BYTES` means there; a label that is not
+  a plain file name is refused, and on Windows one holding `\` too). These
+  are pure and tested on every platform. No I/O, no framework deps, exactly
+  one dependency (serde); `serde_json` is dev-only. 29 roles, 7 actions plus
+  `Custom`, whose envelope folds back onto the built-ins on the way in.
+  Version 1 is frozen: additive changes only (new optional fields, new
+  message variants, new roles and actions, which peers degrade to `other` /
+  `Custom` instead of failing the snapshot). The twelve types such an
+  addition can reach are `#[non_exhaustive]`, and so are the six struct-like
+  variants inside them (`AppToBridge::Hello`/`Ack`, `BridgeToApp::Input`,
+  `AgentInput::Act`/`Key`/`Text`), which is why peers build through
+  constructors and destructure with `..`; `AgentInput::Unknown` is the
+  `#[serde(other)]` fallback that keeps an unreadable input's id, so it can
+  still be acked. So additive on the wire is additive in Rust too.
+  `MAX_NODE_DEPTH` is 32, against a measured ceiling of 63 nested nodes before a
+  JSON parser refuses; `Node::check_depth` reports a violation and names a node
+  at the offending depth. Anything else bumps `PROTOCOL_VERSION`. Version 1 has
+  had three additions since it froze in 0.1.0. First `relayed` (0.3.3, issue
+  #6): a node marks its label and value as text from outside the app, data and
+  never instructions; strictly per node, never inherited, and absent means not
+  marked, not vouched for. Then typed state (0.4.0), flat optional node fields:
+  `selected`, `checked` (`true`, `false` or `"mixed"`, `taria::Checked`),
+  `expanded`, `disabled` (only `true` is sent), `description` (the app's own
+  words, never relayed text), `value_now`/`value_min`/`value_max`
+  (`taria::Number`, finite only, so `Node` keeps `Eq`), `pos_in_set`/`set_size`,
+  `row`/`column` and `row_count`/`column_count` (positions from 1). Absent means
+  not stated, never `false`, and a wrong shape reads as not stated rather than
+  failing the node (`relayed` stays strict). Hidden has no field: it is not
+  published. A node setting none of them serializes as in 0.3.3. Then stamps
+  (0.4.0, issue #17): `Snapshot::after_input`, the newest input the app had
+  dequeued on the connection, written before `root` and omitted when unset, and
+  `stamps: true` on the hello (`.stamps(true)`); both read leniently.
+- `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket or, on
+  Windows, its named pipe, refuses a label that is not a plain file name (it
+  binds and unlinks what the label resolves to), vets the socket directory,
+  and serves one bridge client at a time from background threads (listener
+  plus per-connection reader/writer). The platform half sits behind
+  `transport/` (`Listener`, `Connection`, `Reader`, `Writer`,
+  `user_identity`); the Windows half is hand-rolled on `windows-sys`
+  (overlapped I/O, a closed event per session; see docs/architecture.md,
+  Transports): one instance, `FILE_FLAG_FIRST_PIPE_INSTANCE`,
+  `PIPE_REJECT_REMOTE_CLIENTS`, owned by the user with a DACL granting only
+  that user, reused across sessions, closed and never disconnected at
+  shutdown; a name in use is retried for 500 ms (`BIND_RETRY`), since a
+  bridge still holding a just-exited app's end keeps the name taken, then
+  is `AddrInUse`, as on Unix.
   `bind_or_disabled` never fails, so taria cannot block startup; the layer
   never prints (the app reports `bind_error()` outside the alternate screen).
-  Nodes come from `publish(nodes)` or `FrameRecorder`/`sem`; identical trees
-  are deduped. Input arrives via
-  `drain_acking`/`drain`/`drain_with_ids`/`try_recv`/`recv_timeout`, acked
-  `Delivered` on dequeue, `Dropped` when the queue is full, and `Ignored`
-  when the app says so, by returning it from `drain_acking` or calling `ack`.
-  The wildcard arm `#[non_exhaustive]` forces on a `match` over `AgentInput`
-  is the arm that swallows `Text`; the demo carries
-  `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are flushed
-  before the snapshot published after them, from a bounded queue that drops
-  its oldest, and once more at shutdown, within `SHUTDOWN_FLUSH` (250 ms).
-  Inputs are tagged with their connection's generation and discarded (not
+  Nodes come from `publish(nodes)` or `FrameRecorder`/`sem`; a node marked
+  `disabled` is published with no actions (no counter); identical trees are
+  deduped, except that after a dequeue the latest snapshot is sent again,
+  uncut and under the same `seq`, with only its stamp moved. Every snapshot is
+  stamped with the newest input `drain`/`try_recv`/`recv_timeout` handed over
+  on the live connection (dropped, unknown, stale and pre-hello inputs never
+  stamp), a new connection's first snapshot is unstamped, and the hello says
+  `stamps: true`. Input arrives via `drain`/`try_recv`/`recv_timeout` (the
+  last two hand over the `InputId`), acked `Delivered` on dequeue, `Dropped`
+  when the queue is full, and `Ignored` when the app says so, by returning it
+  from `drain` or calling `ack`, before its next publish: the first tree
+  after a dequeue answers the input, so a later `Ignored` is too late. The
+  wildcard arm `#[non_exhaustive]` forces on a `match` over `AgentInput` is
+  the arm that swallows `Text`; the demo carries
+  `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are
+  flushed before the snapshot published after them, from a bounded queue that
+  drops its oldest, and once more at shutdown, within `SHUTDOWN_FLUSH` (250
+  ms). Inputs are tagged with their connection's generation and discarded (not
   applied) once that connection ends, and `ack` refuses an id whose connection
   is gone. Input written before the `hello` is discarded unacked, but only
   from a client that waited in the backlog behind the previous session. Each
-  line written gets 5 s in all (`WRITE_TIMEOUT`), so a stuck bridge is
-  dropped and `Drop` stays bounded. Four counters of lost agent traffic:
-  `dropped_inputs()`, `stale_inputs()` (both discards), `unknown_inputs()`,
-  `dropped_acks()`. A tree over `MAX_NODE_DEPTH` is cut branch-wise at publish
-  rather than withheld (a withheld tree leaves the agent on a stale one),
-  reported via `truncated_snapshots()`/`last_truncation()`; then a tree over
-  `MAX_LINE_BYTES` is trimmed to fit (nodes that can never fit, then the
-  longest strings, then trailing nodes; ids and custom action names never
-  change), reported via `oversized_snapshots()`/`last_oversize()`. Both count
-  snapshots sent, not frames, and an unchanged frame skips both cuts. Binding
-  unlinks only a socket nothing is listening on, refuses a live one so a
-  second instance cannot steal it, and the listener polls a shutdown flag so
-  exit never waits on a connection.
+  line written gets 5 s in all (`WRITE_TIMEOUT`), so a stuck bridge is dropped
+  and `Drop` stays bounded. Four counters of lost agent traffic, fields of the
+  `LayerStats` that `stats()` returns: `dropped_inputs`, `stale_inputs` (both
+  discards), `unknown_inputs`, `dropped_acks`. A tree over `MAX_NODE_DEPTH` is
+  cut branch-wise at publish rather than withheld (a withheld tree leaves the
+  agent on a stale one), reported via `truncated_snapshots`/`last_truncation`;
+  then a tree over `MAX_LINE_BYTES` is trimmed to fit (nodes that can never
+  fit, then the longest strings, then trailing nodes; ids and custom action
+  names never change), reported via `oversized_snapshots`/`last_oversize`.
+  Both count snapshots sent, not frames, and an unchanged frame skips both
+  cuts. Binding unlinks only a socket nothing is listening on, refuses a live
+  one so a second instance cannot steal it, and the listener polls a shutdown
+  flag so exit never waits on a connection.
 - `crates/taria-mcp`: rmcp stdio server exposing
   `read_tree`/`act`/`key`/`type_text`. A socket-manager task holds the latest
   snapshot in a watch channel and rebroadcasts acks. The binary connects on
-  demand (`TariaMcpServer::on_demand`): nothing until the first tool call
-  (`initialize` and `tools/list` open nothing), which waits briefly (at most
-  1.2 s) for the `hello` and the tree; then it reconnects with capped backoff
-  while tool calls want the app, and after 60 s with no tool calls
-  (`--idle-release`, plain digits from 0 to 86400, `0` never) closes the
-  connection or leaves the backlog and stops reconnecting, but not while an
-  input awaits its ack, for up to 30 s past the window. `bridge::spawn`
-  still connects at once and never lets go, and
-  `TariaMcpServer::new`/`with_tree_format` serve such a handle as in 0.3.1.
-  That is the fix for issue #13: the adapter serves one bridge at a time and
-  a repo `.mcp.json` starts one in every session. A snapshot is kept as the
-  app's own line (minus the `type` framing key) beside the parse of it: the
-  line is what the agent reads, so an unknown role, action or field survives
-  by name; the parse is what the bridge validates and diffs against.
-  `--tree-format outline` (default `json`) renders that line as one indented
-  line per node (a relayed node prints `*relayed` before its label, and `*`
-  is never bare otherwise, so the mark cannot be forged) for every tree an
-  agent receives, with action names taken from the parse because that is
-  what `act` checks, and swaps only the format passages of the instructions
-  and of the `read_tree` and `act` descriptions.
-  Those texts are short because they are resent with every model call: no
-  parameter is described but `repeat`'s default, the `{"custom":...}` rule is
-  in `act`'s description only, and a test pins both modes' text byte for byte.
-  The input tools promise the tree only if it changed: three answers that are
-  not errors carry a note and no tree. `act` validates node ids and advertised
-  actions and bounds `value` (4096 chars), `key` parses the shared grammar and
-  bounds `repeat` (1-64), `type_text` bounds the payload (4096 chars). Results
-  are anchored on the app's ack, not on whatever the tree did: dropped,
-  ignored, delivered-and-changed, delivered-and-unchanged, no ack, partial
-  burst, lost acks, and the app disconnecting. A protocol mismatch keeps
-  `read_tree` for as long as the peer's snapshots parse, and refuses every
-  input tool. When lines from the app were rejected, `read_tree` says the
-  socket path is right and quotes the reason rather than sending an adopter
-  back to check the path. A line over `MAX_LINE_BYTES` ends the connection and
-  leaves the reason `OVERSIZED_LINE`, kept across reconnects until a snapshot
-  parses or a connect finds nothing listening; while it holds, every answer
-  names the 1 MiB limit instead of "may have exited". A bridge locked out by
-  another (waiting in the backlog, or the loser of the reconnect race when the
-  app restarts) is told the app is "held by another bridge" and that a
-  taria-mcp lets go after 60 s with no tool calls, so the agent retries. A
-  bridge that had the app and reconnects answers from the new link, after the
-  same "disconnected (last snapshot seq N)" opening: greeted with no tree yet,
+  demand (`TariaMcpServer::builder(..).on_demand()`): nothing until the first
+  tool call (`initialize`, `tools/list` and the stateless lifecycle's
+  `server/discover` open nothing), which waits briefly (at most 1.2 s) for the
+  `hello` and the tree; then it reconnects with capped backoff while tool
+  calls want the app, and after 60 s with no tool calls (`--idle-release`,
+  plain digits from 0 to 86400, `0` never) closes the connection or leaves the
+  backlog and stops reconnecting, but not while an input awaits its ack, for
+  up to 30 s past the window. Connecting on demand and letting go when idle is
+  the fix for issue #13: the adapter serves one bridge at a time and a repo
+  `.mcp.json` starts one in every session.
+  `TariaMcpServer::builder(..).connected()` connects at once and never lets
+  go, as every bridge before 0.3.2 did. A snapshot is kept as the app's own
+  line (minus the `type` framing key) beside the parse of it: the line is what
+  the agent reads, so an unknown role, action or field survives by name; the
+  parse is what the bridge validates and diffs against. `--tree-format
+  outline` (default `json`) renders that line as one indented line per node (a
+  relayed node prints `*relayed` before its label, typed state prints as marks
+  after `*focused`, `*selected`, `*checked=false`, `*num=42[0..100]`, and `*`
+  is never bare otherwise, so no mark can be forged) for every tree an agent
+  receives, with action names taken from the parse because that is what `act`
+  checks, and swaps only the format passages of the instructions and of the
+  `read_tree` and `act` descriptions. Those texts are short because they are
+  resent with every model call: no parameter is described but `repeat`'s
+  default, the `{"custom":...}` rule is in `act`'s description only, and a
+  test pins both modes' text byte for byte. The input tools promise the tree
+  only if it changed: three answers that are not errors carry a note and no
+  tree. `act` validates node ids, refuses a node marked `disabled` before
+  resolving the action (never inferred from an empty action list), validates
+  advertised actions and bounds `value` (4096 chars), `key` parses the shared
+  grammar and bounds `repeat` (1-64), `type_text` bounds the payload (4096
+  chars). Results are anchored on the app's ack, not on whatever the tree did:
+  dropped, ignored, delivered-and-changed, delivered-and-unchanged, no ack,
+  partial burst, lost acks, and the app disconnecting. Against a peer whose
+  hello says `stamps`, a tree is credited to an input only once stamped at or
+  after its id (ids are claimed and queued under one lock, so id order is send
+  order), compared on `root`; an earlier-stamped tree is the new baseline, an
+  unchanged credited tree answers "did not change." at once, and the cap is
+  3 s (`SETTLE_WAIT`), `Ignored` at the first credited tree, or 500 ms past
+  its ack, within the 3 s. A disconnect mid-wait is answered within 500 ms
+  of it, inside the cap; a peer that says `stamps` but sends unstamped
+  snapshots is read by the unstamped rules for the rest of the connection (a
+  changed tree is credited), with a warning logged. Any other peer keeps
+  the 500 ms window (`UPDATE_WAIT`) and 0.3.3's texts byte for byte. The stamp
+  is stripped like `type`. A protocol mismatch keeps `read_tree` for as long as
+  the peer's snapshots parse, and refuses every input tool. When lines from
+  the app were rejected, `read_tree` says the socket path is right and quotes
+  the reason rather than sending an adopter back to check the path. A line
+  over `MAX_LINE_BYTES` ends the connection and leaves the reason
+  `OVERSIZED_LINE`, kept across reconnects until a snapshot parses or a
+  connect finds nothing listening; while it holds, every answer names the 1
+  MiB limit instead of "may have exited". A bridge locked out by another
+  (waiting in the backlog, or the loser of the reconnect race when the app
+  restarts) is told the app is "held by another bridge" and that a taria-mcp
+  lets go after 60 s with no tool calls, so the agent retries. A bridge that
+  had the app and reconnects answers from the new link, after the same
+  "disconnected (last snapshot seq N)" opening: greeted with no tree yet,
   retry and the first snapshot is served; no handshake inside the 500 ms
   grace, worth one retry; past it, held. Only a link that is down still reads
   "it may have exited", byte for byte as in 0.3.1. A connect forgets every
@@ -142,19 +200,45 @@ refuses a `target/debug` older than the sources.
   app resumes within the window plus 30 s of the last tool call, since a
   bridge that lets go leaves the adapter to discard it. An app that never
   sends `hello` is held to the `protocol_version` its first snapshot states.
+  On Windows (`transport/windows.rs`) it opens the pipe with tokio's client
+  and refuses one whose owner is not its own token's SID
+  (`Refusal::Foreign`: "not the app's", the owner logged) or whose open is
+  denied (`Refusal::Denied`: not the app's, or a bridge with fewer rights
+  than the app's user, sandboxed, low integrity or another account; the
+  answer names both and what to check); nothing such a pipe sent is parsed
+  and nothing written. Either stands over later busy refusals until a
+  connect passes the owner check, finds nothing listening, or the bridge
+  releases (`forget_refusal`). `--app` derives the name from that SID
+  (`transport/windows_sid.rs`, compiled into the binary too by `#[path]`,
+  so the SID is not a public item), and `--socket` takes only a local pipe
+  name. A pipe has no backlog (`BACKLOG` false): a busy open is retried for
+  250 ms (`BUSY_RETRY`, the gap between two sessions), then a held app's
+  refusal (`Refusal::Busy`) is answered "held by another bridge" with "the
+  app's pipe refused this bridge as busy" as the evidence, and a connection
+  silent past the grace is the app "suspended or stuck", not held. A
+  foreign or denied pipe outranks every answer. The answers shared with
+  Unix say "pipe" and "pipe name" where Unix says "socket" and "socket
+  path" (`ENDPOINT`/`ENDPOINT_ADDRESS`). The pid comes from
+  `GetNamedPipeServerProcessId`; stopped-app detection stays Linux only.
+  Linux and macOS texts are unchanged.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
-  identities (`IdSpace`), stable across deletes and restarts; the list
-  publishes its selection as its own value; chords are never treated as the
-  plain key they contain. Typed text is routed to the new-task input and
-  `Ignored` elsewhere. The input advertises `Focus` while the keyboard is
-  elsewhere, `Dismiss` while it holds it, and `Activate` only while the draft
-  would submit, and a `quit` node advertises the way out of the app, so every
-  state an agent can enter has an advertised way out; acts on nodes that are
-  gone (the dialog's, a deleted task) report `Ignored`. Submitting switches
-  to the tab the new task landed on, so the effect is in the next snapshot.
+  identities (`IdSpace`), stable across deletes and restarts; a task's done
+  state is `checked`, the cursor row and the active tab are `selected`, and
+  the list and the tab bar still name them in their values, for the bench;
+  chords are never treated as the plain key they contain. Typed text is
+  routed to the new-task input and `Ignored` elsewhere. The input
+  advertises `Focus` while the keyboard is elsewhere, `Dismiss` while it
+  holds it, and `Activate` only while the draft would submit, and a `quit`
+  node advertises the way out of the app, so every state an agent can enter
+  has an advertised way out; acts on nodes that are gone (the dialog's, a
+  deleted task) report `Ignored`. Submitting switches to the tab the new
+  task landed on, so the effect is in the next snapshot.
   At exit it prints every nonzero layer counter. The draft is published
   whole on purpose: e2e step w grows it past 1 MiB to make the adapter trim.
+  `TARIA_DEMO_SLOW_MS=<n>` holds each agent input `n` ms between its dequeue
+  and its effect, so issue #17 reproduces; e2e step aa runs the demo at 800
+  and holds three acts to their own answers.
   `tree.rs` and `update.rs` are pure and unit-tested, including the
   one-focused-node and modal-dialog invariants.
 

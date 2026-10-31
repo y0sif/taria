@@ -43,18 +43,38 @@ INVALID_PARAMS = -32602  # JSON-RPC code the bridge rejects bad arguments with
 SOURCE_ROOTS = ("crates", "examples", "Cargo.toml", "Cargo.lock")
 SOURCE_SUFFIXES = (".rs", ".toml", ".lock")
 
-# The five shapes an input-sending tool (act / key / type_text) can answer
-# with, as of the v0.1 ack protocol. Matched by prefix, verbatim: an agent
-# reads these strings, so a reworded one is a behaviour change this script has
-# to notice rather than absorb.
+# The six shapes an input-sending tool (act / key / type_text) can answer
+# with, as of the v0.1 ack protocol and the 0.4.0 stamps. Matched by prefix,
+# verbatim: an agent reads these strings, so a reworded one is a behaviour
+# change this script has to notice rather than absorb.
 IGNORED_PREFIX = (
     "The app received this input and deliberately did nothing with it "
     "(for example an act a modal dialog blocks or naming a node it no "
     "longer knows, a set_value carrying no value, or text sent while "
     "nothing is accepting typing). Re-plan from the current tree below."
 )
-NO_CHANGE_PREFIX = "The app received this input, and its tree did not change within"
+# The no-change answer has two endings: " within 500ms. ..." from a peer that
+# does not stamp its snapshots, and a bare "." from one that does, the demo
+# among them (issue #17). The prefix stops before either.
+NO_CHANGE_PREFIX = "The app received this input, and its tree did not change"
+# The exact no-change answer from a peer that stamps, which step aa holds the
+# demo to: a tree stamped at the input arrived, and it was the same tree.
+NO_CHANGE_STAMPED = "The app received this input, and its tree did not change."
+# A peer that stamps acknowledged the input and published no tree after it
+# within the bridge's 3 s window: a slow handler, or an app that publishes
+# only on change. No step expects it of the demo, which publishes every frame.
+NO_TREE_PREFIX = "The app received this input but published no tree after it within"
 NO_ACK_PREFIX = "The app neither acknowledged this input nor changed its tree within"
+# The same silence from a peer that stamps, the demo among them: it acks every
+# input it dequeues, so the answer does not say it may not report acks, and
+# a burst whose first presses were acknowledged says how many were.
+NO_ACK_STAMPED_PREFIX = (
+    "The app neither acknowledged this input nor published a tree after it within"
+)
+NO_ACK_STAMPED_BURST_RE = re.compile(
+    r"The app acknowledged \d+ of the \d+ inputs this call sent, then neither "
+    r"acknowledged the last nor (published a tree after it|changed its tree) within"
+)
 # An input the app took delivery of and did not survive. A result rather than
 # an error, because the input's fate is known and an advertised `quit` reaches
 # this state on purpose; the shape exists so a working quit is not reported as
@@ -209,7 +229,10 @@ def parse_result(text):
       "ignored"   the app acked Ignored; the tree to re-plan from follows
                   the note on the second line
       "no_change" the app acked Delivered but published nothing new
-      "no_ack"    no ack and no new tree inside the bridge's window
+      "no_tree"   the app acked Delivered and, though it stamps its trees,
+                  published none after the input inside the bridge's window
+      "no_ack"    no ack and no new tree inside the bridge's window (for a
+                  burst to a peer that stamps: no ack for its last input)
       "gone"      the app acked the input and then disconnected; no tree,
                   because the app it would describe is gone
 
@@ -231,7 +254,13 @@ def parse_result(text):
             )
     if text.startswith(NO_CHANGE_PREFIX):
         return "no_change", None
-    if text.startswith(NO_ACK_PREFIX):
+    if text.startswith(NO_TREE_PREFIX):
+        return "no_tree", None
+    if (
+        text.startswith(NO_ACK_PREFIX)
+        or text.startswith(NO_ACK_STAMPED_PREFIX)
+        or NO_ACK_STAMPED_BURST_RE.match(text)
+    ):
         return "no_ack", None
     if text.startswith(GONE_PREFIX):
         return "gone", None
@@ -261,7 +290,7 @@ def response_text(resp):
 class PtyApp:
     """taria-demo running headless under a pty."""
 
-    def __init__(self, sock_path):
+    def __init__(self, sock_path, extra_env=None):
         self.sock_path = sock_path
         self.master, slave = pty.openpty()
         # Both fds are owned from here on, so every exit from this block has
@@ -274,8 +303,12 @@ class PtyApp:
             # Give the pty a sane size so ratatui has an area to draw into.
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
             env = dict(os.environ)
+            # The demo's own knobs are the caller's to set, never the shell's:
+            # an exported TARIA_DEMO_SLOW_MS would slow every step but aa.
+            env.pop("TARIA_DEMO_SLOW_MS", None)
             env["TARIA_SOCK"] = sock_path
             env.setdefault("TERM", "xterm-256color")
+            env.update(extra_env or {})
             self.proc = subprocess.Popen(
                 [DEMO_BIN],
                 stdin=slave,
@@ -700,6 +733,11 @@ def show_tab(client, tab_id):
         f"selected {tab_id}, but the tabs node reads "
         f"{find(tree, 'tabs').get('value')!r}, expected {TAB_LABELS[tab_id]!r}",
     )
+    flags = {tab: find(tree, tab).get("selected") for tab in TAB_LABELS}
+    require(
+        flags == {tab: tab == tab_id for tab in TAB_LABELS},
+        f"selected {tab_id}, but the tabs' selected flags read {flags}",
+    )
     return tree
 
 
@@ -785,14 +823,36 @@ def step_c_act_select(client, ctx):
         after == target and after != before,
         f"focus went {before} -> {after}, expected {target}",
     )
+    # The cursor row says so with `selected`, and every other row says it is
+    # not: the typed state, beside the list's value naming the same row.
+    flags = {row["id"]: row.get("selected") for row in task_items(tree)}
+    require(
+        flags.pop(target, None) is True and all(flag is False for flag in flags.values()),
+        f"after select {target}, the rows' selected flags read {flags}",
+    )
+    require(
+        find(tree, "tasks").get("value") == target,
+        f"the list's value is {find(tree, 'tasks').get('value')!r}, expected {target}",
+    )
     ctx["snapshot"] = tree
     ctx["selected"] = target
-    return f"focus {before} -> {after}"
+    return f"focus {before} -> {after}, selected moved with it"
+
+
+def done_state(node):
+    """A task row's done state as the demo publishes it: `checked`, true or
+    false, never absent on a row."""
+    checked = node.get("checked")
+    require(
+        isinstance(checked, bool),
+        f"{node.get('id')} has checked {checked!r}, expected true or false",
+    )
+    return "done" if checked else "todo"
 
 
 def step_d_act_toggle(client, ctx):
     target = ctx["selected"]
-    before_val = find(ctx["snapshot"], target)["value"]
+    before_val = done_state(find(ctx["snapshot"], target))
     require(before_val == "todo", f"{target} starts as {before_val!r}, expected todo")
 
     # Toggle: the task flips to done and therefore moves to the Done tab.
@@ -804,9 +864,9 @@ def step_d_act_toggle(client, ctx):
     tree = show_tab(client, "tab-done")
     node = find(tree, target)
     require(node is not None, f"{target} not found on the Done tab after toggle")
-    require(node["value"] == "done", f"{target} value {node['value']!r}, expected done")
+    require(done_state(node) == "done", f"{target} is {done_state(node)!r}, expected done")
 
-    # Toggle back: value returns to todo (visible again on the Active tab).
+    # Toggle back: checked returns to false (visible again on the Active tab).
     tree = act(client, target, "toggle")
     require(
         find(tree, target) is None,
@@ -815,7 +875,7 @@ def step_d_act_toggle(client, ctx):
     tree = show_tab(client, "tab-active")
     node = find(tree, target)
     require(node is not None, f"{target} not back on the Active tab")
-    require(node["value"] == "todo", f"{target} value {node['value']!r}, expected todo")
+    require(done_state(node) == "todo", f"{target} is {done_state(node)!r}, expected todo")
     one_focused(tree, "after toggle round-trip")
     ctx["snapshot"] = tree
     return f"{target}: todo -> done -> todo"
@@ -842,7 +902,7 @@ def step_e_add_task(client, ctx):
         f"expected exactly one node labelled {title!r} after activate, got "
         f"{len(added)}: {[n['id'] for n in added]}",
     )
-    require(added[0]["value"] == "todo", "new task should start as todo")
+    require(done_state(added[0]) == "todo", "new task should start as todo")
     require(
         find(tree, "input")["value"] in (None, ""),
         "input should clear after submitting",
@@ -966,7 +1026,7 @@ def step_i_type_text(client, ctx):
         node["id"] not in before_ids,
         f"{node['id']} existed before type_text; no new task was created",
     )
-    require(node["value"] == "todo", f"typed task value {node['value']!r}, expected todo")
+    require(done_state(node) == "todo", f"typed task is {done_state(node)!r}, expected todo")
     require(
         find(tree, "input")["value"] in (None, ""),
         "input should clear after the typed newline submits it",
@@ -1792,6 +1852,106 @@ def step_u_dropped_counter(ctx):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# How long step aa's demo holds each agent input before applying it
+# (`TARIA_DEMO_SLOW_MS`): past the 500 ms a bridge gives a peer that does not
+# stamp, well inside the 3 s it gives one that does.
+SLOW_MS = 800
+# The bridge's cap on a wait for a peer that stamps (`SETTLE_WAIT`), in s.
+SETTLE_S = 3.0
+
+
+def step_aa_slow_handler_credited(ctx):
+    """An input the app takes 800 ms over is answered with its own tree.
+
+    Issue #17. The bridge used to wait a fixed 500 ms for a tree that
+    differed, so a slower handler read as "did not change" and its tree
+    landed in the next call's window, credited to that input instead. The
+    demo now stamps every snapshot with the newest input it dequeued, and the
+    bridge credits a tree only to the input it is stamped at.
+
+    A demo of its own, started with `TARIA_DEMO_SLOW_MS`, which holds each
+    input that long between the dequeue (and its `delivered` ack) and the
+    effect. Three acts, each on the tree the one before it answered with:
+
+    - selecting the Done tab answers with the tree showing Done, no sooner
+      than the handler's 800 ms;
+    - selecting it again changes nothing, and is answered "did not change"
+      as soon as the stamped tree is in, not at the bridge's 3 s cap;
+    - selecting Active answers with Active: its own effect, not the one
+      before it, which is what the late tree used to be credited as.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="taria-e2e-slow-")
+    sock = os.path.join(tmpdir, "slow.sock")
+    app = None
+    client = None
+    slow = SLOW_MS / 1000
+    try:
+        app = PtyApp(sock, extra_env={"TARIA_DEMO_SLOW_MS": str(SLOW_MS)})
+        require(app.wait_for_socket(), f"the slow demo never bound {sock}")
+        client = McpClient(sock)
+        client.initialize()
+        tree = client.read_tree()
+        require(
+            find(tree, "tabs")["value"] == "Active",
+            f"the slow demo should open on Active: {find(tree, 'tabs')}",
+        )
+
+        timings = []
+        for tab, label in (("tab-done", "Done"), ("tab-done", None), ("tab-active", "Active")):
+            started = time.monotonic()
+            text = client.call_raw("act", {"node": tab, "action": "select"})
+            took = time.monotonic() - started
+            timings.append(took)
+            kind, after = parse_result(text)
+            require(
+                took >= slow,
+                f"act select {tab} answered after {took:.3f}s, sooner than the "
+                f"{SLOW_MS} ms the demo holds the input: {text[:160]}",
+            )
+            if label is None:
+                require(
+                    text == NO_CHANGE_STAMPED,
+                    f"re-selecting the tab on screen should read as no change "
+                    f"from a demo that stamps; answered {kind!r}: {text[:200]}",
+                )
+                # A bridge that waited out its cap answers at 3 s or later
+                # with these same words, so the bound has to sit under the
+                # cap; anything under it says the answer came on the stamped
+                # tree. The quarter second short of it is all the margin the
+                # check needs, and leaves a slow runner almost 2 s past the
+                # handler's 0.8 s for the frame and the round trip.
+                require(
+                    took < SETTLE_S - 0.25,
+                    f"the unchanged act took {took:.3f}s: the bridge waited out "
+                    "its cap instead of answering on the stamped tree",
+                )
+                continue
+            require(
+                kind == "tree",
+                f"act select {tab} answered {kind!r} after {took:.3f}s; the tree "
+                f"published after the {SLOW_MS} ms handler belongs in this "
+                f"act's own answer: {text[:200]}",
+            )
+            require(
+                find(after, "tabs")["value"] == label,
+                f"act select {tab} answered with the tabs reading "
+                f"{find(after, 'tabs')['value']!r}: the tree is another input's",
+            )
+        return (
+            f"{SLOW_MS} ms handler: select Done -> Done tree in {timings[0]:.2f}s, "
+            f"again -> no change in {timings[1]:.2f}s, select Active -> Active "
+            f"tree in {timings[2]:.2f}s"
+        )
+    finally:
+        if client is not None:
+            client.close()
+            if client.proc.poll() is None:
+                client.proc.kill()
+        if app is not None:
+            app.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def split_outside_strings(text, sep):
     """`text` split at every `sep` that is not inside a JSON string."""
     parts, part, in_string, escaped = [], "", False, False
@@ -1921,6 +2081,21 @@ def step_v_outline_format(ctx):
                 for line in after
             ),
             f"{target} is not the focused row after select:\n{answer}",
+        )
+        # The typed state prints as marks: the cursor row alone `*selected`,
+        # the others `*selected=false`, and every active task `*checked=false`.
+        marks = {
+            line.split()[0]: [t for t in outline_tokens(line) if t.startswith("*")]
+            for line in after
+            if re.match(r"^    task-\S+ list_item ", line)
+        }
+        require(
+            all(
+                ("*selected" if node == target else "*selected=false") in found
+                and "*checked=false" in found
+                for node, found in marks.items()
+            ),
+            f"the task rows' state marks after select {target}: {marks}",
         )
 
         def node_line(outline, depth, node_id):
@@ -2863,7 +3038,7 @@ def main():
         ("a tools/list exact", step_a_tools_list),
         ("b read_tree shape", step_b_read_tree),
         ("c act select moves focus", step_c_act_select),
-        ("d act toggle flips value", step_d_act_toggle),
+        ("d act toggle flips checked", step_d_act_toggle),
         ("e set_value+activate adds task", step_e_add_task),
         ("f custom delete dialog + cancel", step_f_dialog),
         ("g error messages", step_g_errors),
@@ -2973,6 +3148,9 @@ def main():
             ("x a bridge never called leaves the app free", step_x_unused_bridge_takes_nothing),
             ("y an idle bridge hands the app over", step_y_idle_bridge_hands_over),
             ("z restart race: the loser is told held", step_z_restart_race_loser_is_held),
+            # Issue #17, on a demo of its own for the same reason as u: its
+            # demo is slowed on purpose, and no other step should be.
+            ("aa a slow handler's tree answers its own act", step_aa_slow_handler_credited),
         ):
             try:
                 evidence = fn(ctx)

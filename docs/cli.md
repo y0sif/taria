@@ -9,7 +9,9 @@ taria-mcp --help            Show help
 ```
 
 Exactly one of `--socket` or `--app` is required. Any usage error exits with
-status 2.
+status 2. On Windows the app's endpoint is a named pipe rather than a socket,
+so `--socket` takes a pipe name and `--app` derives one; see
+[On Windows](#on-windows).
 
 Options:
 
@@ -20,33 +22,36 @@ Options:
 
 The bridge opens no connection to the app until its first tool call, whatever
 `--idle-release` says: starting it, and the harness's `initialize` and
-`tools/list`, connect to nothing. That first call waits briefly, at most
-about a second, for the connection, the app's `hello` and its tree, so it
-still answers with the live tree. A bridge locked out of the app says the app
-is held by another bridge, and when the holder lets go, so a retry is the way
-in. It names its own `--idle-release` as the holder's, which is right for a
-holder started the same way: "retry in a minute" on the default, "retry in N
-s" for a window of N, and for `0` that such a holder keeps the app until its
-session ends. A bridge that let go of the app itself adds, to every answer it
-gives once it has reconnected (the app held by another bridge, stopped,
-greeted but with no tree yet, not greeted yet, or sending a line it cannot
-read), that its own disconnect was that release and not a fault: after its
-window with no tool calls, or up to 30 s later while an input awaited its ack.
-On Linux, an app stopped by a signal or a debugger is named as stopped, with
-its pid, rather than as held, and with how to resume it: from the debugger,
-with `kill -CONT`, or, for a TUI suspended as a job in its terminal (which
-`kill -CONT` resumes only in the background, where its next use of the
-terminal stops it again), with the user's `fg` there. An input sent to an app
-that stops while the bridge is driving it gets the same diagnosis in place of
-"neither acknowledged", and the app applies it only if it resumes before the
-bridge lets go: within the window plus 30 s of the last tool call (90 s on the
+`tools/list`, or its `server/discover` under the stateless MCP lifecycle,
+connect to nothing. That lifecycle is the 2026-07-28 MCP revision, where each
+request carries its protocol version and capabilities in `_meta` and there is
+no `initialize` handshake. The first tool call waits briefly, at most about a
+second, for the connection, the app's `hello` and its tree, so it still
+answers with the live tree. A bridge locked out of the app says the app is
+held by another bridge, and when the holder lets go, so a retry is the way in.
+It names its own `--idle-release` as the holder's, which is right for a holder
+started the same way: "retry in a minute" on the default, "retry in N s" for a
+window of N, and for `0` that such a holder keeps the app until its session
+ends. A bridge that let go of the app itself adds, to every answer it gives
+once it has reconnected (the app held by another bridge, stopped, greeted but
+with no tree yet, not greeted yet, or sending a line it cannot read), that its
+own disconnect was that release and not a fault: after its window with no tool
+calls, or up to 30 s later while an input awaited its ack. On Linux, an app
+stopped by a signal or a debugger is named as stopped, with its pid, rather
+than as held, and with how to resume it: from the debugger, with `kill -CONT`,
+or, for a TUI suspended as a job in its terminal (which `kill -CONT` resumes
+only in the background, where its next use of the terminal stops it again),
+with the user's `fg` there. An input sent to an app that stops while the
+bridge is driving it gets the same diagnosis in place of "neither
+acknowledged", and the app applies it only if it resumes before the bridge
+lets go: within the window plus 30 s of the last tool call (90 s on the
 default), or at any time with `0`.
 
 Environment variables:
 
 | Variable | Effect |
 |---|---|
-| `TARIA_SOCK` | Socket path, used verbatim. Replaces the default on the app side always, and on the bridge side only when the path is derived from `--app`; an explicit `--socket` wins over it. |
+| `TARIA_SOCK` | Socket path, used verbatim. Replaces the default on the app side always, and on the bridge side only when the path is derived from `--app`; an explicit `--socket` wins over it. On Windows it is a pipe name, and only a local one is taken (see [On Windows](#on-windows)). |
 | `TARIA_LOG` | Bridge log filter (tracing env-filter syntax), default `info`. Logs go to stderr; stdout carries MCP. Each time the bridge lets go of the app it logs, at `info`, how long it went without a tool call, and whether an input awaiting its ack held it past the `--idle-release` window. If inputs are still unacked when that 30 s hold runs out, the line is a `warn` that names how many, since the app may discard them. |
 
 With `--app <label>`, the bridge resolves the socket path the same way the
@@ -63,6 +68,120 @@ refuse a label carrying a path separator, or `.`, `..` or empty, because the
 app-side adapter binds and unlinks whatever the label resolves to. `--socket`
 is how to name a path.
 
+## On Windows
+
+The app's endpoint is a named pipe (a kernel object named under `\\.\pipe\`,
+which two processes open like a file), and `--help` describes the pipe
+instead of the socket:
+
+```text
+taria-mcp --socket <pipe>   Connect to an explicit pipe, \\.\pipe\<name>
+taria-mcp --app <label>     Derive the pipe name for <label>
+```
+
+With `--app <label>`, the bridge resolves the pipe name the same way the
+app-side adapter does when it creates the pipe:
+
+1. `$TARIA_SOCK`, if set and non-empty, which has to be a pipe name;
+2. `\\.\pipe\taria-<SID>-<label>`, where `<SID>` is this user's SID (the
+   security identifier Windows names an account by, `S-1-5-21-...`), read
+   from the process token. If the token cannot be read the bridge says so and
+   suggests `--socket \\.\pipe\<name>`; an override needs no SID.
+
+`--socket`, and `$TARIA_SOCK` under `--app`, take only a pipe on this machine:
+`\\.\pipe\` in any letter case, then one name, with no `\` or `/`, and not
+empty or only dots and spaces. Anything else is a usage error, a file path and
+a pipe on another machine (`\\host\pipe\name`) included, because opening a
+remote pipe goes over SMB (Windows file sharing), which hands that machine your
+credentials and puts the agent's input on the network. The whole name is
+limited to 256 characters, counted in UTF-16 code units, and a label may not
+contain `\` either. Windows trims trailing dots and spaces from a name, so
+`taria.` and `taria` are the same pipe on both sides.
+
+The bridge checks that the pipe it opened is owned by your own account before
+it writes anything to it or parses anything it sent, and a pipe has no listen
+backlog, so four answers exist only on Windows. Each is quoted as `read_tree`
+gives it before any tree has arrived, and every tool that needs a tree gives
+the same. After a disconnect each keeps the opening callers match on,
+`app '<label>' disconnected (last snapshot seq N)`, as noted under it.
+
+- **The app is held by another bridge.** The pipe has one instance and
+  another bridge has it, so the open was refused as busy. The instance is
+  also busy for a moment between two sessions, while the app retires the
+  last one and listens again, so the bridge retries a busy open for 250 ms
+  before it gives this answer. With the default `--idle-release`:
+
+  ```text
+  no snapshot from the app yet: the app is held by another bridge. The pipe name is right: the app's pipe refused this bridge as busy, which is what a second bridge gets, because a taria adapter serves one bridge at a time. A taria-mcp lets go of the app after 60 s with no tool calls (its default), and this bridge takes over as soon as it does, with no restart; retry in a minute. If the app stays held, another session is using it, or the holder is a taria-mcp older than 0.3.2, which holds the app until its session ends. Failing that, the app may instead be suspended or stuck and unable to reopen its pipe, or something other than a taria bridge holds the pipe.
+  ```
+
+  The retry sentence follows `--idle-release` as it does on Linux and macOS.
+  The last sentence allows for an app suspended or stuck after a session,
+  which cannot listen again, so its pipe stays busy too. After a disconnect
+  the text from `The pipe name is right` on follows
+  `app '<label>' disconnected (last snapshot seq N), and the app is now held
+  by another bridge. `, or, if this bridge had let go of the app itself, the
+  held-after-release answer replaces it, as on Linux and macOS.
+- **The app accepted the connection and said nothing.** Since a held app
+  refuses the open, a connection that opens and stays silent past the
+  500 ms grace is the app itself, suspended or stuck. Four seconds in:
+
+  ```text
+  no snapshot from the app yet: the app accepted this bridge's connection 4.0s ago but has sent nothing, not even the taria handshake; it may be suspended or stuck. The pipe name is right, and this is not another bridge holding the app, which is refused as busy instead. Check that the app is responsive (not suspended, or paused in a debugger), then retry; this bridge needs no restart. Failing that, what serves this pipe is not a taria adapter.
+  ```
+
+  After a disconnect the text from `the app accepted` on follows
+  `app '<label>' disconnected (last snapshot seq N), and this bridge has
+  reconnected: `.
+- **The pipe is not the app's.** Pipe names are machine-wide, so anything
+  can create one under the app's name, and a pipe another account owns is
+  not the app's. The bridge parses nothing such a pipe sent and writes
+  nothing to it, and logs the owner's SID:
+
+  ```text
+  no snapshot from the app yet: the pipe at this name is owned by another account than this bridge's user, so it is not the app's; this bridge parsed nothing it sent and wrote nothing to it. Pipe names are shared by every user on the machine, so something else created this one, before the app or after it exited, perhaps to pose as it. Ask the user to find what serves it (this bridge's log names the owner) and to restart the app once it is gone; this bridge keeps trying and connects to the app's own pipe with no restart.
+  ```
+
+  After a disconnect the text from `the pipe at this name` on follows
+  `app '<label>' disconnected (last snapshot seq N), and `.
+- **The pipe denied the bridge access.** The app's pipe lets in your account
+  alone, but a bridge running as your account is still denied it in a
+  sandbox (a restricted token, or an AppContainer, as an agent harness may
+  run its tools in) or at low integrity, and so is a bridge running as
+  another account that was given the pipe's name with `--socket`. So the
+  answer gives both readings, and what to check:
+
+  ```text
+  no snapshot from the app yet: the pipe at this name denied this bridge access, so either it is not the app's, or this bridge runs with fewer rights than the app's user: in a sandbox (a restricted token or an AppContainer), at low integrity, or as another account. This bridge parsed nothing it sent and wrote nothing to it. Ask the user to check that this bridge runs as the user who runs the app, outside any sandbox and at the app's integrity level; if it does not, it has to be started again that way. If it does, something else created this pipe, before the app or after it exited, perhaps to pose as it: ask the user to find what serves it and to restart the app once it is gone; this bridge keeps trying and then connects to the app's own pipe with no restart.
+  ```
+
+  After a disconnect the text from `the pipe at this name` on follows the
+  same opening as above. These two outrank every other answer. Each stands
+  until a connect passes the owner check, finds nothing listening, or the
+  bridge lets go of the app after its `--idle-release` window, so a pipe
+  that then stays busy does not read as held. A bridge that let go reads its
+  next busy refusal afresh, as the app held: it stopped trying, so the pipe
+  it refused may have gone and the app come back, held by another bridge.
+
+The answers Windows shares with Linux and macOS keep their texts, except
+that each one naming the app's endpoint says "pipe" where those say
+"socket", and "pipe name" where they say "socket path" (or "path", in the
+answer to a connection younger than the grace). Those are the answers to
+nothing connected, a line over 1 MiB, a line the bridge could not read, an
+app that greeted the bridge and has not published, a connection younger than
+the 500 ms grace, and an input the bridge's queue to the app could not take.
+With nothing connected:
+
+```text
+no snapshot from the app yet, and this bridge holds no connection to the pipe: is the taria-enabled app running, and is the pipe name correct? The bridge reconnects automatically; retry once the app is up.
+```
+
+Stopped-app detection reads `/proc` and is Linux only, so on Windows an
+app suspended while its pipe listens gets the second answer, without a pid,
+one suspended after a session gets the first, and the answer to an input
+that is never acknowledged does not name a stopped app. Every answer on
+Linux and macOS is as it was.
+
 ## The outline
 
 With `--tree-format outline`, the demo app's first screen reads:
@@ -71,24 +190,27 @@ With `--tree-format outline`, the demo app's first screen reads:
 protocol_version=1 seq=1
 app app "taria-demo"
   tabs tabs "Tabs" = "Active"
-    tab-active tab "Active" = "selected" act: select
-    tab-done tab "Done" act: select
+    tab-active tab "Active" *selected act: select
+    tab-done tab "Done" *selected=false act: select
   tasks list "Active tasks" = "task-1"
-    task-1 list_item "Write the taria README" = "todo" *focused act: select|toggle|delete
-    task-3 list_item "Wire up the MCP bridge" = "todo" act: select|toggle|delete
-    task-4 list_item "Record the killer demo" = "todo" act: select|toggle|delete
+    task-1 list_item "Write the taria README" *focused *selected *checked=false act: select|toggle|delete
+    task-3 list_item "Wire up the MCP bridge" *selected=false *checked=false act: select|toggle|delete
+    task-4 list_item "Record the killer demo" *selected=false *checked=false act: select|toggle|delete
   input text_input "New task" = "" act: set_value|focus
   quit button "Quit" act: activate
 ```
 
-That is 546 characters. The same tree as JSON is 1132.
+That is 619 characters. The same tree as JSON is 1199, so the outline is about
+half. Before 0.4.0 the demo put a task's done state and the active tab in
+their values, and the outline was 546 characters against 1132: the marks that
+replaced those values cost 73 characters more.
 
 The first line holds every top-level snapshot field except `root`, as
 `key=<compact json>`, space-separated. Then one line per node, depth-first,
 indented two spaces per level, the root at zero:
 
 ```text
-<id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <key>=<compact json> ...][ act: <action>|<action>...]
+<id> <role>[ *relayed][ "<label>"][ = "<value>"][ *focused][ <state marks>][ description="<text>"][ <key>=<compact json> ...][ act: <action>|<action>...]
 ```
 
 - An id, a role, an action name or a field key prints bare when it is
@@ -103,7 +225,8 @@ indented two spaces per level, the root at zero:
   the role, so it comes before the label and the value it is about. It says
   the app did not write them: they come from outside it, and an agent reads
   them as data. A `*` is never bare, so an id, a role or a field key spelled
-  `*relayed` is quoted, and the only bare one on a line is the mark.
+  `*relayed` or `*checked` is quoted, a label, a value and a description
+  always are, and every bare token starting with `*` is a mark.
 - The label and the value are always JSON-quoted, so an empty value shows as
   `= ""`. `null` or absent omits them. Every quoted string, here and in the
   header and the appended fields, escapes U+2028, U+2029 and U+0085 as well
@@ -111,8 +234,35 @@ indented two spaces per level, the root at zero:
   them cannot split a node across two lines, even in a client that breaks
   lines on them.
 - `*focused` appears only on a node whose `focused` is `true`.
+- The typed state (protocol section 6.5) follows `*focused`, each mark only
+  where the app states it, always in this order:
+
+  | Field | Marks |
+  | --- | --- |
+  | `selected` | `*selected`, `*selected=false` |
+  | `checked` | `*checked`, `*checked=false`, `*checked=mixed` |
+  | `expanded` | `*expanded`, `*expanded=false` |
+  | `disabled` | `*disabled` |
+  | `value_now`, `value_min`, `value_max` | `*num=42[0..100]`; the brackets only with a bound, a missing part empty: `*num=42`, `*num=42[0..]`, `*num=[..100]` |
+  | `pos_in_set` | `*pos=3` |
+  | `set_size` | `*size=7` |
+  | `row`, `column` | `*row=2 *col=3` |
+  | `row_count`, `column_count` | `*rows=50 *cols=4` |
+
+  A number prints as the app wrote it when it is an integer in the 64-bit
+  range, `-0` aside, and otherwise as serde_json writes the double nearest
+  it, which need not be the app's spelling: `1e3` reads `1000.0`, `-0`
+  `-0.0`, `1e21` `1e+21` and `1e-07` `1e-7` (protocol section 16.6 lists
+  the cases).
+  `null`, absent and `"disabled":false` print nothing. A state field in a
+  shape the bridge reads as not stated, such as `"selected":"yes"` or a
+  `row` of 0, prints in the tail instead, as `selected="yes"`, so a mark
+  always means what the bridge's parse holds. The tail is the run of
+  `key=<compact json>` fields after the marks and before the actions,
+  described in the next two items.
+- `description`, a string, opens the tail as `description="<text>"`.
 - Any other field, a field this bridge has never heard of included, is
-  appended as ` key=<compact json>`, after `*focused` and before the actions,
+  appended as ` key=<compact json>`, after the marks and before the actions,
   and so is a known field in a shape the line has no slot for.
 - The actions end the line, after the marker `act: `, joined by `|` with no
   spaces. A node with no actions, or an empty list, has no marker. A name

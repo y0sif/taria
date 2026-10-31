@@ -21,7 +21,9 @@ agent a set of tools). All are registered as `tui`, so the agent sees
   line per node, `id role "label" = "value" *focused act: a|b|c`, the
   actions last, absent when a node has none, as in
   `input text_input "New task" = "x" *focused act: set_value|activate|dismiss`
-  (the grammar is in `docs/cli.md`, The outline), and its instructions and
+  (the grammar is in `docs/cli.md`, The outline). From 0.4.0 a line also
+  carries typed state marks after `*focused`, such as `*selected` and
+  `*checked=false`, which the dry-run solver reads too. Its instructions and
   its `read_tree` and `act` descriptions describe the outline instead of the
   JSON. It measures whether the outline cuts tokens without hurting pass
   rates. Batches outline1 and probe3 ran the outline before the actions
@@ -31,6 +33,12 @@ agent a set of tools). All are registered as `tui`, so the agent sees
   `send_keys` (tmux key names, or text with `literal: true`). Key names go
   30 ms apart, so `"Escape d"` is not alt+d, and the settle wait is capped at
   the 500 ms taria-mcp waits for an app to react.
+
+The cycle-2 token and character figures in `RESULTS.md` predate the 0.4.0
+demo, so they are not a baseline for a batch run against 0.4.0. Its task
+rows carry `"selected"` and `"checked"` instead of `"value":"todo"`, which
+grew the first tree from 1132 to 1199 characters as JSON and from 546 to 619
+as an outline, and the outline's `read_tree` legend is 15 characters longer.
 
 taria and outline offer the same tool names, so what tells their runs apart
 is the `read_tree` description each server serves ("the current semantic

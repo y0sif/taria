@@ -1,10 +1,11 @@
-//! Socket manager: owns the connection to the app's taria Unix socket.
+//! Socket manager: owns the connection to the app's taria Unix socket (a
+//! named pipe on Windows; see [`transport`]).
 //!
 //! A single background task connects, retrying with capped backoff for as long
 //! as it wants the app. [`spawn`] wants it from the start and for good: it
 //! connects at once and holds the app until the session ends. The `taria-mcp`
 //! binary starts the manager on demand instead (through
-//! [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand)):
+//! [`TariaMcpServerBuilder::on_demand`](crate::TariaMcpServerBuilder::on_demand)):
 //! it opens no connection until the first tool call, and once no tool call has
 //! run for its idle window it lets go of the app, closing its connection and
 //! reconnecting only when the next call comes. Either way the task
@@ -22,6 +23,10 @@
 //! `AppToBridge::Ack`. Acks are republished on a [`broadcast`] channel rather
 //! than kept here, because only the tool call that sent an input knows which
 //! id it is waiting for; the manager stays free of per-input bookkeeping.
+//! Whether the app's hello said it stamps its snapshots is kept in one more
+//! [`watch`] ([`BridgeHandle::stamps_rx`]), and ids are claimed and queued
+//! under one lock ([`BridgeHandle::send`]), so a stamp can be compared with
+//! them in the order they went out.
 //!
 //! A line the reader cannot parse is skipped, so that a buggy app cannot kill
 //! the bridge, and the reason is kept in a third [`watch`] channel
@@ -54,13 +59,12 @@ use std::time::{Duration, Instant};
 
 use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus, MAX_LINE_BYTES};
 use taria::{AgentInput, PROTOCOL_VERSION, Snapshot};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::net::unix::OwnedReadHalf;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant as TokioInstant;
 
 use crate::server::{MAX_KEY_REPEAT, SILENT_LINK_GRACE};
+use crate::transport::{self, Refusal};
 
 /// First reconnect delay after a failed connect attempt.
 const RETRY_MIN: Duration = Duration::from_millis(250);
@@ -152,10 +156,10 @@ pub(crate) const OVERSIZED_LINE: &str =
 /// whatever the typed struct could hold. Re-serializing
 /// [`parsed`](Self::parsed) destroyed exactly that information: an app
 /// publishing `"role":"sparkline"` had the agent read `"role":"other"`, and the
-/// real name had been on the wire all along for the bridge to pass on. The one
-/// thing dropped on the way is the message's own framing key, which belongs to
-/// the transport rather than to the tree; see
-/// [`from_line`](Self::from_line).
+/// real name had been on the wire all along for the bridge to pass on. The two
+/// things dropped on the way are the message's own framing key, which belongs
+/// to the transport rather than to the tree, and the snapshot's stamp, which
+/// belongs to the bridge; see [`from_line`](Self::from_line).
 ///
 /// The **parsed form is authoritative for what the bridge decides**: `act`
 /// validates node ids and advertised actions against it, and the tool layer
@@ -166,35 +170,37 @@ pub(crate) const OVERSIZED_LINE: &str =
 /// A line reaches here only after it parsed, so a malformed line is still
 /// skipped rather than forwarded.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AppSnapshot {
+pub(crate) struct AppSnapshot {
     /// The app's snapshot as the agent reads it: its own line, minus the
-    /// message framing. What `read_tree` and every tool result hand back.
+    /// message framing and the stamp. What `read_tree` and every tool result
+    /// hand back.
     /// Built by [`from_line`](Self::from_line), which is the only thing that
     /// removes anything.
-    pub tree_json: String,
+    pub(crate) tree_json: String,
     /// The same message decoded into this build's types. For validation and
     /// change detection, never for output, except the action names in an
     /// outline, which have to be the names validation accepts.
-    pub parsed: Snapshot,
+    pub(crate) parsed: Snapshot,
 }
 
 impl AppSnapshot {
-    /// Pair one app line with its parse, dropping the transport envelope from
-    /// the copy the agent reads.
+    /// Pair one app line with its parse, dropping the transport envelope and
+    /// the stamp from the copy the agent reads.
     ///
     /// [`AppToBridge`] is internally tagged, so the line carries a
     /// `"type":"snapshot"` key beside the snapshot's own fields. That key
     /// frames the message on the wire and says nothing about the tree, while
     /// `read_tree` promises the app's tree, so handing it on reads as a field
-    /// the app published.
+    /// the app published. The stamp, `after_input`, goes too; see
+    /// [`strip_envelope`].
     ///
     /// Removed through a `serde_json::Value`, which holds every key the line
     /// has, including the roles, actions and fields this build has never
-    /// heard of. Only the one key goes, but the spelling of the rest becomes
+    /// heard of. Only the two keys go, but the spelling of the rest becomes
     /// the serializer's again: keys sorted, whitespace gone, escapes and
     /// numbers rewritten (`1e3` as `1000.0`), and a key repeated in one object
     /// kept once, with its last value (`docs/protocol.md` section 16.6).
-    pub fn from_line(line: &str, parsed: Snapshot) -> Self {
+    pub(crate) fn from_line(line: &str, parsed: Snapshot) -> Self {
         Self {
             tree_json: strip_envelope(line),
             parsed,
@@ -202,7 +208,14 @@ impl AppSnapshot {
     }
 }
 
-/// `line` without its `"type"` key.
+/// `line` without its `"type"` key and its stamp.
+///
+/// The stamp (`after_input`) goes for the reason the framing key does: it
+/// says when the tree was published relative to the bridge's own inputs,
+/// which is for the bridge to reason about and not part of the tree. An
+/// agent shown it would read an input id it never sent as a fact about the
+/// app, and would see a tree that only had its stamp moved as one that
+/// changed. A peer that stamps without saying so in its hello loses it too.
 ///
 /// Both fallbacks return the line untouched, and neither is reachable from a
 /// line that got here: it parsed as an `AppToBridge::Snapshot`, so it is a
@@ -215,6 +228,7 @@ fn strip_envelope(line: &str) -> String {
     };
     if let Some(object) = value.as_object_mut() {
         object.remove("type");
+        object.remove("after_input");
     }
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
 }
@@ -225,8 +239,14 @@ fn strip_envelope(line: &str) -> String {
 /// [`Disconnected`](Self::Disconnected) exists purely for error messages:
 /// "the app was never there" and "the app was there and died" call for very
 /// different next steps from the agent.
+///
+/// [`Connected`](Self::Connected) holds a whole tree by value, which clippy
+/// flags beside the small variants since a node gained its typed state. One
+/// value lives in the watch channel and its clones are short-lived, so the
+/// size costs nothing a `Box` would win back.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
-pub enum BridgeState {
+pub(crate) enum BridgeState {
     /// No app has delivered a snapshot since the bridge started.
     Never,
     /// An app is connected; its latest snapshot is available.
@@ -251,7 +271,7 @@ pub enum BridgeState {
 /// call for opposite next steps: check the path, or leave the path alone
 /// because the bridge is connected to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LinkState {
+pub(crate) enum LinkState {
     /// No connection is open: the last connect attempt failed, or the last
     /// connection ended.
     Down,
@@ -262,13 +282,21 @@ pub enum LinkState {
         /// arriving, and one open far longer is a socket nobody is reading.
         since: Instant,
     },
+    /// No connection is open because the last connect was turned away by
+    /// something listening at the path, for this reason. Only the Windows
+    /// transport refuses a connect this way: a pipe busy with another bridge
+    /// is the app held, as an open, silent connection is on Unix, a pipe
+    /// another account owns is not the app at all, and a pipe that refuses
+    /// this bridge access is not the app's, or one this bridge lacks the
+    /// rights to open.
+    Refused(Refusal),
 }
 
 impl LinkState {
     /// How long the open connection has been up, or `None` when none is.
-    pub fn open_for(self) -> Option<Duration> {
+    pub(crate) fn open_for(self) -> Option<Duration> {
         match self {
-            Self::Down => None,
+            Self::Down | Self::Refused(_) => None,
             Self::Open { since } => Some(since.elapsed()),
         }
     }
@@ -288,14 +316,14 @@ static NEXT_INPUT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Handles the MCP tool layer uses to talk to the socket-manager task.
 #[derive(Clone)]
-pub struct BridgeHandle {
+pub(crate) struct BridgeHandle {
     /// Latest connection state; holds the current [`Snapshot`] while an app
     /// is connected.
-    pub state_rx: watch::Receiver<BridgeState>,
+    pub(crate) state_rx: watch::Receiver<BridgeState>,
     /// Queue of identified agent inputs to forward to the app.
-    pub input_tx: mpsc::Sender<(InputId, AgentInput)>,
+    pub(crate) input_tx: mpsc::Sender<(InputId, AgentInput)>,
     /// Every ack the app sends, republished for whoever is waiting on one.
-    pub ack_tx: broadcast::Sender<(InputId, InputStatus)>,
+    pub(crate) ack_tx: broadcast::Sender<(InputId, InputStatus)>,
     /// The `protocol_version` the connected app declared in its handshake.
     ///
     /// `None` before the peer has said anything, and again once the app goes
@@ -311,7 +339,7 @@ pub struct BridgeHandle {
     /// still delivers parseable snapshots while being unable to parse the
     /// inputs sent back to it, and reporting an input as sent to such a peer
     /// would be a lie.
-    pub protocol_rx: watch::Receiver<Option<u32>>,
+    pub(crate) protocol_rx: watch::Receiver<Option<u32>>,
     /// Why the most recent line from an app was thrown away, if one was.
     ///
     /// Set for every line the reader could not turn into an [`AppToBridge`],
@@ -340,7 +368,7 @@ pub struct BridgeHandle {
     /// Read only where no snapshot is available. Once a snapshot has arrived,
     /// a later rejected line says nothing about the tree being served, and
     /// the tools do not mention it.
-    pub rejected_rx: watch::Receiver<Option<String>>,
+    pub(crate) rejected_rx: watch::Receiver<Option<String>>,
     /// Whether this bridge currently holds an open connection, and since when.
     ///
     /// The one fact that separates "nothing is there" from "this bridge is
@@ -350,7 +378,31 @@ pub struct BridgeHandle {
     /// Read only where no snapshot is available, like
     /// [`rejected_rx`](Self::rejected_rx): once a tree is being served, the
     /// connection carrying it is not what an agent needs to hear about.
-    pub link_rx: watch::Receiver<LinkState>,
+    pub(crate) link_rx: watch::Receiver<LinkState>,
+    /// Whether the connected app said in its hello that it stamps its
+    /// snapshots (`after_input`, the newest input it dequeued).
+    ///
+    /// False until a hello says otherwise, and again once the connection
+    /// ends, like [`protocol_rx`](Self::protocol_rx), so a peer is never
+    /// judged by the previous one's hello. The tool layer reads it to decide
+    /// how long an input waits for its tree and what the answer says: a peer
+    /// that stamps can be told "did not change" the moment a tree stamped at
+    /// the input arrives unchanged, and one that does not is answered as
+    /// every peer was before stamps existed.
+    pub(crate) stamps_rx: watch::Receiver<bool>,
+    /// Held across claiming an input's id and queueing the input, so ids
+    /// reach the socket in the order they were claimed, however tool calls
+    /// overlap. See [`send`](Self::send).
+    pub(crate) send_order: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Why [`BridgeHandle::send`] sent nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendError {
+    /// The socket task is gone, so nothing will ever read the queue.
+    Closed,
+    /// The queue to the app stayed full for the whole wait.
+    Full,
 }
 
 impl BridgeHandle {
@@ -360,8 +412,42 @@ impl BridgeHandle {
     /// handle: callers ask the bridge for an id rather than reaching for a
     /// counter of their own, and two tool calls racing still get different
     /// ids.
-    pub fn next_input_id(&self) -> InputId {
-        NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed)
+    pub(crate) fn next_input_id(&self) -> InputId {
+        InputId::new(NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Claim the next id and queue `input` under it for the socket task,
+    /// within `wait` in all, returning the id.
+    ///
+    /// The id is claimed and the input queued under one lock, so the ids go
+    /// out on the socket in the order they were claimed. A stamped tree is
+    /// credited to an input by comparing ids, and that comparison is only
+    /// sound in the order the app received them: with the two steps apart,
+    /// two calls racing could put id 8 on the wire before id 7, and a tree
+    /// stamped 8 would be credited to 7 before the app had read it.
+    ///
+    /// The wait covers the lock too. Nothing holds the lock but a send
+    /// waiting for room in the queue, so running out of time on either is
+    /// the same full queue. A send that runs out of time claimed its id and
+    /// queued nothing, which leaves a gap in the ids, and the protocol asks
+    /// only that they never repeat.
+    pub(crate) async fn send(
+        &self,
+        input: AgentInput,
+        wait: Duration,
+    ) -> Result<InputId, SendError> {
+        let send = async {
+            let _order = self.send_order.lock().await;
+            let id = self.next_input_id();
+            self.input_tx
+                .send((id, input))
+                .await
+                .map(|()| id)
+                .map_err(|_| SendError::Closed)
+        };
+        tokio::time::timeout(wait, send)
+            .await
+            .unwrap_or(Err(SendError::Full))
     }
 
     /// Start receiving acks from now on.
@@ -369,7 +455,7 @@ impl BridgeHandle {
     /// A broadcast receiver only sees what is published after it subscribes,
     /// so a caller that waits on an input must subscribe *before* sending it:
     /// the app can ack before the sending task is scheduled again.
-    pub fn subscribe_acks(&self) -> broadcast::Receiver<(InputId, InputStatus)> {
+    pub(crate) fn subscribe_acks(&self) -> broadcast::Receiver<(InputId, InputStatus)> {
         self.ack_tx.subscribe()
     }
 }
@@ -379,12 +465,13 @@ impl BridgeHandle {
 /// The manager connects at once and holds the app for as long as the returned
 /// handle (or a clone of its `input_tx`) lives, reconnecting whenever the
 /// connection ends. That is every bridge before 0.3.2, and what a library
-/// caller driving its own [`TariaMcpServer`](crate::server::TariaMcpServer)
-/// keeps getting. The `taria-mcp` binary connects on demand instead, through
-/// [`TariaMcpServer::on_demand`](crate::server::TariaMcpServer::on_demand),
+/// caller gets from
+/// [`TariaMcpServerBuilder::connected`](crate::TariaMcpServerBuilder::connected).
+/// The `taria-mcp` binary connects on demand instead, through
+/// [`TariaMcpServerBuilder::on_demand`](crate::TariaMcpServerBuilder::on_demand),
 /// so that a session with no tool calls in flight does not keep every other
 /// session away from the app.
-pub fn spawn(socket_path: PathBuf) -> BridgeHandle {
+pub(crate) fn spawn(socket_path: PathBuf) -> BridgeHandle {
     spawn_manager(socket_path, None)
 }
 
@@ -427,6 +514,7 @@ fn spawn_manager(socket_path: PathBuf, idle: Option<Idle>) -> BridgeHandle {
     let (protocol_tx, protocol_rx) = watch::channel(None);
     let (rejected_tx, rejected_rx) = watch::channel(None);
     let (link_tx, link_rx) = watch::channel(LinkState::Down);
+    let (stamps_tx, stamps_rx) = watch::channel(false);
     tokio::spawn(manager_loop(
         socket_path,
         state_tx,
@@ -435,6 +523,7 @@ fn spawn_manager(socket_path: PathBuf, idle: Option<Idle>) -> BridgeHandle {
         protocol_tx,
         rejected_tx,
         link_tx,
+        stamps_tx,
         idle,
     ));
     BridgeHandle {
@@ -444,6 +533,8 @@ fn spawn_manager(socket_path: PathBuf, idle: Option<Idle>) -> BridgeHandle {
         protocol_rx,
         rejected_rx,
         link_rx,
+        stamps_rx,
+        send_order: Arc::new(tokio::sync::Mutex::new(())),
     }
 }
 
@@ -934,11 +1025,19 @@ async fn manager_loop(
     protocol_tx: watch::Sender<Option<u32>>,
     rejected_tx: watch::Sender<Option<String>>,
     link_tx: watch::Sender<LinkState>,
+    stamps_tx: watch::Sender<bool>,
     mut idle: Option<Idle>,
 ) {
     let mut backoff = RETRY_MIN;
     'asleep: loop {
         if let Some(idle) = idle.as_mut() {
+            // Asleep, the manager holds nothing and tries nothing, so a
+            // refusal its last connect met is no longer what the link is, and
+            // the next connect is judged afresh: a pipe that barred this
+            // bridge stands over busy refusals only while the bridge keeps
+            // trying (see `note_refusal`). Done before the manager wakes, so a
+            // call that finds it awake never reads the refusal it let go of.
+            forget_refusal(&link_tx);
             if !idle.until_wanted(&mut input_rx).await {
                 tracing::debug!("session ended while the bridge was idle; bridge task exiting");
                 return;
@@ -947,8 +1046,11 @@ async fn manager_loop(
             backoff = RETRY_MIN;
         }
         loop {
-            match UnixStream::connect(&path).await {
+            match transport::connect(&path).await {
                 Ok(stream) => {
+                    // "socket" on Windows too, where the endpoint is a pipe:
+                    // scripts/e2e.py waits on this line (`CONNECTED_LOG`),
+                    // so its bytes stay as they are on every platform.
                     tracing::info!(path = %path.display(), "connected to app socket");
                     drain_stale_inputs(&mut input_rx);
                     // A reason a line was rejected belongs to the connection
@@ -963,15 +1065,8 @@ async fn manager_loop(
                     forget_rejected_except_oversized(&rejected_tx);
                     if let Some(idle) = idle.as_ref() {
                         // For a connection the app has not accepted yet, the
-                        // process listening at the path. A pid of 0 is the
-                        // kernel saying it cannot name the peer in this pid
-                        // namespace, which is no pid at all.
-                        let peer_pid = stream
-                            .peer_cred()
-                            .ok()
-                            .and_then(|cred| cred.pid())
-                            .filter(|pid| *pid > 0);
-                        idle.note_connect(peer_pid);
+                        // process listening at the path.
+                        idle.note_connect(transport::peer_pid(&stream));
                     }
                     let connected_at = Instant::now();
                     // Published before the connection is served, not after it
@@ -988,6 +1083,7 @@ async fn manager_loop(
                         &ack_tx,
                         &protocol_tx,
                         &rejected_tx,
+                        &stamps_tx,
                         &mut conn_label,
                         idle.as_mut(),
                     )
@@ -997,8 +1093,10 @@ async fn manager_loop(
                     link_tx.send_replace(LinkState::Down);
                     // The peer's protocol version belongs to the connection
                     // that declared it; forget it here so the next connection
-                    // is never judged by the previous app's handshake.
+                    // is never judged by the previous app's handshake. The
+                    // same goes for whether it stamps its snapshots.
                     protocol_tx.send_replace(None);
+                    stamps_tx.send_replace(false);
                     // The watch only ever holds `Connected` while this
                     // connection was being served (it is demoted below after
                     // every connection), so `Connected` here means this
@@ -1098,6 +1196,7 @@ async fn manager_loop(
                         retry_in_ms = backoff.as_millis() as u64,
                         "connect failed; is the app running?"
                     );
+                    note_refusal(&path, &err, &link_tx, &rejected_tx);
                     // An app that overflowed and then exited leaves its reason
                     // behind, and the tools would go on telling the agent that
                     // a running app resends the same tree to every reconnect,
@@ -1111,8 +1210,12 @@ async fn manager_loop(
                         // describes what happened to it, and a held answer
                         // about the next instance must not say it. Cleared
                         // before the outcome is counted, which is what a
-                        // waiting call reads it after.
-                        if nothing_listens(&err) {
+                        // waiting call reads it after. A pipe at the path
+                        // that barred this bridge says much the same: what
+                        // is there is not the app it let go of, or is out of
+                        // its reach, for as long as the link says so (see
+                        // `note_refusal`).
+                        if transport::nothing_listens(&err) || bars(*link_tx.borrow()) {
                             idle.note(|activity| activity.released = false);
                         }
                         idle.settled();
@@ -1230,26 +1333,117 @@ fn log_pause_release(path: &std::path::Path, idle: Option<&Idle>, quiet_since: T
 
 /// Retire [`OVERSIZED_LINE`] when a failed `connect` means nothing is
 /// listening at the path: a socket file nobody is bound to any more
-/// (`ConnectionRefused`), or no file at all (`NotFound`). Either way the app
-/// that sent the tree has gone. Any other failure (a permission, a resource
-/// limit) says nothing about whether the app is still there, and leaves the
-/// reason alone.
+/// (`ConnectionRefused`), or no file at all (`NotFound`), as
+/// [`transport::nothing_listens`] tells them. Either way the app that sent the
+/// tree has gone. Any other failure (a permission, a resource limit) says
+/// nothing about whether the app is still there, and leaves the reason alone.
 fn forget_oversized_if_nothing_listens(
     err: &io::Error,
     rejected_tx: &watch::Sender<Option<String>>,
 ) {
-    if nothing_listens(err) {
+    if transport::nothing_listens(err) {
         forget_oversized(rejected_tx);
     }
 }
 
-/// True when a failed `connect` means nothing is listening at the path: the
-/// app has gone. See [`forget_oversized_if_nothing_listens`].
-fn nothing_listens(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-    )
+/// Publish what a failed connect says about the link, before the outcome is
+/// counted, so a tool call answered by that outcome reads it: a refusal as
+/// [`LinkState::Refused`], anything else as [`LinkState::Down`].
+///
+/// Changed only when it changes, so where connects are never refused (Unix)
+/// a failed connect leaves the link exactly as it was, unsent: down since
+/// the last connection ended.
+///
+/// A busy pipe is the Windows form of a connect into the backlog, the app
+/// there and serving another bridge, so what the last connection's lines
+/// failed on is forgotten, as a connect forgets it, oversized tree aside. A
+/// pipe another account owns is not the app, and one that refused this
+/// bridge access is not the app's or not one this bridge can open, so
+/// everything the app's lines failed on goes, the oversized tree included,
+/// and the refusal is logged as a warning when it is new, with what the
+/// error names: the owner, or the refusal.
+///
+/// Either of those two stands, as it was, until a connect passes the owner
+/// check or finds nothing listening, whatever fails in between, or the
+/// manager releases (see [`forget_refusal`]). A pipe that takes one open and
+/// fails the check stays busy until its server disconnects that open, which
+/// an impostor need never do. Read as busy, those refusals turned "not the
+/// app" into the app held by another bridge, about a pipe the app never
+/// made. A refusal of either kind that is new replaces the one standing.
+///
+/// What it stands over is only what this manager tried since, which is why a
+/// release ends it: a released manager stops trying, so the impostor it met
+/// may exit and the app come back meanwhile, held by another session, and a
+/// busy refusal then is the app's. Kept past the release, the answer went on
+/// sending the agent after an impostor that had gone.
+fn note_refusal(
+    path: &std::path::Path,
+    err: &io::Error,
+    link_tx: &watch::Sender<LinkState>,
+    rejected_tx: &watch::Sender<Option<String>>,
+) {
+    let refusal = standing_refusal(
+        *link_tx.borrow(),
+        transport::refusal(err),
+        transport::nothing_listens(err),
+    );
+    let now = refusal.map_or(LinkState::Down, LinkState::Refused);
+    let changed = link_tx.send_if_modified(|link| {
+        if *link == now {
+            false
+        } else {
+            *link = now;
+            true
+        }
+    });
+    match refusal {
+        Some(Refusal::Busy) => forget_rejected_except_oversized(rejected_tx),
+        Some(Refusal::Foreign | Refusal::Denied) => {
+            if changed {
+                tracing::warn!(path = %path.display(), %err, "refused the app's endpoint");
+            }
+            rejected_tx.send_if_modified(|rejected| rejected.take().is_some());
+        }
+        None => {}
+    }
+}
+
+/// What a failed connect reads as, from what the link read as before it
+/// (`link`), what the failure itself says (`fresh`, [`transport::refusal`]'s
+/// reading of it), and whether it found nothing listening: the refusal that
+/// barred this bridge, while one stands and the failure is not a new one or
+/// nothing listening, and otherwise the failure's own. See [`note_refusal`].
+fn standing_refusal(
+    link: LinkState,
+    fresh: Option<Refusal>,
+    nothing_listens: bool,
+) -> Option<Refusal> {
+    match (link, fresh) {
+        (_, Some(fresh)) if fresh.bars() => Some(fresh),
+        (LinkState::Refused(standing), _) if standing.bars() && !nothing_listens => Some(standing),
+        _ => fresh,
+    }
+}
+
+/// True when `link` is a refusal that barred this bridge (see
+/// [`Refusal::bars`]).
+fn bars(link: LinkState) -> bool {
+    matches!(link, LinkState::Refused(refusal) if refusal.bars())
+}
+
+/// Let go of whatever refusal the link holds, for a manager that has just
+/// released: it is down, as a link with nothing open and nothing tried is.
+/// Where connects are never refused (Unix) the link is down already, and is
+/// left unsent.
+fn forget_refusal(link_tx: &watch::Sender<LinkState>) {
+    link_tx.send_if_modified(|link| {
+        if matches!(link, LinkState::Refused(_)) {
+            *link = LinkState::Down;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// Retire every reason but [`OVERSIZED_LINE`], the counterpart of
@@ -1323,7 +1517,7 @@ enum LineRead {
 /// cap is recomputed from `buf.len()`, so being cancelled by `select!` and
 /// re-called continues the same line without loosening the limit.
 async fn read_line_capped(
-    reader: &mut BufReader<OwnedReadHalf>,
+    reader: &mut BufReader<impl AsyncRead + Unpin>,
     buf: &mut Vec<u8>,
 ) -> io::Result<LineRead> {
     loop {
@@ -1346,7 +1540,7 @@ async fn read_line_capped(
 /// tests below drive one connection by hand.
 #[cfg(test)]
 async fn run_connection(
-    stream: UnixStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin,
     state_tx: &watch::Sender<BridgeState>,
     input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>,
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
@@ -1354,6 +1548,7 @@ async fn run_connection(
     rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) -> ConnectionEnd {
+    let (stamps_tx, _) = watch::channel(false);
     serve_connection(
         stream,
         state_tx,
@@ -1361,6 +1556,7 @@ async fn run_connection(
         ack_tx,
         protocol_tx,
         rejected_tx,
+        &stamps_tx,
         conn_label,
         None,
     )
@@ -1429,18 +1625,22 @@ impl Unacked {
 /// [`UNACKED_HOLD`]), the manager lets go, and the connection ends as
 /// [`ConnectionEnd::Released`]. Returning drops the socket, which closes it
 /// whether the app accepted it or it is still waiting in the backlog.
+///
+/// The connection is any stream the transport hands over, split here into
+/// the halves the loop below reads and writes.
 #[allow(clippy::too_many_arguments)]
 async fn serve_connection(
-    stream: UnixStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin,
     state_tx: &watch::Sender<BridgeState>,
     input_rx: &mut mpsc::Receiver<(InputId, AgentInput)>,
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
     protocol_tx: &watch::Sender<Option<u32>>,
     rejected_tx: &watch::Sender<Option<String>>,
+    stamps_tx: &watch::Sender<bool>,
     conn_label: &mut Option<String>,
     mut idle: Option<&mut Idle>,
 ) -> ConnectionEnd {
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line_buf: Vec<u8> = Vec::new();
     let mut unacked = Unacked::default();
@@ -1457,6 +1657,7 @@ async fn serve_connection(
                         state_tx,
                         ack_tx,
                         protocol_tx,
+                        stamps_tx,
                         rejected_tx,
                         conn_label,
                     );
@@ -1554,6 +1755,7 @@ fn handle_app_line(
     state_tx: &watch::Sender<BridgeState>,
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
     protocol_tx: &watch::Sender<Option<u32>>,
+    stamps_tx: &watch::Sender<bool>,
     rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) -> Option<InputId> {
@@ -1570,6 +1772,7 @@ fn handle_app_line(
         Ok(AppToBridge::Hello {
             app_label,
             protocol_version,
+            stamps,
             ..
         }) => {
             if protocol_version == PROTOCOL_VERSION {
@@ -1584,6 +1787,7 @@ fn handle_app_line(
                 );
             }
             protocol_tx.send_replace(Some(protocol_version));
+            stamps_tx.send_replace(stamps);
             *conn_label = Some(app_label);
         }
         Ok(AppToBridge::Snapshot(parsed)) => {
@@ -1622,7 +1826,7 @@ fn handle_app_line(
             state_tx.send_replace(BridgeState::Connected(AppSnapshot::from_line(line, parsed)));
         }
         Ok(AppToBridge::Ack { id, status, .. }) => {
-            tracing::debug!(id, ?status, "input ack received");
+            tracing::debug!(id = id.get(), ?status, "input ack received");
             // An ack nobody is waiting for is the normal case (the tool call
             // that sent the input has already returned), so a send with no
             // subscribers is not an error worth reporting.
@@ -1680,8 +1884,36 @@ fn is_unknown_message_type(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use taria::{Node, Role};
+    #[cfg(unix)]
+    use tokio::net::UnixStream;
 
     use super::*;
+
+    /// Both ends of one connection over this platform's transport, the
+    /// bridge's first: a socket pair on Unix, and on Windows a pipe made the
+    /// way the adapter makes the app's, connected through the transport's own
+    /// [`connect`](transport::connect), owner check and all.
+    #[cfg(unix)]
+    async fn stream_pair() -> (
+        impl AsyncRead + AsyncWrite + Unpin,
+        impl AsyncRead + AsyncWrite + Unpin,
+    ) {
+        UnixStream::pair().expect("a socket pair")
+    }
+
+    #[cfg(windows)]
+    async fn stream_pair() -> (
+        impl AsyncRead + AsyncWrite + Unpin,
+        impl AsyncRead + AsyncWrite + Unpin,
+    ) {
+        let name = transport::testing::unique_pipe_name("pair");
+        let app_end = transport::testing::app_pipe(&name).expect("create the app's pipe");
+        let bridge_end = transport::connect(std::path::Path::new(&name))
+            .await
+            .expect("connect to the app's pipe");
+        app_end.connect().await.expect("the app takes the bridge");
+        (bridge_end, app_end)
+    }
 
     /// The reason is a fixed string, so nothing else keeps its number in step
     /// with the cap the reader enforces.
@@ -1700,7 +1932,7 @@ mod tests {
     /// reason already there.
     #[tokio::test]
     async fn an_oversized_line_is_recorded_before_the_connection_ends() {
-        let (bridge_end, mut app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, mut app_end) = stream_pair().await;
         let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
         // Held open, so the end of the session cannot be what ends the call.
         let (_input_tx, mut input_rx) = mpsc::channel(1);
@@ -1737,6 +1969,7 @@ mod tests {
         let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
         let (ack_tx, _) = broadcast::channel(1);
         let (protocol_tx, _protocol_rx) = watch::channel(None);
+        let (stamps_tx, _stamps_rx) = watch::channel(false);
         let (rejected_tx, rejected_rx) = watch::channel(Some(OVERSIZED_LINE.to_string()));
         let mut label = None;
         let hello = serde_json::to_string(&AppToBridge::hello("demo", PROTOCOL_VERSION))
@@ -1752,6 +1985,7 @@ mod tests {
                 &state_tx,
                 &ack_tx,
                 &protocol_tx,
+                &stamps_tx,
                 &rejected_tx,
                 &mut label,
             );
@@ -1774,21 +2008,38 @@ mod tests {
     /// A `connect` that finds nothing listening retires the oversized reason,
     /// because the app that resent that tree on every reconnect has gone.
     /// The errors are the ones this platform really returns for a socket file
-    /// nobody is bound to and for a path with no file, so a kind the matcher
-    /// misses fails here rather than leaving the reason in place for good.
+    /// nobody is bound to and for a path with no file (on Windows, a pipe
+    /// name nobody serves), so a kind the matcher misses fails here rather
+    /// than leaving the reason in place for good.
     #[tokio::test]
     async fn a_connect_that_finds_nothing_listening_forgets_the_oversized_reason() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let stale = dir.path().join("stale.sock");
-        // Bound, then dropped: the file stays and nothing listens on it, which
-        // is what an app that crashed leaves behind.
-        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
-        let gone = dir.path().join("gone.sock");
-
-        for (name, path) in [("stale socket", &stale), ("no socket", &gone)] {
-            let err = UnixStream::connect(path)
+        #[cfg(unix)]
+        let (_dir, failures) = {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let stale = dir.path().join("stale.sock");
+            // Bound, then dropped: the file stays and nothing listens on it,
+            // which is what an app that crashed leaves behind.
+            drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
+            let gone = dir.path().join("gone.sock");
+            let mut failures = Vec::new();
+            for (name, path) in [("stale socket", &stale), ("no socket", &gone)] {
+                let err = UnixStream::connect(path)
+                    .await
+                    .expect_err("nothing listens here");
+                failures.push((name, err));
+            }
+            (dir, failures)
+        };
+        #[cfg(windows)]
+        let failures = {
+            let name = transport::testing::unique_pipe_name("gone");
+            let err = transport::connect(std::path::Path::new(&name))
                 .await
-                .expect_err("nothing listens here");
+                .expect_err("nothing serves this pipe");
+            vec![("no pipe", err)]
+        };
+
+        for (name, err) in failures {
             let (rejected_tx, rejected_rx) = watch::channel(Some(OVERSIZED_LINE.to_string()));
             forget_oversized_if_nothing_listens(&err, &rejected_tx);
             assert_eq!(
@@ -1850,6 +2101,53 @@ mod tests {
         assert!(!rejected_rx.has_changed().expect("the sender is alive"));
     }
 
+    /// A pipe that barred this bridge, by its owner or by denying it access,
+    /// stands over every failure after it that is not a new refusal of
+    /// either kind or nothing listening, a busy pipe included; a busy pipe
+    /// with nothing standing is the app held, as it is once the link that
+    /// held the refusal is down again.
+    #[test]
+    fn a_barring_refusal_stands_until_something_says_otherwise() {
+        use Refusal::{Busy, Denied, Foreign};
+        let refused = LinkState::Refused;
+        for standing in [Foreign, Denied] {
+            let link = refused(standing);
+            assert_eq!(standing_refusal(link, Some(Busy), false), Some(standing));
+            assert_eq!(standing_refusal(link, None, false), Some(standing));
+            assert_eq!(standing_refusal(link, None, true), None);
+            assert_eq!(standing_refusal(link, Some(Foreign), false), Some(Foreign));
+            assert_eq!(standing_refusal(link, Some(Denied), false), Some(Denied));
+        }
+        for link in [LinkState::Down, refused(Busy)] {
+            assert_eq!(standing_refusal(link, Some(Busy), false), Some(Busy));
+            assert_eq!(standing_refusal(link, None, false), None);
+            assert_eq!(standing_refusal(link, Some(Foreign), false), Some(Foreign));
+            assert_eq!(standing_refusal(link, Some(Denied), false), Some(Denied));
+        }
+    }
+
+    /// A release puts any refusal down, so the next connect is read afresh,
+    /// and sends nothing for a link that is down already, which is every
+    /// link on Unix.
+    #[test]
+    fn a_release_forgets_the_refusal_and_nothing_else() {
+        let (link_tx, mut link_rx) = watch::channel(LinkState::Refused(Refusal::Foreign));
+        link_rx.borrow_and_update();
+        forget_refusal(&link_tx);
+        assert_eq!(*link_rx.borrow_and_update(), LinkState::Down);
+        forget_refusal(&link_tx);
+        assert!(!link_rx.has_changed().expect("the sender is alive"));
+
+        let open = LinkState::Open {
+            since: Instant::now(),
+        };
+        link_tx.send_replace(open);
+        link_rx.borrow_and_update();
+        forget_refusal(&link_tx);
+        assert_eq!(*link_rx.borrow(), open);
+        assert!(!link_rx.has_changed().expect("the sender is alive"));
+    }
+
     /// A peer that publishes before it greets is taken at the version its
     /// snapshot states, so a peer on another version is refused input even
     /// with no `hello`; a `hello` later replaces it, and a version the
@@ -1859,6 +2157,7 @@ mod tests {
         let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
         let (ack_tx, _) = broadcast::channel(1);
         let (protocol_tx, protocol_rx) = watch::channel(None);
+        let (stamps_tx, _stamps_rx) = watch::channel(false);
         let (rejected_tx, _rejected_rx) = watch::channel(None);
         let mut label = None;
         let mut line = |message: &AppToBridge| {
@@ -1868,6 +2167,7 @@ mod tests {
                 &state_tx,
                 &ack_tx,
                 &protocol_tx,
+                &stamps_tx,
                 &rejected_tx,
                 &mut label,
             );
@@ -1984,10 +2284,10 @@ mod tests {
         let (mut idle, demand) = idle_and_demand(Duration::from_secs(1));
         let mut wiring = Wiring::new();
         idle.note(|activity| activity.released = true);
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
         drop(demand.begin());
         let app = async {
-            let (read, mut write) = app_end.into_split();
+            let (read, mut write) = tokio::io::split(app_end);
             let mut snapshot = serde_json::to_string(&AppToBridge::Snapshot(Snapshot::new(
                 1,
                 Node::new("app", Role::App),
@@ -2080,10 +2380,11 @@ mod tests {
         /// tokio's clock.
         async fn serve(
             &mut self,
-            stream: UnixStream,
+            stream: impl AsyncRead + AsyncWrite + Unpin,
             idle: &mut Idle,
         ) -> (ConnectionEnd, TokioInstant) {
             let mut label = None;
+            let (stamps_tx, _) = watch::channel(false);
             let end = serve_connection(
                 stream,
                 &self.state_tx,
@@ -2091,6 +2392,7 @@ mod tests {
                 &self.ack_tx,
                 &self.protocol_tx,
                 &self.rejected_tx,
+                &stamps_tx,
                 &mut label,
                 Some(idle),
             )
@@ -2100,7 +2402,7 @@ mod tests {
     }
 
     /// The app's end of a connection, held open until the bridge closes it.
-    async fn hold_open(app_end: UnixStream) {
+    async fn hold_open(app_end: impl AsyncRead + Unpin) {
         let mut rest = Vec::new();
         let mut app_end = app_end;
         app_end
@@ -2186,7 +2488,7 @@ mod tests {
         let wall = Instant::now();
 
         // One call, and nothing after it.
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
         let t0 = TokioInstant::now();
         drop(demand.begin());
         let ((end, at), ()) = tokio::join!(wiring.serve(bridge_end, &mut idle), hold_open(app_end));
@@ -2196,7 +2498,7 @@ mod tests {
         assert_at(t0, at, window);
 
         // A call that ends a millisecond before the window closes.
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
         let t1 = TokioInstant::now();
         drop(demand.begin());
         let late_call = async {
@@ -2213,7 +2515,7 @@ mod tests {
 
         // A call that is still running when the window would close, and ends
         // three seconds in.
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
         let t2 = TokioInstant::now();
         drop(demand.begin());
         let long_call = async {
@@ -2249,20 +2551,20 @@ mod tests {
         let (mut idle, demand) = idle_and_demand(window);
         let mut wiring = Wiring::new();
         let wall = Instant::now();
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
 
         // Sent while a call is in flight, as every input is.
         let call = demand.begin();
         wiring
             .input_tx
-            .send((7, AgentInput::key("x")))
+            .send((InputId::new(7), AgentInput::key("x")))
             .await
             .expect("queued");
         let t0 = TokioInstant::now();
         drop(call);
         let app = async move {
             let mut reader = BufReader::new(app_end);
-            assert_eq!(next_input_id(&mut reader).await, 7);
+            assert_eq!(next_input_id(&mut reader).await, InputId::new(7));
             let mut rest = Vec::new();
             reader
                 .read_to_end(&mut rest)
@@ -2298,23 +2600,26 @@ mod tests {
             (Duration::from_secs(5), Hold::UntilAcked),
             (window / 2, Hold::None),
         ] {
-            let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+            let (bridge_end, app_end) = stream_pair().await;
             let call = demand.begin();
             wiring
                 .input_tx
-                .send((9, AgentInput::key("x")))
+                .send((InputId::new(9), AgentInput::key("x")))
                 .await
                 .expect("queued");
             let t0 = TokioInstant::now();
             drop(call);
             let mut acks = wiring.ack_tx.subscribe();
             let app = async move {
-                let (read, mut write) = app_end.into_split();
+                let (read, mut write) = tokio::io::split(app_end);
                 let mut reader = BufReader::new(read);
-                assert_eq!(next_input_id(&mut reader).await, 9);
+                assert_eq!(next_input_id(&mut reader).await, InputId::new(9));
                 tokio::time::sleep_until(t0 + acked_after).await;
-                let mut ack = serde_json::to_string(&AppToBridge::ack(9, InputStatus::Delivered))
-                    .expect("an ack serializes");
+                let mut ack = serde_json::to_string(&AppToBridge::ack(
+                    InputId::new(9),
+                    InputStatus::Delivered,
+                ))
+                .expect("an ack serializes");
                 ack.push('\n');
                 write.write_all(ack.as_bytes()).await.expect("send the ack");
                 // Until the bridge has read it: the next timer is the end of
@@ -2351,12 +2656,12 @@ mod tests {
         let (mut idle, demand) = idle_and_demand(window);
         let mut wiring = Wiring::new();
         let wall = Instant::now();
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
 
         let call = demand.begin();
         wiring
             .input_tx
-            .send((11, AgentInput::key("x")))
+            .send((InputId::new(11), AgentInput::key("x")))
             .await
             .expect("queued");
         let t0 = TokioInstant::now();
@@ -2370,7 +2675,7 @@ mod tests {
         };
         let app = async move {
             let mut reader = BufReader::new(app_end);
-            assert_eq!(next_input_id(&mut reader).await, 11);
+            assert_eq!(next_input_id(&mut reader).await, InputId::new(11));
             tokio::time::sleep_until(t0 + leaves_after).await;
             // Gone with the input unacked, five seconds into the hold. Shut
             // down before the drop: a child process another test spawns holds
@@ -2441,19 +2746,19 @@ mod tests {
     #[test]
     fn the_unacked_inputs_are_bounded_and_the_oldest_forgotten() {
         let mut unacked = Unacked::default();
-        let past = MAX_UNACKED as InputId + 5;
+        let past = MAX_UNACKED as u64 + 5;
         for id in 1..=past {
-            unacked.sent(id);
+            unacked.sent(InputId::new(id));
         }
         assert_eq!(unacked.len(), MAX_UNACKED);
         assert_eq!(
             unacked.ids.first(),
-            Some(&6),
+            Some(&InputId::new(6)),
             "the five oldest are forgotten"
         );
 
         // Acking a forgotten input changes nothing, and is no error.
-        unacked.acked(1);
+        unacked.acked(InputId::new(1));
         assert_eq!(unacked.len(), MAX_UNACKED);
         assert!(unacked.cleared_at.is_none());
 
@@ -2466,7 +2771,7 @@ mod tests {
             }
         );
         for id in 6..=past {
-            unacked.acked(id);
+            unacked.acked(InputId::new(id));
         }
         assert!(!unacked.any());
         assert!(unacked.cleared_at.is_some());
@@ -2569,6 +2874,8 @@ mod tests {
                     protocol_rx,
                     rejected_rx,
                     link_rx,
+                    stamps_rx: watch::channel(false).1,
+                    send_order: Default::default(),
                 },
                 link_tx,
                 _state_tx: state_tx,

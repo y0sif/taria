@@ -15,12 +15,15 @@
 //! snapshot does not arrive at all, and nothing says so, which is why
 //! [`Node::check_depth`] exists for an adapter to call before publishing.
 
+#![warn(missing_docs)]
+
 mod action;
 pub mod id;
 pub mod key;
 mod node;
 mod snapshot;
 pub mod socket;
+mod state;
 pub mod wire;
 
 pub use action::{Action, AgentInput};
@@ -30,6 +33,7 @@ pub use action::{Action, AgentInput};
 pub use id::IdSpace;
 pub use node::{MAX_NODE_DEPTH, Node, NodeId, Role, TreeTooDeep};
 pub use snapshot::Snapshot;
+pub use state::{Checked, Number};
 
 /// Protocol version, bumped on breaking changes to the wire format.
 ///

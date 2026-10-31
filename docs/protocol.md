@@ -65,12 +65,16 @@ the app is the one that speaks first (section 3).
 ### 1.3 What a conforming app MUST do
 
 1. Bind an `AF_UNIX` `SOCK_STREAM` socket at a path a bridge can find
-   (section 14).
+   (section 14), or on Windows create a named pipe a bridge can find: in
+   byte mode (section 2.1), as the first instance of its name
+   (`FILE_FLAG_FIRST_PIPE_INSTANCE`), rejecting remote clients
+   (`PIPE_REJECT_REMOTE_CLIENTS`), owned by its user and open to that user
+   alone (section 14.8).
 2. Send exactly one `hello` as the first message on every accepted connection,
    before any other message (section 3).
 3. Publish `snapshot` messages whose `protocol_version` is 1, whose `seq`
-   increases within one run, and whose tree obeys section 6 and the depth
-   limit in section 13.
+   never decreases within one run and repeats only on the resend section 5.1
+   allows, and whose tree obeys section 6 and the depth limit in section 13.
 4. Answer every `input` message it reads on a live connection with at least
    one `ack` naming the same `id` (section 10). An input the app cannot act on
    is answered `ignored`, not left unanswered. The exceptions are a line
@@ -81,6 +85,9 @@ the app is the one that speaks first (section 3).
 5. Skip a line it cannot parse and keep the connection (section 2.6).
 6. Never apply an input that arrived on a connection that has since ended
    (section 11).
+7. If its `hello` says `"stamps":true`, stamp every snapshot on that
+   connection by the rules of section 5.3. An app that does not say so need
+   not stamp at all.
 
 An app MAY publish no snapshots at all (it is then a connected peer with no
 tree, which the reference bridge reports as such), and MAY accept only one
@@ -89,8 +96,11 @@ bridge connection at a time.
 ### 1.4 What a conforming bridge MUST do
 
 1. Connect to the app's socket and read `hello`, `snapshot` and `ack` lines.
-2. Stamp every `input` with an `id` that does not repeat for the lifetime of
-   the bridge **process**, not merely of one connection (section 10.1).
+   On Windows, open the app's pipe only by a local name, and check that the
+   pipe's owner is the bridge's own user before writing anything to it or
+   parsing anything it sent (section 14.8).
+2. Give every `input` an `id` that does not repeat for the lifetime of the
+   bridge **process**, not merely of one connection (section 10.1).
 3. Skip a line it cannot parse and keep the connection (section 2.6).
 4. Treat the `hello` version as the peer's version and refuse to send input
    across a mismatch (section 16.5).
@@ -104,9 +114,11 @@ A bridge MUST NOT send any handshake of its own (section 3.3).
 ### 1.5 Out of scope
 
 The MCP tool surface `taria-mcp` exposes (`read_tree`, `act`, `key`,
-`type_text`), its 500 ms result windows, and its per-tool argument bounds are
-a bridge's agent-facing API, not the wire protocol. They appear here only
-where they are marked as conventions an implementer may want to match.
+`type_text`), its result windows (500 ms against a peer that does not stamp
+its snapshots, 3 s against one that does, section 5.3), and its per-tool
+argument bounds are a bridge's agent-facing API, not the wire protocol. They
+appear here only where they are marked as conventions an implementer may
+want to match.
 
 ### 1.6 Normative artefacts
 
@@ -122,9 +134,30 @@ literal line in this document is real serializer output or a real capture
 
 ### 2.1 Transport
 
-The transport is a Unix domain socket, `AF_UNIX` with type `SOCK_STREAM`. The
-app binds and listens; the bridge connects. Nothing about the protocol depends
-on a particular socket path, but discovery does (section 14).
+The transport is a bidirectional byte stream between the two processes, and
+which one depends on the platform:
+
+| Platform | Transport |
+|---|---|
+| Linux, macOS and the other unixes | A Unix domain socket, `AF_UNIX` with type `SOCK_STREAM`. |
+| Windows | A named pipe (a kernel object, named under `\\.\pipe\`, that two processes open like a file) in byte mode both ways: `PIPE_TYPE_BYTE` and `PIPE_READMODE_BYTE`. |
+
+The pipe carries the same ndjson as the socket, byte for byte: everything in
+this document from section 2.2 on applies to it unchanged. An app **MUST**
+create the pipe in byte mode, so the stream holds no message boundaries a
+peer could take for framing. A line may span several pipe writes and one
+write may hold several lines, exactly as on a socket.
+
+The app binds and listens, or on Windows creates the pipe and waits for a
+client; the bridge connects. This document says *socket* for either where
+the two do not differ. Nothing about the protocol depends on a particular
+socket path or pipe name, but discovery does (section 14, and section 14.8 on
+Windows).
+
+The named pipe is a new transport for a platform version 1 did not reach,
+not a change to version 1. A peer on a unix sees no difference, and a peer
+that implements only the socket is still conforming there. Adding it is
+additive in the sense of section 16: `PROTOCOL_VERSION` stays 1.
 
 ### 2.2 Framing
 
@@ -268,11 +301,25 @@ before any snapshot or ack:
 {"type":"hello","app_label":"demo-app","protocol_version":1}
 ```
 
+An app that stamps its snapshots (section 5.3) says so in the same line, as
+the reference adapter does from 0.4.0:
+
+```json
+{"type":"hello","app_label":"taria-demo","protocol_version":1,"stamps":true}
+```
+
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `type` | string | yes | `"hello"` |
 | `app_label` | string | yes | Human-readable app name shown to agents, typically the binary name. |
 | `protocol_version` | integer (u32) | yes | The version this app speaks. `1` for this specification. |
+| `stamps` | boolean | no | `true` when this app stamps its snapshots on the connection by the rules of section 5.3. **Omitted when false.** Added in 0.4.0. |
+
+A reader **MUST** read `stamps` leniently: anything but `true`, a wrong type
+included, reads as a peer that does not stamp, and fails nothing else in the
+line. An app **MUST NOT** say `"stamps":true` unless it stamps every
+snapshot by the rules of section 5.3, since a bridge that believes the claim
+answers "did not change" on one unchanged stamped tree.
 
 `app_label` is free-form UTF-8. No length bound and no character restriction
 is specified for it. It is not the same thing as the socket label, which does
@@ -308,7 +355,7 @@ one.
 Immediately after `hello` the app **SHOULD** send its latest snapshot, if it
 has one, so a bridge that connects mid-session is not left with no tree until
 the app's next state change. The reference adapter does exactly this, then
-streams every subsequent publish.
+streams every later publish and stamp resend (section 14.5).
 
 ### 3.5 An app that sends no hello
 
@@ -337,7 +384,7 @@ agent strips it.
 | `ack` | app to bridge | What became of one input. | 10 |
 
 ```json
-{"type":"hello","app_label":"demo-app","protocol_version":1}
+{"type":"hello","app_label":"demo-app","protocol_version":1,"stamps":true}
 ```
 
 ```json
@@ -367,17 +414,21 @@ adding to this direction is narrower than "additive": see section 16.4.
 |---|---|---|---|---|
 | `hello` | `app_label` | string | yes | never |
 | `hello` | `protocol_version` | integer | yes | never |
+| `hello` | `stamps` | boolean | no | false |
 | `snapshot` | `protocol_version` | integer | yes | never |
 | `snapshot` | `seq` | integer (u64) | yes | never |
+| `snapshot` | `after_input` | integer (u64) | no | unset |
 | `snapshot` | `root` | Node | yes | never |
 | `ack` | `id` | integer (u64) | yes | never |
 | `ack` | `status` | string | yes | never |
 | `input` | `id` | integer (u64) | yes | never |
 | `input` | `input` | AgentInput | yes | never |
 
-Every field in this table is required in both directions. Verified: removing
-any one of them from an otherwise valid line fails the parse with
-"missing field".
+Every field marked required is required in both directions. Verified:
+removing any one of them from an otherwise valid line fails the parse with
+"missing field". The two optional ones were added in 0.4.0 (section 16.9).
+A hello without `stamps` is from a peer that does not stamp; a snapshot
+without `after_input` is unstamped.
 
 ## 5. Snapshot
 
@@ -392,25 +443,41 @@ own fields, not nested under one.
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `protocol_version` | integer (u32) | yes | The version the snapshot is written in. Always emitted. |
-| `seq` | integer (u64) | yes | Publish counter within one app run. Always emitted. |
+| `seq` | integer (u64) | yes | Counts the trees published within one app run; repeats only on a resend whose sole change is `after_input` (section 5.1). Always emitted. |
+| `after_input` | integer (u64) | no | The newest input id the app had dequeued on this connection when it published the tree (section 5.3). **Omitted when unset**, and written before `root`. |
 | `root` | Node | yes | The root of the tree. Always emitted. |
 
-No snapshot field is ever omitted.
+`after_input` is the one snapshot field ever omitted: an app that does not
+stamp never sends it, and one that does leaves it off until it has dequeued
+an input on the connection. A stamped snapshot:
+
+```json
+{"type":"snapshot","protocol_version":1,"seq":2,"after_input":1,"root":{"id":"app","role":"app","label":"demo-app","focused":false,"children":[{"id":"save","role":"button","label":"Save","focused":true,"actions":["activate"]}]}}
+```
 
 ### 5.1 `seq`
 
-`seq` increments once per **published** snapshot within one run of the app. It
-says which of two snapshots from the same run is the newer one and nothing
-beyond that.
+`seq` counts the trees an app publishes within one run; it never decreases,
+and repeats only on a resend whose sole change is `after_input`. It says which
+of two snapshots from the same run is the newer one, and that two from the
+same run under one `seq` carry the same tree, and nothing beyond that.
 
 - A restarted app starts counting again, so a **lower `seq` with different
   content is a change, not a stale tree**. A reader **MUST NOT** order
   snapshots by `seq` across connections, and **SHOULD** detect change by
-  comparing whole snapshots rather than by `seq`.
+  comparing trees, the `root` of each, rather than by `seq`.
 - `seq` counts publishes, not frames. A sender **MAY** skip publishing a tree
   identical to the one it last published, in which case `seq` does not move
   (the reference adapter deduplicates exactly this way, and the whole publish
   is skipped).
+- The one exception is a stamp moving (section 5.3). An app that stamps and
+  has dequeued an input since its last snapshot went out **MUST** send a
+  snapshot for the next tree it builds, identical or not. If that tree is
+  identical, the app **SHOULD** send the last snapshot again, unchanged but
+  for `after_input` and under the **same `seq`**, which is what the
+  reference adapter does. Such a resend is not a publish: no new tree went
+  out, so `seq` does not move. A reader that ignores `after_input` then sees
+  the same snapshot twice, `seq` included, and reads it as unchanged.
 - No behaviour is specified for `seq` reaching the u64 maximum.
 
 ### 5.2 `protocol_version` on the snapshot
@@ -425,6 +492,115 @@ reader **MUST NOT** treat this field as a validity check.
 **Not specified.** What a peer should do when a snapshot's `protocol_version`
 disagrees with the `hello`'s, or with its own. The reference bridge goes by
 the `hello` where there is one, and until there is, by the first snapshot's.
+
+### 5.3 `after_input`: stamped snapshots
+
+A stamp orders a tree against the bridge's inputs. Without one, a bridge can
+compare trees but cannot tell a tree published after its input from one
+published before it, and section 10.4 forbids it to guess from arrival order.
+So a bridge that waits a fixed window for a tree that differs reads a handler
+slower than the window as "did not change", and credits its tree, when it
+lands, to whatever input was sent next (issue #17).
+
+An app that sends `"stamps":true` in its `hello` (section 3.1) **MUST** keep
+these rules on that connection:
+
+- **What the stamp is.** Every snapshot carries, in `after_input`, the id of
+  the newest input the app had **dequeued** on this connection when it
+  published that tree, or no `after_input` when it had dequeued none.
+  Dequeued means handed to the app's own code, the moment the `delivered` ack
+  is sent (section 10.2).
+- **What never stamps.** An input dropped for want of queue room, one of a
+  kind the app cannot read (answered `ignored` where it is parsed, section
+  9.5), one discarded because its connection ended (section 11) and one
+  written before the `hello` (section 14.5) were never dequeued, and **MUST
+  NOT** become a stamp.
+- **Per connection.** Ids are unique only within one bridge process, so the
+  first snapshot a new connection receives, the latest one resent on accept
+  (section 3.4), **MUST** go out unstamped, and stamps on a connection name
+  only inputs that arrived on it.
+- **No skipped stamp.** Once the app has dequeued an input, it **MUST** send
+  a stamped snapshot for the next tree it builds, even when that tree is
+  identical to the last one (section 5.1).
+- **One unstamped tree after the first dequeue.** The trees the app
+  published before its first dequeue on the connection are unstamped, and
+  section 10.4 lets one go out after that dequeue's `delivered` ack. The app
+  **MUST NOT** send more than one unstamped snapshot after that ack, nor any
+  after a stamped one. An adapter that keeps only its newest unsent
+  snapshot, as the reference adapter does, keeps this rule for free; one
+  that queues snapshots can keep it by dropping all but the newest of them
+  at the dequeue.
+- **Acks first.** An app that answers an input `ignored` **SHOULD** send that
+  ack before the first snapshot it publishes after dequeuing the input. That
+  snapshot is the one a bridge credits to the input, and an `ignored` behind
+  it arrives after the answer has gone out. Section 10.4 keeps an ack ahead
+  of every snapshot sent after it, a resend included, so an app that decides
+  inside the drain and acks there keeps this rule for free; the reference
+  adapter's `drain` does. An app that can decide only later **SHOULD**
+  publish, in that first snapshot, a status node saying the input is under
+  way, so the answer it is credited with says so.
+
+A stamp covers the dequeue, not the effect. An app that publishes between
+taking an input and applying it sends a stamped tree without the effect, and
+a bridge credits that tree to the input. The integration guide ("Drain agent
+input around the blocking call") asks for the first tree published after a
+drain to carry the effect, or a status saying it is under way.
+
+Nor does a stamp separate two inputs applied in one drain. A handler slower
+than the bridge's wait (3 s in the reference bridge) whose next input is
+already queued can have both applied in one drain, before the app publishes
+again, so the one tree, stamped at the later id, carries the earlier input's
+effect too, and the earlier input's call has already ended without a
+credited tree.
+
+A bridge that reads stamps **SHOULD** treat them like this, which is what the
+reference bridge does against a peer whose `hello` said `stamps`:
+
+- Credit a tree to an input only once it is stamped at or after that input's
+  id **in the bridge's own send order**. The protocol fixes no start and no
+  step for ids (section 10.1), so the order is the bridge's to know: the
+  reference bridge claims each id and queues its input under one lock, from
+  a counter that only goes up, so a higher id is a later input.
+- Compare a credited tree with the newest tree published before the input,
+  on its `root` and never on `seq`, and answer "did not change" as soon as a
+  credited tree is unchanged.
+- Take a tree stamped below the input, or not stamped at all, as the new
+  baseline instead of crediting it: it was published before the app had the
+  input in hand, so it carries an earlier input's effect, however late it
+  arrived. For a burst, "below" is below its first input, and a tree stamped
+  inside the burst is its effect so far, which neither answers nor moves the
+  baseline.
+- Strip `after_input` from what it hands an agent, as it strips `type`
+  (section 16.6).
+- Answer by the rules for a peer that does not stamp, from the call that
+  shows it for the rest of the connection, when the peer's hello said
+  `stamps` but its snapshots break the rules above: a tree that differs from
+  the one before the input is then credited, as it was before stamps
+  existed. Its claim and its snapshots disagree, and believing the claim
+  would leave every input waiting for a stamp that never comes.
+
+**Reference implementation.** The reference bridge waits up to 3 s for a
+credited tree from a peer that stamps, against 500 ms for one that does not,
+and answers at once when the credited tree is unchanged: "The app received
+this input, and its tree did not change." With no credited tree inside the
+3 s it answers "The app received this input but published no tree after it
+within 3000ms; it may still be working. Call read_tree to see its effect." An
+`ignored` ack still ends the wait early, at the first credited tree, or
+500 ms after the ack when none comes; a `dropped` ack ends it at once. A
+disconnect mid-wait is answered within 500 ms of the disconnect, inside the
+3 s cap. Its no-ack and rejected-line answers to a peer that stamps name the
+3000ms window, not the 500ms one. A peer that said `stamps` is taken to
+break the rules at an unstamped snapshot read after one of the call's
+`delivered` acks, once the connection has carried a stamped snapshot or one
+that surely followed a `delivered` ack, so the one unstamped tree the rules
+allow after the first dequeue's ack is never taken for a break. It is
+degraded as above for the rest of the connection: the call that shows it
+keeps its 3 s window, later calls get the 500 ms one and the texts for a
+peer that does not stamp, and the bridge logs a warning once per
+connection. The bridge's snapshot channel keeps only the newest tree, so a
+tree stamped below the input and the credited one arriving back to back can
+be read as the credited one alone, compared with the tree before both: the
+one gap it leaves.
 
 ## 6. Node
 
@@ -464,10 +640,28 @@ A node with nothing set beyond its identity:
 | `role` | string (or object, section 7.2) | yes | always emitted | parse error |
 | `label` | string | no | **omitted when unset** | no label |
 | `value` | string | no | **omitted when unset** | no value |
+| `description` | string | no | **omitted when unset** | not stated |
 | `focused` | boolean | no | **always emitted**, including `false` | `false` |
 | `relayed` | boolean | no | **omitted when `false`** | `false`: not marked |
+| `selected` | boolean | no | **omitted when unset**; `true` and `false` both sent | not stated |
+| `checked` | `true`, `false` or `"mixed"` | no | **omitted when unset**; all three sent | not stated |
+| `expanded` | boolean | no | **omitted when unset**; `true` and `false` both sent | not stated |
+| `disabled` | boolean | no | **omitted unless `true`** | not stated |
+| `value_now` | number | no | **omitted when unset** | not stated |
+| `value_min` | number | no | **omitted when unset** | not stated |
+| `value_max` | number | no | **omitted when unset** | not stated |
+| `pos_in_set` | integer, 1 to 4294967295 | no | **omitted when unset** | not stated |
+| `set_size` | integer, 0 to 4294967295 | no | **omitted when unset** | not stated |
+| `row` | integer, 1 to 4294967295 | no | **omitted when unset** | not stated |
+| `column` | integer, 1 to 4294967295 | no | **omitted when unset** | not stated |
+| `row_count` | integer, 0 to 4294967295 | no | **omitted when unset** | not stated |
+| `column_count` | integer, 0 to 4294967295 | no | **omitted when unset** | not stated |
 | `actions` | array | no | **omitted when empty** | no actions advertised |
 | `children` | array | no | **omitted when empty** | a leaf |
+
+`description` and the thirteen fields from `selected` to `column_count`,
+fourteen in all, are the typed state, added in 0.4.0 (section 16.8). Section
+6.5 says what each means.
 
 Rules a reader has to implement:
 
@@ -494,6 +688,32 @@ Rules a reader has to implement:
   "invalid type: null" in the reference implementation, a value of any other
   wrong type fails it too, and failing takes the whole snapshot with it.
 - `id` **MUST** be a JSON string. Verified: `{"id":7,...}` fails.
+- A reader **MUST** accept every typed state field absent, and **MUST** read
+  absence as not stated, never as `false` or zero.
+- A reader **MUST** read a typed state field of the wrong type or shape as not
+  stated, exactly as if it were absent, and **MUST NOT** fail the node over
+  it: `"selected":"yes"`, `"checked":2`, `"checked":"partial"`, a negative or
+  zero `row`, `"pos_in_set":3.5`, a `set_size` over 4294967295, a string
+  where a number goes. `null` reads as absent too. This is the opposite of
+  `focused` and `relayed`, whose wrong type fails the line; the reason is in
+  section 16.8. Verified:
+  `{"id":"c","role":"checkbox","checked":2,"row":-1,"selected":"yes"}`
+  parses as a node with none of the three stated.
+- A sender **MUST NOT** send `"disabled":false`; it sends `true` or nothing.
+  A reader reads `false` as not stated.
+- A number is a JSON number, so it is always finite: JSON has no spelling for
+  `NaN` or an infinity. A sender **MUST** leave a field unset rather than
+  invent one. The reference `taria::Number` cannot hold either, and writes a
+  whole number within 2^53 without a fraction (`42`, not `42.0`).
+- A sender **MUST NOT** write a number outside the double range, such as
+  `1e999`. The lenient read above does not cover it: the reference reader
+  fails the whole line over one anywhere in it, in a typed state field or
+  one it does not know, with "number out of range" from `serde_json`, before
+  any field's own rule runs.
+- An integer field (`pos_in_set`, `set_size`, `row`, `column`, `row_count`,
+  `column_count`) written with a fraction or an exponent, `3.0` or `3e0`,
+  reads as not stated, though the value is whole. Python's `json` writes a
+  float as `3.0`, so a Python sender converts with `int()` first.
 
 ### 6.2 Node ids
 
@@ -516,9 +736,9 @@ authors, not a wire rule. See section 18.3.
 
 `children` carries the node's children in order. Depth is bounded
 (section 13.1). No bound is specified on the number of children, on the number
-of nodes in a tree, or on the length of a `label` or a `value`; the 1 MiB line
-cap (section 2.5) bounds all of them together, and crossing it costs the
-connection rather than the tree (section 13.2).
+of nodes in a tree, or on the length of a `label`, a `value` or a
+`description`; the 1 MiB line cap (section 2.5) bounds all of them together,
+and crossing it costs the connection rather than the tree (section 13.2).
 
 ### 6.4 Relayed text
 
@@ -560,6 +780,67 @@ peer can check it. A bridge needs nothing new to carry it: it passes the mark
 on with the rest of the line, and a bridge built before the field does too,
 because it hands the agent the app's line rather than its parse of it
 (section 16.6).
+
+### 6.5 Typed state
+
+A node's role says what a widget is; its typed state says what condition it
+is in, in fields an agent can read without parsing prose out of a `value`.
+Every field is optional and is a statement only when present: absent means
+the app said nothing, never `false`. An app built before 0.4.0 states
+nothing.
+
+- **`selected`**: whether the node is selected among its siblings: the row a
+  list's cursor sits on, the active tab, the chosen option, or each of the rows
+  picked in a list that allows more than one. Selection is not focus (section
+  15): a cursor sits on a row whether or not the list holds the keyboard.
+  `false` is a statement too, so a list whose rows all say `false` has no
+  selection, while a row without the field says nothing either way.
+- **`checked`**: whether a checkable node is checked: `true`, `false`, or
+  `"mixed"` for a parent whose children disagree.
+- **`expanded`**: `true` is expanded and `false` collapsed. Absent says
+  nothing; an app that states expansion omits it only where a node cannot
+  expand.
+- **`disabled`**: the node is shown but takes no action until the app enables
+  it. Only `true` is sent. A sender **SHOULD** advertise no actions on a
+  disabled node, and the reference adapter strips every action from one when it
+  publishes. A bridge **SHOULD** refuse an `act` naming a disabled node, and the
+  reference bridge does, before it looks at the action, with an answer that says
+  the node is disabled. A reader **MUST NOT** infer `disabled` from an empty
+  action list: a node advertises nothing for other reasons, such as a modal
+  dialog in front of it, and is not disabled then. Neither `key` nor `text` is
+  affected: they go where the app sends them. Like `relayed` (section 6.4), it
+  covers that node alone: a reader **MUST NOT** read a child of a disabled node
+  as disabled, and a sender marks each node it disables. The reference adapter's
+  strip and the reference bridge's refusal both look at the node itself and
+  nothing above it.
+- **`description`**: longer text than the label, in the app's own words: a
+  hint, what a setting does, why a button is disabled. `relayed` covers the
+  label and the value only, so a sender **MUST NOT** put relayed text in a
+  description; text from outside the app goes in a child marked relayed
+  (section 6.4).
+- **`value_now`**, **`value_min`**, **`value_max`**: a numeric value and its
+  bounds, for a progress bar, a slider, a gauge. Any of the three may come
+  without the others. Nothing checks that the value lies within its bounds.
+- **`pos_in_set`** and **`set_size`**: an item's position among its
+  siblings, counting from 1, and on the container (a `list`, `tree`,
+  `tree_item`, `tabs`, `select` or `menu`) how many items it holds. Both count
+  every item, published or not: row 40 of 1000 is `"pos_in_set":40` beside
+  `"set_size":1000` when the app publishes only the rows on screen.
+- **`row`** and **`column`**: the row and column a table `row` or `cell` is
+  in, counting from 1; a `row` node carries only `row`. **`row_count`** and
+  **`column_count`**: how many rows and columns the `table` holds, published
+  or not.
+
+Positions count from 1 on the wire, as a person counts rows. AccessKit counts
+`position_in_set`, row and column indices from 0, so an exporter to it
+subtracts one (`docs/architecture.md` has the mapping).
+
+**Hidden** has no field. A node an app hides, a collapsed branch, a
+scrolled-away row, a closed panel, is simply not published. So a node with
+`"expanded":true` and fewer children than its `set_size` has children that
+were not published: off screen, cut at the depth limit (section 13.1), which
+drops every child of a node at the limit, or cut to fit the line (section
+13.2). A reader **MUST NOT** read the published children as all of them.
 
 ## 7. Role vocabulary
 
@@ -794,7 +1075,9 @@ An app with nothing accepting typing **MUST NOT** find somewhere else to put
 the characters and **SHOULD** answer `ignored`. Somewhere else is usually the
 key bindings, and one text holding `d` and `y` deleted a task. Verified
 against the demo: `{"kind":"text","text":"hello"}` sent while the task list
-had focus drew `delivered` then `ignored`, and no snapshot followed.
+had focus drew `delivered` then `ignored`, and no new tree followed: only the
+tree already published, sent again under its own `seq` with its stamp moved
+to the input (section 5.3).
 
 **Convention, not protocol.** An adapter whose typing surface is made of key
 events has to lower the text into them, and the reference lowering
@@ -921,10 +1204,11 @@ newest received is the app's current answer.
 
 ### 10.4 Ordering against snapshots
 
-An app **MUST NOT** let an ack be overtaken by a snapshot published after it.
-An agent that saw the snapshot first could not tell whether it reflects its own
-input yet. The reference adapter enforces this by giving one thread the stream
-and flushing every pending ack before the pending snapshot in each pass.
+An app **MUST NOT** let an ack be overtaken by a snapshot sent after it, a
+newly published tree or a resend (section 5.1) alike. An agent that saw the
+snapshot first could not tell whether it reflects its own input yet. The
+reference adapter enforces this by giving one thread the stream and
+flushing every pending ack before the pending snapshot in each pass.
 
 The converse is not guaranteed. An ack **MAY** arrive before a snapshot that
 was published earlier, because the reference adapter batches: a pass that
@@ -932,13 +1216,20 @@ finds both waiting writes the acks first whatever order they were produced in.
 A bridge **MUST NOT** infer, from a snapshot arriving after an ack, that the
 snapshot post-dates the input.
 
+What it may read instead is the stamp. A snapshot from a peer that stamps
+(section 5.3) says in `after_input` which inputs it post-dates, whatever
+order it arrived in, and the rule above holds for stamped snapshots too: a
+resend of an identical tree with its stamp moved is not a publish (section
+5.1), but it is sent, so it goes out behind the acks queued before it.
+
 ### 10.5 No fallback for an unknown status
 
 `status` has **no** unknown-value fallback, unlike `role` and `action`. A
 status name a reader does not know fails its whole ack line, id included, and
-the reader skips that line. Verified: `{"type":"ack","id":7,"status":"coalesced"}`
-is a parse error, and `"Delivered"` is too, because the names are exactly the
-three lowercase spellings.
+the reader skips that line. Verified:
+`{"type":"ack","id":7,"status":"coalesced"}` is a parse error, and
+`"Delivered"` is too, because the names are exactly the three lowercase
+spellings.
 
 This is deliberate and an implementer needs to understand the consequence. A
 status sits at the top of a message rather than nested inside one, so losing
@@ -989,11 +1280,11 @@ the ack exists to remove.
   or snapshot version.
 
 **Reference implementation.** The adapter tags each connection with a
-generation, stamps every queued input with the generation it arrived on, and
+generation, tags every queued input with the generation it arrived on, and
 retires that generation as the reader thread exits, before the disconnect is
 observable anywhere. An input from a retired generation is discarded at
-dequeue and counted in `stale_inputs()`. Input a waiting client wrote before
-the `hello` is counted there too, though it never reaches the queue
+dequeue and counted in `stats().stale_inputs`. Input a waiting client wrote
+before the `hello` is counted there too, though it never reaches the queue
 (section 14.5). The same bookkeeping decides who may still be answered: `ack`
 refuses an id whose connection has ended, and an id also stops being
 answerable once its own connection has delivered a queue's worth (256) of
@@ -1113,13 +1404,13 @@ marking it stale. This is why the obligation sits on the sender.
 **What to do about a tree that is too deep is the sender's choice**, not a
 protocol rule. The reference adapter **cuts**: every node at the limit
 publishes without its children, per branch, and the app is told through
-`truncated_snapshots()` and `last_truncation()`. Cutting, because the other
-two answers are the same failure: publishing the tree as built puts a line on
-the wire the bridge cannot parse, and skipping the publish is that same stale
-tree chosen deliberately. Only the cut still delivers the part of the tree
-that is fine. The fix is nearly always to publish what the widget draws rather
-than the data behind it: for a deep tree view, the expanded path and the rows
-on screen.
+`stats()`'s `truncated_snapshots` and `last_truncation` fields. Cutting,
+because the other two answers are the same failure: publishing the tree as
+built puts a line on the wire the bridge cannot parse, and skipping the
+publish is that same stale tree chosen deliberately. Only the cut still
+delivers the part of the tree that is fine. The fix is nearly always to
+publish what the widget draws rather than the data behind it: for a deep tree
+view, the expanded path and the rows on screen.
 
 ### 13.2 Line length
 
@@ -1139,21 +1430,32 @@ other string keeps its start. Ids and custom action names are never changed,
 so whatever an agent can read it can still act on. `docs/architecture.md`
 (Snapshot size) gives the order the adapter cuts in and how it tells the app.
 
-### 13.3 Socket path length
+### 13.3 Socket path and pipe name length
 
 `sockaddr_un.sun_path` has to hold the path and its terminating NUL, so the
 limit is that buffer minus one, and the buffer is not the same size
-everywhere.
+everywhere. Windows has no `sun_path`: its endpoint is a named pipe (section
+14.8), and the limit is on the pipe's whole name.
 
-| Platform | `sun_path` | Longest path, bytes |
+| Platform | Buffer | Longest endpoint |
 |---|---|---|
-| Linux and other unixes | 108 | **107** |
-| macOS, FreeBSD, NetBSD, OpenBSD, DragonFly | 104 | **103** |
+| Linux and other unixes | `sun_path`, 108 | **107** bytes |
+| macOS, FreeBSD, NetBSD, OpenBSD, DragonFly | `sun_path`, 104 | **103** bytes |
+| Windows | none | **256** UTF-16 code units, the whole pipe name, `\\.\pipe\` included |
 
-Length is the byte length of the path, the same count the kernel applies. A
-path in the band between the two binds on Linux and is refused on macOS, which
-is not hypothetical: the macOS temp dir is around 49 bytes, so the fallback
-path plus a long app label lands in it.
+On a unix, length is the byte length of the path, the same count the kernel
+applies. A path in the band between the two binds on Linux and is refused on
+macOS, which is not hypothetical: the macOS temp dir is around 49 bytes, so
+the fallback path plus a long app label lands in it.
+
+On Windows, length is counted the way Windows counts the name, in UTF-16 code
+units (a character outside the Basic Multilingual Plane, such as most emoji,
+counts two). The 256 covers the prefix, so the default name
+`\\.\pipe\taria-<SID>-<label>` spends 16 units on its fixed parts and the
+SID's own length on the user (a SID is the account's security id, section
+14.8): a typical account's SID is around 45 characters, which leaves a label
+about 190. A label that holds `\` is refused before the length is counted
+(section 14.8).
 
 Both peers **SHOULD** check this before binding or connecting rather than
 letting the kernel refuse. The kernel's own refusal names neither the path,
@@ -1199,6 +1501,10 @@ where it is available (through `/proc/self` on Linux), else `$USER`, else
 rather than in the shared crate, so a third-party adapter that wants to be
 discoverable through the fallback branch **MUST** match it.
 
+This resolution, sections 14.3 and 14.4, and the socket file of section 14.6
+are about a file on a unix. On Windows the endpoint is a named pipe, which is
+named, protected and freed differently; section 14.8 says how.
+
 ### 14.2 The label rule
 
 The label is formatted into a file name, so it has to be one. A label that is
@@ -1223,6 +1529,10 @@ rejects passes the path itself.
 
 The reference bridge refuses the same labels while parsing `--app`, where
 `--socket` remains the way to name a path.
+
+On Windows the label ends a pipe name rather than a file name, and a label
+that also contains `\` **MUST** be refused, since Windows reads `\` as a
+separator there too (section 14.8).
 
 ### 14.3 Directory vetting
 
@@ -1267,8 +1577,10 @@ The app listens and **MAY** serve one client at a time; the reference adapter
 does. On accept it sends, in this order:
 
 1. the `hello`,
-2. the latest snapshot, if it has one,
-3. every subsequent publish, as it happens.
+2. the latest snapshot, if it has one, unstamped (section 5.3),
+3. every snapshot published after that, as it happens, and every resend of
+   the last one with only its stamp moved, which is not a publish (section
+   5.1).
 
 Multiple simultaneous bridge clients per app are a deferred feature, not a
 protocol rule. With a one-at-a-time adapter, a second bridge's `connect`
@@ -1291,8 +1603,8 @@ it would be answered in has not begun. A bridge that writes nothing before the
 already waiting in the backlog when the previous session ended. Just before
 writing that client's `hello`, it reads off whatever is already waiting and
 discards it, counting each complete `input` line, of any kind, in
-`stale_inputs()`. If what it read stops partway through a line, the rest of
-that line is skipped when it arrives. More than 1 MiB waiting is treated like
+`stats().stale_inputs`. If what it read stops partway through a line, the rest
+of that line is skipped when it arrives. More than 1 MiB waiting is treated like
 a line over the cap and closes the connection. The first connection of a
 process, and a client that connects to an idle app, waited behind nobody and
 keep what they wrote. The adapter tells the two apart by whether an accept
@@ -1300,7 +1612,7 @@ has found the backlog empty since the last session ended, so a client that
 connects the instant a session ends counts as one that waited.
 
 **Not specified.** What a second bridge should do while its connection waits,
-beyond reporting it.
+or on Windows after its open is refused as busy, beyond reporting it.
 
 **Reference implementation.** The reference bridge takes turns, which is its
 own policy and not a rule. It opens no connection until its first tool call,
@@ -1323,7 +1635,37 @@ terminal's foreground process group, resumes only with `fg` there:
 `kill -CONT` resumes it only in the background, where its next use of the
 terminal stops it again. A tracing stop (state `t`) ends from the debugger,
 and any other stop with `kill -CONT`. Nothing on the wire carries any of it,
-and elsewhere a stopped app reads as held.
+and on macOS and the other unixes a stopped app reads as held.
+
+**On Windows there is no backlog**, and both of the silences above mean
+something else. A one-instance pipe (section 14.8) has no queue to wait in:
+while a bridge is served, a second bridge's open fails at once with
+`ERROR_PIPE_BUSY`, and no connection opens at all. That refusal is the only
+sign of an app held by another bridge, and a bridge **SHOULD** report it as
+the app held, not as a wrong pipe name or an app that has gone, and
+**SHOULD** retry it as it retries any connect (section 14.7). So:
+
+- A second bridge never has a connection to write into before its turn, and
+  the discard of input written before the `hello`, above, never applies.
+- An open connection that stays silent is not a bridge waiting its turn: the
+  app's pipe took it, and an app greets a bridge as soon as it takes one. A
+  bridge **SHOULD NOT** report that silence as the app held. It is the app
+  itself, suspended (by a debugger or a process tool), or stuck before its
+  `hello`, or a pipe that is not a taria app at all.
+
+**Reference implementation.** The reference bridge retries a busy open for
+250 ms (section 14.8), and answers a refusal that outlasts that with the held
+answer, in the same words and the same retry advice as on a unix, with the
+pipe's refusal as the evidence in place of the silent connection's age, and
+last that the app may instead be suspended or stuck: an app stopped after a
+session cannot listen again, so its pipe stays busy. The exception is a busy
+refusal while a pipe it refused still stands (section 14.8), which keeps that
+pipe's answer instead. It answers the silent pipe with the app suspended or
+stuck, the pipe name right, and a retry once the app responds. Stopped-app
+detection needs `/proc`, so on Windows a suspended app is named only as
+possibly suspended, never with its pid's state. Every answer that names the
+endpoint names the pipe and the pipe name where a unix answer names the
+socket and the socket path, and is otherwise the same text.
 
 ### 14.6 Shutdown
 
@@ -1385,6 +1727,172 @@ unless it has seen signs of a new instance since: nothing listening, or another
 pid listening than the one it let go of. None of this is a protocol rule. To
 the app, a bridge that let go is one that left.
 
+On Windows the same bridge reads a reconnect refused as busy as the app held
+by another bridge, the Windows form of landing in the backlog, and a
+reconnect that opens and stays silent as the app suspended or stuck (section
+14.5). It takes the peer's pid from `GetNamedPipeServerProcessId` rather
+than `SO_PEERCRED`, for telling one instance from the next. Since a pipe's
+name lives while any handle to the pipe is open (section 14.8), the bridge
+closes its end as soon as it reads end of stream, so that a restarted app can
+create the pipe again.
+
+### 14.8 Windows discovery
+
+On Windows the endpoint is a named pipe (section 2.1), and this section
+replaces sections 14.1, 14.3 and 14.4 there, and the socket file of section
+14.6. Sections 14.2, 14.5, 14.6 and 14.7 otherwise apply, with the
+differences they and this section state. Nothing here changes a byte on the
+connection: it is a transport a peer adds, and version 1 is unchanged.
+
+Two Windows terms recur. A **SID** (security identifier) is the string that
+names an account, `S-1-5-21-...`. A **DACL** (discretionary access control
+list) is the part of an object's security descriptor that lists who may open
+it and how.
+
+**The name.** Both peers derive the same default name, or they never meet:
+
+1. **`$TARIA_SOCK`**, when set and non-empty, if it passes the rule below.
+2. **`\\.\pipe\taria-<SID>-<label>`**, where `<SID>` is the SID string of the
+   user the process runs as, read from the process token (not a thread's
+   impersonation token) and written as `ConvertSidToStringSidW` writes it.
+
+Pipe names share one namespace per machine rather than living in a per-user
+directory, so the SID is in the name to keep one user's pipes apart from
+another's. A peer that wants to be found by the default **MUST** derive it
+exactly this way. The name only keeps users apart; it does not keep anyone
+out. What does is four things below, together: the first-instance flag, the
+reject-remote flag, the DACL, and the bridge's owner check.
+
+**The override.** A peer **MUST** honour `$TARIA_SOCK` only when it names a
+pipe on the local machine: it starts with `\\.\pipe\`, in any letter case,
+since Windows matches the prefix without regard to case (`\\.\PIPE\x` is
+`\\.\pipe\x`), and what follows is one name, with no `\` or `/`, no NUL, and
+not empty or only dots and spaces. Anything else **MUST** be refused, not
+fallen back from: the user named an endpoint, and serving or connecting
+somewhere else would leave the two peers apart with nothing said. A remote
+name, `\\host\pipe\x`, is the reason for the rule. Opening a pipe on another
+machine goes over SMB (Windows file sharing), which sends that machine the
+user's credentials and puts the agent's input on the network. The other
+refusals close the ways around the prefix: Windows normalises a `\\.\` name
+before opening it, folding `/` into `\` and resolving `..`, so
+`\\.\pipe\..\UNC\host\share` passes a plain prefix check and leaves for SMB.
+The same rule holds for a name passed whole, such as the reference bridge's
+`--socket` and the adapter's `bind_at`.
+
+That normalisation also trims trailing dots and spaces, so `\\.\pipe\taria.`
+and `\\.\pipe\taria` name the same pipe, and a label `app.` the same pipe as
+`app`. Both peers pass the name to Windows, which normalises it alike for
+each, so they still meet. A peer **SHOULD** pass the name as UTF-16 to the
+wide-character (`W`) functions: the ANSI ones convert it through the code
+page first, and a best-fit conversion can turn a character the rule allowed
+into a `\`.
+
+**The label** is held to section 14.2's rule, and **MUST** also be refused if
+it contains `\`. The whole name is limited to 256 UTF-16 code units (section
+13.3).
+
+**Creating the pipe.** The app:
+
+- **MUST** create it as the first instance of its name
+  (`FILE_FLAG_FIRST_PIPE_INSTANCE`), which fails while any instance of that
+  name exists. That is what refuses a second app on a live name, as section
+  14.4's `AddrInUse` does on a unix, and what keeps an app from joining, as a
+  second instance, a pipe something else created first under its name.
+  Taking a name over is impossible here, so there is nothing to free.
+- **MUST** reject remote clients (`PIPE_REJECT_REMOTE_CLIENTS`).
+- **MUST** create it with a security descriptor whose owner is the user, and
+  whose DACL grants that user alone, protected from inherited entries. This
+  is section 14.3's private directory in another form: it decides who can
+  open the app's pipe.
+- **SHOULD** allow one instance (`nMaxInstances` 1). A second instance would
+  let a second bridge connect into it and wait unserved, which section 14.5
+  says a bridge reads as a stuck app, not a held one.
+- **MAY** reuse the one instance across sessions: disconnect the last client
+  (`DisconnectNamedPipe`) and listen again (`ConnectNamedPipe`). The
+  reference adapter does.
+
+**Opening the pipe.** The bridge:
+
+- **MUST** check, after the open and before it writes anything to the pipe
+  or parses anything it sent, that the pipe's owner is its own user's SID,
+  and otherwise close it with nothing written to it and nothing it sent
+  parsed. Any process can create a pipe under the app's name before the app
+  does, or after it exits, and an agent that read it would take its tree for
+  the app's and send it input. An owner that is a group the user belongs to
+  is not the user. A runtime that starts a read into its own buffer as it
+  registers the pipe, as tokio's does, still conforms, provided what that
+  read took is dropped with the pipe and never parsed.
+- **SHOULD** read an open refused as access denied (`ERROR_ACCESS_DENIED`)
+  as a pipe it cannot use, not as no app there, and **SHOULD NOT** report it
+  as surely not the app's, as it may a pipe another account owns. The app's
+  pipe grants its user access (above), but a bridge running as that user is
+  still denied it in a sandbox (a restricted token or an AppContainer) or at
+  low integrity, and a bridge running as another account, given the name
+  whole, is denied it too. So access denied means either a pipe the app did
+  not create, or a bridge with fewer rights than the app's user, and a
+  report of it names both, and what to check: that the bridge runs as the
+  app's user, outside any sandbox and at the app's integrity level.
+- **SHOULD** open it at the `SECURITY_IDENTIFICATION` impersonation level, so
+  that what serves the pipe can learn who the bridge is but cannot act as it.
+- **SHOULD** retry an open refused as busy (`ERROR_PIPE_BUSY`) for a short
+  while before it reads the refusal as the app held by another bridge.
+  Between two sessions the one instance is busy for a moment: the last
+  bridge has closed its end, and the app has yet to disconnect it and
+  listen again. Refused at once, a bridge arriving in that moment would
+  report a free app as held.
+- **SHOULD** read a refusal as busy that outlasts the retry as the app held
+  by another bridge, unless a refusal of the pipe stands (below), and a
+  missing name (`ERROR_FILE_NOT_FOUND`) as no app there (section 14.5).
+- **SHOULD** keep reporting a pipe it refused, one another account owns or
+  one that denied it access, on the busy refusals that follow, until a
+  connect passes the owner check, finds nothing listening, or the bridge
+  stops trying, as the reference bridge does when it lets go of the app
+  after its idle window (section 14.7). A pipe that takes one open, fails
+  the owner check and is closed stays busy until its server disconnects that
+  open, which an impostor need never do, and read as the app held, its busy
+  refusals would send the agent to wait for an app that is not there. The
+  rule ends with the trying because what it stands over is what the bridge
+  has tried since: a bridge that stops trying cannot see the impostor exit
+  and the app come back, held by another bridge, and its next busy refusal
+  is read afresh.
+
+**The pipe's lifetime.** A pipe, and its name with it, lives while any handle
+to it is open, on either end. An app that exits while a bridge still holds
+its end leaves the name taken until that bridge closes, and a restarted app
+is refused as if the old one were still serving. A bridge **SHOULD** close
+its end as soon as it reads end of stream. An app **SHOULD** retry, for a
+short while, a create that fails because the name is in use
+(`ERROR_ACCESS_DENIED` from the first-instance flag, or `ERROR_PIPE_BUSY`)
+before it reports the name in use, so that an app restarted at once
+outlasts that bridge instead of running with taria off for the whole of its
+run. The retry has to stay short, since binding must not park the app's
+startup (section 14.6), and a second app on a name that is still served is
+refused all the same, that much later.
+
+**Shutdown.** A pipe leaves no file behind, so section 14.6's rule on removing
+the socket file has nothing to act on. The acks flushed at shutdown (section
+14.6) still have to reach the bridge: an app **SHOULD** close its end at
+shutdown rather than disconnect the client, since closing leaves what the
+app wrote readable by the bridge until it has read it, and
+`DisconnectNamedPipe` discards it. It **SHOULD NOT** wait for the bridge to
+read it either (`FlushFileBuffers`), which can wait forever and so park the
+app's exit.
+
+**Reference implementation.** `taria::socket` holds the pure parts both
+reference peers use: `pipe_name` builds the default name, `check_pipe_name`
+holds a name given whole to the override rule, and `resolve_pipe_name` is the
+precedence above. They build and are tested on every platform. The adapter
+creates the pipe with `PIPE_ACCESS_DUPLEX`, byte mode, one instance, the
+first-instance and reject-remote flags, and a DACL granting the user
+`GENERIC_READ | GENERIC_WRITE`, and retries a create that finds the name in
+use for 500 ms, 20 ms between tries, before it reports `AddrInUse`. The
+bridge opens it with tokio's named-pipe client, retries a busy open for
+250 ms, 10 ms between tries, checks the owner with `GetSecurityInfo`, and
+answers an open refused as access denied with both readings, the bridge's
+rights first. It keeps a refused pipe's answer over every failed connect
+after it but nothing listening, a busy refusal included, and drops it when
+it lets go of the app after its idle window, the one way it stops trying.
+
 ## 15. Focus contract
 
 **Every snapshot should carry exactly one focused node, and this is the
@@ -1412,9 +1920,12 @@ decides where typed characters go is the app, not the protocol.
 a row whether or not that list owns the keyboard. An app that publishes only
 focus makes a moved cursor invisible, and a bridge then truthfully reports
 "the tree did not change" for an input the app handled. Publish the selection
-as its own readable fact: the demo puts the selected item's node id in the
-list node's `value`, which is visible in the capture in section 18 as the
-list's `"value":"task-1"` moving to `"value":"task-3"` after a `down` key.
+as its own readable fact, in `selected` (section 6.5): the demo marks the
+cursor row `"selected":true` and every other row `"selected":false`, and also
+names the selected row's id in the list node's `value`, as it did before
+`selected` existed. Both are visible in the capture in section 18, where a
+`down` key moves `"selected":true` from `task-1` to `task-3` and the list's
+`"value":"task-1"` to `"value":"task-3"`.
 
 ## 16. Versioning
 
@@ -1439,17 +1950,18 @@ something it quietly ignores.
 - A new ack **`status`** value.
 - A new **key name** in the grammar (section 12.3).
 
-### 16.3 The three degrade fallbacks
+### 16.3 The four degrade fallbacks
 
 Neither property in 16.1 covers a value nested inside a message the peer does
-want, so the open vocabularies carry their own fallbacks. A reader **MUST**
-implement all three:
+want, so the open vocabularies and the typed state carry their own
+fallbacks. A reader **MUST** implement all four:
 
 | Value | Unknown reads as | Section |
 |---|---|---|
 | `role` | `other` | 7.2 |
 | `action` | a custom action **keeping the name** | 8.4 |
 | `input` `kind` | an unreadable input **keeping the message's id** | 9.5 |
+| a typed state field, such as a `checked` of `"partial"` | not stated, **keeping the node** | 6.1 |
 
 An ack's `status` deliberately has **no** fallback (section 10.5), because it
 sits at the top of a message rather than nested inside one, so losing it loses
@@ -1516,18 +2028,26 @@ typed: validating node ids and advertised actions, and detecting change, read
 the parse rather than the text. A line is passed on only after it parsed, so
 a malformed one is still skipped.
 
-The one thing a bridge **SHOULD** remove from the line it passes on is the
+The two things a bridge **SHOULD** remove from the line it passes on are the
 `"type":"snapshot"` framing key, which belongs to the transport rather than to
-the tree. The reference bridge removes it by parsing the line into a JSON
-value and writing that out again, which keeps every other key but not the
-app's spelling of the line: keys come out sorted and whitespace gone, string
-escapes are rewritten (`"\u00e9"` becomes `"é"`), numbers are rewritten
-(`1e3` becomes `1000.0`, `-0` becomes `-0.0`, and an integer outside the
-64-bit range becomes a float, keeping about 17 significant digits), and of a
-key repeated in one object only the last value is kept, though a repeated
-field the bridge knows never gets that far, because it fails the parse
-(section 2.2). A sender **MUST NOT** rely on any of these spellings reaching
-the agent.
+the tree, and the `after_input` stamp (section 5.3), which orders the tree
+against the bridge's inputs and is for the bridge to reason about: an agent
+shown it reads an id it never sent as a fact about the app, and a tree sent
+again with only its stamp moved as one that changed. The reference bridge
+removes both, from every peer and in both tree formats, by parsing the line
+into a JSON value and writing that out again, which keeps every other key but
+not the app's spelling of the line: keys come out sorted and whitespace gone,
+string escapes are rewritten (`"\u00e9"` becomes `"é"`), and of a key
+repeated in one object only the last value is kept, though a repeated field
+the bridge knows never gets that far, because it fails the parse (section
+2.2). Numbers are rewritten too. An integer in the 64-bit range comes through
+as written, `-0` aside; any other number is read as the double nearest it and
+printed as serde_json writes that double: `1e3` becomes `1000.0`, `-0`
+becomes `-0.0`, `1e21` becomes `1e+21`, `1e-07` becomes `1e-7`, and an
+integer outside the 64-bit range becomes a float, keeping about 17
+significant digits. The read is exact since 0.4.0, so `1.4000000000000001`
+comes through digit for digit, where before 0.4.0 it read `1.4`. A sender
+**MUST NOT** rely on any of these spellings reaching the agent.
 
 ### 16.7 What forces a version bump
 
@@ -1540,6 +2060,99 @@ Anything that is not additive:
 
 The last is the dangerous one, because an old peer parses the message
 successfully and acts on the old meaning.
+
+### 16.8 Typed state (0.4.0)
+
+The second addition since version 1 froze, after `relayed` in 0.3.3: fourteen
+optional node fields, `description` and the thirteen from `selected` to
+`column_count` (sections 6.1 and 6.5). Each is a new optional field, omitted
+when unset, so the addition is additive under section 16.2 and
+`PROTOCOL_VERSION` stays 1.
+
+- **An older reader** ignores the fields as unknown (section 2.7) and parses
+  every node as before. It reads no state, so to it a node is exactly what a
+  0.3.3 app would have sent, `value` and all.
+- **An older reference bridge** from 0.1.0 to 0.3.3, which hands the agent the
+  app's own line (section 16.6), passes the fields on in the JSON tree with the
+  rest of it. Its outline, in 0.3.0 to 0.3.3, shows them among the fields at the
+  end of the line, `checked=false selected=true`, rather than as marks, and its
+  `read_tree` description says nothing about them. It does not refuse `act` on a
+  disabled node, but against the reference adapter there is nothing to send: the
+  node advertises no actions, so its own validation refuses the act as
+  unadvertised.
+- **An older app** sends none of them, so every node reads as stating
+  nothing, which is what absent means.
+- **Leniently read.** A field added later fails the node when it is read
+  strictly, and a failed node fails the line, which the reader skips: the
+  agent is left on a stale tree with nothing saying why, over one field.
+  `relayed` is read strictly because a mark that is not a boolean is no
+  clearer about who wrote the text; state is not like that, so every field
+  added in 0.4.0 reads a wrong shape as not stated (section 6.1), and
+  `relayed` keeps its 0.3.3 rule.
+- **A repeated key now fails the line.** A 0.4.0 reader fails a line whose
+  node repeats one of the new keys, `"checked"` twice, with "duplicate
+  field", where a 0.3.3 reader skipped both copies as unknown. Section 2.2
+  already forbids a sender to repeat a key, so no conforming line changes
+  meaning; only a reader's tolerance of that mistake is gone.
+- **What changed for the demo.** The reference demo now states a task's done
+  state as `checked` instead of the value `"todo"` or `"done"`, and the
+  active tab and the cursor row as `selected` instead of a tab's value
+  `"selected"`. It keeps the list's and the tab bar's values. A reader that
+  matched the old values reads the demo, and only the demo, differently.
+
+### 16.9 Stamps (0.4.0)
+
+The third addition since version 1 froze: `after_input` on the snapshot and
+`stamps` on the hello (sections 3.1 and 5.3), for issue #17. Each is a new
+optional field, omitted when unset, so the addition is additive under
+section 16.2 and `PROTOCOL_VERSION` stays 1. What changed beside the fields
+is one behaviour, which section 5.1 now allows: an app that stamps sends its
+latest snapshot again, under the same `seq`, when the app has dequeued an
+input since it went out.
+
+That resend moves what `seq` promises, from one number per snapshot sent to
+one per tree published, and section 16.7 makes a change of meaning the one
+that forces a bump. It does not force one here. Within one run `seq` still
+never decreases, so a higher one is still the newer tree. One inference
+does stop being true: until 0.4.0, item 3 of section 1.3 said `seq`
+"increases within one run", which let a reader assume no two snapshots
+share a `seq`. Such a reader, meeting the repeat, at worst drops it as a
+duplicate, which is harmless, because the tree is unchanged: the resend
+differs only in `after_input`, which an older reader never reads. Across
+runs `seq` promised nothing before and promises nothing now (section 5.1).
+
+- **An older reader** ignores both fields as unknown (section 2.7). It reads
+  the hello it always read, and every snapshot as the snapshot it was. The
+  resend of an identical tree is, to it, the same snapshot twice: `seq` and
+  every field it knows are unchanged, so a reader that compares whole
+  snapshots reads no change, and a reader that compares `seq` none either.
+- **An older reference bridge** from 0.1.0 to 0.3.3 hands the agent the app's
+  own line (section 16.6), so its JSON tree shows `"after_input":N` once the
+  app has dequeued an input, and its outline, in 0.3.0 to 0.3.3, shows
+  `after_input=N` among the header's fields. To an agent that can look like
+  a change, since two reads of one tree differ in it, and it names an input
+  id the agent never sent: ids are the bridge's, and no tool shows them.
+  Its answers do not move: it still waits its 500 ms and still reads a slow
+  handler as "did not change", the behaviour issue #17 is about, which only
+  a bridge that reads the stamp avoids.
+- **An older app** sends neither field. A bridge that reads stamps answers it
+  as it answered every peer before stamps existed, window and texts
+  included: the reference bridge does so byte for byte.
+- **An app that claims stamps and does not stamp** says `"stamps":true` and
+  sends unstamped snapshots section 5.3 does not allow: one after a stamped
+  snapshot, or more than one after its first dequeue's `delivered` ack,
+  which an adapter that queues snapshots can do without meaning to. A
+  bridge that reads stamps degrades the rest of the connection, from the
+  call that shows it, to the rules for a peer that does not stamp, so a
+  tree that differs is credited as it was before stamps existed, rather
+  than leaving every input waiting for a stamp that never comes. The
+  reference bridge also logs a warning, since the claim is the app's bug.
+  Both rules bind only an app that says `stamps`, which no app before 0.4.0
+  does.
+- **Leniently read.** A `stamps` that is not `true`, and an `after_input`
+  that is not an unsigned 64-bit integer, read as absent rather than failing
+  the line: the hello would otherwise take the version and label with it,
+  and the snapshot its whole tree.
 
 ## 17. Rust language binding (non-normative)
 
@@ -1554,11 +2167,11 @@ peers this format is written for are exactly the ones that match on these
 types.
 
 So every type a version-1 addition can reach is `#[non_exhaustive]`. There are
-**eleven**: `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`,
-`Action`, `Role`, `Node`, `Snapshot`, `key::Key`, `key::Modifiers` and
-`key::KeyPress`. The key types are on the list even though a key travels as a
-string, because the string is parsed into them and an adapter takes the result
-by value.
+**twelve**: `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`,
+`Action`, `Role`, `Node`, `Checked`, `Snapshot`, `key::Key`, `key::Modifiers`
+and `key::KeyPress`. The key types are on the list even though a key travels
+as a string, because the string is parsed into them and an adapter takes the
+result by value.
 
 The same reasoning reaches one level in, to the variants. A new optional field
 on an existing message is the format's cheapest additive change and also the
@@ -1571,10 +2184,11 @@ neither: it is a newtype around `Snapshot`, which is marked already.
 What that costs a Rust peer:
 
 - **Build marked variants through their constructors**, since a marked variant
-  has no struct literal from outside the crate: `AppToBridge::hello`, `ack`,
-  `BridgeToApp::input`, `AgentInput::act`, `key`, `text`, `Snapshot::new`,
-  `Node::new` plus its chainable setters, `Modifiers::NONE` / `Modifiers::new`,
-  `KeyPress::new`.
+  has no struct literal from outside the crate: `AppToBridge::hello` (with
+  `.stamps(true)` for a peer that stamps), `ack`, `BridgeToApp::input`,
+  `AgentInput::act`, `key`, `text`, `Snapshot::new` (with `.after(id)` for
+  a stamp), `Node::new` plus its chainable setters, `Modifiers::NONE` /
+  `Modifiers::new`, `KeyPress::new`.
 - **End a destructuring pattern with `..`**, so a field added later does not
   break the match.
 - **Carry a wildcard arm** on any `match` over these enums. The cost of the
@@ -1601,60 +2215,77 @@ is verbatim; the tab-separated direction column is not on the wire, and each
 message is followed by a single `\n`.
 
 ```
-app->bridge	{"type":"hello","app_label":"taria-demo","protocol_version":1}
-app->bridge	{"type":"snapshot","protocol_version":1,"seq":1,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","value":"selected","focused":false,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-1","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","value":"todo","focused":true,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","value":"todo","focused":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","value":"todo","focused":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
+app->bridge	{"type":"hello","app_label":"taria-demo","protocol_version":1,"stamps":true}
+app->bridge	{"type":"snapshot","protocol_version":1,"seq":1,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"selected":true,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"selected":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-1","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","focused":true,"selected":true,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
 bridge->app	{"type":"input","id":1,"input":{"kind":"act","node":"tab-done","action":"select"}}
 app->bridge	{"type":"ack","id":1,"status":"delivered"}
-app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Done","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","value":"selected","focused":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Done tasks","value":"task-2","focused":false,"children":[{"id":"task-2","role":"list_item","label":"Sketch the protocol wire types","value":"done","focused":true,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-5","role":"list_item","label":"Publish a snapshot per frame","value":"done","focused":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
+app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"after_input":1,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Done","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"selected":false,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"selected":true,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Done tasks","value":"task-2","focused":false,"children":[{"id":"task-2","role":"list_item","label":"Sketch the protocol wire types","focused":true,"selected":true,"checked":true,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-5","role":"list_item","label":"Publish a snapshot per frame","focused":false,"selected":false,"checked":true,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
 ```
 
 What to read out of it:
 
-- The `hello` comes first and the bridge answers nothing.
+- The `hello` comes first and the bridge answers nothing. It says
+  `"stamps":true`: every snapshot on this connection is stamped (section 5.3).
 - The first snapshot arrives unprompted, immediately after the handshake,
-  because the app already had one.
+  because the app already had one. It carries no `after_input`: nothing has
+  been dequeued on this connection yet.
 - `seq` is 1, then 2. Nothing was published in between, because nothing
   changed.
 - The act names a node id and an action the tree advertised on that node
   (`tab-done`, `select`). Neither was guessed.
-- The ack precedes the snapshot published after it.
+- The ack precedes the snapshot published after it, and that snapshot is
+  stamped `"after_input":1`: published after the app dequeued input 1, so a
+  bridge can credit it to that input whenever it arrives.
 - The effect is legible in the next tree: the tabs node's value moved from
-  `Active` to `Done`, `tab-done` gained `"value":"selected"`, and the list
-  node re-labelled itself and published a different set of children. A tree
-  diff, without the ack, could not have told that from an unrelated redraw.
+  `Active` to `Done`, `"selected":true` moved from `tab-active` to
+  `tab-done`, and the list node re-labelled itself and published a different
+  set of children, whose `"checked":true` says they are done. A tree diff,
+  without the ack, could not have told that from an unrelated redraw.
 - Exactly one node is focused in each snapshot, and it is not the root: the
   root carries `"focused":false` because a recorded node below it has focus.
-- The list publishes its selection as its own `value` (`task-1`, then
-  `task-2`), which is the focus-is-not-selection rule (section 15) in
-  practice.
+- The list publishes its selection twice: the cursor row says
+  `"selected":true` and every other row `"selected":false` (section 6.5), and
+  the list names the row in its own `value` (`task-1`, then `task-2`). That
+  is the focus-is-not-selection rule (section 15) in practice.
+- `selected`, `checked` and the rest of the typed state sit between
+  `focused` and `actions` in the app's line, while `description` comes before
+  `focused`. Every field is omitted where the app states nothing: no node
+  here says `expanded` or `disabled`.
 
 ### 18.2 The four ack shapes
 
 From a second capture against the same app, showing every acknowledgement
-pattern in one session:
+pattern in one session. The `hello` and the unstamped `seq` 1 the app sent on
+accept, the same two lines that open section 18.1, are left out:
 
 ```
 bridge->app	{"type":"input","id":1,"input":{"kind":"text","text":"hello"}}
 app->bridge	{"type":"ack","id":1,"status":"delivered"}
 app->bridge	{"type":"ack","id":1,"status":"ignored"}
+app->bridge	{"type":"snapshot","protocol_version":1,"seq":1,"after_input":1,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"selected":true,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"selected":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-1","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","focused":true,"selected":true,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
 bridge->app	{"type":"input","id":2,"input":{"kind":"paste","text":"hi","from":"clip"}}
 app->bridge	{"type":"ack","id":2,"status":"ignored"}
 bridge->app	{"type":"input","id":3,"input":{"kind":"key","key":"down"}}
 app->bridge	{"type":"ack","id":3,"status":"delivered"}
-app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","value":"selected","focused":false,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-3","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","value":"todo","focused":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","value":"todo","focused":true,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","value":"todo","focused":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
+app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"after_input":3,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"selected":true,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"selected":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-3","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","focused":true,"selected":true,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
 bridge->app	{"type":"input","id":4,"input":{"kind":"act","node":"nope","action":"activate"}}
 app->bridge	{"type":"ack","id":4,"status":"delivered"}
 app->bridge	{"type":"ack","id":4,"status":"ignored"}
+app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"after_input":4,"root":{"id":"app","role":"app","label":"taria-demo","focused":false,"children":[{"id":"tabs","role":"tabs","label":"Tabs","value":"Active","focused":false,"children":[{"id":"tab-active","role":"tab","label":"Active","focused":false,"selected":true,"actions":["select"]},{"id":"tab-done","role":"tab","label":"Done","focused":false,"selected":false,"actions":["select"]}]},{"id":"tasks","role":"list","label":"Active tasks","value":"task-3","focused":false,"children":[{"id":"task-1","role":"list_item","label":"Write the taria README","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-3","role":"list_item","label":"Wire up the MCP bridge","focused":true,"selected":true,"checked":false,"actions":["select","toggle",{"custom":"delete"}]},{"id":"task-4","role":"list_item","label":"Record the killer demo","focused":false,"selected":false,"checked":false,"actions":["select","toggle",{"custom":"delete"}]}]},{"id":"input","role":"text_input","label":"New task","value":"","focused":false,"actions":["set_value","focus"]},{"id":"quit","role":"button","label":"Quit","focused":false,"actions":["activate"]}]}}
 ```
 
 - **id 1**: text sent while nothing was accepting typing. Two acks, last wins.
+  Then the tree already published, sent again under its own `seq` 1 with
+  only `"after_input":1` added: the app dequeued the input and its tree did
+  not change (sections 5.1 and 5.3).
 - **id 2**: a `kind` this app has never heard of. One ack, `ignored`, sent
   where the line was parsed, with no `delivered` before it because the input
-  was never queued.
+  was never queued. Never dequeued, so it stamps nothing, and no tree
+  follows.
 - **id 3**: a key that moved the cursor. `delivered`, then the tree that shows
-  the move, in that order.
+  the move, in that order, stamped 3.
 - **id 4**: an act naming a node that does not exist. `delivered`, then
-  `ignored`.
+  `ignored`, then the tree of `seq` 2 again, stamped 4.
 
 The same session also confirms the skip rules: a blank line, `not json at
 all`, `{"type":"input","id":9,"input":{"kind":"key"}}` (a known kind missing
@@ -1674,8 +2305,8 @@ that followed.
   node, not that particular one.
 - **`text_to_keys`** and its `\n` to Enter, `\t` to Tab, `\r` dropped
   convention (section 9.3).
-- **Every 500 ms window, queue size, backoff and retry figure** in the
-  reference peers, and the reference bridge's 60 s idle release (section
+- **Every 500 ms and 3 s window, queue size, backoff and retry figure** in
+  the reference peers, and the reference bridge's 60 s idle release (section
   14.7). Nothing in the protocol specifies timing.
 - **The reference bridge's tool argument bounds** (section 13.4).
 
@@ -1712,3 +2343,13 @@ behaviour a peer may rely on.
     as fencing or escaping it in what an agent reads. The reference bridge
     alters no text: it hands the mark on, and its outline prints it as
     `*relayed` (section 6.4).
+12. **Typed state that contradicts itself**: a `value_now` outside its
+    bounds, a `pos_in_set` past its parent's `set_size`, several siblings
+    `selected` in a widget that selects one, `checked` on a role that cannot
+    be checked. Neither reference peer checks any of it (section 6.5).
+13. **A stamp that breaks the rules of section 5.3**: one naming an id the
+    bridge never sent on the connection, one that goes down, or an
+    `after_input` from a peer whose `hello` did not say `stamps`. The
+    reference bridge strips the field from what the agent reads either way,
+    reads a stamp only from a peer that said it stamps, and compares it as a
+    number against its own ids.

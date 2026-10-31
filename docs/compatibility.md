@@ -31,10 +31,52 @@ but no `read_tree` description before 0.3.3 says what the mark means. An app
 built before 0.3.3 never sends it, so nothing in its tree is marked, whoever
 wrote it.
 
-In Rust the same promise is `#[non_exhaustive]` on the eleven types a version-1
-addition can reach, from `Role` and `Action` to the two wire message enums,
-and on the six struct-like variants inside them, where a new optional field
-would land. So a new role, key, field or message variant costs an app that
+The typed state, added in 0.4.0, is the same case again: `description`,
+`selected`, `checked`, `expanded`, `disabled`, `value_now`, `value_min`,
+`value_max`, `pos_in_set`, `set_size`, `row`, `column`, `row_count` and
+`column_count`, all optional and omitted when unset ([protocol section
+6.5](protocol.md#65-typed-state)). With them a node's fields are, in the
+order the reference `Node` writes them: `id`, `role`, `label`, `value`,
+`description`, `focused`, `relayed`, the state from `selected` to
+`column_count`, `actions`, `children`. A taria-mcp from 0.1.0 to 0.3.3
+passes the state on in the JSON tree, because it hands the agent the app's
+own line, and its outline (0.3.0 on) shows it among the fields at the end of
+the line, `checked=false selected=true`, rather than as marks such as
+`*checked=false *selected`. It does not refuse `act` on a disabled node
+itself, but the 0.4.0 adapter publishes a disabled node with no actions, so
+the older bridge refuses the act as unadvertised. An app built before 0.4.0
+states nothing, which reads as not stated, never as `false`. A state field in
+a shape a 0.4.0 peer cannot read costs only that field, not the node. Two
+things to know as a sender: a number outside the double range, such as
+`1e999`, does not count as a wrong shape, which would cost only the field: it
+fails the whole line in the reference reader, which reports "number out of
+range"; and an integer field written with a fraction or an exponent,
+`"row":3.0` or `"row":3e0`, reads as not stated, though its value is whole.
+Python's `json` writes a float as `3.0`, so convert with `int()` first.
+
+The stamps, added in 0.4.0 for issue #17, are the third case: `after_input`
+on a snapshot, the newest input the app had dequeued when it published, and
+`"stamps":true` in the hello of an app that sends it ([protocol section
+5.3](protocol.md#53-after_input-stamped-snapshots)). Both are optional, and
+they change one behaviour of the 0.4.0 adapter: after a dequeue, a frame
+identical to the last one sends that snapshot again under the same `seq`,
+with only the stamp moved. Measured against the demo, with and without
+`TARIA_DEMO_SLOW_MS=800`:
+
+| Bridge | App | What the agent gets |
+| --- | --- | --- |
+| taria-mcp 0.4.0 | taria-ratatui 0.4.0 | Each input's own tree: an act the demo held 800 ms answered with its effect in 0.81 s, three in a row each with its own. An input that changes nothing reads "The app received this input, and its tree did not change." within a frame (50 ms, where 0.3.3 took 503 ms), and an ignored one is answered as fast. Up to 3 s for a tree, then "published no tree after it within 3000ms". The stamp is stripped from both formats. |
+| taria-mcp 0.1.0 to 0.3.3 | taria-ratatui 0.4.0 | Works as with a 0.3.3 app: the 500 ms window and its texts, and the resend reads as no change. The stamp shows: `"after_input":N` in the JSON tree, and `after_input=N` at the head of the outline (0.3.0 on), which can look like a change, since two reads of one tree differ in it, and names an input id the agent never sent ([protocol section 16.9](protocol.md#169-stamps-040)). Issue #17 stays: the 800 ms act read "did not change within 500ms", and the acts after it read as unacknowledged while the demo worked through them. |
+| taria-mcp 0.4.0 | taria-ratatui 0.3.3 or older, or any app whose hello does not say `stamps` | Answered exactly as 0.3.3 answered it: the 500 ms window and every text, byte for byte. A stamp from an app that did not say it stamps is stripped and ignored. |
+
+A Rust peer that compares whole `Snapshot`s now compares the stamp too, so
+against a 0.4.0 adapter it reads the resend of an unchanged tree as a change.
+Compare `root`, as taria-mcp does, or `seq` and `root` together.
+
+In Rust the same promise is `#[non_exhaustive]` on the twelve types a version-1
+addition can reach, from `Role`, `Action` and `Checked` to the two wire message
+enums, and on the six struct-like variants inside them, where a new optional
+field would land. So a new role, key, field or message variant costs an app that
 integrated taria a recompile rather than a repair, in exchange for building
 messages through their constructors and ending a destructuring pattern with
 `..`. An input kind this build cannot read parses as `AgentInput::Unknown`,
@@ -60,14 +102,29 @@ has a lint that catches it.
   snapshot shape moved leaves the bridge with no tree at all and `read_tree`
   reports that none has arrived. Every input tool refuses either way,
   because the app cannot parse the input messages this bridge writes.
-- Unix only for now: the adapter is built on unix-only APIs, and the
-  transport is a Unix domain socket bound through them. Linux is the
-  tested platform.
+- Three platforms, since 0.4.0, each with its own transport and its own
+  gaps:
+
+  | Platform | Transport | CI | What it lacks |
+  | --- | --- | --- | --- |
+  | Linux | Unix domain socket | Rust suites, `scripts/e2e.py`, `scripts/adversarial.py` | nothing |
+  | macOS | Unix domain socket | Rust suites, both scripts (the one probe that reads `/proc` is skipped) | stopped-app detection: a stopped app reads as held |
+  | Windows | named pipe, `\\.\pipe\taria-<SID>-<label>`, where the SID is the account's security id | Rust suites, among them a real adapter driven by the real `taria-mcp` | stopped-app detection: a suspended app reads as suspended or stuck, with no pid, or, suspended after a session, as held (the answer allows it may be suspended); the two Python scripts, which need a pseudo-terminal, `/proc` and `AF_UNIX` |
+
+  The release page carries a `taria-mcp` build for each: tarballs for
+  x86_64 and aarch64 Linux and both macOS architectures, and a `.zip` for
+  x86_64 Windows. The BSDs' `sun_path` limit is handled, but nothing builds
+  or tests taria on them.
 - Socket paths are capped by AF_UNIX at the platform's `sun_path` minus the
   terminating NUL: 107 bytes on Linux, 103 on macOS and the BSDs. Set
   `$TARIA_SOCK` to a shorter path when the default is too long, inside a
   directory only you can reach: the adapter binds only under a directory you
   own that grants no group or other access, so `/tmp` is refused.
+- On Windows the cap is 256 UTF-16 code units for the whole pipe name, and
+  `$TARIA_SOCK` must be a pipe on this machine, `\\.\pipe\<name>`, with one
+  name after the prefix: anything else is refused, a pipe on another
+  machine included, because opening one goes over SMB (Windows file
+  sharing). A label may not contain `\`.
 - Trees are capped at `MAX_NODE_DEPTH`, 32 levels, because a snapshot past
   that exceeds what a JSON parser will recurse into and would arrive as
   nothing. The adapter cuts deeper branches at publish and tells the app.
@@ -75,7 +132,7 @@ has a lint that catches it.
   longer line costs the app its bridge on every reconnect. The adapter trims
   at publish and tells the app (the stages are in architecture.md, Snapshot
   size): it drops any node that could never fit, shortens the longest values
-  and labels, marking each cut with `…`, and drops more nodes only when that
-  is not enough, keeping each node's first children with no gap apart from a
-  node that could never fit. Once nodes are dropped, the strings left are cut
-  only as far as the smaller tree needs.
+  and descriptions, then labels, marking each cut with `…`, and drops more
+  nodes only when that is not enough, keeping each node's first children with
+  no gap apart from a node that could never fit. Once nodes are dropped, the
+  strings left are cut only as far as the smaller tree needs.

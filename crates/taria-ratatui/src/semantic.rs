@@ -1,6 +1,8 @@
 //! The [`sem`] wrapper: attach a semantic node to any ratatui widget.
 
+use std::any;
 use std::cell::RefCell;
+use std::fmt;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -58,6 +60,19 @@ pub struct Semantic<'a, W> {
     widget: W,
     node: Node,
     sink: &'a RefCell<Vec<Node>>,
+}
+
+impl<W> fmt::Debug for Semantic<'_, W> {
+    /// The wrapped widget's type and the node's id and role. Neither the
+    /// widget nor the node is printed whole, so a widget need not be `Debug`
+    /// itself and a deep node costs nothing to print.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Semantic")
+            .field("widget", &format_args!("{}", any::type_name::<W>()))
+            .field("id", &self.node.id.0)
+            .field("role", &self.node.role)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<W: Widget> Widget for Semantic<'_, W> {
@@ -122,5 +137,51 @@ mod tests {
         let root = layer.latest_snapshot().unwrap().root;
         let ids: Vec<&str> = root.children.iter().map(|c| c.id.0.as_str()).collect();
         assert_eq!(ids, ["first", "second", "third"]);
+    }
+
+    /// `Debug` prints what is cheap to read and locks nothing: the layer's
+    /// label, endpoint and state, how many nodes a recorder holds, and a
+    /// wrapped widget's type with its node's id and role, never a tree.
+    #[test]
+    fn layer_recorder_and_sem_print_without_their_trees() {
+        let mut layer = test_layer("debug");
+        let path = layer.socket_path().to_path_buf();
+        let printed = format!("{:?}", *layer);
+        assert_eq!(
+            printed,
+            format!(
+                "TariaLayer {{ app_label: \"debug\", socket_path: {path:?}, enabled: true, \
+                 bind_error: None, seq: Some(0), .. }}"
+            )
+        );
+
+        let mut rec = layer.frame();
+        rec.push(Node::new("first", Role::Text).label("not printed"));
+        let wrapped = sem(
+            &rec,
+            "x",
+            Node::new("second", Role::Button).label("not printed"),
+        );
+        assert_eq!(
+            format!("{wrapped:?}"),
+            r#"Semantic { widget: &str, id: "second", role: Button, .. }"#
+        );
+        let printed = format!("{rec:?}");
+        assert!(
+            printed.starts_with("FrameRecorder { layer: TariaLayer {"),
+            "{printed}"
+        );
+        assert!(printed.ends_with("}, recorded: 1, .. }"), "{printed}");
+        assert!(!printed.contains("not printed"), "{printed}");
+
+        let area = Rect::new(0, 0, 1, 1);
+        wrapped.render(area, &mut Buffer::empty(area));
+        assert!(format!("{rec:?}").ends_with("}, recorded: 2, .. }"));
+        // Mid-record, the count is not waited for.
+        let held = rec.sink().borrow_mut();
+        assert!(format!("{rec:?}").ends_with("}, recorded: <being recorded>, .. }"));
+        drop(held);
+        rec.publish();
+        assert!(format!("{:?}", *layer).contains("seq: Some(1)"));
     }
 }
