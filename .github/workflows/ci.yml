@@ -122,3 +122,16 @@ jobs:
         run: cargo check --workspace --all-targets --locked
       - name: Check (Windows target)
         run: cargo check --workspace --all-targets --locked --target x86_64-pc-windows-gnu
+
+  # Fails a release that breaks the public Rust API without the version
+  # saying so. It compares each published crate with its newest release on
+  # crates.io; a 0.x minor (0.3 to 0.4) counts as major, so the intended
+  # breaks of 0.4.0 pass, and from 0.4.0 on a break needs 0.5.
+  semver:
+    name: Semver checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: taria, taria-ratatui, taria-mcp

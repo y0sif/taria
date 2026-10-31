@@ -13,7 +13,7 @@ The wire format carries its own number, `PROTOCOL_VERSION`, which moves
 independently of the crate version: a crate release is not a format bump, and
 a format bump would not wait for one.
 
-## [Unreleased]
+## [0.4.0] - 2026-10-31
 
 0.4.0 is the first alpha. It reshapes the Rust API in one pass; later 0.x
 minors may still change it, each with an upgrade note. It brings four
@@ -1351,7 +1351,7 @@ they were missed.
 `mode` is the one that is a safety gap rather than a completeness one. Without
 it, an agent typing into a vim-modal editor runs commands instead of typing.
 
-[Unreleased]: https://github.com/y0sif/taria/compare/v0.3.3...HEAD
+[0.4.0]: https://github.com/y0sif/taria/releases/tag/v0.4.0
 [0.3.3]: https://github.com/y0sif/taria/releases/tag/v0.3.3
 [0.3.2]: https://github.com/y0sif/taria/releases/tag/v0.3.2
 [0.3.1]: https://github.com/y0sif/taria/releases/tag/v0.3.1
