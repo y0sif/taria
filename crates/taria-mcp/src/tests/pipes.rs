@@ -124,12 +124,11 @@ async fn an_app_that_exits_is_nothing_listening_and_may_have_exited() {
     let name = unique_pipe_name("exits");
     let tools = on_demand(&name);
     let never = tools.read_tree().await.expect_err("nothing serves it");
-    assert!(
-        never
-            .message
-            .starts_with("no snapshot from the app yet, and this bridge holds no connection"),
-        "{}",
-        never.message
+    assert_eq!(
+        never.message,
+        "no snapshot from the app yet, and this bridge holds no connection to the pipe: is the \
+         taria-enabled app running, and is the pipe name correct? The bridge reconnects \
+         automatically; retry once the app is up."
     );
 
     let mut pipe = app_pipe(&name).expect("create the app's pipe");
@@ -272,7 +271,8 @@ async fn a_pipe_another_account_owns_is_closed_unwritten_and_named() {
     let refused = tools.read_tree().await.expect_err("not the app");
     assert!(
         refused.message.starts_with(
-            "no snapshot from the app yet: the pipe at this name is owned by another account"
+            "no snapshot from the app yet: the pipe at this name is owned by another account \
+             than this bridge's user, or refused this user access"
         ),
         "{}",
         refused.message

@@ -92,11 +92,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
   # The MSRV is a promise on the crates.io page, not a comment: `rust-version
   # = "1.88"` is what tells cargo to refuse the crate on an older toolchain,

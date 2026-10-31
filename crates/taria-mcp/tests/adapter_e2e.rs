@@ -656,9 +656,14 @@ fn the_bridge_reconnects_to_a_restarted_app() {
     let tree = tree_in(&bridge.read_tree().expect("the bridge gets the app"));
     assert_eq!(pid_of(&tree), first_pid, "{tree}");
 
+    // Gone for good before the next one starts: `kill` waits on the process.
     first_app.kill();
-    // A Unix socket outlives a killed app, as a file nobody listens on; the
-    // new process clears it and binds, which is part of what this tests.
+    // Started at once, which is part of what this tests. A Unix socket
+    // outlives a killed app, as a file nobody listens on, and the new process
+    // clears it and binds. A pipe's name stays in use until the bridge has
+    // closed its end of the killed app's instance as well, and the new
+    // process's bind waits that moment out rather than starting with taria
+    // off.
     let second_app = AppProcess::start(&endpoint);
     assert_ne!(second_app.pid, first_pid);
 

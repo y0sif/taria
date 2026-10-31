@@ -6,14 +6,19 @@
 //! `ERROR_PIPE_BUSY` while the first is served. That is the only sign Windows
 //! gives of an app held by another bridge: there is no listen backlog to wait
 //! in, so a connection that opens is one the app's pipe took, and silence on
-//! it is the app's own (see [`BACKLOG`]).
+//! it is the app's own (see [`BACKLOG`]). The instance is also busy for a
+//! moment between two sessions, while the adapter retires the last one and
+//! listens again, so a busy open is retried for [`BUSY_RETRY`] before it
+//! counts as held.
 //!
 //! Pipe names are machine-wide, so any process can create a pipe under the
 //! app's name before the app does. Every connection is checked to be to a
-//! pipe owned by this bridge's own user, and refused unread and unwritten
-//! otherwise ([`Refusal::Foreign`]). The open itself asks for
-//! `SECURITY_IDENTIFICATION`, tokio's default, so whatever serves the pipe can
-//! learn who this bridge is and cannot act as it.
+//! pipe owned by this bridge's own user, and refused otherwise, with nothing
+//! written to it and nothing it sent parsed ([`Refusal::Foreign`]); so is an
+//! open the pipe refuses as access denied, which the app's own pipe never
+//! answers its user. The open itself asks for `SECURITY_IDENTIFICATION`,
+//! tokio's default, so whatever serves the pipe can learn who this bridge is
+//! and cannot act as it.
 //!
 //! Only the wide-character (`W`) Win32 functions are called, and names reach
 //! them as UTF-16. The ANSI ones convert a name through the code page first,
@@ -23,25 +28,24 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::mem::size_of;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr;
+use std::time::Duration;
 
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, ERROR_SUCCESS, HANDLE, LocalFree};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT,
+use tokio::time::Instant;
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, ERROR_SUCCESS, HANDLE, LocalFree,
 };
+use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{
-    EqualSid, GetTokenInformation, IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    EqualSid, IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
 };
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows_sys::core::PWSTR;
 
 use super::Refusal;
+use super::windows_sid::{TokenUser, sid_string};
 
 /// A connection to the app: a named pipe's client end.
 pub(crate) type Stream = NamedPipeClient;
@@ -52,20 +56,72 @@ pub(crate) type Stream = NamedPipeClient;
 /// suspended, or stuck.
 pub(crate) const BACKLOG: bool = false;
 
+/// What the answers call the app's endpoint: a pipe.
+pub(crate) const ENDPOINT: &str = "pipe";
+
+/// What the answers call what the bridge was given to find the app by: a
+/// pipe name, where Unix has a socket path.
+pub(crate) const ENDPOINT_ADDRESS: &str = "pipe name";
+
+/// How long an open the pipe refuses as busy is retried before the refusal
+/// stands, as tokio's docs advise for a client.
+///
+/// Between two sessions the app's one instance is busy for a moment: the
+/// bridge that left has closed its end, and the adapter has yet to retire its
+/// session, disconnect it and listen again, which takes a poll of its
+/// accept loop (50 ms) and the session's threads ending. Refused at once, a
+/// bridge arriving in that moment was told the app is held by another bridge,
+/// about an app that was free. A pipe still busy at the end of this is served
+/// to another bridge.
+pub(crate) const BUSY_RETRY: Duration = Duration::from_millis(250);
+
+/// How long a busy open naps before the next try.
+const BUSY_NAP: Duration = Duration::from_millis(10);
+
 /// Open the app's pipe named by `path`, and check that it is owned by this
-/// bridge's user before anything is read from it or written to it.
+/// bridge's user before anything is written to it or anything it sent is
+/// parsed.
+///
+/// Registering the pipe with the runtime starts a read into the runtime's
+/// own buffer at once, so bytes the pipe sent may have been read by the time
+/// of the check. Nothing reads them out of that buffer before it passes, and
+/// a pipe that fails it is dropped with them.
 ///
 /// A name that is not a pipe on this machine is refused before it is opened:
 /// a file path would open the file, and `\\host\pipe\...` goes over SMB. A
-/// pipe owned by anyone else is closed again and refused with an error that
-/// [`refusal`] reads as [`Refusal::Foreign`].
+/// pipe owned by anyone else is closed again, and a pipe that refuses the
+/// open as access denied is not opened at all; both fail with an error that
+/// [`refusal`] reads as [`Refusal::Foreign`]. A busy pipe is retried for
+/// [`BUSY_RETRY`] first.
 pub(crate) async fn connect(path: &Path) -> io::Result<Stream> {
     let name = pipe_name(path)?;
-    let pipe = ClientOptions::new().open(name)?;
+    let pipe = open(name).await?;
     let user = TokenUser::of_this_process()?;
     let owner = Owner::of(pipe.as_raw_handle())?;
     check_owner(owner.sid, user.sid(), name)?;
     Ok(pipe)
+}
+
+/// Open the pipe `name`, retrying for [`BUSY_RETRY`] while it is busy, and
+/// with an open refused as access denied turned into the error [`refusal`]
+/// reads as [`Refusal::Foreign`].
+async fn open(name: &str) -> io::Result<NamedPipeClient> {
+    let until = Instant::now() + BUSY_RETRY;
+    loop {
+        match ClientOptions::new().open(name) {
+            Err(err) if is_busy(&err) && Instant::now() < until => {}
+            Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                return Err(denied(name));
+            }
+            result => return result,
+        }
+        tokio::time::sleep(BUSY_NAP).await;
+    }
+}
+
+/// True when an open failed because every instance of the pipe is taken.
+fn is_busy(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
 }
 
 /// The pid of the process serving the pipe, from
@@ -93,10 +149,18 @@ pub(crate) fn nothing_listens(err: &io::Error) -> bool {
 }
 
 /// What a failed [`connect`] says about who turned it away: the app's pipe
-/// busy with another client, or a pipe at its name that another account owns.
+/// busy with another client, or a pipe at its name that is not the app's,
+/// because another account owns it or it refused this user access.
+///
+/// Access denied is read as foreign whether [`connect`] wrapped it or not:
+/// the adapter's pipe grants its user all access, so a pipe at the name that
+/// denies this user is not one the adapter made for it.
 pub(crate) fn refusal(err: &io::Error) -> Option<Refusal> {
-    if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) {
+    if is_busy(err) {
         return Some(Refusal::Busy);
+    }
+    if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+        return Some(Refusal::Foreign);
     }
     err.get_ref()
         .is_some_and(|inner| inner.is::<NotOurPipe>())
@@ -113,21 +177,6 @@ pub(crate) fn check_endpoint(path: &Path) -> io::Result<()> {
 /// The bridge works here, so there is nothing to refuse.
 pub(crate) fn ensure_supported() -> io::Result<()> {
     Ok(())
-}
-
-/// The SID string of the user this process runs as (`S-1-5-21-...`), read
-/// from its token: what [`taria::socket::resolve_pipe_name`] names this
-/// user's pipes by, so `taria-mcp --app <label>` finds the pipe the app-side
-/// adapter serves for the same user.
-///
-/// Windows only.
-///
-/// # Errors
-///
-/// When the process token cannot be opened or read, or its SID cannot be
-/// written as a string. None of these happens to a process running normally.
-pub fn current_user_sid() -> io::Result<String> {
-    sid_string(TokenUser::of_this_process()?.sid())
 }
 
 /// `path` as the pipe name it has to be, or the reason it is not one.
@@ -160,7 +209,7 @@ fn check_owner(owner: PSID, user: PSID, name: &str) -> io::Result<()> {
     let unreadable = |_| "a SID that cannot be written out".to_string();
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
-        NotOurPipe {
+        NotOurPipe::Owned {
             name: name.to_string(),
             owner: sid_string(owner).unwrap_or_else(unreadable),
             user: sid_string(user).unwrap_or_else(unreadable),
@@ -168,93 +217,51 @@ fn check_owner(owner: PSID, user: PSID, name: &str) -> io::Result<()> {
     ))
 }
 
-/// A pipe at the app's name that another account owns, refused unused.
+/// The error an open of `name` refused as access denied is reported as.
+fn denied(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        NotOurPipe::Denied {
+            name: name.to_string(),
+        },
+    )
+}
+
+/// A pipe at the app's name that is not the app's, refused unused.
 #[derive(Debug)]
-struct NotOurPipe {
-    name: String,
-    owner: String,
-    user: String,
+enum NotOurPipe {
+    /// Opened, and owned by another account than this user: closed again.
+    Owned {
+        name: String,
+        owner: String,
+        user: String,
+    },
+    /// Refused as access denied at the open, so never opened.
+    Denied { name: String },
 }
 
 impl fmt::Display for NotOurPipe {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the pipe {} is owned by {}, not by this user ({}), so it is not the app's: pipe names \
-             are machine-wide, and any process can create one under the app's name first. This \
-             bridge closed it without reading or writing anything",
-            self.name, self.owner, self.user
-        )
+        match self {
+            Self::Owned { name, owner, user } => write!(
+                f,
+                "the pipe {name} is owned by {owner}, not by this user ({user}), so it is not \
+                 the app's: pipe names are machine-wide, and any process can create one under \
+                 the app's name first. This bridge closed it without parsing anything it sent or \
+                 writing anything to it"
+            ),
+            Self::Denied { name } => write!(
+                f,
+                "the pipe {name} refused this user access, which the app's own pipe never does, \
+                 so it is not the app's: pipe names are machine-wide, and any process can create \
+                 one under the app's name first. This bridge never opened it, so nothing was read \
+                 from it or written to it"
+            ),
+        }
     }
 }
 
 impl Error for NotOurPipe {}
-
-/// The `TOKEN_USER` of this process's token, which holds the user's SID.
-struct TokenUser {
-    /// The structure and the SID it points at, as `GetTokenInformation`
-    /// wrote them: in `u64`s, so the structure is aligned.
-    buf: Vec<u64>,
-}
-
-impl TokenUser {
-    fn of_this_process() -> io::Result<Self> {
-        let mut raw: HANDLE = ptr::null_mut();
-        // SAFETY: `GetCurrentProcess` is a pseudo-handle that needs no
-        // closing, and `raw` is a valid place for the handle written.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the call succeeded, so `raw` is a token handle this process
-        // now owns, and nothing else closes it.
-        let token = unsafe { OwnedHandle::from_raw_handle(raw) };
-        let mut len = 0u32;
-        // Asked with no buffer, for the size: this fails with
-        // `ERROR_INSUFFICIENT_BUFFER` and sets `len`, or fails for a reason
-        // of its own and leaves it at 0.
-        // SAFETY: a null buffer of length 0 is how the size is asked for.
-        unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenUser,
-                ptr::null_mut(),
-                0,
-                &mut len,
-            )
-        };
-        if len == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut buf = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
-        // SAFETY: `buf` holds at least `len` bytes, the size just reported.
-        let read = unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenUser,
-                buf.as_mut_ptr().cast(),
-                len,
-                &mut len,
-            )
-        };
-        if read == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if (len as usize) < size_of::<TOKEN_USER>() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the process token's user record is shorter than one",
-            ));
-        }
-        Ok(Self { buf })
-    }
-
-    /// The user's SID, valid for as long as `self` is.
-    fn sid(&self) -> PSID {
-        // SAFETY: `buf` holds a whole `TOKEN_USER` (checked when it was
-        // read), aligned to 8 bytes, which covers the structure's alignment.
-        unsafe { (*self.buf.as_ptr().cast::<TOKEN_USER>()).User.Sid }
-    }
-}
 
 /// The owner of a kernel object, with the security descriptor it lives in,
 /// freed on drop.
@@ -309,25 +316,6 @@ impl Drop for Owner {
     }
 }
 
-/// `sid` written out the standard way, `S-1-...`.
-fn sid_string(sid: PSID) -> io::Result<String> {
-    let mut wide: PWSTR = ptr::null_mut();
-    // SAFETY: `sid` is a valid SID, per every caller, and `wide` a valid
-    // place for the string's address.
-    if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the call succeeded, so `wide` is a NUL-terminated UTF-16 string
-    // allocated for the caller, read here up to its NUL and freed once, after.
-    let text = unsafe {
-        let len = (0..).take_while(|&at| *wide.add(at) != 0).count();
-        let text = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
-        LocalFree(wide.cast());
-        text
-    };
-    Ok(text)
-}
-
 /// Pipes for the tests to connect to: created the way the app-side adapter
 /// creates its own, or owned by somebody else.
 #[cfg(test)]
@@ -344,6 +332,8 @@ pub(crate) mod testing {
     };
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
+    use super::super::windows_sid::current_user_sid;
+
     /// A pipe name no other test, and no other run, uses.
     pub(crate) fn unique_pipe_name(tag: &str) -> String {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -358,15 +348,23 @@ pub(crate) mod testing {
     /// first of its name, local clients only, owned by this user, and open
     /// to this user alone.
     pub(crate) fn app_pipe(name: &str) -> io::Result<NamedPipeServer> {
-        let user = super::current_user_sid()?;
+        let user = current_user_sid()?;
         pipe_with_sddl(name, &format!("O:{user}D:P(A;;GA;;;{user})"))
     }
 
     /// A pipe like [`app_pipe`] that names `owner` (an SDDL SID, such as
     /// `BA` for the Administrators group) as its owner instead.
     pub(crate) fn pipe_owned_by(name: &str, owner: &str) -> io::Result<NamedPipeServer> {
-        let user = super::current_user_sid()?;
+        let user = current_user_sid()?;
         pipe_with_sddl(name, &format!("O:{owner}D:P(A;;GA;;;{user})"))
+    }
+
+    /// A pipe like [`app_pipe`] whose DACL has no entries, so it lets
+    /// nobody open it to read or write, its owner included: what a pipe at
+    /// the app's name that refuses this user looks like.
+    pub(crate) fn pipe_denying_this_user(name: &str) -> io::Result<NamedPipeServer> {
+        let user = current_user_sid()?;
+        pipe_with_sddl(name, &format!("O:{user}D:P"))
     }
 
     fn pipe_with_sddl(name: &str, sddl: &str) -> io::Result<NamedPipeServer> {
@@ -411,7 +409,8 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{app_pipe, pipe_owned_by, unique_pipe_name};
+    use super::super::windows_sid::current_user_sid;
+    use super::testing::{app_pipe, pipe_denying_this_user, pipe_owned_by, unique_pipe_name};
     use super::*;
     use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -501,11 +500,94 @@ mod tests {
             "the server is this process"
         );
 
+        let tried = Instant::now();
         let err = connect(Path::new(&name)).await.expect_err("one instance");
+        assert!(
+            tried.elapsed() >= BUSY_RETRY,
+            "refused as busy after {:?}, inside the retry",
+            tried.elapsed()
+        );
         assert_eq!(err.raw_os_error(), Some(ERROR_PIPE_BUSY as i32), "{err}");
         assert_eq!(refusal(&err), Some(Refusal::Busy));
         assert!(!nothing_listens(&err), "a busy pipe is held, not gone");
         drop(first);
+    }
+
+    /// Between two sessions the one instance is busy for a moment: the last
+    /// bridge has gone and the app has yet to disconnect it and listen again.
+    /// An open in that moment waits it out and gets in, rather than reading
+    /// a free app as held.
+    #[tokio::test]
+    async fn a_pipe_busy_between_two_sessions_is_waited_for() {
+        let name = unique_pipe_name("between");
+        let server = app_pipe(&name).expect("create the app's pipe");
+        let last = connect(Path::new(&name)).await.expect("the last bridge");
+        server.connect().await.expect("the app takes it");
+        drop(last);
+        // The last bridge has gone, and the app has not listened again yet.
+        let err = ClientOptions::new()
+            .open(&name)
+            .expect_err("busy until the app listens again");
+        assert!(is_busy(&err), "{err}");
+
+        let app = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            server.disconnect().expect("retire the last session");
+            server
+                .connect()
+                .await
+                .expect("the app takes the next bridge");
+            server
+        });
+        let tried = Instant::now();
+        let next = connect(Path::new(&name))
+            .await
+            .expect("the open waits out the moment between sessions");
+        assert!(
+            tried.elapsed() < BUSY_RETRY + Duration::from_millis(200),
+            "took {:?}",
+            tried.elapsed()
+        );
+        let _server = app.await.expect("the app task");
+        drop(next);
+    }
+
+    /// An open the pipe refuses as access denied is a pipe that is not the
+    /// app's, since the adapter's pipe lets its own user in: refused as
+    /// foreign, never as an app that is not running. Wine may let the open
+    /// through a DACL that Windows enforces, and then the mapping alone is
+    /// what is tested.
+    #[tokio::test]
+    async fn a_pipe_that_refuses_this_user_is_foreign() {
+        let name = unique_pipe_name("denied");
+        let server = pipe_denying_this_user(&name).expect("create the pipe");
+        match connect(Path::new(&name)).await {
+            Ok(_) => eprintln!("this system let the open through an empty DACL; the mapping alone"),
+            Err(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+                assert_eq!(refusal(&err), Some(Refusal::Foreign), "{err}");
+                assert!(!nothing_listens(&err));
+                assert!(
+                    err.to_string()
+                        .starts_with(&format!("the pipe {name} refused this user access")),
+                    "{err}"
+                );
+            }
+        }
+        drop(server);
+
+        let raw = io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32);
+        assert_eq!(refusal(&raw), Some(Refusal::Foreign));
+        assert!(!nothing_listens(&raw));
+        let wrapped = denied(r"\\.\pipe\x");
+        assert_eq!(refusal(&wrapped), Some(Refusal::Foreign));
+        assert_eq!(
+            wrapped.to_string(),
+            "the pipe \\\\.\\pipe\\x refused this user access, which the app's own pipe \
+             never does, so it is not the app's: pipe names are machine-wide, and any process \
+             can create one under the app's name first. This bridge never opened it, so nothing \
+             was read from it or written to it"
+        );
     }
 
     /// A pipe at the app's name that someone else owns is refused, and the
@@ -546,8 +628,8 @@ mod tests {
             format!(
                 "the pipe \\\\.\\pipe\\x is owned by S-1-5-32-544, not by this user ({user}), so it \
                  is not the app's: pipe names are machine-wide, and any process can create one \
-                 under the app's name first. This bridge closed it without reading or writing \
-                 anything"
+                 under the app's name first. This bridge closed it without parsing anything it \
+                 sent or writing anything to it"
             )
         );
     }

@@ -286,7 +286,8 @@ pub(crate) enum LinkState {
     /// something listening at the path, for this reason. Only the Windows
     /// transport refuses a connect this way: a pipe busy with another bridge
     /// is the app held, as an open, silent connection is on Unix, and a pipe
-    /// another account owns is not the app at all.
+    /// another account owns, or one that refuses this user, is not the app
+    /// at all.
     Refused(Refusal),
 }
 
@@ -1198,9 +1199,9 @@ async fn manager_loop(
                         // describes what happened to it, and a held answer
                         // about the next instance must not say it. Cleared
                         // before the outcome is counted, which is what a
-                        // waiting call reads it after. A pipe another account
-                        // owns at the path says the same: the app is not
-                        // what is there.
+                        // waiting call reads it after. A pipe at the path
+                        // that is not the app's says the same: the app is
+                        // not what is there.
                         if transport::nothing_listens(&err)
                             || transport::refusal(&err) == Some(Refusal::Foreign)
                         {
@@ -1345,9 +1346,10 @@ fn forget_oversized_if_nothing_listens(
 /// A busy pipe is the Windows form of a connect into the backlog, the app
 /// there and serving another bridge, so what the last connection's lines
 /// failed on is forgotten, as a connect forgets it, oversized tree aside. A
-/// pipe another account owns is not the app, so everything the app's lines
-/// failed on goes, the oversized tree included, and the refusal is logged
-/// as a warning when it is new, with the owner the error names.
+/// pipe that is not the app's (another account owns it, or it refused this
+/// user) is not the app, so everything the app's lines failed on goes, the
+/// oversized tree included, and the refusal is logged as a warning when it
+/// is new, with what the error names: the owner, or the refusal.
 fn note_refusal(
     path: &std::path::Path,
     err: &io::Error,

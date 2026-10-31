@@ -37,7 +37,7 @@ use crate::bridge::{
     self, AppSnapshot, BridgeHandle, BridgeState, Call, Demand, LinkState, OVERSIZED_LINE,
     SendError, UNACKED_HOLD,
 };
-use crate::transport::{self, Refusal};
+use crate::transport::{self, ENDPOINT, ENDPOINT_ADDRESS, Refusal};
 use crate::tree_format::TreeFormat;
 
 /// How long the bridge keeps the app with no tool calls before it lets go,
@@ -802,7 +802,7 @@ impl Tools {
                 format!(
                     "the app is not accepting input: the bridge's queue to it stayed full for \
                      {}ms, so this input was not sent. The app is stopped or not reading its \
-                     socket; retry once it is responsive.",
+                     {ENDPOINT}; retry once it is responsive.",
                     QUEUE_WAIT.as_millis()
                 ),
                 None,
@@ -1145,7 +1145,7 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
                 "app '{}' disconnected (last snapshot seq {last_seq})",
                 app_label.as_deref().unwrap_or("unknown")
             );
-            // A pipe another account owns comes first, and a busy one after
+            // A pipe that is not the app's comes first, and a busy one after
             // an open connection: only the Windows transport refuses a
             // connect, so on Unix neither is ever the answer.
             let message = if report.link == LinkState::Refused(Refusal::Foreign) {
@@ -1233,13 +1233,13 @@ fn reconnected_reason(
         return format!(
             "{departed}, and this bridge has reconnected: the app completed the taria handshake \
              (protocol version {version}) and has not published a tree on this connection yet. \
-             The socket path is right and the app is running, so nothing needs restarting; \
-             retry, and the first snapshot it publishes is served."
+             The {ENDPOINT_ADDRESS} is right and the app is running, so nothing needs \
+             restarting; retry, and the first snapshot it publishes is served."
         );
     }
     if open_for < SILENT_LINK_GRACE {
         return format!(
-            "{departed}, and this bridge reconnected to the socket {}ms ago; no handshake has \
+            "{departed}, and this bridge reconnected to the {ENDPOINT} {}ms ago; no handshake has \
              arrived yet. The path is right, so this is worth one retry; a connection that is \
              still silent on the next call is diagnosed rather than waited on.",
             open_for.as_millis()
@@ -1311,7 +1311,7 @@ send can fix it.";
 /// question, and the two things that produce such a line.
 fn unreadable_line_hints() -> String {
     format!(
-        "The socket path is right, so the line is what is wrong. A snapshot more than \
+        "The {ENDPOINT_ADDRESS} is right, so the line is what is wrong. A snapshot more than \
          {MAX_NODE_DEPTH} levels deep exceeds what a JSON parser will recurse into and fails \
          exactly like this; so does an app built against a taria whose snapshot shape differs \
          from this bridge's. Fix the tree the app publishes, or match its taria dependency to \
@@ -1353,8 +1353,9 @@ fn is_oversized(rejected: Option<&str>) -> bool {
 /// - Nothing is connected. Here, and only here, the path and whether the app
 ///   is running are the questions.
 ///
-/// A pipe another account owns, which the Windows transport refuses, is
-/// none of these, and outranks them all: it is not the app.
+/// A pipe that another account owns, or that refuses this user, which the
+/// Windows transport refuses in turn, is none of these, and outranks them
+/// all: it is not the app.
 fn no_snapshot_reason(report: LinkReport) -> String {
     if report.link == LinkState::Refused(Refusal::Foreign) {
         return format!("no snapshot from the app yet: {FOREIGN_PIPE}");
@@ -1371,9 +1372,9 @@ fn no_snapshot_reason(report: LinkReport) -> String {
     if is_oversized(report.rejected.as_deref()) {
         return format!(
             "no snapshot from the app yet, but not because nothing is there: an app reached \
-             this socket, and its snapshot was over 1 MiB ({MAX_LINE_BYTES} bytes), this \
-             bridge's line limit, so the bridge closed the connection. The socket path is right, \
-             so the tree is what is wrong. {OVERSIZED_REPEATS}"
+             this {ENDPOINT}, and its snapshot was over 1 MiB ({MAX_LINE_BYTES} bytes), this \
+             bridge's line limit, so the bridge closed the connection. The {ENDPOINT_ADDRESS} is \
+             right, so the tree is what is wrong. {OVERSIZED_REPEATS}"
         );
     }
     // A rejected line outranks the rest: it is the most specific thing that
@@ -1382,7 +1383,8 @@ fn no_snapshot_reason(report: LinkReport) -> String {
     if let Some(err) = report.rejected {
         return format!(
             "no snapshot from the app yet, but not because nothing is there: an app reached \
-             this socket and sent lines, and this bridge could not read the last one ({err}). {}",
+             this {ENDPOINT} and sent lines, and this bridge could not read the last one \
+             ({err}). {}",
             unreadable_line_hints()
         );
     }
@@ -1393,14 +1395,15 @@ fn no_snapshot_reason(report: LinkReport) -> String {
                 held_busy(report.idle_release)
             );
         }
-        return "no snapshot from the app yet, and this bridge holds no connection to the \
-                socket: is the taria-enabled app running, and is the socket path correct? The \
-                bridge reconnects automatically; retry once the app is up."
-            .to_string();
+        return format!(
+            "no snapshot from the app yet, and this bridge holds no connection to the \
+             {ENDPOINT}: is the taria-enabled app running, and is the {ENDPOINT_ADDRESS} \
+             correct? The bridge reconnects automatically; retry once the app is up."
+        );
     };
     if let Some(version) = report.peer_protocol {
         return format!(
-            "no snapshot from the app yet, and the socket is not what is wrong: this bridge is \
+            "no snapshot from the app yet, and the {ENDPOINT} is not what is wrong: this bridge is \
              connected to it and the app completed the taria handshake (protocol version \
              {version}), so what is missing is the tree. An app that binds the layer and never \
              publishes nodes looks exactly like this; publish once per draw, from \
@@ -1410,7 +1413,7 @@ fn no_snapshot_reason(report: LinkReport) -> String {
     }
     if open_for < SILENT_LINK_GRACE {
         return format!(
-            "no snapshot from the app yet: this bridge connected to the socket {}ms ago and no \
+            "no snapshot from the app yet: this bridge connected to the {ENDPOINT} {}ms ago and no \
              handshake has arrived yet. The path is right, so this is worth one retry; a \
              connection that is still silent on the next call is diagnosed rather than waited \
              on.",
@@ -1485,19 +1488,28 @@ fn silent_pipe(open_for: Duration) -> String {
     )
 }
 
-/// What a pipe at the app's name that another account owns is, after the
-/// answer's opening: not the app, and refused for that.
+/// What a pipe at the app's name that another account owns, or that refuses
+/// this user access, is, after the answer's opening: not the app, and
+/// refused for that.
 ///
 /// Pipe names are machine-wide, so any process can create a pipe under the
 /// app's name before the app does, or after it exits, and an agent that read
-/// it would take its tree for the app's and send it input. The bridge closes
-/// such a pipe unread and unwritten, and says so; its log names the owner.
+/// it would take its tree for the app's and send it input. The app's own
+/// pipe lets its user in, so one that refuses this user access is not the
+/// app's either. The bridge parses nothing such a pipe sent and writes
+/// nothing to it, and says so; its log names the owner, where the pipe let it
+/// read one.
+///
+/// Parses, not reads: registering a pipe with the runtime starts a read into
+/// the runtime's own buffer before the owner check, and what that read took
+/// is dropped with the pipe, never read out of the buffer.
 const FOREIGN_PIPE: &str = "the pipe at this name is owned by another account than this \
-bridge's user, so it is not the app's, and this bridge closed it without reading or writing \
-anything. Pipe names are shared by every user on the machine, so something else created this one, \
-before the app or after it exited, perhaps to pose as it. Ask the user to find what serves it \
-(this bridge's log names the owner) and to restart the app once it is gone; this bridge keeps \
-trying and connects to the app's own pipe with no restart.";
+bridge's user, or refused this user access, which the app's own pipe never does, so it is not the \
+app's; this bridge parsed nothing it sent and wrote nothing to it. Pipe names are shared by every \
+user on the machine, so something else created this one, before the app or after it exited, \
+perhaps to pose as it. Ask the user to find what serves it (this bridge's log names the owner, \
+where it could read one) and to restart the app once it is gone; this bridge keeps trying and \
+connects to the app's own pipe with no restart.";
 
 /// What follows "held by another bridge" for a bridge whose own departure was
 /// letting go after its idle window: that the disconnect the answer opens
@@ -2909,9 +2921,19 @@ mod tests {
             peer_pid: None,
             idle_release: None,
             // Unix's transport, whose answers the cases below pin on every
-            // platform; the pipe's are pinned where `backlog` is false.
+            // platform, in its nouns (see `here`); the pipe's are pinned
+            // where `backlog` is false.
             backlog: true,
         }
+    }
+
+    /// `unix`, words of an answer as Unix says them, as this platform says
+    /// them: on Windows with a pipe and its name where Unix has a socket and
+    /// its path ([`ENDPOINT`], [`ENDPOINT_ADDRESS`]). The identity on Unix,
+    /// so a text pinned through it is pinned there byte for byte.
+    fn here(unix: &str) -> String {
+        unix.replace("socket path", ENDPOINT_ADDRESS)
+            .replace("socket", ENDPOINT)
     }
 
     /// A link that has been open for `ms`, however long ago that puts the
@@ -3082,10 +3104,13 @@ mod tests {
         .expect_err("a greeting is not a tree");
         assert_eq!(
             greeted.message,
-            "app 'demo' disconnected (last snapshot seq 7), and this bridge has reconnected: the \
-             app completed the taria handshake (protocol version 1) and has not published a tree \
-             on this connection yet. The socket path is right and the app is running, so nothing \
-             needs restarting; retry, and the first snapshot it publishes is served."
+            here(
+                "app 'demo' disconnected (last snapshot seq 7), and this bridge has reconnected: \
+                 the app completed the taria handshake (protocol version 1) and has not \
+                 published a tree on this connection yet. The socket path is right and the app \
+                 is running, so nothing needs restarting; retry, and the first snapshot it \
+                 publishes is served."
+            )
         );
         // A greeting outranks the age: a greeted connection is not waiting
         // to be accepted, however young or old it is.
@@ -3112,10 +3137,10 @@ mod tests {
         .expect_err("no handshake yet");
         let ms = young
             .message
-            .strip_prefix(
+            .strip_prefix(&here(
                 "app 'demo' disconnected (last snapshot seq 7), and this bridge reconnected to \
                  the socket ",
-            )
+            ))
             .and_then(|rest| rest.split_once("ms ago"))
             .map(|(ms, _)| ms.parse::<u64>().expect("a whole number of ms"))
             .unwrap_or_else(|| panic!("{}", young.message));
@@ -3133,7 +3158,7 @@ mod tests {
         for (name, message) in [("greeted", &greeted.message), ("young", &young.message)] {
             assert!(
                 !message.contains("may have exited")
-                    && !message.contains("socket path correct")
+                    && !message.contains(&here("socket path correct"))
                     && !message.contains('\u{2014}'),
                 "{name}: {message}"
             );
@@ -3189,8 +3214,8 @@ mod tests {
     fn with_no_connection_the_path_and_the_app_are_the_questions() {
         let reason = no_snapshot_reason(silent_link());
         assert!(
-            reason.contains("holds no connection to the socket")
-                && reason.contains("is the socket path correct"),
+            reason.contains(&here("holds no connection to the socket"))
+                && reason.contains(&here("is the socket path correct")),
             "nothing connected is the one case the path is worth checking: {reason}"
         );
 
@@ -3242,7 +3267,7 @@ mod tests {
             assert!(
                 reason.starts_with("no snapshot from the app yet")
                     && reason.contains(OVER_THE_LIMIT)
-                    && reason.contains("The socket path is right"),
+                    && reason.contains(&here("The socket path is right")),
                 "{name}: the size is the story, and the path is not in question: {reason}"
             );
             for wrong in [
@@ -3253,7 +3278,7 @@ mod tests {
                 "levels deep",
             ] {
                 assert!(
-                    !reason.contains(wrong),
+                    !reason.contains(&here(wrong)),
                     "{name}: `{wrong}` is another state's answer: {reason}"
                 );
             }
@@ -3336,14 +3361,17 @@ mod tests {
     #[test]
     fn a_reconnected_bridge_quotes_the_line_its_new_connection_sent() {
         let reason = "invalid type: string \"not a number\", expected u64";
-        let want = "app 'demo' disconnected (last snapshot seq 7), and this bridge has \
-                    reconnected: the app sent lines on the new connection, and this bridge could \
-                    not read the last one (invalid type: string \"not a number\", expected u64). \
-                    The socket path is right, so the line is what is wrong. A snapshot more than \
-                    32 levels deep exceeds what a JSON parser will recurse into and fails exactly \
-                    like this; so does an app built against a taria whose snapshot shape differs \
-                    from this bridge's. Fix the tree the app publishes, or match its taria \
-                    dependency to this bridge's; the bridge keeps reading and needs no restart.";
+        let want = here(
+            "app 'demo' disconnected (last snapshot seq 7), and this bridge has reconnected: the \
+             app sent lines on the new connection, and this bridge could not read the last one \
+             (invalid type: string \"not a number\", expected u64). The socket path is right, so \
+             the line is what is wrong. A snapshot more than 32 levels deep exceeds what a JSON \
+             parser will recurse into and fails exactly like this; so does an app built against \
+             a taria whose snapshot shape differs from this bridge's. Fix the tree the app \
+             publishes, or match its taria dependency to this bridge's; the bridge keeps reading \
+             and needs no restart.",
+        );
+        let want = want.as_str();
         // After a release the opening says the disconnect was that, and the
         // rest is the same.
         let after_release = want.replacen(
@@ -3610,7 +3638,7 @@ mod tests {
                 // The age is read off the clock between the two calls.
                 let ms = |message: &str| {
                     let (before, rest) = message
-                        .split_once("reconnected to the socket ")
+                        .split_once(&here("reconnected to the socket "))
                         .unwrap_or_else(|| panic!("{message}"));
                     let (_, after) = rest
                         .split_once("ms ago")
@@ -3662,6 +3690,69 @@ mod tests {
             backlog: false,
             idle_release: Some(DEFAULT_IDLE_RELEASE),
             ..silent_link()
+        }
+    }
+
+    /// On Windows the answers that name the endpoint name a pipe and its
+    /// name, pinned here whole: nothing connected, a line over the limit, a
+    /// line that does not parse, a reconnected app that greeted and has not
+    /// drawn, and a connection younger than the grace.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_answers_name_a_pipe_and_its_name() {
+        assert_eq!(
+            no_snapshot_reason(pipe_link(LinkState::Down)),
+            "no snapshot from the app yet, and this bridge holds no connection to the pipe: is \
+             the taria-enabled app running, and is the pipe name correct? The bridge reconnects \
+             automatically; retry once the app is up."
+        );
+        assert_eq!(
+            no_snapshot_reason(LinkReport {
+                rejected: Some(OVERSIZED_LINE.to_string()),
+                ..pipe_link(LinkState::Down)
+            }),
+            format!(
+                "no snapshot from the app yet, but not because nothing is there: an app reached \
+                 this pipe, and its snapshot was over 1 MiB (1048576 bytes), this bridge's line \
+                 limit, so the bridge closed the connection. The pipe name is right, so the tree \
+                 is what is wrong. {OVERSIZED_REPEATS}"
+            )
+        );
+        let rejected = no_snapshot_reason(LinkReport {
+            rejected: Some("expected value at line 1".to_string()),
+            ..pipe_link(open_for(4_000))
+        });
+        assert!(
+            rejected.starts_with(
+                "no snapshot from the app yet, but not because nothing is there: an app reached \
+                 this pipe and sent lines, and this bridge could not read the last one (expected \
+                 value at line 1). The pipe name is right, so the line is what is wrong."
+            ),
+            "{rejected}"
+        );
+        let greeted = available_snapshot(
+            gone_demo(),
+            LinkReport {
+                peer_protocol: Some(PROTOCOL_VERSION),
+                ..pipe_link(open_for(800))
+            },
+        )
+        .expect_err("a greeting is not a tree");
+        assert_eq!(
+            greeted.message,
+            "app 'demo' disconnected (last snapshot seq 7), and this bridge has reconnected: the \
+             app completed the taria handshake (protocol version 1) and has not published a tree \
+             on this connection yet. The pipe name is right and the app is running, so nothing \
+             needs restarting; retry, and the first snapshot it publishes is served."
+        );
+        let young = no_snapshot_reason(pipe_link(open_for(10)));
+        assert!(
+            young.starts_with("no snapshot from the app yet: this bridge connected to the pipe ")
+                && young.contains("ms ago and no handshake has arrived yet"),
+            "{young}"
+        );
+        for answer in [young.as_str(), &greeted.message, rejected.as_str()] {
+            assert!(!answer.contains("socket"), "{answer}");
         }
     }
 
@@ -3857,12 +3948,13 @@ mod tests {
     #[test]
     fn a_pipe_another_account_owns_is_named_as_not_the_app() {
         let pinned = "the pipe at this name is owned by another account than this bridge's user, \
-                      so it is not the app's, and this bridge closed it without reading or \
-                      writing anything. Pipe names are shared by every user on the machine, so \
-                      something else created this one, before the app or after it exited, \
-                      perhaps to pose as it. Ask the user to find what serves it (this bridge's \
-                      log names the owner) and to restart the app once it is gone; this bridge \
-                      keeps trying and connects to the app's own pipe with no restart.";
+                      or refused this user access, which the app's own pipe never does, so it is \
+                      not the app's; this bridge parsed nothing it sent and wrote nothing to it. \
+                      Pipe names are shared by every user on the machine, so something else \
+                      created this one, before the app or after it exited, perhaps to pose as \
+                      it. Ask the user to find what serves it (this bridge's log names the owner, \
+                      where it could read one) and to restart the app once it is gone; this \
+                      bridge keeps trying and connects to the app's own pipe with no restart.";
         for rejected in [None, Some(OVERSIZED_LINE.to_string())] {
             let foreign = LinkReport {
                 rejected,

@@ -38,8 +38,6 @@ mod transport;
 mod tree_format;
 
 pub use server::{DEFAULT_IDLE_RELEASE, TariaMcpServer, TariaMcpServerBuilder};
-#[cfg(windows)]
-pub use transport::current_user_sid;
 pub use tree_format::TreeFormat;
 
 #[cfg(test)]

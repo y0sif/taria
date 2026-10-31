@@ -16,6 +16,11 @@ use rmcp::ServiceExt;
 use taria_mcp::{TariaMcpServer, TreeFormat};
 
 mod args;
+// This user's SID, for `--app`: the library's own reader, compiled into the
+// binary as well, so the library need not export it.
+#[cfg(windows)]
+#[path = "transport/windows_sid.rs"]
+mod windows_sid;
 
 fn main() -> ExitCode {
     let cli = match args::parse(std::env::args().skip(1)) {

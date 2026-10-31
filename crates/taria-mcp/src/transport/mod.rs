@@ -17,6 +17,9 @@
 //!   turned this bridge away, as a [`Refusal`];
 //! - [`BACKLOG`], whether a connect can open before the app accepts it, which
 //!   decides what a connection that stays silent means;
+//! - [`ENDPOINT`] and [`ENDPOINT_ADDRESS`], what the answers call the app's
+//!   endpoint and what the bridge was given to find it by: a socket and a
+//!   socket path on Unix, a pipe and a pipe name on Windows;
 //! - [`check_endpoint`], which refuses a path the platform's transport must
 //!   never open, before a server is built around it;
 //! - [`ensure_supported`], which the server builders call first, so a
@@ -30,18 +33,20 @@
 mod unix;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod windows_sid;
 
 #[cfg(unix)]
 pub(crate) use unix::{
-    BACKLOG, check_endpoint, connect, ensure_supported, nothing_listens, peer_pid, refusal,
+    BACKLOG, ENDPOINT, ENDPOINT_ADDRESS, check_endpoint, connect, ensure_supported,
+    nothing_listens, peer_pid, refusal,
 };
-#[cfg(windows)]
-pub use windows::current_user_sid;
 #[cfg(all(test, windows))]
 pub(crate) use windows::testing;
 #[cfg(windows)]
 pub(crate) use windows::{
-    BACKLOG, check_endpoint, connect, ensure_supported, nothing_listens, peer_pid, refusal,
+    BACKLOG, ENDPOINT, ENDPOINT_ADDRESS, check_endpoint, connect, ensure_supported,
+    nothing_listens, peer_pid, refusal,
 };
 
 /// Why something listening at the path turned a connect away, so that no
@@ -59,10 +64,10 @@ pub(crate) enum Refusal {
     /// bridge at a time, so the app is held by another bridge, and this one
     /// gets in on a later retry, once the holder lets go.
     Busy,
-    /// The endpoint at the path belongs to another account than this
-    /// bridge's user, so it is not the app's: on Windows a pipe whose owner
-    /// is not this user's SID. Pipe names are machine-wide, and any process
-    /// can create one under the app's name first. The bridge closed it
-    /// without reading or writing anything.
+    /// The endpoint at the path is not the app's: on Windows a pipe whose
+    /// owner is not this user's SID, or one that refused this user access,
+    /// which the app's own pipe never does. Pipe names are machine-wide, and
+    /// any process can create one under the app's name first. The bridge
+    /// parsed nothing it sent and wrote nothing to it.
     Foreign,
 }

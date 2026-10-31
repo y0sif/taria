@@ -94,6 +94,20 @@ use security::{PipeSecurity, Sid};
 /// default on Windows).
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
+/// How long [`Listener::bind`] keeps trying a name in use before it gives up
+/// with [`AddrInUse`](io::ErrorKind::AddrInUse).
+///
+/// A name stays in use until every handle to its last instance is closed,
+/// the client's included, so an app restarted at once can find its own
+/// name still taken: the bridge connected to the previous instance has seen
+/// it go, and has not closed its end yet. Refused at once, the new instance
+/// ran with taria off for the whole of its run. A second app at the name of
+/// one still serving is refused all the same, this much later.
+const BIND_RETRY: Duration = Duration::from_millis(500);
+
+/// How long a bind that found the name in use naps before the next try.
+const BIND_NAP: Duration = Duration::from_millis(20);
+
 /// The size the pipe's buffers are asked for, each way. Advisory: the system
 /// may round it. A write that does not fit waits for the bridge to read,
 /// which is what the write deadline bounds.
@@ -133,9 +147,14 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         // SAFETY: the handle is owned by this value, valid, and closed only
-        // here. A pipe handle is closed only once no operation is in flight on
-        // it: every one runs inside a call on an owner that holds the handle's
-        // `Arc` (see `Op`).
+        // here. A pipe handle is closed once the last `Arc` of it goes, and
+        // every operation on it runs inside a call on an owner that holds one
+        // (see `Op`), so as a rule nothing is in flight on it by then. The
+        // exception is an `Op` dropped with an operation it could not see
+        // finish: it leaks its state, OVERLAPPED, event and buffer, and still
+        // lets go of its `Arc`. Closing the handle then cancels that
+        // operation, and whatever the kernel writes as it ends lands in the
+        // leaked state, which is never freed or reused.
         unsafe { CloseHandle(self.0) };
     }
 }
@@ -495,7 +514,9 @@ impl Listener {
     /// A name another instance is serving is refused with
     /// [`AddrInUse`](io::ErrorKind::AddrInUse), as on Unix. The system
     /// decides that, not a probe: the pipe is created as the first instance
-    /// of its name, which fails while any instance of it exists.
+    /// of its name, which fails while any instance of it exists. Such a
+    /// failure is retried for [`BIND_RETRY`] first, which a name still held
+    /// by the bridge of an instance that has just exited outlasts.
     pub(crate) fn bind(path: PathBuf) -> io::Result<Self> {
         let Some(name) = path.to_str() else {
             return Err(io::Error::new(
@@ -516,25 +537,34 @@ impl Listener {
         let user = Sid::current_user()?;
         let security = PipeSecurity::owned_by(&user)?;
         let attributes = security.attributes();
-        // SAFETY: `wide` is NUL-terminated and `attributes` points at a
-        // descriptor `security` keeps alive, both for the length of the call,
-        // which copies what it needs. The handle returned is owned below.
-        let handle = unsafe {
-            CreateNamedPipeW(
-                wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                PIPE_BUFFER,
-                PIPE_BUFFER,
-                0,
-                &attributes,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
+        let until = Instant::now() + BIND_RETRY;
+        let handle = loop {
+            // SAFETY: `wide` is NUL-terminated and `attributes` points at a
+            // descriptor `security` keeps alive, both for the length of the
+            // call, which copies what it needs. The handle returned is owned
+            // below.
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    wide.as_ptr(),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    1,
+                    PIPE_BUFFER,
+                    PIPE_BUFFER,
+                    0,
+                    &attributes,
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                break handle;
+            }
             // SAFETY: reads this thread's last error, set by the call above.
-            return Err(create_error(name, unsafe { GetLastError() }));
-        }
+            let code = unsafe { GetLastError() };
+            if !name_in_use(code) || Instant::now() >= until {
+                return Err(create_error(name, code));
+            }
+            thread::sleep(BIND_NAP);
+        };
         let pipe = Arc::new(Handle(handle));
         let connect = Op::new(Arc::clone(&pipe), 0)?;
         Ok(Self {
@@ -690,14 +720,19 @@ impl Listener {
     }
 }
 
+/// Does a failed `CreateNamedPipeW` say the name is in use? Access denied is
+/// what the first-instance flag answers while any instance of the name
+/// exists, and pipe busy what a pipe with no instance to spare answers.
+fn name_in_use(code: u32) -> bool {
+    code == ERROR_ACCESS_DENIED || code == ERROR_PIPE_BUSY
+}
+
 /// The error a failed `CreateNamedPipeW` is reported as.
 ///
-/// Access denied is what the first-instance flag answers when the name is
-/// taken, and pipe busy what a pipe with no instance to spare answers: both
-/// mean the name is in use, which is [`AddrInUse`](io::ErrorKind::AddrInUse)
+/// A name in use ([`name_in_use`]) is [`AddrInUse`](io::ErrorKind::AddrInUse),
 /// as on Unix. Anything else keeps its own kind, with the name added.
 fn create_error(name: &str, code: u32) -> io::Error {
-    if code == ERROR_ACCESS_DENIED || code == ERROR_PIPE_BUSY {
+    if name_in_use(code) {
         return io::Error::new(
             io::ErrorKind::AddrInUse,
             format!(
@@ -1199,9 +1234,19 @@ mod tests {
         let first = bind("twice");
         let name = name_of(&first);
 
+        let tried = Instant::now();
         let Err(err) = Listener::bind(PathBuf::from(&name)) else {
             panic!("a second instance must not get the first's pipe");
         };
+        let took = tried.elapsed();
+        assert!(
+            took >= BIND_RETRY,
+            "refused after {took:?}, inside the retry"
+        );
+        assert!(
+            took < BIND_RETRY + Duration::from_millis(500),
+            "refused only after {took:?}"
+        );
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "err: {err}");
         let message = err.to_string();
         assert!(message.contains("already serving"), "err: {message}");
@@ -1209,6 +1254,51 @@ mod tests {
 
         // The first is untouched, and still the one a bridge reaches.
         let (_first, _connection, _client) = next_session(first);
+    }
+
+    /// An app restarted at once can find its name still in use for a
+    /// moment, and waits it out instead of running with taria off: here the
+    /// instance holding it goes 150 ms into the bind.
+    #[test]
+    fn a_bind_waits_for_a_name_in_use_to_come_free() {
+        let first = bind("comesfree");
+        let name = name_of(&first);
+        let holder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(first);
+        });
+
+        let tried = Instant::now();
+        let second = Listener::bind(PathBuf::from(&name)).expect("the name came free in time");
+        let took = tried.elapsed();
+        holder.join().expect("the holder thread");
+        assert!(took < BIND_RETRY, "bound only after {took:?}");
+
+        // The new instance is the one a bridge reaches.
+        let (_second, _connection, _client) = next_session(second);
+    }
+
+    /// The restart the retry is for: the app's instance is gone, and the
+    /// bridge it served still holds its end of the pipe for a moment. The
+    /// next app's bind outlasts it.
+    #[test]
+    fn a_bind_outlasts_a_bridge_still_holding_the_last_instance() {
+        let (listener, connection, client) = session("lingering");
+        let name = name_of(&listener);
+        // The app exits: everything of its side of the pipe goes.
+        drop((connection, listener));
+        let bridge = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(client);
+        });
+
+        let tried = Instant::now();
+        let next = Listener::bind(PathBuf::from(&name)).expect("the bridge let go in time");
+        let took = tried.elapsed();
+        bridge.join().expect("the bridge thread");
+        assert!(took < BIND_RETRY, "bound only after {took:?}");
+
+        let (_next, _connection, _client) = next_session(next);
     }
 
     #[test]

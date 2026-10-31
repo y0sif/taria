@@ -258,7 +258,7 @@ fn user_identity() -> String {
 pub fn resolve_socket_path(app_label: &str) -> Result<PathBuf, String> {
     resolve_pipe(
         env::var_os("TARIA_SOCK"),
-        taria_mcp::current_user_sid,
+        crate::windows_sid::current_user_sid,
         app_label,
     )
 }
@@ -602,9 +602,9 @@ mod tests {
         let err = resolve_pipe(None, sid, r"a\b").unwrap_err();
         assert!(err.contains("cannot end a pipe name"), "{err}");
 
-        let user = taria_mcp::current_user_sid().expect("the token names a user");
+        let user = crate::windows_sid::current_user_sid().expect("the token names a user");
         assert_eq!(
-            resolve_pipe(None, taria_mcp::current_user_sid, "demo"),
+            resolve_pipe(None, crate::windows_sid::current_user_sid, "demo"),
             Ok(PathBuf::from(format!(r"\\.\pipe\taria-{user}-demo")))
         );
     }

@@ -13,6 +13,13 @@ pub(crate) type Stream = tokio::net::UnixStream;
 /// until the first one leaves.
 pub(crate) const BACKLOG: bool = true;
 
+/// What the answers call the app's endpoint: a socket.
+pub(crate) const ENDPOINT: &str = "socket";
+
+/// What the answers call what the bridge was given to find the app by: a
+/// socket path.
+pub(crate) const ENDPOINT_ADDRESS: &str = "socket path";
+
 /// Connect to the app's socket at `path`.
 pub(crate) async fn connect(path: &Path) -> io::Result<Stream> {
     Stream::connect(path).await
