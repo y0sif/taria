@@ -71,8 +71,11 @@ impl<'a> FrameRecorder<'a> {
     /// snapshot always carries focus somewhere. `seq` increments per
     /// published snapshot. A frame whose tree is the one the previous frame
     /// built is skipped before anything is cut or measured, and one that is
-    /// cut to the snapshot already sent is not sent again. This never blocks
-    /// the render path.
+    /// cut to the snapshot already sent is not sent again, unless the app
+    /// has dequeued an input since that snapshot went out: then it is sent
+    /// again as it is, stamped with the input (see
+    /// [`TariaLayer::publish`](crate::TariaLayer::publish), under Stamps).
+    /// This never blocks the render path.
     ///
     /// A tree deeper than [`taria::MAX_NODE_DEPTH`] is cut rather than sent
     /// or skipped, because a snapshot past that depth does not arrive at the

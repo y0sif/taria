@@ -320,6 +320,28 @@ pub(crate) fn not_disabled(disabled: &Option<bool>) -> bool {
     *disabled != Some(true)
 }
 
+/// A snapshot's `after_input`: an unsigned 64-bit integer, or not stated.
+///
+/// Read like the node's state, for the same reason: the field was added
+/// within version 1, and a reader that failed the line over it would leave
+/// the agent on a stale tree over one field. Not stated is what an
+/// unstamped peer sends, so the bridge treats the tree as one it cannot
+/// order against its inputs, which is the safe reading.
+pub(crate) fn lenient_input_id<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<crate::wire::InputId>, D::Error> {
+    Ok(match Shape::read(d)? {
+        Shape::Unsigned(n) => Some(crate::wire::InputId::new(n)),
+        _ => None,
+    })
+}
+
+/// A hello's `stamps`: only `true` is a statement, and anything else reads
+/// as a peer that does not stamp, which is what an older peer is.
+pub(crate) fn lenient_flag<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(Shape::read(d)?.bool() == Some(true))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::hash_map::DefaultHasher;

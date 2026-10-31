@@ -1500,11 +1500,12 @@ async fn a_full_input_queue_fails_the_call_instead_of_hanging() {
         protocol_rx,
         rejected_rx,
         link_rx,
+        stamps_rx: watch::channel(false).1,
+        send_order: Default::default(),
     };
     // Occupy the only slot, so the tool's own send has nowhere to go.
     handle
-        .input_tx
-        .send((handle.next_input_id(), AgentInput::key("x")))
+        .send(AgentInput::key("x"), WAIT)
         .await
         .expect("fill the queue");
     let server = Tools::new(handle);
@@ -1559,6 +1560,8 @@ async fn a_burst_cut_short_reports_how_much_of_it_was_sent() {
         protocol_rx,
         rejected_rx,
         link_rx,
+        stamps_rx: watch::channel(false).1,
+        send_order: Default::default(),
     });
 
     let err = timeout(
@@ -1747,10 +1750,8 @@ async fn stale_inputs_do_not_replay_into_next_connection() {
     // ...so queue stale inputs directly; the listener is still unbound, so
     // these sit in the channel until the next successful connect.
     for key in ["q", "y"] {
-        let id = handle.next_input_id();
         handle
-            .input_tx
-            .send((id, AgentInput::key(key)))
+            .send(AgentInput::key(key), WAIT)
             .await
             .expect("queue input while down");
     }

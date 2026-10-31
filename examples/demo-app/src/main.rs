@@ -8,6 +8,12 @@
 //! With `TARIA_DEMO_STATE=<path>` set, the demo also keeps its state as JSON
 //! at that path (see [`mod@state`]), for harnesses that grade what an agent
 //! did. Unset, nothing is written.
+//!
+//! With `TARIA_DEMO_SLOW_MS=<n>` set, the demo holds each agent input for `n`
+//! milliseconds after dequeueing it and before applying it, the way an app
+//! whose handler does real work does. That is the app issue #17 was about:
+//! its input is acknowledged at once and its tree comes later. Unset, empty,
+//! `0` or not a number, inputs are applied at once.
 
 mod app;
 mod events;
@@ -20,6 +26,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use taria_ratatui::TariaLayer;
@@ -133,7 +141,8 @@ fn run(terminal: &mut DefaultTerminal, layer: &mut TariaLayer) -> io::Result<()>
         "taria disabled".to_string()
     };
     let mut state_file = StateFile::from_env();
-    let result = event_loop(terminal, layer, &mut app, &mut state_file);
+    let slow = slow_from_env();
+    let result = event_loop(terminal, layer, &mut app, &mut state_file, slow);
     // On exit, however the loop ended, so the file holds the final state.
     sync_state(&mut state_file, &app);
     result
@@ -144,13 +153,14 @@ fn event_loop(
     layer: &mut TariaLayer,
     app: &mut App,
     state_file: &mut Option<StateFile>,
+    slow: Option<Duration>,
 ) -> io::Result<()> {
     let rx = setup_event_channel();
 
     while app.running {
         // Agent inputs are drained around the blocking recv below; the 50ms
         // tick bounds the latency between an agent act and its effect.
-        drain_agent_input(app, layer);
+        drain_agent_input(app, layer, slow);
         // Before the draw and the publish, so a harness that sees the effect
         // on screen or in the tree finds it in the file too.
         sync_state(state_file, app);
@@ -159,13 +169,15 @@ fn event_loop(
 
         // Publish the semantic tree for the exact state just drawn; the
         // layer dedups identical trees, so publishing every frame is free.
+        // After the drain above and never before it, so the first tree the
+        // layer stamps with an input's id carries that input's effect.
         layer.publish(tree::build_nodes(app));
 
         match rx.recv() {
             Ok(event) => update(app, event),
             Err(_) => break,
         }
-        drain_agent_input(app, layer);
+        drain_agent_input(app, layer, slow);
         sync_state(state_file, app);
     }
     Ok(())
@@ -222,6 +234,27 @@ fn sync_state(state_file: &mut Option<StateFile>, app: &App) {
 /// waiting on an effect that no effect is coming, and last ack wins.
 /// `apply_agent_input` returns the status and `drain` sends the ones that
 /// refine it, so no input id passes through this app at all.
-fn drain_agent_input(app: &mut App, layer: &TariaLayer) {
-    layer.drain(|input| apply_agent_input(app, input));
+///
+/// With `slow` set, each input is held that long between its dequeue and
+/// its effect (see `TARIA_DEMO_SLOW_MS`).
+fn drain_agent_input(app: &mut App, layer: &TariaLayer, slow: Option<Duration>) {
+    layer.drain(|input| {
+        if let Some(slow) = slow {
+            thread::sleep(slow);
+        }
+        apply_agent_input(app, input)
+    });
+}
+
+/// How long `TARIA_DEMO_SLOW_MS` asks the demo to hold each agent input, or
+/// `None` when it is unset, empty, zero or not a whole number of
+/// milliseconds.
+fn slow_from_env() -> Option<Duration> {
+    std::env::var("TARIA_DEMO_SLOW_MS")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
 }

@@ -55,6 +55,25 @@ fraction or an exponent, `"row":3.0` or `"row":3e0`, reads as not stated,
 though its value is whole. Python's `json` writes a float as `3.0`, so
 convert with `int()` first.
 
+The stamps, added in 0.4.0 for issue #17, are the third case: `after_input`
+on a snapshot, the newest input the app had dequeued when it published, and
+`"stamps":true` in the hello of an app that sends it ([protocol section
+5.3](protocol.md#53-after_input-stamped-snapshots)). Both are optional, and
+they change one behaviour of the 0.4.0 adapter: after a dequeue, a frame
+identical to the last one sends that snapshot again under the same `seq`,
+with only the stamp moved. Measured against the demo, with and without
+`TARIA_DEMO_SLOW_MS=800`:
+
+| Bridge | App | What the agent gets |
+| --- | --- | --- |
+| taria-mcp 0.4.0 | taria-ratatui 0.4.0 | Each input's own tree: an act the demo held 800 ms answered with its effect in 0.81 s, three in a row each with its own. An input that changes nothing reads "The app received this input, and its tree did not change." within a frame (50 ms against 503 ms), and an ignored one is answered as fast. Up to 3 s for a tree, then "published no tree after it within 3000ms". The stamp is stripped from both formats. |
+| taria-mcp 0.2.0 to 0.3.3 | taria-ratatui 0.4.0 | Works as with a 0.3.3 app: the 500 ms window and its texts, and the resend reads as no change. The stamp shows: `"after_input":N` in the JSON tree, and `after_input=N` at the head of the outline (0.3.0 on). Issue #17 stays: the 800 ms act read "did not change within 500ms", and the acts after it read as unacknowledged while the demo worked through them. taria-mcp 0.1.0 hands the agent its own parse, so the stamp never shows. |
+| taria-mcp 0.4.0 | taria-ratatui 0.3.3 or older, or any app whose hello does not say `stamps` | Answered exactly as 0.3.3 answered it: the 500 ms window and every text, byte for byte. A stamp from an app that did not say it stamps is stripped and ignored. |
+
+A Rust peer that compares whole `Snapshot`s now compares the stamp too, so
+against a 0.4.0 adapter it reads the resend of an unchanged tree as a change.
+Compare `root`, as taria-mcp does, or `seq` and `root` together.
+
 In Rust the same promise is `#[non_exhaustive]` on the twelve types a version-1
 addition can reach, from `Role`, `Action` and `Checked` to the two wire message
 enums, and on the six struct-like variants inside them, where a new optional

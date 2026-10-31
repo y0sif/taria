@@ -45,8 +45,9 @@ and an input the app deliberately dropped looks like a slow one.
 - Framing: both message enums are internally tagged, so every line carries a
   `type` naming its variant. That key frames the message on the transport and
   says nothing about the tree, so the bridge drops it from the snapshot it
-  hands an agent. `read_tree` returns the snapshot, not the line carrying it.
-- Ids: the bridge stamps each input with an `InputId` and must not reuse one
+  hands an agent, and the stamp (`after_input`, below) with it. `read_tree`
+  returns the snapshot, not the line carrying it.
+- Ids: the bridge tags each input with an `InputId` and must not reuse one
   for the lifetime of its process. An ack can outlive the connection it was
   sent on, so ids that never repeat are what stop a dead app's ack from
   answering a live input. A process-wide counter satisfies this.
@@ -61,7 +62,20 @@ and an input the app deliberately dropped looks like a slow one.
 - Dedup: a frame whose tree is the one the previous frame built is skipped
   before anything is cut or measured, and a frame whose cut tree is the
   snapshot already sent is skipped after the cut. Either way `seq` does not
-  move.
+  move. The one exception is a stamp moving: once the app has dequeued an
+  input since the last snapshot went out, that snapshot goes out again,
+  neither cut nor measured again, with only `after_input` moved and under
+  the same `seq`.
+- Stamps (0.4.0, issue #17): every snapshot carries `after_input`, the newest
+  input the app had dequeued on this connection when it published, and the
+  hello says `"stamps":true`. Only an input `drain`, `try_recv` or
+  `recv_timeout` handed over stamps: a dropped one, one of a kind the build
+  cannot read, a stale one and one written before the hello never do. Stamps
+  belong to a connection, because ids belong to a bridge process, so the
+  latest snapshot a new connection is greeted with goes out unstamped. The
+  bridge credits a tree to an input only once it is stamped at that input,
+  which is what lets a slow handler's tree reach its own input's answer
+  (What the bridge does with each outcome, below).
 - `focused`: serialized on every node and accepted when absent, where absence
   reads as `false`. Nothing on the wire moves today; what the pairing buys is
   that omitting the field for the nodes that are not focused stays an additive
@@ -185,9 +199,11 @@ its tail, since that is where those grow; every other string keeps its head.
 Ids and custom action names are never changed, because they are what an agent
 sends back: a node it can read but not address is worse than one it cannot
 read at all. Focus is decided after the bound, since a dropped row can be the
-focused one. The line is sized for the largest possible `seq`, so the same
-tree is always cut the same way and dedup still works on it: an edit past the
-cut of a trimmed value produces the tree already sent, and nothing goes out.
+focused one. The line is sized for the largest possible `seq` and the largest
+stamp, so the same tree is always cut the same way and dedup still works on
+it: an edit past the cut of a trimmed value produces the tree already sent,
+and nothing goes out, or only that tree again with its stamp moved, which
+still fits.
 
 The app is told through `stats()`'s `oversized_snapshots` and
 `last_oversize` fields, the second a `SnapshotTooLarge` that carries the size
@@ -392,21 +408,41 @@ blocks, an unknown node id, a `set_value` with no value) refines that to
 
 Acks share the connection's writer with snapshots and are flushed first in
 every pass, so an ack always reaches the bridge before the snapshot
-published after it. An agent that saw the snapshot first could not tell
-whether it reflects its own input yet.
+published after it, the stamped resend of an unchanged tree included. An
+agent that saw the snapshot first could not tell whether it reflects its own
+input yet.
 
 ### What the bridge does with each outcome
 
-An input tool sends, then watches acks and snapshots for up to 500 ms. Both
-signals are needed and neither is sufficient: an ack says the app saw the
-input but not what it did, a new tree says something happened but not that
-this input caused it. The window is not cut short by a tree arriving without
-an ack, because the ack still owed can be a `dropped`, for an input that
-never reached the app while an unrelated redraw did, and answering that with
-a tree would report a dropped input as applied. A `delivered` does not cut it
-short either: the app can still refine it to `ignored`. What a `delivered`
-never becomes is a `dropped`, which says the input never reached the app at
-all.
+An input tool sends, then watches acks and snapshots. Both signals are
+needed and neither is sufficient: an ack says the app saw the input but not
+what it did, a new tree says something happened but not that this input
+caused it. The window is not cut short by a tree arriving without an ack,
+because the ack still owed can be a `dropped`, for an input that never
+reached the app while an unrelated redraw did, and answering that with a tree
+would report a dropped input as applied. A `delivered` does not cut it short
+either: the app can still refine it to `ignored`. What a `delivered` never
+becomes is a `dropped`, which says the input never reached the app at all.
+
+How long it watches, and which tree answers, depends on whether the peer's
+hello said it stamps. Against a peer that does not, the window is 500 ms and
+any tree that differs from the one the input was aimed at is the answer, as
+it was before 0.4.0, so a handler slower than the window reads as "no change"
+and its tree lands in the next input's window (issue #17). Against a peer
+that stamps, the window is 3 s and the stamp decides. A tree stamped at or
+after the input is the tree published after the app took it: compared with
+the baseline on its `root`, not its `seq`, it is the answer when it differs,
+and "did not change" at once when it does not, so a no-op still costs about
+a frame. A tree stamped before the input, or not at all, was published before
+the app had it, so it becomes the baseline rather than the answer, and a late
+tree is never credited to the input after it. For a burst the stamp has to
+reach the last press, and the baseline is the tree before the first. An
+`ignored` ends the wait at the first stamped tree, or 500 ms after the ack;
+a `dropped` at once. For the comparison to be sound, the bridge claims each
+id and queues its input under one lock, so ids reach the app in the order
+they were claimed even when tool calls overlap. The one gap is the snapshot
+watch, which keeps only the newest tree: a tree stamped before the input and
+the credited one arriving back to back are read as the credited one alone.
 
 | Outcome | Tool answer |
 |---|---|
@@ -419,7 +455,8 @@ all.
 | `dropped` | Error: nothing was applied; send fewer inputs. |
 | `ignored` | Text saying the app deliberately did nothing, plus the current tree to re-plan from. |
 | `delivered`, tree changed | The new tree. |
-| `delivered`, tree unchanged | Text: received, no change within 500 ms. |
+| `delivered`, tree unchanged | Text: received, no change within 500 ms, from a peer that does not stamp. From one that does: received, no change, once a tree stamped at the input arrives unchanged. |
+| `delivered`, no stamped tree within 3 s (a peer that stamps) | Text: received, but no tree published after it within 3000 ms; it may still be working, call `read_tree`. |
 | No ack, tree changed | The new tree. |
 | No ack, no change | Text: neither acknowledged nor changed; it may be an adapter that sends no acks. If a line was rejected inside the window, that line is quoted instead, because it may have been this input's ack. Otherwise, on Linux, if the app is stopped, the text says so instead, with its pid. The input waits in the socket, and the app applies it only if it resumes while the bridge still holds the connection: the window plus 30 s from the last tool call, since the input awaits its ack, and for good with `--idle-release 0`. A bridge that lets go first leaves the adapter to discard it. So the agent is told that deadline and how to resume the app (as for a stopped app below), then to call `read_tree` and resend the input if its effect is missing. A burst is spoken of as one: "these 3 inputs". |
 

@@ -506,6 +506,44 @@ arrived while the previous pass was drawing, before the frame that will be
 published is built. Publishing a tree that does not include an input you are
 already holding is how an agent gets told nothing happened.
 
+**The first tree you publish after a drain is the answer.** From 0.4.0 the
+layer stamps every snapshot with the newest input it has handed you
+(`after_input`), and `taria-mcp` credits a tree to an input only once it is
+stamped at that input. So an act your handler takes a second over is still
+answered with its own tree, an act that changes nothing is answered "did not
+change" within a frame, and a tree that lands late is never credited to the
+input after it. The stamp says when you took the input, though, not when you
+applied it. Whatever tree you publish first after the drain is the one the
+agent is handed, so it has to carry the effect, or a status saying the
+effect is under way.
+
+The loop to avoid publishes at the top and applies at the bottom:
+
+```rust
+// Wrong: the tree published here can be stamped with an input that is
+// dequeued above it but applied only further down.
+while app.running {
+    drain_agent_input(&mut app, layer); // queues the work
+    terminal.draw(|frame| view(&app, frame))?;
+    layer.publish(tree::build_nodes(&app)); // stamped, without the effect
+    app.apply_pending(); // the effect lands here, a frame too late
+    // ...
+}
+```
+
+Apply what you drained before the next publish, as the loop above does. If
+the work takes long enough to show, set a status first (a `Role::Status`
+node reading "Switching language", or a `disabled` control) and publish
+that, so the agent's answer says the input is being worked on rather than
+that it changed nothing, then publish the result when it is done.
+
+Publish every frame, not only when you think the tree changed. The layer
+skips a frame identical to the last one, but right after a dequeue it sends
+the last snapshot again with only its stamp moved, which is how an input
+that changed nothing gets its answer at once. An app that publishes only on
+change publishes nothing after such an input, and the bridge waits out its
+3 s window before saying it got no tree.
+
 The assumption underneath is that the loop wakes up on its own. An event loop
 that blocks on terminal input alone never returns while the keyboard is idle,
 and agent input then sits in the queue until a human touches a key. The demo
@@ -605,7 +643,10 @@ Acks are flushed ahead of the pending snapshot in every writer pass, so an
 ack queued first arrives first, and the bridge reports the refinement. Publish
 first and the bridge sees a changed tree behind a plain `Delivered`, returns
 that tree, and the `Ignored` arrives after the answer has already gone out.
-Draining before drawing, as above, gives you this for free.
+Against a layer that stamps, the same goes for an unchanged tree: the first
+tree stamped at the input answers it, and a `Delivered` in front of an
+unchanged one reads as "did not change". Draining before drawing, as above,
+gives you this for free.
 
 An input you can only answer later, a frame on or more, needs its id kept
 until then. For those, loop on `try_recv` instead of calling `drain`. It hands
@@ -724,7 +765,10 @@ snapshot, the agent has been told a truth it cannot check.
 Identical trees are deduped: a frame whose nodes match the previous frame's
 is skipped before anything is cut or measured, and `seq` does not move.
 Publishing every frame therefore costs one comparison, but only for as long
-as the tree actually holds still.
+as the tree actually holds still. The exception is the first frame after you
+dequeue an input: the snapshot already published goes out again, neither cut
+nor measured again, with its stamp moved to that input and under the same
+`seq`, as the drain section above explains.
 
 A live metric defeats it. A words-per-minute counter carried to four
 decimals puts a new string in the tree on every frame, so every frame

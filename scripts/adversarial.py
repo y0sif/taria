@@ -627,7 +627,7 @@ def probe_rapid_acts(client, ctx):
     """Fire 10 selects back-to-back without waiting for responses.
 
     Answering all ten without an error is only half of it. "The tree did not
-    change within 500ms" is a success result, so an app that acknowledged ten
+    change" is a success result, so an app that acknowledged ten
     selects and applied none would pass an errors-only probe -- and so would
     a bridge that answered without forwarding anything. The burst therefore
     ends on a row it did not start on, and the list has to name that row when

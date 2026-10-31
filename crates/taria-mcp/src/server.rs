@@ -34,7 +34,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::bridge::{
     self, AppSnapshot, BridgeHandle, BridgeState, Call, Demand, LinkState, OVERSIZED_LINE,
-    UNACKED_HOLD,
+    SendError, UNACKED_HOLD,
 };
 use crate::tree_format::TreeFormat;
 
@@ -51,9 +51,31 @@ use crate::tree_format::TreeFormat;
 /// `taria-mcp` binary does by default.
 pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(60);
 
-/// How long an input-sending tool waits for the app to answer, counting both
-/// the app's ack and any snapshot it publishes in response.
+/// How long an input-sending tool waits for a peer that does not stamp its
+/// snapshots to answer, counting both the app's ack and any snapshot it
+/// publishes in response: 500 ms.
+///
+/// Such a peer gives no way to tell a tree published after the input from
+/// one published before it, so whatever differs inside the window is the
+/// answer, and a handler slower than the window reads as "did not change",
+/// its tree credited to whatever input comes next (issue #17). A peer that
+/// stamps waits on [`SETTLE_WAIT`] instead. This is also how long an
+/// `Ignored` ack from a peer that stamps waits for the tree published after
+/// it.
 const UPDATE_WAIT: Duration = Duration::from_millis(500);
+
+/// How long an input-sending tool waits for a peer that stamps its snapshots
+/// to publish a tree after its input: 3 s.
+///
+/// A stamp says which input the app had dequeued when it published, so the
+/// wait can end on the tree published after this input, changed or not, and
+/// never on an earlier one. An input that changes nothing is answered as
+/// soon as that tree arrives, which for an app drawing every frame is within
+/// a frame of the dequeue, so the length of this window is paid only by an
+/// app that is slow or publishes nothing. Long enough for a handler that
+/// rebuilds its state, short enough that an app which never publishes again
+/// does not hold the agent long.
+const SETTLE_WAIT: Duration = Duration::from_secs(3);
 
 /// How long one input waits for room in the bridge's queue to the app.
 ///
@@ -545,6 +567,9 @@ impl Tools {
         repeat: u32,
     ) -> Result<CallToolResult, McpError> {
         self.check_protocol()?;
+        // Read before anything is sent, from the hello of the connection the
+        // baseline tree came from.
+        let stamped = *self.bridge.stamps_rx.borrow();
         // Subscribe before anything is sent: an ack published before this
         // point is one the receiver would never see.
         let acks = self.bridge.subscribe_acks();
@@ -580,13 +605,17 @@ impl Tools {
                 }
             }
         }
-        let mut seen = observe(acks, rx, &pre, &ids).await;
+        let mut seen = observe(acks, rx, &pre, &ids, stamped).await;
         if rejected.has_changed().unwrap_or(false) {
             seen.rejected = rejected.borrow_and_update().clone();
         }
         // Only silence is worth the read: an ack, a tree or a rejected line
         // inside the window is the app running.
-        if seen.status.is_none() && seen.changed.is_none() && seen.rejected.is_none() {
+        if seen.status.is_none()
+            && seen.changed.is_none()
+            && !seen.credited
+            && seen.rejected.is_none()
+        {
             seen.stopped = stopped_peer(self.demand.as_ref().and_then(Demand::peer_pid));
             seen.window = self.idle_release;
         }
@@ -653,16 +682,18 @@ impl Tools {
     }
 
     /// Hand one input to the socket task, returning the id it was sent under.
+    ///
+    /// Through [`BridgeHandle::send`], which claims the id and queues the
+    /// input under one lock, so the ids of overlapping calls reach the app in
+    /// the order they were claimed.
     async fn send_input(&self, input: AgentInput) -> Result<InputId, McpError> {
-        let id = self.bridge.next_input_id();
-        let send = self.bridge.input_tx.send((id, input));
-        match tokio::time::timeout(QUEUE_WAIT, send).await {
-            Ok(Ok(())) => Ok(id),
-            Ok(Err(_)) => Err(McpError::internal_error(
+        match self.bridge.send(input, QUEUE_WAIT).await {
+            Ok(id) => Ok(id),
+            Err(SendError::Closed) => Err(McpError::internal_error(
                 "failed to forward input: the bridge connection task is gone",
                 None,
             )),
-            Err(_) => Err(McpError::internal_error(
+            Err(SendError::Full) => Err(McpError::internal_error(
                 format!(
                     "the app is not accepting input: the bridge's queue to it stayed full for \
                      {}ms, so this input was not sent. The app is stopped or not reading its \
@@ -1582,7 +1613,9 @@ fn snapshot_text(snapshot: &AppSnapshot, format: TreeFormat) -> String {
     format.render(snapshot)
 }
 
-/// What the app said about one burst of inputs inside [`UPDATE_WAIT`].
+/// What the app said about one burst of inputs inside the window:
+/// [`UPDATE_WAIT`] for a peer that does not stamp its snapshots, and
+/// [`SETTLE_WAIT`] for one that does.
 #[derive(Debug, Default)]
 struct Observed {
     /// Newest ack naming the last input of the burst, if the app sent one.
@@ -1605,7 +1638,20 @@ struct Observed {
     /// a floor rather than a count, and the burst's fate only partly known.
     lost: u64,
     /// Newest snapshot differing from the one the input was aimed at.
+    ///
+    /// From a peer that stamps, only a tree stamped at or after the burst's
+    /// last input counts, compared with the newest tree published before the
+    /// burst's first input was dequeued; see [`observe`]. A reconnect counts
+    /// either way, as a fresh instance's tree.
     changed: Option<AppSnapshot>,
+    /// Whether the peer stamps its snapshots, which decides how long the
+    /// window was and what an answer without a tree says.
+    stamped: bool,
+    /// From a peer that stamps: a tree stamped at or after the burst's last
+    /// input arrived, so the tree the app published after this input is
+    /// known, and [`changed`](Self::changed) being empty means it did not
+    /// change rather than that nothing came.
+    credited: bool,
     /// The state the bridge was left in when the app went away and had not
     /// come back by the end of the window.
     ///
@@ -1643,8 +1689,9 @@ struct Observed {
     window: Option<Duration>,
 }
 
-/// Watch the app's acks and snapshots for up to [`UPDATE_WAIT`], and report
-/// what arrived about the inputs sent as `ids`.
+/// Watch the app's acks and snapshots for up to the window, and report what
+/// arrived about the inputs sent as `ids`; `stamped` says the peer stamps its
+/// snapshots.
 ///
 /// Both signals are needed, and neither is sufficient: an ack says the app saw
 /// the input but not what it did, a new tree says something happened but not
@@ -1656,7 +1703,10 @@ struct Observed {
 /// in the last press's ack alone, which is the misreport [`Observed::dropped`]
 /// exists to catch.
 ///
-/// The window is not cut short by a snapshot that arrives without an ack: an
+/// # A peer that does not stamp
+///
+/// The window is [`UPDATE_WAIT`], and any tree that differs from `pre` is the
+/// answer. It is not cut short by a snapshot that arrives without an ack: an
 /// app that acks could still be about to report this very input dropped, and
 /// answering "here is your new tree" to a dropped input is the misreport this
 /// whole path exists to prevent. An app that never acks pays the full window
@@ -1668,10 +1718,41 @@ struct Observed {
 ///
 /// "Differs" is a full comparison against `pre` rather than a `seq > pre.seq`
 /// check: after an app restart the fresh instance's `seq` starts over at 1, so
-/// a lower (or equal) `seq` with different content is still a change. Watching
-/// the state pass through a non-`Connected` value (the bridge's disconnect
-/// marker) also counts as a change, because the next snapshot then comes from
-/// a fresh app instance.
+/// a lower (or equal) `seq` with different content is still a change. It
+/// leaves out `after_input` alone, which such a peer is not supposed to send,
+/// so a stamp from a peer that never said it stamps reads as the same tree,
+/// the way a bridge built before stamps reads it.
+///
+/// # A peer that stamps
+///
+/// The window is [`SETTLE_WAIT`], and the stamp decides which tree answers.
+/// A tree stamped at or after the burst's last id was published after the
+/// app dequeued it, so it is credited to this call: compared on its `root`
+/// with the baseline, it is the answer when it differs, and "did not change"
+/// when it does not, at once in both cases once the last ack is in. A tree
+/// stamped below the burst's first id, or not at all, was published before
+/// the app had any of it in hand, so it becomes the baseline instead: the
+/// effect of an earlier input that landed late, which an answer here would
+/// credit to the wrong one. A tree stamped inside the burst is its effect so
+/// far, and neither. `seq` is never compared: a tree sent again with only
+/// its stamp moved keeps its `seq`.
+///
+/// An `Ignored` ack still ends the wait early: at once when the credited tree
+/// is already in, and otherwise at the first one to come, or [`UPDATE_WAIT`]
+/// after the ack if none does. A `Dropped` ack ends it at once, as for any
+/// peer.
+///
+/// One gap is left, and it is the watch channel's: it keeps only the newest
+/// tree, so a tree stamped below the burst and the credited one arriving back
+/// to back can be read as the credited one alone, and the baseline is then
+/// the tree before both. The earlier input's effect is then read as this
+/// call's.
+///
+/// # Either way
+///
+/// Watching the state pass through a non-`Connected` value (the bridge's
+/// disconnect marker) counts as a change, because the next snapshot then
+/// comes from a fresh app instance, whatever it is stamped with.
 ///
 /// A departure the window ends on is kept in [`Observed::gone`] instead: the
 /// app that received this input is not there any more, and no ack or tree
@@ -1682,8 +1763,12 @@ async fn observe(
     mut rx: watch::Receiver<BridgeState>,
     pre: &AppSnapshot,
     ids: &[InputId],
+    stamped: bool,
 ) -> Observed {
-    let mut seen = Observed::default();
+    let mut seen = Observed {
+        stamped,
+        ..Observed::default()
+    };
     let mut reconnected = false;
     let mut acks_open = true;
     let mut state_open = true;
@@ -1692,7 +1777,13 @@ async fn observe(
     // wins" means for the drop tally: a re-ack replaces an input's fate
     // instead of adding to a running count.
     let mut fates: Vec<Option<InputStatus>> = vec![None; ids.len()];
-    let deadline = tokio::time::sleep(UPDATE_WAIT);
+    // What a credited tree is compared with: the newest tree published
+    // before the app dequeued any of this burst. Only a peer that stamps
+    // moves it.
+    let mut baseline = pre.parsed.root.clone();
+    let started = tokio::time::Instant::now();
+    let window = if stamped { SETTLE_WAIT } else { UPDATE_WAIT };
+    let deadline = tokio::time::sleep(window);
     tokio::pin!(deadline);
     loop {
         tokio::select! {
@@ -1739,8 +1830,16 @@ async fn observe(
                     // A test on `Dropped` rather than a match with a wildcard,
                     // so an unreadable status cannot fall into the arm that
                     // declares a verdict final.
-                    if seen.changed.is_some() {
+                    if seen.changed.is_some() || seen.credited {
                         return seen;
+                    }
+                    // A peer that stamps tells which tree follows the ignore,
+                    // so the wait is for that one tree, and no longer than a
+                    // peer that does not stamp would have waited for any.
+                    if stamped && status == InputStatus::Ignored {
+                        let by = (tokio::time::Instant::now() + UPDATE_WAIT)
+                            .min(started + SETTLE_WAIT);
+                        deadline.as_mut().reset(by);
                     }
                 }
                 // Lagging drops the oldest acks, and the oldest are this
@@ -1763,20 +1862,77 @@ async fn observe(
                     }
                     BridgeState::Connected(snapshot) => {
                         seen.gone = None;
-                        // Compared on the parse, not on the line the agent
-                        // reads: two lines spelling the same tree differently
-                        // are not a change the agent needs to hear about.
-                        if reconnected || snapshot.parsed != pre.parsed {
-                            seen.changed = Some(snapshot);
-                            if seen.status.is_some() {
-                                return seen;
+                        let answers = if reconnected {
+                            true
+                        } else if stamped {
+                            match stamp_of(&snapshot.parsed, ids) {
+                                Stamp::Before => {
+                                    baseline = snapshot.parsed.root.clone();
+                                    false
+                                }
+                                Stamp::During => false,
+                                Stamp::After => {
+                                    seen.credited = true;
+                                    seen.changed = None;
+                                    snapshot.parsed.root != baseline
+                                }
                             }
+                        } else {
+                            // Compared on the parse, not on the line the agent
+                            // reads: two lines spelling the same tree
+                            // differently are not a change the agent needs to
+                            // hear about.
+                            !same_tree_unstamped(&snapshot.parsed, &pre.parsed)
+                        };
+                        if answers {
+                            seen.changed = Some(snapshot);
+                        }
+                        if (answers || seen.credited) && seen.status.is_some() {
+                            return seen;
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Where a snapshot's stamp falls against a burst of inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stamp {
+    /// Published before the app dequeued any of the burst: unstamped, or
+    /// stamped below its first id.
+    Before,
+    /// Published partway through the burst.
+    During,
+    /// Published once the app had dequeued the burst's last input.
+    After,
+}
+
+/// Place `snapshot`'s stamp against `ids`, in this bridge's send order.
+///
+/// The ids are compared as numbers, which is the send order because
+/// [`BridgeHandle::send`] claims each id and queues its input under one lock,
+/// from a counter that only goes up. The protocol fixes no start and no step
+/// for ids, so this holds for the ids this bridge sends and for no others.
+fn stamp_of(snapshot: &taria::Snapshot, ids: &[InputId]) -> Stamp {
+    let (Some(stamp), Some(first), Some(last)) = (snapshot.after_input, ids.first(), ids.last())
+    else {
+        return Stamp::Before;
+    };
+    if stamp >= *last {
+        Stamp::After
+    } else if stamp >= *first {
+        Stamp::During
+    } else {
+        Stamp::Before
+    }
+}
+
+/// Whether two snapshots are the same as a bridge built before stamps saw
+/// them: every field but `after_input`, which such a bridge never read.
+fn same_tree_unstamped(a: &taria::Snapshot, b: &taria::Snapshot) -> bool {
+    a.protocol_version == b.protocol_version && a.seq == b.seq && a.root == b.root
 }
 
 /// Turn what was observed into the tool's answer.
@@ -1928,10 +2084,9 @@ fn report(
             )))
         }
         (Some(InputStatus::Delivered), Some(snapshot)) => tree_result(&snapshot, format),
-        (Some(InputStatus::Delivered), None) => Ok(text_result(format!(
-            "The app received this input, and its tree did not change within {}ms. Call \
-             read_tree if you expect a delayed effect.",
-            UPDATE_WAIT.as_millis()
+        (Some(InputStatus::Delivered), None) => Ok(text_result(delivered_without_a_tree(
+            seen.stamped,
+            seen.credited,
         ))),
         // No ack at all is how an adapter that predates acks behaves. Its
         // changed tree is the only answer it can give, and answer enough.
@@ -1949,7 +2104,7 @@ fn report(
                  not know fails as a whole and takes the input id with it, so it arrives here \
                  as silence. If it was, matching the app's taria dependency to this bridge's \
                  makes it readable; call read_tree for the current tree either way.",
-                UPDATE_WAIT.as_millis()
+                window(seen.stamped).as_millis()
             ),
             // A stopped app is silent to every input, and is the one silent
             // app whose reason this bridge can name. Only on Linux, and only
@@ -1960,7 +2115,7 @@ fn report(
                     "The app neither acknowledged this input nor changed its tree within {}ms. \
                      It may not report acknowledgements, or it may not have reacted yet; call \
                      read_tree to re-check.",
-                    UPDATE_WAIT.as_millis()
+                    window(seen.stamped).as_millis()
                 ),
             },
         })),
@@ -1990,6 +2145,40 @@ fn report(
                 snapshot_text(&snapshot, format)
             )))
         }
+    }
+}
+
+/// How long an input waits on a peer, by whether it stamps its snapshots.
+fn window(stamped: bool) -> Duration {
+    if stamped { SETTLE_WAIT } else { UPDATE_WAIT }
+}
+
+/// The answer to an input the app acknowledged and answered with no changed
+/// tree.
+///
+/// A peer that does not stamp cannot say whether a tree is still coming, so
+/// the answer names the window and leaves the rest to `read_tree`, as it
+/// always has. A peer that stamps can: once a tree stamped at this input has
+/// arrived unchanged, nothing this input did is still to come in the tree,
+/// and the answer says so without a window. Without one, the app took the
+/// input and published nothing after it, which is a slow handler or an app
+/// that publishes only on change, so the answer says it may still be working
+/// rather than that nothing changed.
+fn delivered_without_a_tree(stamped: bool, credited: bool) -> String {
+    if !stamped {
+        format!(
+            "The app received this input, and its tree did not change within {}ms. Call \
+             read_tree if you expect a delayed effect.",
+            UPDATE_WAIT.as_millis()
+        )
+    } else if credited {
+        "The app received this input, and its tree did not change.".to_string()
+    } else {
+        format!(
+            "The app received this input but published no tree after it within {}ms; it may \
+             still be working. Call read_tree to see its effect.",
+            SETTLE_WAIT.as_millis()
+        )
     }
 }
 
@@ -3426,7 +3615,7 @@ mod tests {
             let _ = ack_tx.send((InputId::new(id), InputStatus::Delivered));
         }
 
-        let seen = observe(acks, rx, &pre, &[1, 2, 3, 4].map(InputId::new)).await;
+        let seen = observe(acks, rx, &pre, &[1, 2, 3, 4].map(InputId::new), false).await;
         assert_eq!(seen.lost, 2, "skipped acks must be counted: {seen:?}");
 
         let err = report(seen, pre, 4, TreeFormat::Json)
@@ -3461,6 +3650,8 @@ mod tests {
             rejected: None,
             stopped: None,
             window: None,
+            stamped: false,
+            credited: false,
         };
         let err = report(seen, snapshot("after"), 5, TreeFormat::Json)
             .expect_err("lost acks are not a success");
@@ -3485,6 +3676,8 @@ mod tests {
             rejected: None,
             stopped: None,
             window: None,
+            stamped: false,
+            credited: false,
         };
         let err = report(seen, snapshot("after"), 1, TreeFormat::Json)
             .expect_err("lost acks are not a success");
@@ -3530,7 +3723,7 @@ mod tests {
         let _ = ack_tx.send((InputId::new(1), InputStatus::Dropped));
         let _ = ack_tx.send((InputId::new(2), InputStatus::Dropped));
 
-        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new)).await;
+        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new), false).await;
         assert_eq!(
             seen.dropped, 2,
             "two inputs were dropped however many acks said so: {seen:?}"
@@ -3562,7 +3755,7 @@ mod tests {
         // The last input's `Dropped` ends the window, so this stays fast.
         let _ = ack_tx.send((InputId::new(2), InputStatus::Dropped));
 
-        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new)).await;
+        let seen = observe(acks, rx, &pre, &[1, 2].map(InputId::new), false).await;
         assert_eq!(
             seen.dropped, 1,
             "only the input whose newest ack is a drop counts: {seen:?}"
@@ -3598,7 +3791,7 @@ mod tests {
             last_seq: 7,
         });
 
-        let seen = observe(acks, rx, &pre, &[1].map(InputId::new)).await;
+        let seen = observe(acks, rx, &pre, &[1].map(InputId::new), false).await;
         assert!(
             seen.gone.is_some(),
             "a departure must be recorded: {seen:?}"
@@ -3747,7 +3940,7 @@ mod tests {
             state_tx.send_replace(BridgeState::Connected(after));
         });
 
-        let seen = observe(acks, rx, &pre, &[1].map(InputId::new)).await;
+        let seen = observe(acks, rx, &pre, &[1].map(InputId::new), false).await;
         assert!(
             seen.gone.is_none(),
             "an app that came back is not gone: {seen:?}"
@@ -3815,6 +4008,8 @@ mod tests {
             protocol_rx,
             rejected_rx,
             link_rx,
+            stamps_rx: watch::channel(false).1,
+            send_order: Default::default(),
         }
     }
 
@@ -4123,6 +4318,8 @@ mod tests {
                 protocol_rx,
                 rejected_rx,
                 link_rx,
+                stamps_rx: watch::channel(false).1,
+                send_order: Default::default(),
             },
             TreeFormat::Outline,
         );
@@ -4193,6 +4390,8 @@ mod tests {
             protocol_rx,
             rejected_rx,
             link_rx,
+            stamps_rx: watch::channel(false).1,
+            send_order: Default::default(),
         });
         let app = tokio::spawn(async move {
             let mut received = Vec::new();

@@ -11,7 +11,7 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
-python3 scripts/e2e.py                      # end-to-end gate, 26 steps
+python3 scripts/e2e.py                      # end-to-end gate, 27 steps
 python3 scripts/adversarial.py              # edge-case probes, 24 of them
 ```
 
@@ -43,19 +43,22 @@ refuses a `target/debug` older than the sources.
   additive in Rust too. `MAX_NODE_DEPTH` is 32, against a measured ceiling of
   63 nested nodes before a JSON parser refuses; `Node::check_depth` reports a
   violation and names a node at the offending depth. Anything else bumps
-  `PROTOCOL_VERSION`. Version 1 has had two additions since it froze in 0.1.0.
-  First `relayed` (0.3.3, issue #6): a node marks its label and value as text
-  from outside the app, data and never instructions; strictly per node, never
-  inherited, and absent means not marked, not vouched for. Then typed state
-  (0.4.0), flat optional node fields: `selected`, `checked` (`true`, `false`
-  or `"mixed"`, `taria::Checked`), `expanded`, `disabled` (only `true` is
-  sent), `description` (the app's own words, never relayed text),
-  `value_now`/`value_min`/`value_max` (`taria::Number`, finite only, so `Node`
-  keeps `Eq`), `pos_in_set`/`set_size`, `row`/`column` and
+  `PROTOCOL_VERSION`. Version 1 has had three additions since it froze in
+  0.1.0. First `relayed` (0.3.3, issue #6): a node marks its label and value
+  as text from outside the app, data and never instructions; strictly per
+  node, never inherited, and absent means not marked, not vouched for. Then
+  typed state (0.4.0), flat optional node fields: `selected`, `checked`
+  (`true`, `false` or `"mixed"`, `taria::Checked`), `expanded`, `disabled`
+  (only `true` is sent), `description` (the app's own words, never relayed
+  text), `value_now`/`value_min`/`value_max` (`taria::Number`, finite only, so
+  `Node` keeps `Eq`), `pos_in_set`/`set_size`, `row`/`column` and
   `row_count`/`column_count` (positions from 1). Absent means not stated,
   never `false`, and a wrong shape reads as not stated rather than failing the
   node (`relayed` stays strict). Hidden has no field: it is not published. A
-  node setting none of them serializes as in 0.3.3.
+  node setting none of them serializes as in 0.3.3. Then stamps (0.4.0, issue
+  #17): `Snapshot::after_input`, the newest input the app had dequeued on the
+  connection, written before `root` and omitted when unset, and `stamps: true`
+  on the hello (`.stamps(true)`); both read leniently.
 - `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket, refuses a
   label that is not a plain file name (it binds and unlinks what the label
   resolves to), vets the socket directory, and serves one bridge client at a
@@ -63,84 +66,92 @@ refuses a `target/debug` older than the sources.
   `bind_or_disabled` never fails, so taria cannot block startup; the layer
   never prints (the app reports `bind_error()` outside the alternate screen).
   Nodes come from `publish(nodes)` or `FrameRecorder`/`sem`; a node marked
-  `disabled` is published with no actions (no counter); identical trees
-  are deduped. Input arrives via `drain`/`try_recv`/`recv_timeout` (the last
-  two hand over the `InputId`), acked `Delivered` on dequeue, `Dropped` when
-  the queue is full, and `Ignored` when the app says so, by returning it from
-  `drain` or calling `ack`.
-  The wildcard arm `#[non_exhaustive]` forces on a `match` over `AgentInput`
-  is the arm that swallows `Text`; the demo carries
-  `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are flushed
-  before the snapshot published after them, from a bounded queue that drops
-  its oldest, and once more at shutdown, within `SHUTDOWN_FLUSH` (250 ms).
-  Inputs are tagged with their connection's generation and discarded (not
+  `disabled` is published with no actions (no counter); identical trees are
+  deduped, except that after a dequeue the latest snapshot is sent again,
+  uncut and under the same `seq`, with only its stamp moved. Every snapshot is
+  stamped with the newest input `drain`/`try_recv`/`recv_timeout` handed over
+  on the live connection (dropped, unknown, stale and pre-hello inputs never
+  stamp), a new connection's first snapshot is unstamped, and the hello says
+  `stamps: true`. Input arrives via `drain`/`try_recv`/`recv_timeout` (the
+  last two hand over the `InputId`), acked `Delivered` on dequeue, `Dropped`
+  when the queue is full, and `Ignored` when the app says so, by returning it
+  from `drain` or calling `ack`. The wildcard arm `#[non_exhaustive]` forces
+  on a `match` over `AgentInput` is the arm that swallows `Text`; the demo
+  carries `clippy::wildcard_enum_match_arm` to catch exactly that. Acks are
+  flushed before the snapshot published after them, from a bounded queue that
+  drops its oldest, and once more at shutdown, within `SHUTDOWN_FLUSH` (250
+  ms). Inputs are tagged with their connection's generation and discarded (not
   applied) once that connection ends, and `ack` refuses an id whose connection
   is gone. Input written before the `hello` is discarded unacked, but only
   from a client that waited in the backlog behind the previous session. Each
-  line written gets 5 s in all (`WRITE_TIMEOUT`), so a stuck bridge is
-  dropped and `Drop` stays bounded. Four counters of lost agent traffic,
-  fields of the `LayerStats` that `stats()` returns: `dropped_inputs`,
-  `stale_inputs` (both discards), `unknown_inputs`, `dropped_acks`. A tree
-  over `MAX_NODE_DEPTH` is cut branch-wise at publish rather than withheld
-  (a withheld tree leaves the agent on a stale one), reported via
-  `truncated_snapshots`/`last_truncation`; then a tree over `MAX_LINE_BYTES`
-  is trimmed to fit (nodes that can never fit, then the
-  longest strings, then trailing nodes; ids and custom action names never
-  change), reported via `oversized_snapshots`/`last_oversize`. Both count
-  snapshots sent, not frames, and an unchanged frame skips both cuts. Binding
-  unlinks only a socket nothing is listening on, refuses a live one so a
-  second instance cannot steal it, and the listener polls a shutdown flag so
-  exit never waits on a connection.
+  line written gets 5 s in all (`WRITE_TIMEOUT`), so a stuck bridge is dropped
+  and `Drop` stays bounded. Four counters of lost agent traffic, fields of the
+  `LayerStats` that `stats()` returns: `dropped_inputs`, `stale_inputs` (both
+  discards), `unknown_inputs`, `dropped_acks`. A tree over `MAX_NODE_DEPTH` is
+  cut branch-wise at publish rather than withheld (a withheld tree leaves the
+  agent on a stale one), reported via `truncated_snapshots`/`last_truncation`;
+  then a tree over `MAX_LINE_BYTES` is trimmed to fit (nodes that can never
+  fit, then the longest strings, then trailing nodes; ids and custom action
+  names never change), reported via `oversized_snapshots`/`last_oversize`.
+  Both count snapshots sent, not frames, and an unchanged frame skips both
+  cuts. Binding unlinks only a socket nothing is listening on, refuses a live
+  one so a second instance cannot steal it, and the listener polls a shutdown
+  flag so exit never waits on a connection.
 - `crates/taria-mcp`: rmcp stdio server exposing
   `read_tree`/`act`/`key`/`type_text`. A socket-manager task holds the latest
   snapshot in a watch channel and rebroadcasts acks. The binary connects on
   demand (`TariaMcpServer::builder(..).on_demand()`): nothing until the first
   tool call (`initialize`, `tools/list` and the stateless lifecycle's
-  `server/discover` open nothing), which waits briefly (at most 1.2 s) for
-  the `hello` and the tree; then it reconnects with capped backoff while
-  tool calls want the app, and after 60 s with no tool calls
-  (`--idle-release`, plain digits from 0 to 86400, `0` never) closes the
-  connection or leaves the backlog and stops reconnecting, but not while an
-  input awaits its ack, for up to 30 s past the window. Connecting on demand
-  and letting go when idle is the fix for issue #13: the adapter serves one
-  bridge at a time and a repo `.mcp.json` starts one in every session.
+  `server/discover` open nothing), which waits briefly (at most 1.2 s) for the
+  `hello` and the tree; then it reconnects with capped backoff while tool
+  calls want the app, and after 60 s with no tool calls (`--idle-release`,
+  plain digits from 0 to 86400, `0` never) closes the connection or leaves the
+  backlog and stops reconnecting, but not while an input awaits its ack, for
+  up to 30 s past the window. Connecting on demand and letting go when idle is
+  the fix for issue #13: the adapter serves one bridge at a time and a repo
+  `.mcp.json` starts one in every session.
   `TariaMcpServer::builder(..).connected()` connects at once and never lets
-  go, as every bridge before 0.3.2 did. A snapshot is kept as the
-  app's own line (minus the `type` framing key) beside the parse of it: the
-  line is what the agent reads, so an unknown role, action or field survives
-  by name; the parse is what the bridge validates and diffs against.
-  `--tree-format outline` (default `json`) renders that line as one indented
-  line per node (a relayed node prints `*relayed` before its label, typed
-  state prints as marks after `*focused`, `*selected`, `*checked=false`,
-  `*num=42[0..100]`, and `*` is never bare otherwise, so no mark can be
-  forged) for every tree an agent receives, with action names taken from the
-  parse because that is what `act` checks, and swaps only the format
-  passages of the instructions and of the `read_tree` and `act`
-  descriptions.
-  Those texts are short because they are resent with every model call: no
-  parameter is described but `repeat`'s default, the `{"custom":...}` rule is
-  in `act`'s description only, and a test pins both modes' text byte for byte.
-  The input tools promise the tree only if it changed: three answers that are
-  not errors carry a note and no tree. `act` validates node ids, refuses a
-  node marked `disabled` before resolving the action (never inferred from an
-  empty action list), validates advertised actions and bounds `value` (4096
-  chars), `key` parses the shared grammar and bounds `repeat` (1-64),
-  `type_text` bounds the payload (4096 chars). Results
-  are anchored on the app's ack, not on whatever the tree did: dropped,
-  ignored, delivered-and-changed, delivered-and-unchanged, no ack, partial
-  burst, lost acks, and the app disconnecting. A protocol mismatch keeps
-  `read_tree` for as long as the peer's snapshots parse, and refuses every
-  input tool. When lines from the app were rejected, `read_tree` says the
-  socket path is right and quotes the reason rather than sending an adopter
-  back to check the path. A line over `MAX_LINE_BYTES` ends the connection and
-  leaves the reason `OVERSIZED_LINE`, kept across reconnects until a snapshot
-  parses or a connect finds nothing listening; while it holds, every answer
-  names the 1 MiB limit instead of "may have exited". A bridge locked out by
-  another (waiting in the backlog, or the loser of the reconnect race when the
-  app restarts) is told the app is "held by another bridge" and that a
-  taria-mcp lets go after 60 s with no tool calls, so the agent retries. A
-  bridge that had the app and reconnects answers from the new link, after the
-  same "disconnected (last snapshot seq N)" opening: greeted with no tree yet,
+  go, as every bridge before 0.3.2 did. A snapshot is kept as the app's own
+  line (minus the `type` framing key) beside the parse of it: the line is what
+  the agent reads, so an unknown role, action or field survives by name; the
+  parse is what the bridge validates and diffs against. `--tree-format
+  outline` (default `json`) renders that line as one indented line per node (a
+  relayed node prints `*relayed` before its label, typed state prints as marks
+  after `*focused`, `*selected`, `*checked=false`, `*num=42[0..100]`, and `*`
+  is never bare otherwise, so no mark can be forged) for every tree an agent
+  receives, with action names taken from the parse because that is what `act`
+  checks, and swaps only the format passages of the instructions and of the
+  `read_tree` and `act` descriptions. Those texts are short because they are
+  resent with every model call: no parameter is described but `repeat`'s
+  default, the `{"custom":...}` rule is in `act`'s description only, and a
+  test pins both modes' text byte for byte. The input tools promise the tree
+  only if it changed: three answers that are not errors carry a note and no
+  tree. `act` validates node ids, refuses a node marked `disabled` before
+  resolving the action (never inferred from an empty action list), validates
+  advertised actions and bounds `value` (4096 chars), `key` parses the shared
+  grammar and bounds `repeat` (1-64), `type_text` bounds the payload (4096
+  chars). Results are anchored on the app's ack, not on whatever the tree did:
+  dropped, ignored, delivered-and-changed, delivered-and-unchanged, no ack,
+  partial burst, lost acks, and the app disconnecting. Against a peer whose
+  hello says `stamps`, a tree is credited to an input only once stamped at or
+  after its id (ids are claimed and queued under one lock, so id order is send
+  order), compared on `root`; an earlier-stamped tree rebases, an unchanged
+  credited tree answers "did not change." at once, and the cap is 3 s
+  (`SETTLE_WAIT`), `Ignored` 500 ms past its ack. Any other peer keeps the 500
+  ms window (`UPDATE_WAIT`) and 0.3.3's texts byte for byte. The stamp is
+  stripped like `type`. A protocol mismatch keeps `read_tree` for as long as
+  the peer's snapshots parse, and refuses every input tool. When lines from
+  the app were rejected, `read_tree` says the socket path is right and quotes
+  the reason rather than sending an adopter back to check the path. A line
+  over `MAX_LINE_BYTES` ends the connection and leaves the reason
+  `OVERSIZED_LINE`, kept across reconnects until a snapshot parses or a
+  connect finds nothing listening; while it holds, every answer names the 1
+  MiB limit instead of "may have exited". A bridge locked out by another
+  (waiting in the backlog, or the loser of the reconnect race when the app
+  restarts) is told the app is "held by another bridge" and that a taria-mcp
+  lets go after 60 s with no tool calls, so the agent retries. A bridge that
+  had the app and reconnects answers from the new link, after the same
+  "disconnected (last snapshot seq N)" opening: greeted with no tree yet,
   retry and the first snapshot is served; no handshake inside the 500 ms
   grace, worth one retry; past it, held. Only a link that is down still reads
   "it may have exited", byte for byte as in 0.3.1. A connect forgets every

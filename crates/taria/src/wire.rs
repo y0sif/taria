@@ -42,6 +42,15 @@
 //! snapshots in wire order, because an app writes an ack ahead of the snapshot
 //! it publishes next. [`InputStatus`] states the rule in full.
 //!
+//! An ack says the app took an input, and a snapshot arriving after it says
+//! nothing about whether the tree was published before or after that. An app
+//! that says `stamps` in its [`AppToBridge::Hello`] fills the gap: each of its
+//! snapshots names, in [`Snapshot::after_input`], the newest input it had
+//! dequeued when it published, and it sends an unchanged tree again when
+//! that moves. A bridge can then credit a tree to the input it was published
+//! after, however slow the app, and answer "did not change" as soon as that
+//! tree is unchanged.
+//!
 //! # Compatibility
 //!
 //! Version 1 is the frozen format. Within version 1, changes must be additive,
@@ -227,13 +236,28 @@ pub enum AppToBridge {
     ///
     /// `#[non_exhaustive]`: build it with [`hello`](Self::hello) and
     /// destructure it with `..`, so a field added later (a capability list, a
-    /// process id) does not break the peer reading it.
+    /// process id) does not break the peer reading it, as `stamps` did not.
     #[non_exhaustive]
     Hello {
         /// Human-readable app name shown to agents (typically the binary name).
         app_label: String,
         /// The app's [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION).
         protocol_version: u32,
+        /// Whether this app stamps its snapshots with the newest input it
+        /// dequeued ([`Snapshot::after_input`]).
+        ///
+        /// A bridge reads it to know whether a tree with no stamp is one
+        /// published before any input was dequeued, or one from a peer that
+        /// never stamps, which it has to answer the way it answered every
+        /// peer before stamps existed. Sent only when true, and set with
+        /// [`stamps`](AppToBridge::stamps). Read leniently: anything but
+        /// `true` reads as a peer that does not stamp.
+        #[serde(
+            default,
+            deserialize_with = "crate::state::lenient_flag",
+            skip_serializing_if = "std::ops::Not::not"
+        )]
+        stamps: bool,
     },
     /// A newly published state of the app's semantic tree.
     Snapshot(Snapshot),
@@ -266,7 +290,21 @@ impl AppToBridge {
         Self::Hello {
             app_label: app_label.into(),
             protocol_version,
+            stamps: false,
         }
+    }
+
+    /// Say in a [`Hello`](Self::Hello) whether the app stamps its snapshots;
+    /// chained onto [`hello`](Self::hello), which leaves it false:
+    /// `AppToBridge::hello("my-app", PROTOCOL_VERSION).stamps(true)`.
+    ///
+    /// Any other message is returned as it is, since only a hello carries
+    /// the flag.
+    pub fn stamps(mut self, stamps: bool) -> Self {
+        if let Self::Hello { stamps: flag, .. } = &mut self {
+            *flag = stamps;
+        }
+        self
     }
 
     /// Build an [`Ack`](Self::Ack) answering one input.
@@ -376,10 +414,49 @@ mod tests {
         let msg = AppToBridge::Hello {
             app_label: "demo-app".into(),
             protocol_version: PROTOCOL_VERSION,
+            stamps: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"hello""#), "json: {json}");
         assert_eq!(roundtrip_app(&msg), msg);
+    }
+
+    /// A hello that does not stamp is the line 0.3.3 wrote, byte for byte,
+    /// and one that does adds the flag at the end.
+    #[test]
+    fn the_stamps_flag_is_sent_only_when_true() {
+        let line = |msg: &AppToBridge| serde_json::to_string(msg).unwrap();
+        assert_eq!(
+            line(&AppToBridge::hello("demo-app", 1)),
+            r#"{"type":"hello","app_label":"demo-app","protocol_version":1}"#
+        );
+        let stamping = AppToBridge::hello("demo-app", 1).stamps(true);
+        assert_eq!(
+            line(&stamping),
+            r#"{"type":"hello","app_label":"demo-app","protocol_version":1,"stamps":true}"#
+        );
+        assert_eq!(roundtrip_app(&stamping), stamping);
+        assert_eq!(
+            stamping.stamps(false),
+            AppToBridge::hello("demo-app", 1),
+            "the flag can be turned off again"
+        );
+        // Only a hello carries it.
+        let ack = AppToBridge::ack(InputId::new(1), InputStatus::Delivered);
+        assert_eq!(ack.clone().stamps(true), ack);
+    }
+
+    /// A flag of the wrong shape reads as a peer that does not stamp, rather
+    /// than failing the hello and the version and label it carries.
+    #[test]
+    fn a_wrong_shaped_stamps_flag_reads_as_false() {
+        for flag in ["\"yes\"", "1", "null", "[true]", "{}", "false"] {
+            let line = format!(
+                r#"{{"type":"hello","app_label":"a","protocol_version":1,"stamps":{flag}}}"#
+            );
+            let msg: AppToBridge = serde_json::from_str(&line).expect(&line);
+            assert_eq!(msg, AppToBridge::hello("a", 1), "{flag}");
+        }
     }
 
     #[test]
@@ -540,6 +617,7 @@ mod tests {
             AppToBridge::Hello {
                 app_label: "demo-app".into(),
                 protocol_version: 7,
+                stamps: false,
             }
         );
         assert_eq!(

@@ -43,17 +43,27 @@ INVALID_PARAMS = -32602  # JSON-RPC code the bridge rejects bad arguments with
 SOURCE_ROOTS = ("crates", "examples", "Cargo.toml", "Cargo.lock")
 SOURCE_SUFFIXES = (".rs", ".toml", ".lock")
 
-# The five shapes an input-sending tool (act / key / type_text) can answer
-# with, as of the v0.1 ack protocol. Matched by prefix, verbatim: an agent
-# reads these strings, so a reworded one is a behaviour change this script has
-# to notice rather than absorb.
+# The six shapes an input-sending tool (act / key / type_text) can answer
+# with, as of the v0.1 ack protocol and the 0.4.0 stamps. Matched by prefix,
+# verbatim: an agent reads these strings, so a reworded one is a behaviour
+# change this script has to notice rather than absorb.
 IGNORED_PREFIX = (
     "The app received this input and deliberately did nothing with it "
     "(for example an act a modal dialog blocks or naming a node it no "
     "longer knows, a set_value carrying no value, or text sent while "
     "nothing is accepting typing). Re-plan from the current tree below."
 )
-NO_CHANGE_PREFIX = "The app received this input, and its tree did not change within"
+# The no-change answer has two endings: " within 500ms. ..." from a peer that
+# does not stamp its snapshots, and a bare "." from one that does, the demo
+# among them (issue #17). The prefix stops before either.
+NO_CHANGE_PREFIX = "The app received this input, and its tree did not change"
+# The exact no-change answer from a peer that stamps, which step aa holds the
+# demo to: a tree stamped at the input arrived, and it was the same tree.
+NO_CHANGE_STAMPED = "The app received this input, and its tree did not change."
+# A peer that stamps acknowledged the input and published no tree after it
+# within the bridge's 3 s window: a slow handler, or an app that publishes
+# only on change. No step expects it of the demo, which publishes every frame.
+NO_TREE_PREFIX = "The app received this input but published no tree after it within"
 NO_ACK_PREFIX = "The app neither acknowledged this input nor changed its tree within"
 # An input the app took delivery of and did not survive. A result rather than
 # an error, because the input's fate is known and an advertised `quit` reaches
@@ -209,6 +219,8 @@ def parse_result(text):
       "ignored"   the app acked Ignored; the tree to re-plan from follows
                   the note on the second line
       "no_change" the app acked Delivered but published nothing new
+      "no_tree"   the app acked Delivered and, though it stamps its trees,
+                  published none after the input inside the bridge's window
       "no_ack"    no ack and no new tree inside the bridge's window
       "gone"      the app acked the input and then disconnected; no tree,
                   because the app it would describe is gone
@@ -231,6 +243,8 @@ def parse_result(text):
             )
     if text.startswith(NO_CHANGE_PREFIX):
         return "no_change", None
+    if text.startswith(NO_TREE_PREFIX):
+        return "no_tree", None
     if text.startswith(NO_ACK_PREFIX):
         return "no_ack", None
     if text.startswith(GONE_PREFIX):
@@ -261,7 +275,7 @@ def response_text(resp):
 class PtyApp:
     """taria-demo running headless under a pty."""
 
-    def __init__(self, sock_path):
+    def __init__(self, sock_path, extra_env=None):
         self.sock_path = sock_path
         self.master, slave = pty.openpty()
         # Both fds are owned from here on, so every exit from this block has
@@ -274,8 +288,12 @@ class PtyApp:
             # Give the pty a sane size so ratatui has an area to draw into.
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
             env = dict(os.environ)
+            # The demo's own knobs are the caller's to set, never the shell's:
+            # an exported TARIA_DEMO_SLOW_MS would slow every step but aa.
+            env.pop("TARIA_DEMO_SLOW_MS", None)
             env["TARIA_SOCK"] = sock_path
             env.setdefault("TERM", "xterm-256color")
+            env.update(extra_env or {})
             self.proc = subprocess.Popen(
                 [DEMO_BIN],
                 stdin=slave,
@@ -1819,6 +1837,98 @@ def step_u_dropped_counter(ctx):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# How long step aa's demo holds each agent input before applying it
+# (`TARIA_DEMO_SLOW_MS`): past the 500 ms a bridge gives a peer that does not
+# stamp, well inside the 3 s it gives one that does.
+SLOW_MS = 800
+
+
+def step_aa_slow_handler_credited(ctx):
+    """An input the app takes 800 ms over is answered with its own tree.
+
+    Issue #17. The bridge used to wait a fixed 500 ms for a tree that
+    differed, so a slower handler read as "did not change" and its tree
+    landed in the next call's window, credited to that input instead. The
+    demo now stamps every snapshot with the newest input it dequeued, and the
+    bridge credits a tree only to the input it is stamped at.
+
+    A demo of its own, started with `TARIA_DEMO_SLOW_MS`, which holds each
+    input that long between the dequeue (and its `delivered` ack) and the
+    effect. Three acts, each on the tree the one before it answered with:
+
+    - selecting the Done tab answers with the tree showing Done, no sooner
+      than the handler's 800 ms;
+    - selecting it again changes nothing, and is answered "did not change"
+      as soon as the stamped tree is in, not at the bridge's 3 s cap;
+    - selecting Active answers with Active: its own effect, not the one
+      before it, which is what the late tree used to be credited as.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="taria-e2e-slow-")
+    sock = os.path.join(tmpdir, "slow.sock")
+    app = None
+    client = None
+    slow = SLOW_MS / 1000
+    try:
+        app = PtyApp(sock, extra_env={"TARIA_DEMO_SLOW_MS": str(SLOW_MS)})
+        require(app.wait_for_socket(), f"the slow demo never bound {sock}")
+        client = McpClient(sock)
+        client.initialize()
+        tree = client.read_tree()
+        require(
+            find(tree, "tabs")["value"] == "Active",
+            f"the slow demo should open on Active: {find(tree, 'tabs')}",
+        )
+
+        timings = []
+        for tab, label in (("tab-done", "Done"), ("tab-done", None), ("tab-active", "Active")):
+            started = time.monotonic()
+            text = client.call_raw("act", {"node": tab, "action": "select"})
+            took = time.monotonic() - started
+            timings.append(took)
+            kind, after = parse_result(text)
+            require(
+                took >= slow,
+                f"act select {tab} answered after {took:.3f}s, sooner than the "
+                f"{SLOW_MS} ms the demo holds the input: {text[:160]}",
+            )
+            if label is None:
+                require(
+                    text == NO_CHANGE_STAMPED,
+                    f"re-selecting the tab on screen should read as no change "
+                    f"from a demo that stamps; answered {kind!r}: {text[:200]}",
+                )
+                require(
+                    took < 2.5,
+                    f"the unchanged act took {took:.3f}s: the bridge waited out "
+                    "its cap instead of answering on the stamped tree",
+                )
+                continue
+            require(
+                kind == "tree",
+                f"act select {tab} answered {kind!r} after {took:.3f}s; the tree "
+                f"published after the {SLOW_MS} ms handler belongs in this "
+                f"act's own answer: {text[:200]}",
+            )
+            require(
+                find(after, "tabs")["value"] == label,
+                f"act select {tab} answered with the tabs reading "
+                f"{find(after, 'tabs')['value']!r}: the tree is another input's",
+            )
+        return (
+            f"{SLOW_MS} ms handler: select Done -> Done tree in {timings[0]:.2f}s, "
+            f"again -> no change in {timings[1]:.2f}s, select Active -> Active "
+            f"tree in {timings[2]:.2f}s"
+        )
+    finally:
+        if client is not None:
+            client.close()
+            if client.proc.poll() is None:
+                client.proc.kill()
+        if app is not None:
+            app.kill()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def split_outside_strings(text, sep):
     """`text` split at every `sep` that is not inside a JSON string."""
     parts, part, in_string, escaped = [], "", False, False
@@ -3015,6 +3125,9 @@ def main():
             ("x a bridge never called leaves the app free", step_x_unused_bridge_takes_nothing),
             ("y an idle bridge hands the app over", step_y_idle_bridge_hands_over),
             ("z restart race: the loser is told held", step_z_restart_race_loser_is_held),
+            # Issue #17, on a demo of its own for the same reason as u: its
+            # demo is slowed on purpose, and no other step should be.
+            ("aa a slow handler's tree answers its own act", step_aa_slow_handler_credited),
         ):
             try:
                 evidence = fn(ctx)

@@ -911,6 +911,27 @@ impl TariaLayer {
     /// The fix is the one for depth, to publish what the widget draws: the
     /// lines of a log the pane shows, the rows of a list on screen, the
     /// visible part of a draft.
+    ///
+    /// # Stamps
+    ///
+    /// Every snapshot carries the newest input the app has dequeued on the
+    /// live connection, through [`drain`](Self::drain),
+    /// [`try_recv`](Self::try_recv) or [`recv_timeout`](Self::recv_timeout)
+    /// ([`Snapshot::after_input`]). A bridge that reads the stamp credits a
+    /// tree to an input only once it is stamped at that input, and answers
+    /// "did not change" as soon as such a tree is unchanged, so an input the
+    /// app takes a second over is still answered with its own tree.
+    ///
+    /// That makes one frame after a drain special: the first tree published
+    /// after an input is dequeued is the one credited to it, so it should
+    /// carry the effect, or a status saying it is under way. Publish after
+    /// applying what you drained, not between the two. A frame drawn
+    /// unchanged after a dequeue is not skipped: the snapshot already
+    /// published goes out again with its stamp moved, under the same `seq`,
+    /// neither measured nor cut again. An app that publishes only when its
+    /// tree changes leaves a bridge waiting out its window on every input
+    /// that changes nothing, so publish every frame and let the layer skip
+    /// the rest.
     pub fn publish(&mut self, nodes: impl IntoIterator<Item = Node>) {
         self.publish_nodes(nodes.into_iter().collect());
     }
@@ -921,8 +942,10 @@ impl TariaLayer {
     /// recorded node is), bumps `seq`, and hands the snapshot to the writer
     /// thread. Skipped when the tree is the one the previous frame built,
     /// before anything is cut or measured; when what is left once it is cut
-    /// is the previous snapshot; and on a disabled layer. Never blocks the
-    /// render path beyond a brief mutex hold.
+    /// is the previous snapshot; and on a disabled layer. In the first two
+    /// cases the previous snapshot is sent again, stamped, if the app has
+    /// dequeued an input since it went out. Never blocks the render path
+    /// beyond a brief mutex hold.
     ///
     /// A tree over [`MAX_NODE_DEPTH`] is cut before any of that, and then a
     /// tree too large for one line; see [`publish`](Self::publish).
@@ -955,8 +978,13 @@ impl TariaLayer {
         // freed without recursing, here and wherever else the layer lets go
         // of one, because the depth cut below exists for trees deeper than
         // the call stack, and the drop glue `Node` derives recurses.
+        //
+        // What it may still do is send the snapshot already published again,
+        // as it is but for its stamp, when the app has dequeued an input
+        // since that snapshot went out. See `Shared::restamp`.
         if inner.is_newest_frame(&mut root) {
             drop_iteratively(root);
+            inner.shared.restamp();
             return;
         }
 
@@ -999,8 +1027,9 @@ impl TariaLayer {
 
         // Compared again once cut: a tree that changed only past a cut, a
         // draft typed into beyond what fits, is cut to the snapshot already
-        // sent.
+        // sent. Restamped like a frame drawn unchanged.
         if inner.last_root.as_ref() == Some(&tree) {
+            inner.shared.restamp();
             return;
         }
         inner.seq += 1;
@@ -1018,12 +1047,7 @@ impl TariaLayer {
         }
         let snapshot = Snapshot::new(inner.seq, tree.clone());
         inner.last_root = Some(tree);
-
-        let mut state = inner.shared.lock_state();
-        state.latest = Some(snapshot);
-        state.epoch += 1;
-        drop(state);
-        inner.shared.cv.notify_all();
+        inner.shared.publish(snapshot);
     }
 
     /// The most recently published snapshot, if any. Test-only introspection.
@@ -1126,7 +1150,17 @@ struct Shared {
 struct State {
     /// Latest published snapshot; sent to newly connected clients and, via
     /// `epoch` bumps, streamed to the current client.
+    ///
+    /// It carries the stamp it was published with, which belongs to the
+    /// connection that was live then, so a new connection is sent it with
+    /// the stamp taken off (see [`serve_client`]).
     latest: Option<Snapshot>,
+    /// The stamp `latest` carries, with the generation it was taken on, or
+    /// `None` when it carries none. Compared with [`stamp`](State::stamp) to
+    /// tell whether the app has dequeued an input since `latest` went out:
+    /// ids restart with each bridge process, so the id alone could match one
+    /// a previous connection's bridge used.
+    latest_stamp: Option<(u64, InputId)>,
     /// Bumped on every publish so the writer knows something new exists.
     epoch: u64,
     /// Acks waiting to go out, oldest first. Queued for the writer rather
@@ -1224,6 +1258,51 @@ impl Shared {
         self.lock_state().acks.clear();
     }
 
+    /// Hand `snapshot` to the writer as the latest, stamped with the newest
+    /// input the app has dequeued on the live connection.
+    ///
+    /// The stamp is read in the same hold of the lock that publishes, so it
+    /// names an input dequeued before this publish and on the connection the
+    /// writer will send it to: a connection that starts or ends takes the
+    /// same lock.
+    fn publish(&self, mut snapshot: Snapshot) {
+        let mut guard = self.lock_state();
+        let state = &mut *guard;
+        let stamp = state.stamp();
+        snapshot.after_input = stamp.map(|(_, id)| id);
+        state.latest_stamp = stamp;
+        state.latest = Some(snapshot);
+        state.epoch += 1;
+        drop(guard);
+        self.cv.notify_all();
+    }
+
+    /// Send the latest snapshot again, under the same `seq`, if the app has
+    /// dequeued an input since it went out; otherwise do nothing.
+    ///
+    /// For a frame whose tree is the one already published. Skipping it
+    /// would leave the bridge with no tree stamped at that input, and a
+    /// bridge waiting on one could not tell an input that changed nothing
+    /// from one the app is still working on. The tree is not cut or measured
+    /// again: it is the snapshot already sent, with only `after_input`
+    /// moved, so a bridge that reads no stamp sees the same snapshot twice.
+    fn restamp(&self) {
+        let mut guard = self.lock_state();
+        let state = &mut *guard;
+        let stamp = state.stamp();
+        if stamp.is_none() || stamp == state.latest_stamp {
+            return;
+        }
+        let Some(latest) = state.latest.as_mut() else {
+            return;
+        };
+        latest.after_input = stamp.map(|(_, id)| id);
+        state.latest_stamp = stamp;
+        state.epoch += 1;
+        drop(guard);
+        self.cv.notify_all();
+    }
+
     /// Answer an input the app just dequeued, or refuse it as stale.
     ///
     /// Returns true after queueing the [`Delivered`](InputStatus::Delivered)
@@ -1275,6 +1354,21 @@ impl State {
     /// that happens to carry the same id.
     fn was_delivered(&self, id: InputId) -> bool {
         self.delivered_generation == self.generation && self.delivered.contains(&id)
+    }
+
+    /// The stamp a snapshot published now carries: the newest input the app
+    /// dequeued on the live connection, with that connection's generation,
+    /// or `None` when it has dequeued none there.
+    ///
+    /// Read from what [`record_delivered`](Self::record_delivered) keeps, so
+    /// only an input [`deliver`](Shared::deliver) handed over can stamp: one
+    /// dropped for want of room, one of a kind this build cannot read, one
+    /// discarded as stale, and one written before the hello never reach it.
+    fn stamp(&self) -> Option<(u64, InputId)> {
+        if self.delivered_generation != self.generation {
+            return None;
+        }
+        self.delivered.back().map(|&id| (self.generation, id))
     }
 }
 
@@ -1515,11 +1609,20 @@ fn serve_client(
     // never used. The generation taken here tags every input this connection
     // queues, so an input that outlives it is discarded rather than applied
     // to the app on behalf of a bridge that is gone.
+    //
+    // The snapshot goes out unstamped. Its stamp, if it has one, names an
+    // input of the connection that was live when it was published, and ids
+    // restart with each bridge process, so on this one it could name an
+    // input this bridge has not sent yet.
     let (initial_snapshot, initial_epoch, generation) = {
         let mut state = shared.lock_state();
         state.acks.clear();
         state.generation += 1;
-        (state.latest.clone(), state.epoch, state.generation)
+        let initial = state.latest.clone().map(|mut snapshot| {
+            snapshot.after_input = None;
+            snapshot
+        });
+        (initial, state.epoch, state.generation)
     };
     let alive = Arc::new(AtomicBool::new(true));
     let (mut write_stream, reader) = match start_connection(
@@ -1623,7 +1726,7 @@ fn start_connection(
 
     write_line(
         &mut write_stream,
-        &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION),
+        &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION).stamps(true),
     )?;
     if let Some(snapshot) = initial_snapshot
         && !shared.is_shutdown()
@@ -2776,10 +2879,11 @@ mod tests {
 
         assert_eq!(layer.stats().oversized_snapshots, 1);
         let too_large = layer.stats().last_oversize.expect("the cut is recorded");
-        // The line it would have been, counted at the largest seq the way
-        // the bound counts it: one byte over the root budget is one byte over
-        // the line.
-        let unbounded = Snapshot::new(u64::MAX, root_around_draft("atsize", over));
+        // The line it would have been, counted at the largest seq and stamp
+        // the way the bound counts them: one byte over the root budget is one
+        // byte over the line.
+        let unbounded = Snapshot::new(u64::MAX, root_around_draft("atsize", over))
+            .after(InputId::new(u64::MAX));
         assert_eq!(too_large.bytes(), line_len(unbounded));
         assert_eq!(too_large.bytes(), MAX_LINE_BYTES + 1);
         assert_eq!(too_large.limit(), MAX_LINE_BYTES);

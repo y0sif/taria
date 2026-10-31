@@ -126,17 +126,21 @@ table.
 
 | Tool | What it does |
 |---|---|
-| `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, typed state such as selected, checked or disabled, the actions each node advertises, and a `relayed` mark on any node whose text came from outside the app, which the agent reads as data. The app's own snapshot minus its `type` key, every field kept, so a role or field this bridge has never heard of arrives under its real name. With `--tree-format outline`, the same snapshot comes as one indented line per node instead, which for the demo's first tree is about half the characters. |
+| `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, typed state such as selected, checked or disabled, the actions each node advertises, and a `relayed` mark on any node whose text came from outside the app, which the agent reads as data. The app's own snapshot minus its `type` key and its input stamp, every other field kept, so a role or field this bridge has never heard of arrives under its real name. With `--tree-format outline`, the same snapshot comes as one indented line per node instead, which for the demo's first tree is about half the characters. |
 | `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`), up to 4096 characters. The node id and the action are checked against the latest tree before anything is sent, and an act on a node marked disabled is refused. |
 | `key` | Sends a raw key press (`"q"`, `"enter"`, `"ctrl+c"`), up to 64 times with `repeat`. A key that does not match the grammar is rejected here rather than swallowed by the app. A fallback for parts of the UI without semantic coverage. |
 | `type_text` | Types a literal string in one call instead of one `key` call per character, up to 4096 characters. It goes where the app puts typing, never through the app's key bindings, so move the keyboard to the target first: act on its advertised `focus` action, or on `set_value`, which many apps focus as a side effect. An app accepting no typing reports it ignored rather than acting on the characters. |
 
-The three input tools wait up to 500 ms for the app's answer and report what
-actually happened: the updated tree, an input the app deliberately ignored
-(with the current tree to re-plan from), an input the app acknowledged and did
-not survive (an advertised `quit`, working), or an error for an input that was
+The three input tools wait for the app's answer and report what actually
+happened: the updated tree, an input the app deliberately ignored (with the
+current tree to re-plan from), an input the app acknowledged and did not
+survive (an advertised `quit`, working), or an error for an input that was
 dropped, never applied, or left unaccounted for by an app that went away
-before acknowledging it.
+before acknowledging it. A taria-ratatui 0.4.0 app stamps each tree with the
+newest input it took, so the answer is the tree published after that input:
+up to 3 s for a slow handler, and "did not change" within a frame for an
+input that changed nothing. Against an app that does not stamp, the wait is
+500 ms, as before.
 
 ## taria-mcp CLI
 
@@ -171,7 +175,7 @@ cargo check --workspace
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-python3 scripts/e2e.py           # end-to-end: 26 steps, demo app + bridge + MCP
+python3 scripts/e2e.py           # end-to-end: 27 steps, demo app + bridge + MCP
 python3 scripts/adversarial.py   # 24 edge-case probes
 ```
 

@@ -28,8 +28,9 @@ every removed name to what replaces it. The cut moves nothing on the wire:
 `InputId`, a newtype in Rust now, is still a bare integer in the JSON. Every
 text an agent reads through `taria-mcp`, from the instructions to each
 answer, is unchanged byte for byte but two the typed state brings, the
-outline's `read_tree` description and the answer to `act` on a disabled node
-(both under "For whoever drives an app"), and so is the binary's command
+outline's `read_tree` description and the answer to `act` on a disabled node,
+and two the stamps bring, both answers to an input from an app that stamps
+(all under "For whoever drives an app"), and so is the binary's command
 line.
 
 **A node can say what state it is in.** Which row is selected, whether a box
@@ -50,6 +51,25 @@ outline line. Absent means not stated, never `false`, and a field of the
 wrong type or shape reads as not stated instead of failing the node. The
 outline's `read_tree` description changes in one place; the JSON mode's
 texts do not move.
+
+**An input is answered with the tree published after it** (closes #17). The
+bridge waited a fixed 500 ms for a tree that differed, and the app acks an
+input the moment it dequeues it, so a handler slower than that read as "did
+not change", and its tree, when it came, was credited to the next input. Now
+the adapter stamps every snapshot with the newest input the app has
+dequeued, `after_input`, and says `"stamps":true` in its hello; after a
+dequeue it sends even an unchanged tree again, under the same `seq`, with
+only the stamp moved. `taria-mcp` credits a tree to an input only once it is
+stamped at that input, waits up to 3 s for it, and answers "did not change"
+the moment such a tree arrives unchanged: against the demo with an 800 ms
+handler, each act came back with its own tree in 0.81 s, and a no-op went
+from 503 ms to 50 ms.
+
+This is the third addition to the wire since version 1 froze, and it is
+additive: `PROTOCOL_VERSION` stays 1. A 0.3.3 `taria-mcp` reads a 0.4.0 app as
+it read a 0.3.3 one, its 500 ms included, and shows the stamp as
+`"after_input":N`; a 0.4.0 `taria-mcp` answers an app that does not stamp
+exactly as 0.3.3 did.
 
 ### Upgrading
 
@@ -136,6 +156,22 @@ texts do not move.
   the session after the third: each is answered `-32602` (invalid params), and
   `initialize` is still accepted after them. rmcp's stderr report of a malformed
   `initialize` is worded differently.
+- **An input from an app that stamps is answered on its own tree.** Against
+  a taria-ratatui 0.4.0 app the input tools wait up to 3 s, not 500 ms, for
+  the tree the app published after the input, and answer with it if it
+  changed. If it did not, the answer is `The app received this input, and
+  its tree did not change.`, as soon as that tree arrives, which against the
+  demo is about a frame. If none comes, `The app received this input but
+  published no tree after it within 3000ms; it may still be working. Call
+  read_tree to see its effect.` A tree published before the input, however
+  late it arrives, is never the answer. An ignored input still ends the wait
+  at once, and its answer is unchanged; an app that has stopped costs 3 s of
+  silence instead of 500 ms. Against an app that does not stamp, every
+  answer and the 500 ms window are as in 0.3.3, word for word.
+- **The stamp never reaches the agent.** `taria-mcp` strips `after_input`
+  from the tree in both formats, as it strips `type`. A 0.3.3 `taria-mcp`
+  does not: its JSON tree shows `"after_input":N` and its outline header
+  `after_input=N`.
 - **The stateless 2026-07-28 lifecycle is accepted too.** That MCP spec revision
   has no `initialize` handshake: each request carries its protocol version and
   capabilities in `_meta`. `server/discover`, like `initialize`, opens no
@@ -167,6 +203,17 @@ texts do not move.
   the six counts, all zero on a disabled layer, and the two `last_*`
   details, `None` until a cut, to read once the terminal is restored, as
   before. A count added later is a new field, not a break.
+- **The first tree you publish after a drain is the one an agent is
+  answered with.** The layer stamps it with the input it just handed you, so
+  it has to carry the effect, or a status saying the effect is under way.
+  Publish after applying what you drained, never between taking an input and
+  applying it, and publish every frame: right after a dequeue the layer sends
+  an unchanged tree again with its stamp moved, which is what lets an input
+  that changed nothing be answered at once. An app that publishes only on
+  change makes a stamping bridge wait out its 3 s on every such input. The
+  integration guide's drain section says more, with the loop to avoid.
+- **The demo can be slowed.** `TARIA_DEMO_SLOW_MS=<n>` holds each agent input
+  `n` ms between its dequeue and its effect, to reproduce #17.
 - **`TariaLayer::bind_or_disabled_at(label, path)` is public.** It binds at a
   path the app chose and returns a disabled layer when that fails, as
   `bind_or_disabled` does at the resolved path.
@@ -193,14 +240,53 @@ texts do not move.
   Rust no longer keeps its own copy of the names.
 - **`TariaMcpServer` implements `Debug`**, which 0.3.3's did not: it prints
   the tree format and the idle window the server was built with.
+- **`docs/protocol.md` gains the stamps.** Section 3.1 adds `stamps` to the
+  hello, section 5 `after_input` to the snapshot, and new section 5.3 states
+  what a stamping app must do (stamp only inputs it dequeued, start each
+  connection unstamped, never skip a stamp, flush acks first) and how a
+  bridge should read one: credit a tree to an input only at or after its id
+  in the bridge's own send order, compare on `root` and never `seq`, rebase
+  on an earlier tree, and strip the field. Section 5.1 allows the resend of
+  an identical tree under the same `seq`, section 16.6 strips the stamp
+  beside `type`, section 16.9 says what an older peer does, Appendix B item
+  13 lists the stamps nobody checks, and section 18's captures are taken
+  again from the 0.4.0 demo.
+- **`Snapshot::after_input` and the hello's `stamps` are new**, set with
+  `Snapshot::after(id)` and `AppToBridge::hello(..).stamps(true)`. Both read
+  leniently: a wrong shape reads as absent. A Rust peer comparing whole
+  `Snapshot`s now sees a stamp-only resend as a change; compare `root`.
+- **`taria-mcp` sends ids in the order it claims them.** Claiming an input's
+  id and queueing it now happen under one lock, so overlapping tool calls
+  cannot put a higher id on the wire first, which crediting by stamp relies
+  on.
 
 ### The gates
 
-- `scripts/e2e.py` keeps its 26 steps and `scripts/adversarial.py` its 24
-  probes. Steps d, e and i read a task's done state from `checked`, step c
-  and every tab switch check `selected`, and step v checks the outline's
-  `*selected` and `*checked=false` marks. The text probe compares `checked`
-  and `selected` too.
+- `scripts/e2e.py` grows from 26 steps to 27, and `scripts/adversarial.py`
+  keeps its 24 probes. Steps d, e and i read a task's done state from
+  `checked`, step c and every tab switch check `selected`, and step v checks
+  the outline's `*selected` and `*checked=false` marks. The text probe
+  compares `checked` and `selected` too.
+- New step aa runs a demo started with `TARIA_DEMO_SLOW_MS=800` and holds
+  three acts to their own answers: select Done answers with the Done tree,
+  select Done again with the stamped "did not change", and select Active with
+  the Active tree. The no-change prefix the steps match now stops before the
+  " within" that only an app that does not stamp is answered with, and a new
+  prefix names the "published no tree" answer. The adversarial stand-in apps
+  do not stamp, so every probe there reads the 0.3.3 answers.
+- New tests stamp a tree from each of `drain`, `try_recv` and
+  `recv_timeout`; resend an unchanged tree after a dequeue under its own
+  `seq` and skip it without one; leave dropped, unreadable, stale and
+  pre-hello inputs unstamped; start a new connection unstamped, a reused id
+  included; and send an `Ignored` ahead of the stamped resend. The snapshot
+  envelope's budget now holds the 35 bytes of the largest stamp. On the
+  bridge, against a fake app that stamps: an 800 ms tree credited to its own
+  act, an unchanged tree answered in under 500 ms, the 3 s cap, a late tree
+  rebased rather than credited to the next input, a burst answered on its
+  last stamp with a partial drop still reported, an `Ignored` ending the
+  wait early, ids kept in order across eight racing senders, and the stamp
+  stripped in both formats; and against one that does not, 0.3.3's answers
+  byte for byte.
 - New tests pin a node without state to its 0.3.3 bytes, read every state
   field in a wrong shape as not stated, strip a disabled node's actions and
   refuse `act` on it, keep `NaN` and infinities out of the tree and out of

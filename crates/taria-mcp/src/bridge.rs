@@ -22,6 +22,10 @@
 //! `AppToBridge::Ack`. Acks are republished on a [`broadcast`] channel rather
 //! than kept here, because only the tool call that sent an input knows which
 //! id it is waiting for; the manager stays free of per-input bookkeeping.
+//! Whether the app's hello said it stamps its snapshots is kept in one more
+//! [`watch`] ([`BridgeHandle::stamps_rx`]), and ids are claimed and queued
+//! under one lock ([`BridgeHandle::send`]), so a stamp can be compared with
+//! them in the order they went out.
 //!
 //! A line the reader cannot parse is skipped, so that a buggy app cannot kill
 //! the bridge, and the reason is kept in a third [`watch`] channel
@@ -152,10 +156,10 @@ pub(crate) const OVERSIZED_LINE: &str =
 /// whatever the typed struct could hold. Re-serializing
 /// [`parsed`](Self::parsed) destroyed exactly that information: an app
 /// publishing `"role":"sparkline"` had the agent read `"role":"other"`, and the
-/// real name had been on the wire all along for the bridge to pass on. The one
-/// thing dropped on the way is the message's own framing key, which belongs to
-/// the transport rather than to the tree; see
-/// [`from_line`](Self::from_line).
+/// real name had been on the wire all along for the bridge to pass on. The two
+/// things dropped on the way are the message's own framing key, which belongs
+/// to the transport rather than to the tree, and the snapshot's stamp, which
+/// belongs to the bridge; see [`from_line`](Self::from_line).
 ///
 /// The **parsed form is authoritative for what the bridge decides**: `act`
 /// validates node ids and advertised actions against it, and the tool layer
@@ -168,7 +172,8 @@ pub(crate) const OVERSIZED_LINE: &str =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppSnapshot {
     /// The app's snapshot as the agent reads it: its own line, minus the
-    /// message framing. What `read_tree` and every tool result hand back.
+    /// message framing and the stamp. What `read_tree` and every tool result
+    /// hand back.
     /// Built by [`from_line`](Self::from_line), which is the only thing that
     /// removes anything.
     pub(crate) tree_json: String,
@@ -179,18 +184,19 @@ pub(crate) struct AppSnapshot {
 }
 
 impl AppSnapshot {
-    /// Pair one app line with its parse, dropping the transport envelope from
-    /// the copy the agent reads.
+    /// Pair one app line with its parse, dropping the transport envelope and
+    /// the stamp from the copy the agent reads.
     ///
     /// [`AppToBridge`] is internally tagged, so the line carries a
     /// `"type":"snapshot"` key beside the snapshot's own fields. That key
     /// frames the message on the wire and says nothing about the tree, while
     /// `read_tree` promises the app's tree, so handing it on reads as a field
-    /// the app published.
+    /// the app published. The stamp, `after_input`, goes too; see
+    /// [`strip_envelope`].
     ///
     /// Removed through a `serde_json::Value`, which holds every key the line
     /// has, including the roles, actions and fields this build has never
-    /// heard of. Only the one key goes, but the spelling of the rest becomes
+    /// heard of. Only the two keys go, but the spelling of the rest becomes
     /// the serializer's again: keys sorted, whitespace gone, escapes and
     /// numbers rewritten (`1e3` as `1000.0`), and a key repeated in one object
     /// kept once, with its last value (`docs/protocol.md` section 16.6).
@@ -202,7 +208,14 @@ impl AppSnapshot {
     }
 }
 
-/// `line` without its `"type"` key.
+/// `line` without its `"type"` key and its stamp.
+///
+/// The stamp (`after_input`) goes for the reason the framing key does: it
+/// says when the tree was published relative to the bridge's own inputs,
+/// which is for the bridge to reason about and not part of the tree. An
+/// agent shown it would read an input id it never sent as a fact about the
+/// app, and would see a tree that only had its stamp moved as one that
+/// changed. A peer that stamps without saying so in its hello loses it too.
 ///
 /// Both fallbacks return the line untouched, and neither is reachable from a
 /// line that got here: it parsed as an `AppToBridge::Snapshot`, so it is a
@@ -215,6 +228,7 @@ fn strip_envelope(line: &str) -> String {
     };
     if let Some(object) = value.as_object_mut() {
         object.remove("type");
+        object.remove("after_input");
     }
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_string())
 }
@@ -357,6 +371,30 @@ pub(crate) struct BridgeHandle {
     /// [`rejected_rx`](Self::rejected_rx): once a tree is being served, the
     /// connection carrying it is not what an agent needs to hear about.
     pub(crate) link_rx: watch::Receiver<LinkState>,
+    /// Whether the connected app said in its hello that it stamps its
+    /// snapshots (`after_input`, the newest input it dequeued).
+    ///
+    /// False until a hello says otherwise, and again once the connection
+    /// ends, like [`protocol_rx`](Self::protocol_rx), so a peer is never
+    /// judged by the previous one's hello. The tool layer reads it to decide
+    /// how long an input waits for its tree and what the answer says: a peer
+    /// that stamps can be told "did not change" the moment a tree stamped at
+    /// the input arrives unchanged, and one that does not is answered as
+    /// every peer was before stamps existed.
+    pub(crate) stamps_rx: watch::Receiver<bool>,
+    /// Held across claiming an input's id and queueing the input, so ids
+    /// reach the socket in the order they were claimed, however tool calls
+    /// overlap. See [`send`](Self::send).
+    pub(crate) send_order: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Why [`BridgeHandle::send`] sent nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendError {
+    /// The socket task is gone, so nothing will ever read the queue.
+    Closed,
+    /// The queue to the app stayed full for the whole wait.
+    Full,
 }
 
 impl BridgeHandle {
@@ -366,8 +404,42 @@ impl BridgeHandle {
     /// handle: callers ask the bridge for an id rather than reaching for a
     /// counter of their own, and two tool calls racing still get different
     /// ids.
-    pub(crate) fn next_input_id(&self) -> InputId {
+    fn next_input_id(&self) -> InputId {
         InputId::new(NEXT_INPUT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Claim the next id and queue `input` under it for the socket task,
+    /// within `wait` in all, returning the id.
+    ///
+    /// The id is claimed and the input queued under one lock, so the ids go
+    /// out on the socket in the order they were claimed. A stamped tree is
+    /// credited to an input by comparing ids, and that comparison is only
+    /// sound in the order the app received them: with the two steps apart,
+    /// two calls racing could put id 8 on the wire before id 7, and a tree
+    /// stamped 8 would be credited to 7 before the app had read it.
+    ///
+    /// The wait covers the lock too. Nothing holds the lock but a send
+    /// waiting for room in the queue, so running out of time on either is
+    /// the same full queue. A send that runs out of time claimed its id and
+    /// queued nothing, which leaves a gap in the ids, and the protocol asks
+    /// only that they never repeat.
+    pub(crate) async fn send(
+        &self,
+        input: AgentInput,
+        wait: Duration,
+    ) -> Result<InputId, SendError> {
+        let send = async {
+            let _order = self.send_order.lock().await;
+            let id = self.next_input_id();
+            self.input_tx
+                .send((id, input))
+                .await
+                .map(|()| id)
+                .map_err(|_| SendError::Closed)
+        };
+        tokio::time::timeout(wait, send)
+            .await
+            .unwrap_or(Err(SendError::Full))
     }
 
     /// Start receiving acks from now on.
@@ -434,6 +506,7 @@ fn spawn_manager(socket_path: PathBuf, idle: Option<Idle>) -> BridgeHandle {
     let (protocol_tx, protocol_rx) = watch::channel(None);
     let (rejected_tx, rejected_rx) = watch::channel(None);
     let (link_tx, link_rx) = watch::channel(LinkState::Down);
+    let (stamps_tx, stamps_rx) = watch::channel(false);
     tokio::spawn(manager_loop(
         socket_path,
         state_tx,
@@ -442,6 +515,7 @@ fn spawn_manager(socket_path: PathBuf, idle: Option<Idle>) -> BridgeHandle {
         protocol_tx,
         rejected_tx,
         link_tx,
+        stamps_tx,
         idle,
     ));
     BridgeHandle {
@@ -451,6 +525,8 @@ fn spawn_manager(socket_path: PathBuf, idle: Option<Idle>) -> BridgeHandle {
         protocol_rx,
         rejected_rx,
         link_rx,
+        stamps_rx,
+        send_order: Arc::new(tokio::sync::Mutex::new(())),
     }
 }
 
@@ -941,6 +1017,7 @@ async fn manager_loop(
     protocol_tx: watch::Sender<Option<u32>>,
     rejected_tx: watch::Sender<Option<String>>,
     link_tx: watch::Sender<LinkState>,
+    stamps_tx: watch::Sender<bool>,
     mut idle: Option<Idle>,
 ) {
     let mut backoff = RETRY_MIN;
@@ -995,6 +1072,7 @@ async fn manager_loop(
                         &ack_tx,
                         &protocol_tx,
                         &rejected_tx,
+                        &stamps_tx,
                         &mut conn_label,
                         idle.as_mut(),
                     )
@@ -1004,8 +1082,10 @@ async fn manager_loop(
                     link_tx.send_replace(LinkState::Down);
                     // The peer's protocol version belongs to the connection
                     // that declared it; forget it here so the next connection
-                    // is never judged by the previous app's handshake.
+                    // is never judged by the previous app's handshake. The
+                    // same goes for whether it stamps its snapshots.
                     protocol_tx.send_replace(None);
+                    stamps_tx.send_replace(false);
                     // The watch only ever holds `Connected` while this
                     // connection was being served (it is demoted below after
                     // every connection), so `Connected` here means this
@@ -1361,6 +1441,7 @@ async fn run_connection(
     rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) -> ConnectionEnd {
+    let (stamps_tx, _) = watch::channel(false);
     serve_connection(
         stream,
         state_tx,
@@ -1368,6 +1449,7 @@ async fn run_connection(
         ack_tx,
         protocol_tx,
         rejected_tx,
+        &stamps_tx,
         conn_label,
         None,
     )
@@ -1444,6 +1526,7 @@ async fn serve_connection(
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
     protocol_tx: &watch::Sender<Option<u32>>,
     rejected_tx: &watch::Sender<Option<String>>,
+    stamps_tx: &watch::Sender<bool>,
     conn_label: &mut Option<String>,
     mut idle: Option<&mut Idle>,
 ) -> ConnectionEnd {
@@ -1464,6 +1547,7 @@ async fn serve_connection(
                         state_tx,
                         ack_tx,
                         protocol_tx,
+                        stamps_tx,
                         rejected_tx,
                         conn_label,
                     );
@@ -1561,6 +1645,7 @@ fn handle_app_line(
     state_tx: &watch::Sender<BridgeState>,
     ack_tx: &broadcast::Sender<(InputId, InputStatus)>,
     protocol_tx: &watch::Sender<Option<u32>>,
+    stamps_tx: &watch::Sender<bool>,
     rejected_tx: &watch::Sender<Option<String>>,
     conn_label: &mut Option<String>,
 ) -> Option<InputId> {
@@ -1577,6 +1662,7 @@ fn handle_app_line(
         Ok(AppToBridge::Hello {
             app_label,
             protocol_version,
+            stamps,
             ..
         }) => {
             if protocol_version == PROTOCOL_VERSION {
@@ -1591,6 +1677,7 @@ fn handle_app_line(
                 );
             }
             protocol_tx.send_replace(Some(protocol_version));
+            stamps_tx.send_replace(stamps);
             *conn_label = Some(app_label);
         }
         Ok(AppToBridge::Snapshot(parsed)) => {
@@ -1744,6 +1831,7 @@ mod tests {
         let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
         let (ack_tx, _) = broadcast::channel(1);
         let (protocol_tx, _protocol_rx) = watch::channel(None);
+        let (stamps_tx, _stamps_rx) = watch::channel(false);
         let (rejected_tx, rejected_rx) = watch::channel(Some(OVERSIZED_LINE.to_string()));
         let mut label = None;
         let hello = serde_json::to_string(&AppToBridge::hello("demo", PROTOCOL_VERSION))
@@ -1759,6 +1847,7 @@ mod tests {
                 &state_tx,
                 &ack_tx,
                 &protocol_tx,
+                &stamps_tx,
                 &rejected_tx,
                 &mut label,
             );
@@ -1866,6 +1955,7 @@ mod tests {
         let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
         let (ack_tx, _) = broadcast::channel(1);
         let (protocol_tx, protocol_rx) = watch::channel(None);
+        let (stamps_tx, _stamps_rx) = watch::channel(false);
         let (rejected_tx, _rejected_rx) = watch::channel(None);
         let mut label = None;
         let mut line = |message: &AppToBridge| {
@@ -1875,6 +1965,7 @@ mod tests {
                 &state_tx,
                 &ack_tx,
                 &protocol_tx,
+                &stamps_tx,
                 &rejected_tx,
                 &mut label,
             );
@@ -2091,6 +2182,7 @@ mod tests {
             idle: &mut Idle,
         ) -> (ConnectionEnd, TokioInstant) {
             let mut label = None;
+            let (stamps_tx, _) = watch::channel(false);
             let end = serve_connection(
                 stream,
                 &self.state_tx,
@@ -2098,6 +2190,7 @@ mod tests {
                 &self.ack_tx,
                 &self.protocol_tx,
                 &self.rejected_tx,
+                &stamps_tx,
                 &mut label,
                 Some(idle),
             )
@@ -2579,6 +2672,8 @@ mod tests {
                     protocol_rx,
                     rejected_rx,
                     link_rx,
+                    stamps_rx: watch::channel(false).1,
+                    send_order: Default::default(),
                 },
                 link_tx,
                 _state_tx: state_tx,

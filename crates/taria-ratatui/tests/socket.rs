@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use taria::wire::{AppToBridge, BridgeToApp, InputId, InputStatus};
-use taria::{AgentInput, Node, PROTOCOL_VERSION, Role};
+use taria::{AgentInput, Node, PROTOCOL_VERSION, Role, Snapshot};
 use taria_ratatui::TariaLayer;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -171,7 +171,10 @@ fn hello_then_snapshots_stream_to_client() {
 
     // First message is always the handshake.
     let hello = client.read_message();
-    assert_eq!(hello, AppToBridge::hello("stream", PROTOCOL_VERSION));
+    assert_eq!(
+        hello,
+        AppToBridge::hello("stream", PROTOCOL_VERSION).stamps(true)
+    );
 
     // A publish after connect streams to the client.
     publish_single_node(&mut layer, "first");
@@ -247,11 +250,28 @@ fn an_oversized_tree_is_replayed_as_a_line_the_bridge_can_read() {
     assert_eq!(poll_input(&layer), Some(key("q")));
     assert_eq!(client.read_message(), ack(1, InputStatus::Delivered));
 
-    // Redrawn unchanged, the tree is not a new snapshot: the next one the
-    // bridge reads is the next change, under the very next seq.
+    // Redrawn unchanged, the tree is not a new snapshot. The first redraw
+    // after the dequeue sends the one already published again, stamped with
+    // the input and under the same seq, without cutting it again; the rest
+    // send nothing, so the next line after it is the next change, under the
+    // very next seq.
     for _ in 0..3 {
         layer.publish(frame());
     }
+    let AppToBridge::Snapshot(restamped) = client.read_message() else {
+        panic!("expected the tree again, stamped");
+    };
+    assert_eq!(restamped.seq, 1, "a stamp moving is not a new snapshot");
+    assert_eq!(restamped.after_input, Some(InputId::new(1)));
+    assert_eq!(
+        restamped.root, snapshot.root,
+        "the tree is the one already cut"
+    );
+    assert_eq!(
+        layer.stats().oversized_snapshots,
+        1,
+        "the resend is not cut again"
+    );
     layer.publish([Node::new("draft", Role::TextInput)
         .value(format!("x{draft}"))
         .focused(true)]);
@@ -259,6 +279,7 @@ fn an_oversized_tree_is_replayed_as_a_line_the_bridge_can_read() {
         panic!("expected the changed tree");
     };
     assert_eq!(snapshot.seq, 2, "the redraws published nothing");
+    assert_eq!(snapshot.after_input, Some(InputId::new(1)));
     let value = snapshot.root.children[0].value.as_deref().unwrap();
     assert!(value.starts_with('x') && value.ends_with('\u{2026}'));
     assert_eq!(layer.stats().oversized_snapshots, 2);
@@ -855,7 +876,7 @@ fn a_second_client_waits_until_the_first_is_gone() {
         .unwrap();
     assert_eq!(
         second.read_message(),
-        AppToBridge::hello("oneatatime", PROTOCOL_VERSION),
+        AppToBridge::hello("oneatatime", PROTOCOL_VERSION).stamps(true),
         "the waiting client must be served in full once its turn comes"
     );
     let AppToBridge::Snapshot(snapshot) = second.read_message() else {
@@ -913,7 +934,7 @@ fn input_a_waiting_client_wrote_before_its_hello_never_reaches_the_app() {
     drop(first);
     assert_eq!(
         second.read_message(),
-        AppToBridge::hello("prehello", PROTOCOL_VERSION)
+        AppToBridge::hello("prehello", PROTOCOL_VERSION).stamps(true)
     );
     assert!(matches!(second.read_message(), AppToBridge::Snapshot(_)));
 
@@ -946,7 +967,7 @@ fn input_a_waiting_client_wrote_before_its_hello_never_reaches_the_app() {
     drop(second);
     assert_eq!(
         third.read_message(),
-        AppToBridge::hello("prehello", PROTOCOL_VERSION)
+        AppToBridge::hello("prehello", PROTOCOL_VERSION).stamps(true)
     );
     assert!(matches!(third.read_message(), AppToBridge::Snapshot(_)));
     third.send_input(2, key("k"));
@@ -979,7 +1000,7 @@ fn a_lone_client_that_writes_before_reading_its_hello_keeps_its_input() {
 
     assert_eq!(
         client.read_message(),
-        AppToBridge::hello("blindlone", PROTOCOL_VERSION)
+        AppToBridge::hello("blindlone", PROTOCOL_VERSION).stamps(true)
     );
     assert_eq!(
         poll_input(&layer),
@@ -1135,4 +1156,275 @@ fn drop_removes_the_socket_file() {
     let TestLayer { layer, _dir } = bound;
     drop(layer);
     assert!(!path.exists(), "socket file should be removed on drop");
+}
+
+/// The next message, which has to be a snapshot.
+fn read_snapshot(client: &mut Client) -> Snapshot {
+    match client.read_message() {
+        AppToBridge::Snapshot(snapshot) => snapshot,
+        other => panic!("expected a snapshot, got {other:?}"),
+    }
+}
+
+/// Assert the layer writes nothing to `client` for `window`.
+fn expect_silence(client: &mut Client, window: Duration) {
+    client
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(window))
+        .unwrap();
+    let mut line = String::new();
+    let read = client.reader.read_line(&mut line);
+    assert!(
+        matches!(
+            &read,
+            Err(err) if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        ),
+        "expected nothing to be written, got {read:?} with {line:?}"
+    );
+    client
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(TIMEOUT))
+        .unwrap();
+}
+
+/// How long [`expect_silence`] listens for a line that must not come. A
+/// write the layer was going to make is made within a few milliseconds.
+const QUIET: Duration = Duration::from_millis(200);
+
+/// Drain until one input has been handed to `f`, failing at the timeout.
+fn drain_one(layer: &TariaLayer, mut f: impl FnMut(AgentInput) -> InputStatus) -> AgentInput {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut got = None;
+    while got.is_none() && Instant::now() < deadline {
+        layer.drain(|input| {
+            got = Some(input.clone());
+            f(input)
+        });
+        thread::sleep(Duration::from_millis(5));
+    }
+    got.expect("an input should reach the drain")
+}
+
+/// The stamp is the newest input handed to the app, by any of the three
+/// ways of taking one, and the first snapshot published after it carries it.
+#[test]
+fn every_way_of_taking_an_input_stamps_the_next_publish() {
+    let mut layer = bind_layer("stampapis");
+    let mut client = Client::connect(&layer);
+    assert_eq!(
+        client.read_message(),
+        AppToBridge::hello("stampapis", PROTOCOL_VERSION).stamps(true),
+        "the hello says this peer stamps"
+    );
+
+    publish_single_node(&mut layer, "before");
+    let snapshot = read_snapshot(&mut client);
+    assert_eq!(snapshot.after_input, None, "nothing has been dequeued yet");
+
+    client.send_input(11, key("a"));
+    assert_eq!(poll_try_recv(&layer), Some((InputId::new(11), key("a"))));
+    publish_single_node(&mut layer, "after-try-recv");
+    assert_eq!(client.read_message(), ack(11, InputStatus::Delivered));
+    let snapshot = read_snapshot(&mut client);
+    assert_eq!(
+        (snapshot.seq, snapshot.after_input),
+        (2, Some(InputId::new(11)))
+    );
+
+    client.send_input(12, key("b"));
+    assert_eq!(
+        layer.recv_timeout(TIMEOUT),
+        Some((InputId::new(12), key("b")))
+    );
+    publish_single_node(&mut layer, "after-recv-timeout");
+    assert_eq!(client.read_message(), ack(12, InputStatus::Delivered));
+    let snapshot = read_snapshot(&mut client);
+    assert_eq!(
+        (snapshot.seq, snapshot.after_input),
+        (3, Some(InputId::new(12)))
+    );
+
+    client.send_input(13, key("c"));
+    assert_eq!(drain_one(&layer, |_| InputStatus::Delivered), key("c"));
+    publish_single_node(&mut layer, "after-drain");
+    assert_eq!(client.read_message(), ack(13, InputStatus::Delivered));
+    let snapshot = read_snapshot(&mut client);
+    assert_eq!(
+        (snapshot.seq, snapshot.after_input),
+        (4, Some(InputId::new(13)))
+    );
+    assert_eq!(snapshot.root.children[0].id.0, "after-drain");
+}
+
+/// An input that changes nothing still gets a tree stamped at it, or a
+/// bridge could not tell it from an input the app is still working on. The
+/// tree is the snapshot already sent, under its own seq, so a bridge that
+/// reads no stamp sees the same snapshot twice; and without a new dequeue a
+/// redraw still sends nothing.
+#[test]
+fn an_unchanged_frame_after_a_dequeue_is_sent_again_under_the_same_seq() {
+    let mut layer = bind_layer("restamp");
+    publish_single_node(&mut layer, "tree");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+    let first = read_snapshot(&mut client);
+    assert_eq!((first.seq, first.after_input), (1, None));
+
+    // Nothing dequeued: the redraws are skipped as they always were.
+    for _ in 0..3 {
+        publish_single_node(&mut layer, "tree");
+    }
+    expect_silence(&mut client, QUIET);
+
+    client.send_input(5, key("x"));
+    assert_eq!(poll_input(&layer), Some(key("x")));
+    assert_eq!(client.read_message(), ack(5, InputStatus::Delivered));
+    publish_single_node(&mut layer, "tree");
+    let again = read_snapshot(&mut client);
+    assert_eq!(again.seq, 1, "a stamp moving is not a new snapshot");
+    assert_eq!(again.after_input, Some(InputId::new(5)));
+    assert_eq!(again.root, first.root);
+
+    // No new dequeue since: skipped again.
+    for _ in 0..3 {
+        publish_single_node(&mut layer, "tree");
+    }
+    expect_silence(&mut client, QUIET);
+
+    // And a change is the next snapshot, still stamped at the newest input.
+    publish_single_node(&mut layer, "changed");
+    let changed = read_snapshot(&mut client);
+    assert_eq!(
+        (changed.seq, changed.after_input),
+        (2, Some(InputId::new(5)))
+    );
+}
+
+/// Only an input the app was handed stamps a tree. One the queue had no room
+/// for, one of a kind this build cannot read, one whose connection ended
+/// before the app took it and one a waiting client wrote before its hello
+/// were never dequeued, and a stamp naming one would tell a bridge the app
+/// had it in hand.
+#[test]
+fn inputs_the_app_never_took_never_stamp() {
+    const QUEUE: u64 = 256;
+    let mut layer = bind_layer("nostamp");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+    publish_single_node(&mut layer, "tree");
+    assert_eq!(read_snapshot(&mut client).after_input, None);
+
+    // A kind this build cannot read is answered by the reader and never
+    // queued, so a redraw has nothing to stamp.
+    client.write_line(r#"{"type":"input","id":41,"input":{"kind":"paste","text":"hi"}}"#);
+    assert_eq!(client.read_message(), ack(41, InputStatus::Ignored));
+    assert_eq!(layer.try_recv(), None);
+    publish_single_node(&mut layer, "tree");
+    expect_silence(&mut client, QUIET);
+
+    // A full queue drops the newest input. Every queued one is then taken,
+    // and the stamp is the last of those, not the one dropped after them.
+    for id in 1..=QUEUE + 1 {
+        client.send_input(id, key("k"));
+    }
+    assert_eq!(client.read_message(), ack(QUEUE + 1, InputStatus::Dropped));
+    let mut taken = 0;
+    while layer.try_recv().is_some() {
+        taken += 1;
+    }
+    assert_eq!(taken, QUEUE);
+    publish_single_node(&mut layer, "tree");
+    for id in 1..=QUEUE {
+        assert_eq!(client.read_message(), ack(id, InputStatus::Delivered));
+    }
+    let restamped = read_snapshot(&mut client);
+    assert_eq!(restamped.after_input, Some(InputId::new(QUEUE)));
+
+    // An input still queued when its connection ends is discarded, and a
+    // client that waited its turn has what it wrote before its hello thrown
+    // away. Neither stamps the next connection's tree.
+    let mut waiting = Client::connect(&layer);
+    waiting.send_input(1, key("blind"));
+    client.send_input(QUEUE + 2, key("late"));
+    drop(client);
+    assert!(matches!(waiting.read_message(), AppToBridge::Hello { .. }));
+    assert_eq!(
+        read_snapshot(&mut waiting).after_input,
+        None,
+        "a new connection's first tree is unstamped"
+    );
+    assert_eq!(layer.try_recv(), None, "both were discarded");
+    assert_eq!(layer.stats().stale_inputs, 2);
+    publish_single_node(&mut layer, "next");
+    let next = read_snapshot(&mut waiting);
+    assert_eq!(next.root.children[0].id.0, "next");
+    assert_eq!(next.after_input, None);
+    assert_eq!(layer.stats().dropped_inputs, 1);
+    assert_eq!(layer.stats().unknown_inputs, 1);
+}
+
+/// Stamps belong to the connection they were taken on. A new bridge is a new
+/// process whose ids start over, so the tree it is greeted with goes out
+/// unstamped, and its first input stamps a tree even when it reuses the id a
+/// previous bridge's last input had.
+#[test]
+fn a_new_connection_starts_unstamped() {
+    let mut layer = bind_layer("stampconn");
+    let mut first = Client::connect(&layer);
+    assert!(matches!(first.read_message(), AppToBridge::Hello { .. }));
+    first.send_input(3, key("a"));
+    assert_eq!(poll_input(&layer), Some(key("a")));
+    assert_eq!(first.read_message(), ack(3, InputStatus::Delivered));
+    publish_single_node(&mut layer, "one");
+    let stamped = read_snapshot(&mut first);
+    assert_eq!(
+        (stamped.seq, stamped.after_input),
+        (1, Some(InputId::new(3)))
+    );
+    drop(first);
+
+    let mut second = Client::connect(&layer);
+    assert!(matches!(second.read_message(), AppToBridge::Hello { .. }));
+    let greeted = read_snapshot(&mut second);
+    assert_eq!((greeted.seq, greeted.after_input), (1, None));
+    assert_eq!(greeted.root, stamped.root);
+    publish_single_node(&mut layer, "one");
+    expect_silence(&mut second, QUIET);
+
+    second.send_input(3, key("b"));
+    assert_eq!(poll_input(&layer), Some(key("b")));
+    assert_eq!(second.read_message(), ack(3, InputStatus::Delivered));
+    publish_single_node(&mut layer, "one");
+    let restamped = read_snapshot(&mut second);
+    assert_eq!(
+        (restamped.seq, restamped.after_input),
+        (1, Some(InputId::new(3))),
+        "the same id on a new connection is a new input"
+    );
+}
+
+/// An `Ignored` refinement still reaches the bridge before the tree
+/// published after it, the stamped resend included: a bridge that read the
+/// tree first would settle on "did not change" for an input the app refused.
+#[test]
+fn an_ignored_ack_precedes_the_stamped_snapshot() {
+    let mut layer = bind_layer("stampignored");
+    let mut client = Client::connect(&layer);
+    assert!(matches!(client.read_message(), AppToBridge::Hello { .. }));
+    publish_single_node(&mut layer, "tree");
+    assert_eq!(read_snapshot(&mut client).seq, 1);
+
+    client.send_input(9, key("x"));
+    assert_eq!(drain_one(&layer, |_| InputStatus::Ignored), key("x"));
+    publish_single_node(&mut layer, "tree");
+
+    assert_eq!(client.read_message(), ack(9, InputStatus::Delivered));
+    assert_eq!(client.read_message(), ack(9, InputStatus::Ignored));
+    let snapshot = read_snapshot(&mut client);
+    assert_eq!(
+        (snapshot.seq, snapshot.after_input),
+        (1, Some(InputId::new(9)))
+    );
 }

@@ -59,24 +59,31 @@ use std::io;
 use taria::wire::MAX_LINE_BYTES;
 use taria::{Action, Node, NodeId, Role};
 
-/// Bytes a snapshot line spends around its root, at the largest `seq`.
+/// Bytes a snapshot line spends around its root, at the largest `seq` and
+/// the largest stamp.
 ///
 /// Spelled out as the literal it measures, the line with the root left out:
-/// the seq is the only part that varies, and it is written here at
-/// `u64::MAX`, so a root within [`ROOT_BUDGET`] fits at any seq the layer
-/// can reach. Budgeting for the worst seq rather than the next one costs at
-/// most 19 bytes of a megabyte, and buys a bound that depends on the tree
-/// alone: the same tree is cut the same way whenever it is published, so
-/// deduplicating a redrawn frame still works on a tree that had to be cut.
+/// the seq and the stamp (`after_input`) are the only parts that vary, and
+/// both are written here at `u64::MAX`, so a root within [`ROOT_BUDGET`]
+/// fits at any seq the layer can reach and under any stamp. Budgeting for
+/// the worst case rather than the next line costs at most 19 bytes of a
+/// megabyte for the seq and 35 for the stamp, which an unstamped line does
+/// not carry at all, and buys a bound that depends on the tree alone: the
+/// same tree is cut the same way whenever it is published, so deduplicating
+/// a redrawn frame still works on a tree that had to be cut, and a snapshot
+/// sent again with only its stamp moved still fits without being cut again.
 ///
 /// Nothing derives this from the wire types, so
 /// `the_envelope_is_measured_not_assumed` holds it against a real
 /// serialization, which is what catches a change to the envelope.
-const SNAPSHOT_ENVELOPE_BYTES: usize =
-    r#"{"type":"snapshot","protocol_version":1,"seq":18446744073709551615,"root":}"#.len();
+const SNAPSHOT_ENVELOPE_BYTES: usize = concat!(
+    r#"{"type":"snapshot","protocol_version":1,"seq":18446744073709551615,"#,
+    r#""after_input":18446744073709551615,"root":}"#
+)
+.len();
 
 /// Longest serialized root that still leaves its snapshot line within
-/// [`MAX_LINE_BYTES`] at any `seq`.
+/// [`MAX_LINE_BYTES`] at any `seq` and under any stamp.
 pub(crate) const ROOT_BUDGET: usize = MAX_LINE_BYTES - SNAPSHOT_ENVELOPE_BYTES;
 
 /// Shortest a trimmed string is cut to, in escaped JSON bytes, marker
@@ -131,12 +138,13 @@ impl SnapshotTooLarge {
     /// depth cut, which runs first: the tree as built is never serialized,
     /// because serializing recurses and the depth cut is what bounds that.
     ///
-    /// Counted with `seq` at its largest, the way the bound counts it. A tree
-    /// is cut when its line would not fit at every seq, not merely at the one
-    /// it went out under, so that whether a tree is cut never depends on how
-    /// many snapshots came before it. That keeps this always over
-    /// [`limit`](Self::limit), and at most 19 bytes over the line actually
-    /// built, which spelled its seq in fewer digits.
+    /// Counted with `seq` and the stamp at their largest, the way the bound
+    /// counts them. A tree is cut when its line would not fit at every seq
+    /// and under every stamp, not merely as it went out, so that whether a
+    /// tree is cut never depends on how many snapshots or inputs came before
+    /// it. That keeps this always over [`limit`](Self::limit), and at most
+    /// 54 bytes over the line actually built: 19 for a seq spelled in fewer
+    /// digits, and 35 for a stamp spelled shorter or not carried.
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -1093,7 +1101,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use taria::Snapshot;
-    use taria::wire::AppToBridge;
+    use taria::wire::{AppToBridge, InputId};
 
     use super::*;
 
@@ -1251,22 +1259,45 @@ mod tests {
     fn the_envelope_is_measured_not_assumed() {
         let root = Node::new("app", Role::App).label("envelope");
         let root_len = json_len(&root);
-        let line_len = |seq| {
-            serde_json::to_vec(&AppToBridge::Snapshot(Snapshot::new(seq, root.clone())))
+        let line_len = |seq, stamp: Option<u64>| {
+            let mut snapshot = Snapshot::new(seq, root.clone());
+            if let Some(stamp) = stamp {
+                snapshot = snapshot.after(InputId::new(stamp));
+            }
+            serde_json::to_vec(&AppToBridge::Snapshot(snapshot))
                 .unwrap()
                 .len()
         };
 
-        assert_eq!(line_len(u64::MAX) - root_len, SNAPSHOT_ENVELOPE_BYTES);
-        // And it is the worst case: no seq spends more, and the smallest
-        // spends exactly the 19 digits less that the budget gives away.
-        for seq in [0, 1, 9, 10, 99, 100, 12_345, u64::MAX / 10] {
-            assert!(
-                line_len(seq) - root_len <= SNAPSHOT_ENVELOPE_BYTES,
-                "seq {seq}"
-            );
+        assert_eq!(
+            line_len(u64::MAX, Some(u64::MAX)) - root_len,
+            SNAPSHOT_ENVELOPE_BYTES
+        );
+        // And it is the worst case: no seq or stamp spends more, the smallest
+        // seq spends exactly the 19 digits less that the budget gives away,
+        // and an unstamped line the 35 bytes of the whole field besides.
+        for seq in [0, 1, 9, 10, 99, 100, 12_345, u64::MAX / 10, u64::MAX] {
+            for stamp in [None, Some(0), Some(1), Some(12_345), Some(u64::MAX)] {
+                assert!(
+                    line_len(seq, stamp) - root_len <= SNAPSHOT_ENVELOPE_BYTES,
+                    "seq {seq}, stamp {stamp:?}"
+                );
+            }
         }
-        assert_eq!(line_len(1) - root_len, SNAPSHOT_ENVELOPE_BYTES - 19);
+        assert_eq!(
+            line_len(1, Some(u64::MAX)) - root_len,
+            SNAPSHOT_ENVELOPE_BYTES - 19
+        );
+        assert_eq!(
+            line_len(1, Some(1)) - root_len,
+            SNAPSHOT_ENVELOPE_BYTES - 19 - 19
+        );
+        let field = r#""after_input":18446744073709551615,"#.len();
+        assert_eq!(field, 35);
+        assert_eq!(
+            line_len(u64::MAX, None) - root_len,
+            SNAPSHOT_ENVELOPE_BYTES - field
+        );
         assert_eq!(ROOT_BUDGET + SNAPSHOT_ENVELOPE_BYTES, MAX_LINE_BYTES);
     }
 
