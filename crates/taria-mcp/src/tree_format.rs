@@ -47,9 +47,11 @@
 //!   and `value_max`, the brackets only when a bound is stated and a missing
 //!   part left empty (`*num=42`, `*num=42[0..]`, `*num=[..100]`); `*pos=` from
 //!   `pos_in_set`; `*size=` from `set_size`; `*row=` and `*col=`; `*rows=`
-//!   and `*cols=` from `row_count` and `column_count`. A number prints as the
-//!   line's compact JSON spells it. `null` or absent prints nothing, and so
-//!   does `"disabled":false`. A value in a shape the bridge's parse reads as
+//!   and `*cols=` from `row_count` and `column_count`. A number prints as
+//!   the bridge's copy of the line spells it: as the app wrote it when that
+//!   is a 64-bit integer or a double's shortest round-trip form, digit for
+//!   digit, and respelled otherwise (`1e3` as `1000.0`). `null` or absent prints
+//!   nothing, and so does `"disabled":false`. A value in a shape the bridge's parse reads as
 //!   not stated, `"selected":"yes"` or a `row` of 0, goes to the tail, so the
 //!   marks show exactly what the parse holds.
 //! - `description`, a string, opens the tail as `description="<text>"`.
@@ -380,7 +382,9 @@ fn state_marks(node: &Map<String, Value>, out: &mut String, tail: &mut Vec<Strin
         }
     }
 
-    // Any JSON number is finite, and the parse reads every one.
+    // A `Value` holds only finite numbers (one outside the double range
+    // fails the whole line before it gets here), and the parse reads every
+    // one.
     let mut number = |key: &str| match node.get(key) {
         None | Some(Value::Null) => None,
         Some(number @ Value::Number(_)) => Some(compact(number)),
@@ -694,8 +698,8 @@ x checkbox *checked=mixed"
     }
 
     /// `*num` shows the parts that are stated: the brackets only with a
-    /// bound, and a missing part left empty. A number prints as the line
-    /// spells it.
+    /// bound, and a missing part left empty. A number prints as the bridge's
+    /// copy of the line spells it, so `1e3` is respelled.
     #[test]
     fn num_omits_the_parts_not_stated() {
         let cases = [
@@ -715,6 +719,37 @@ x progress_bar {mark}"
                 "{fields}: {out}"
             );
         }
+    }
+
+    /// A number the app wrote in its shortest round-trip form reaches the
+    /// agent digit for digit in both formats, through the bridge's envelope
+    /// strip and the outline renderer: `serde_json` reads it exactly
+    /// (`float_roundtrip`) and writes it back in that same shortest form.
+    /// Without the feature, `1.4000000000000001` read as `1.4`. The parse
+    /// holds the same double the app sent.
+    #[test]
+    fn a_number_reaches_the_agent_as_the_app_wrote_it() {
+        let line = r#"{"type":"snapshot","protocol_version":1,"seq":2,"root":{"id":"x","role":"slider","value_now":1.4000000000000001,"value_max":2.7027027027027026}}"#;
+        let Ok(taria::wire::AppToBridge::Snapshot(parsed)) = serde_json::from_str(line) else {
+            panic!("the line is a snapshot");
+        };
+        assert_eq!(
+            (
+                parsed.root.value_now.map(taria::Number::get),
+                parsed.root.value_max.map(taria::Number::get)
+            ),
+            (Some(1.4000000000000001), Some(2.7027027027027026))
+        );
+        let snapshot = AppSnapshot::from_line(line, parsed);
+        let json = TreeFormat::Json.render(&snapshot);
+        assert_eq!(
+            json,
+            r#"{"protocol_version":1,"root":{"id":"x","role":"slider","value_max":2.7027027027027026,"value_now":1.4000000000000001},"seq":2}"#
+        );
+        assert_eq!(
+            TreeFormat::Outline.render(&snapshot),
+            "protocol_version=1 seq=2\nx slider *num=1.4000000000000001[..2.7027027027027026]"
+        );
     }
 
     /// A state field in a shape the parse reads as not stated is no mark:

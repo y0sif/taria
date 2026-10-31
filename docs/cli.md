@@ -20,7 +20,8 @@ Options:
 
 The bridge opens no connection to the app until its first tool call, whatever
 `--idle-release` says: starting it, and the harness's `initialize` and
-`tools/list`, connect to nothing. That first call waits briefly, at most
+`tools/list`, or its `server/discover` under the stateless MCP lifecycle,
+connect to nothing. That first call waits briefly, at most
 about a second, for the connection, the app's `hello` and its tree, so it
 still answers with the live tree. A bridge locked out of the app says the app
 is held by another bridge, and when the holder lets go, so a retry is the way
@@ -130,11 +131,15 @@ indented two spaces per level, the root at zero:
   | `row`, `column` | `*row=2 *col=3` |
   | `row_count`, `column_count` | `*rows=50 *cols=4` |
 
-  A number prints as the app's line spells it, after the bridge's respelling
-  (`1e3` reads `1000.0`). `null`, absent and `"disabled":false` print
-  nothing. A state field in a shape the bridge reads as not stated, such as
-  `"selected":"yes"` or a `row` of 0, prints in the tail instead, as
-  `selected="yes"`, so a mark always means what the bridge's parse holds.
+  A number prints as the app wrote it, digit for digit, when the app wrote
+  a 64-bit integer or a double's shortest round-trip form, and respelled
+  otherwise (`1e3` reads `1000.0`; protocol section 16.6 lists the cases).
+  `null`, absent and `"disabled":false` print nothing. A state field in a
+  shape the bridge reads as not stated, such as `"selected":"yes"` or a
+  `row` of 0, prints in the tail instead, as `selected="yes"`, so a mark
+  always means what the bridge's parse holds. The tail is the run of
+  `key=<compact json>` fields after the marks and before the actions,
+  described in the next two items.
 - `description`, a string, opens the tail as `description="<text>"`.
 - Any other field, a field this bridge has never heard of included, is
   appended as ` key=<compact json>`, after the marks and before the actions,

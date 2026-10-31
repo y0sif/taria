@@ -15,7 +15,7 @@ readme = "../../README.md"
 [dependencies]
 taria.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "sync", "io-util", "time"] }
 schemars = "1"

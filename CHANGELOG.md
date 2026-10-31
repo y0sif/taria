@@ -27,8 +27,10 @@ This breaks Rust callers of all three crates; the table under Upgrading maps
 every removed name to what replaces it. The cut moves nothing on the wire:
 `InputId`, a newtype in Rust now, is still a bare integer in the JSON. Every
 text an agent reads through `taria-mcp`, from the instructions to each
-answer, is unchanged byte for byte but the two below, and so is the binary's
-command line.
+answer, is unchanged byte for byte but two the typed state brings, the
+outline's `read_tree` description and the answer to `act` on a disabled node
+(both under "For whoever drives an app"), and so is the binary's command
+line.
 
 **A node can say what state it is in.** Which row is selected, whether a box
 is checked, whether a branch is open, whether a button can be pressed yet,
@@ -66,9 +68,9 @@ texts do not move.
 | `TariaMcpServer::new(h)` or `with_tree_format(h, format)`, with `h` from `bridge::spawn(socket)` | `TariaMcpServer::builder(socket).tree_format(format).connected()?` |
 | `server::parse_action(name)`, `server::action_name(&action)` | `taria::Action::from_wire(name)`, `action.wire_name()` |
 | the tool methods `read_tree`, `act`, `key` and `type_text`, their `*_tool_attr()` functions, and `ActParams`, `KeyParams`, `TypeTextParams` | rmcp's `ServerHandler`, through a `tools/call` request |
-| `bridge::{spawn, BridgeHandle, AppSnapshot, BridgeState, LinkState}` | none: a finalizer spawns the bridge |
+| `bridge::{spawn, BridgeHandle, AppSnapshot, BridgeState, LinkState}` | none: the builder's `on_demand()` or `connected()` spawns the bridge |
 | `tree_format::outline(line)`, `TreeFormat::render(&snapshot)` | none |
-| `args::{parse, Cli, HELP, MAX_IDLE_RELEASE_SECS, resolve_socket_path}` | none: they are the binary's own. `taria::socket::resolve_path` derives a socket path from a `user` string the caller passes, while the adapter and the binary derive theirs privately: the uid on Linux (from `/proc/self`), else `$USER`, else `$LOGNAME`. A caller passing `$USER` gets a different temp-dir fallback path on Linux than the adapter binds |
+| `args::{parse, Cli, HELP, MAX_IDLE_RELEASE_SECS, resolve_socket_path}` | none: they are the binary's own (see the socket path note below) |
 | rmcp 3 | rmcp 3.8 or later |
 
 - **`drain` is a new method under an old name.** It is 0.3's `drain_acking`,
@@ -82,9 +84,19 @@ texts do not move.
   modules are private. In-process tool calls, watching the bridge's state and
   rendering a saved line are no longer possible from outside the crate. Each
   can come back as an addition if someone needs it: open an issue.
-- **Both finalizers return `std::io::Result`.** Outside a tokio runtime they
-  return an error, where 0.3's constructors panicked. `connected()` ignores
-  `idle_release`: that bridge never lets go.
+- **A socket path from `taria::socket::resolve_path` can differ from the
+  adapter's.** With `resolve_socket_path` gone, that is the public way to
+  derive one, and it takes the `user` string from the caller. The adapter and
+  the binary derive theirs privately: the uid on Linux (from `/proc/self`),
+  else `$USER`, else `$LOGNAME`, else `default`. The string names only the
+  temp-dir fallback, used when `$TARIA_SOCK` and `$XDG_RUNTIME_DIR` are both
+  unset or empty, so a caller passing `$USER` gets a different fallback path
+  on Linux than the adapter binds.
+- **`on_demand()` and `connected()` return `std::io::Result`.** Outside a
+  tokio runtime they return an error. In 0.3.3, `on_demand` and
+  `bridge::spawn` started their tasks at once and panicked outside a
+  runtime, while `new` and `with_tree_format` took a handle and started
+  nothing. `connected()` ignores `idle_release`: that bridge never lets go.
 
 ### For whoever drives an app
 
@@ -96,8 +108,13 @@ texts do not move.
   `*pos=3`; `*size=7`; `*row=2 *col=3`; `*rows=50 *cols=4`; and a
   `description="..."` opening the tail. A `*` is still never bare
   otherwise, so no mark can be forged. Positions count from 1, and a node
-  with `expanded` set and fewer children than its `set_size` has children
+  with `"expanded":true` and fewer children than its `set_size` has children
   that were not published, not an empty set.
+- **A number reaches the agent as the app wrote it.** `taria-mcp` now reads
+  JSON numbers exactly (`serde_json`'s `float_roundtrip`), so a value such as
+  `1.4000000000000001` is no longer shown as `1.4`, in JSON or in the
+  outline. A spelling that is not a double's shortest form is still
+  respelled: `1e3` reads `1000.0`.
 - **The outline's `read_tree` description shows a state mark.** Its legend
   reads `id role *relayed "label" = "value" *focused *checked=false act:
   a|b`, which teaches the `*name=value` shape: 15 characters more than
@@ -116,23 +133,25 @@ texts do not move.
 - **rmcp 3.8 answers a few requests differently; taria's own texts do not
   move.** A request with `"id":null` now gets a `-32600` (invalid request)
   reply, where 0.3.3 sent nothing. Requests before `initialize` no longer end
-  the session after the third: each is answered `-32602`, and `initialize` is
-  still accepted after them. rmcp's stderr report of a malformed `initialize`
-  is worded differently.
-- **The stateless 2026-07-28 lifecycle is accepted too.** `server/discover`,
-  like `initialize`, opens no connection to the app. In that mode
-  `resources/list` and `prompts/list` carry
+  the session after the third: each is answered `-32602` (invalid params), and
+  `initialize` is still accepted after them. rmcp's stderr report of a malformed
+  `initialize` is worded differently.
+- **The stateless 2026-07-28 lifecycle is accepted too.** That MCP spec revision
+  has no `initialize` handshake: each request carries its protocol version and
+  capabilities in `_meta`. `server/discover`, like `initialize`, opens no
+  connection to the app. In that mode `resources/list` and `prompts/list` carry
   `"ttlMs":0,"cacheScope":"private"`.
 
 ### For an app author adopting taria
 
-- **Set state with the new setters.** `selected(bool)`, `checked(..)`
-  (a `bool` or a `taria::Checked`), `expanded(bool)`, `disabled(bool)`,
-  `description(..)`, `range(now, min, max)`, `pos_in_set(u32)`,
-  `set_size(u32)`, `cell(row, column)` and `table_size(rows, columns)`, each
-  chainable beside `relayed`. `range` leaves a number that is not finite
-  unstated, so `f64::INFINITY` is an open bound, and a 0 position leaves the
-  field unset. The integration guide's new section "Say what state a node is
+- **Set state with the new setters.** `selected(bool)`, `checked(..)` (a `bool`
+  or a `taria::Checked`), `expanded(bool)`, `disabled(bool)`, `description(..)`,
+  `range(now, min, max)`, `value_now(f64)`, `pos_in_set(u32)`, `set_size(u32)`,
+  `cell(row, column)` and `table_size(rows, columns)`, each chainable beside
+  `relayed`. `range` leaves a number that is not finite unstated, so
+  `f64::INFINITY` is an open bound; `value_now` sets the value alone, for one
+  with no bounds, and a value that is not finite clears it. A 0 position leaves
+  the field unset. The integration guide's new section "Say what state a node is
   in" covers them.
 - **A disabled node is published with no actions.** The adapter strips them
   at publish, on both `publish` and `FrameRecorder`, and counts nothing:
@@ -143,7 +162,7 @@ texts do not move.
 - **A description is trimmed with the values.** When a snapshot runs over
   the line limit, the adapter cuts the longest values and descriptions
   first, then labels with them, and `SnapshotTooLarge::largest` can name a
-  description.
+  node because of its description.
 - **`stats()` gathers what the layer lost.** One call returns a `LayerStats`:
   the six counts, all zero on a disabled layer, and the two `last_*`
   details, `None` until a cut, to read once the terminal is restored, as
@@ -154,12 +173,13 @@ texts do not move.
 
 ### For a second implementer
 
-- **`docs/protocol.md` gains the typed state.** Section 6.1 lists the thirteen
+- **`docs/protocol.md` gains the typed state.** Section 6.1 lists the fourteen
   fields and the reading rule (absent and wrong-shaped both read as not
   stated; only `"disabled":true` is ever sent), new section 6.5 says what
   each means, the disabled rule and why there is no hidden field, section
-  16.8 says what an older peer does with them, and Appendix B item 12 lists
-  the contradictions nobody checks. Section 18's captures are taken again
+  16.3 counts the lenient read as a fourth degrade fallback, section 16.8
+  says what an older peer does with them, and Appendix B item 12 lists the
+  contradictions nobody checks. Section 18's captures are taken again
   from the 0.4.0 demo.
 - **`taria::Number` and `taria::Checked` are new.** `Number` is a finite-only
   `f64` with `Eq` and `Hash`, so `Node` and `Snapshot` keep `Eq`; it writes a
@@ -171,6 +191,8 @@ texts do not move.
 - **`Action::from_wire` is public, and `Action::wire_name` is new.** They map
   between an action and the name the wire spells it by, so a bridge written in
   Rust no longer keeps its own copy of the names.
+- **`TariaMcpServer` implements `Debug`**, which 0.3.3's did not: it prints
+  the tree format and the idle window the server was built with.
 
 ### The gates
 
@@ -181,8 +203,9 @@ texts do not move.
   and `selected` too.
 - New tests pin a node without state to its 0.3.3 bytes, read every state
   field in a wrong shape as not stated, strip a disabled node's actions and
-  refuse `act` on it, keep `NaN` and infinities out of the tree and the
-  dedupe, trim descriptions with the values, render every mark, and keep a
+  refuse `act` on it, keep `NaN` and infinities out of the tree and out of
+  the dedupe (the adapter's check that skips a tree equal to the last one it
+  published), trim descriptions with the values, render every mark, and keep a
   label spelling `*checked` from passing for one. The 0.3.3 demo tree still
   renders exactly as it did.
 - New `taria-mcp` tests drive a server built with `connected()` over MCP,

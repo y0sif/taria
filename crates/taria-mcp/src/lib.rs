@@ -24,8 +24,10 @@
 //! or dropped rather than guessing from whether the tree happened to change.
 //!
 //! The library is the server the binary runs: a [`TariaMcpServer`], set up
-//! with [`TariaMcpServer::builder`] and built by one of the builder's two
-//! finalizers, serves over any rmcp transport.
+//! with [`TariaMcpServer::builder`] and built by the builder's
+//! [`on_demand`](TariaMcpServerBuilder::on_demand) or
+//! [`connected`](TariaMcpServerBuilder::connected), serves over any rmcp
+//! transport.
 
 #![warn(missing_docs)]
 

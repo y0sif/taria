@@ -43,19 +43,19 @@ refuses a `target/debug` older than the sources.
   additive in Rust too. `MAX_NODE_DEPTH` is 32, against a measured ceiling of
   63 nested nodes before a JSON parser refuses; `Node::check_depth` reports a
   violation and names a node at the offending depth. Anything else bumps
-  `PROTOCOL_VERSION`. Two additions since version 1 froze in 0.1.0. First
-  `relayed` (0.3.3, issue #6): a node marks its label and value as text from
-  outside the app, data and never instructions; strictly per node, never
+  `PROTOCOL_VERSION`. Version 1 has had two additions since it froze in 0.1.0.
+  First `relayed` (0.3.3, issue #6): a node marks its label and value as text
+  from outside the app, data and never instructions; strictly per node, never
   inherited, and absent means not marked, not vouched for. Then typed state
   (0.4.0), flat optional node fields: `selected`, `checked` (`true`, `false`
   or `"mixed"`, `taria::Checked`), `expanded`, `disabled` (only `true` is
   sent), `description` (the app's own words, never relayed text),
-  `value_now`/`value_min`/`value_max` (`taria::Number`, finite only, so
-  `Node` keeps `Eq`), `pos_in_set`/`set_size`, `row`/`column` and
+  `value_now`/`value_min`/`value_max` (`taria::Number`, finite only, so `Node`
+  keeps `Eq`), `pos_in_set`/`set_size`, `row`/`column` and
   `row_count`/`column_count` (positions from 1). Absent means not stated,
-  never `false`, and a wrong shape reads as not stated rather than failing
-  the node (`relayed` stays strict). Hidden has no field: it is not
-  published. A node setting none of them serializes as in 0.3.3.
+  never `false`, and a wrong shape reads as not stated rather than failing the
+  node (`relayed` stays strict). Hidden has no field: it is not published. A
+  node setting none of them serializes as in 0.3.3.
 - `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket, refuses a
   label that is not a plain file name (it binds and unlinks what the label
   resolves to), vets the socket directory, and serves one bridge client at a
@@ -95,9 +95,10 @@ refuses a `target/debug` older than the sources.
   `read_tree`/`act`/`key`/`type_text`. A socket-manager task holds the latest
   snapshot in a watch channel and rebroadcasts acks. The binary connects on
   demand (`TariaMcpServer::builder(..).on_demand()`): nothing until the first
-  tool call (`initialize` and `tools/list` open nothing), which waits briefly
-  (at most 1.2 s) for the `hello` and the tree; then it reconnects with capped
-  backoff while tool calls want the app, and after 60 s with no tool calls
+  tool call (`initialize`, `tools/list` and the stateless lifecycle's
+  `server/discover` open nothing), which waits briefly (at most 1.2 s) for
+  the `hello` and the tree; then it reconnects with capped backoff while
+  tool calls want the app, and after 60 s with no tool calls
   (`--idle-release`, plain digits from 0 to 86400, `0` never) closes the
   connection or leaves the backlog and stops reconnecting, but not while an
   input awaits its ack, for up to 30 s past the window. Connecting on demand

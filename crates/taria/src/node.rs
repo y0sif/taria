@@ -355,10 +355,10 @@ pub struct Node {
     /// fails the line as a malformed `focused` does.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relayed: bool,
-    /// Whether this node is the selected one among its siblings: the row a
-    /// list's cursor sits on, the active tab, the chosen option. Selection,
-    /// not focus: a cursor sits on a row whether or not the list holds the
-    /// keyboard.
+    /// Whether this node is selected among its siblings: the row a list's
+    /// cursor sits on, the active tab, the chosen option, or each of the rows
+    /// picked in a list that allows more than one. Selection, not focus: a
+    /// cursor sits on a row whether or not the list holds the keyboard.
     ///
     /// This field and every one after it, up to `actions`, came in 0.4.0. Each
     /// is omitted when unset, absence means not stated, never `false`, and a
@@ -377,8 +377,9 @@ pub struct Node {
         skip_serializing_if = "Option::is_none"
     )]
     pub checked: Option<Checked>,
-    /// Whether an expandable node is expanded: `Some(false)` is collapsed,
-    /// and `None` says the node does not expand.
+    /// Whether an expandable node is expanded: `Some(false)` is collapsed.
+    /// `None` says nothing; an app that states expansion leaves it unset
+    /// only where a node cannot expand.
     #[serde(
         default,
         deserialize_with = "state::lenient_bool",
@@ -389,9 +390,10 @@ pub struct Node {
     /// app enables it. Only `Some(true)` is ever sent, and a parsed `false`
     /// reads as `None`.
     ///
-    /// The reference adapter strips every action from a disabled node when
-    /// it publishes, and the reference bridge refuses `act` on one. An empty
-    /// action list alone never means disabled.
+    /// It covers this node alone, as [`relayed`](Self::relayed) does:
+    /// children do not inherit it. The reference adapter strips every action
+    /// from a disabled node when it publishes, and the reference bridge
+    /// refuses `act` on one. An empty action list alone never means disabled.
     #[serde(
         default,
         deserialize_with = "state::lenient_disabled",
@@ -525,7 +527,7 @@ impl Node {
         self
     }
 
-    /// Set whether this node is the selected one among its siblings.
+    /// Set whether this node is selected among its siblings.
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = Some(selected);
         self
@@ -556,11 +558,20 @@ impl Node {
     }
 
     /// Set a numeric value and its bounds; one that is not finite, such as
-    /// an infinite bound, is left unstated.
+    /// an infinite bound, is left unstated. A value with no bounds is
+    /// [`value_now`](Self::value_now()).
     pub fn range(mut self, now: f64, min: f64, max: f64) -> Self {
         self.value_now = Number::new(now);
         self.value_min = Number::new(min);
         self.value_max = Number::new(max);
+        self
+    }
+
+    /// Set a numeric value alone, leaving the bounds as they are; one that
+    /// is not finite clears it. For a count or a reading with no range, where
+    /// [`range`](Self::range) would have to invent bounds.
+    pub fn value_now(mut self, now: f64) -> Self {
+        self.value_now = Number::new(now);
         self
     }
 
@@ -997,6 +1008,34 @@ mod tests {
             serde_json::to_string(&node).unwrap(),
             r#"{"id":"n","role":"progress_bar","focused":false,"value_min":0}"#
         );
+    }
+
+    /// `value_now` sets the value and nothing else: bounds already stated
+    /// stay, none are invented, and a value that is not finite clears the
+    /// one stated before it.
+    #[test]
+    fn value_now_sets_the_value_alone() {
+        let node = Node::new("n", Role::ProgressBar).value_now(42.5);
+        assert_eq!(node.value_now.map(Number::get), Some(42.5));
+        assert_eq!((node.value_min, node.value_max), (None, None));
+        assert_eq!(
+            serde_json::to_string(&node).unwrap(),
+            r#"{"id":"n","role":"progress_bar","focused":false,"value_now":42.5}"#
+        );
+
+        let node = Node::new("n", Role::ProgressBar)
+            .range(1.0, 0.0, 10.0)
+            .value_now(7.0);
+        assert_eq!(node.value_now.map(Number::get), Some(7.0));
+        assert_eq!(node.value_min.map(Number::get), Some(0.0));
+        assert_eq!(node.value_max.map(Number::get), Some(10.0));
+
+        for not_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let node = Node::new("n", Role::ProgressBar)
+                .value_now(3.0)
+                .value_now(not_finite);
+            assert_eq!(node.value_now, None, "{not_finite}");
+        }
     }
 
     /// The leniency the 0.4.0 fields get: a value of the wrong type or shape

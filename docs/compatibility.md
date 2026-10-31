@@ -38,14 +38,22 @@ The typed state, added in 0.4.0, is the same case again: `description`,
 6.5](protocol.md#65-typed-state)). With them a node's fields are, in the
 order the reference `Node` writes them: `id`, `role`, `label`, `value`,
 `description`, `focused`, `relayed`, the state from `selected` to
-`column_count`, `actions`, `children`. A taria-mcp older than 0.4.0 passes
-the state on in the JSON tree, and its outline shows it among the fields at
-the end of the line, `checked=false selected=true`, rather than as marks such
-as `*checked=false *selected`. It does not refuse `act` on a disabled node
+`column_count`, `actions`, `children`. A taria-mcp from 0.2.0 to 0.3.3
+passes the state on in the JSON tree, because it hands the agent the app's
+own line, and its outline (0.3.0 on) shows it among the fields at the end of
+the line, `checked=false selected=true`, rather than as marks such as
+`*checked=false *selected`. It does not refuse `act` on a disabled node
 itself, but the 0.4.0 adapter publishes a disabled node with no actions, so
-the older bridge refuses the act as unadvertised. An app built before 0.4.0
+the older bridge refuses the act as unadvertised. taria-mcp 0.1.0 hands the
+agent its own parse instead, so it drops the state. An app built before 0.4.0
 states nothing, which reads as not stated, never as `false`. A state field in
-a shape a 0.4.0 peer cannot read costs only that field, not the node.
+a shape a 0.4.0 peer cannot read costs only that field, not the node. Two
+things to know as a sender: a number outside the double range, such as
+`1e999`, is no wrong shape but fails the whole line in the reference reader,
+which reports "number out of range"; and an integer field written with a
+fraction or an exponent, `"row":3.0` or `"row":3e0`, reads as not stated,
+though its value is whole. Python's `json` writes a float as `3.0`, so
+convert with `int()` first.
 
 In Rust the same promise is `#[non_exhaustive]` on the twelve types a version-1
 addition can reach, from `Role`, `Action` and `Checked` to the two wire message
@@ -91,7 +99,7 @@ has a lint that catches it.
   longer line costs the app its bridge on every reconnect. The adapter trims
   at publish and tells the app (the stages are in architecture.md, Snapshot
   size): it drops any node that could never fit, shortens the longest values
-  and descriptions, then labels, marking each cut with `…`, and drops more nodes only when that
-  is not enough, keeping each node's first children with no gap apart from a
-  node that could never fit. Once nodes are dropped, the strings left are cut
-  only as far as the smaller tree needs.
+  and descriptions, then labels, marking each cut with `…`, and drops more
+  nodes only when that is not enough, keeping each node's first children with
+  no gap apart from a node that could never fit. Once nodes are dropped, the
+  strings left are cut only as far as the smaller tree needs.

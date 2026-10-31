@@ -294,8 +294,9 @@ impl TariaMcpServer {
     }
 }
 
-/// The settings a server was built with. The bridge and the tool router it
-/// holds have no `Debug` of their own, so they are left out.
+/// The settings a server was built with. The bridge handle it holds has no
+/// `Debug` of its own, and the tool router's would print every tool's
+/// description and input schema, so both are left out.
 impl std::fmt::Debug for TariaMcpServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TariaMcpServer")
@@ -4458,9 +4459,10 @@ mod tests {
                 .expect("a tokio test runs inside a runtime");
             assert_eq!(server.tools.tree_format, format);
             assert_eq!(server.tools.idle_release, Some(Duration::from_secs(5)));
-            // The whole answer to `initialize`, not just the instructions, so
-            // a handler method an rmcp macro adds to the tool layer and the
-            // wrapper does not pass through shows here.
+            // The whole answer to `initialize`, not just the instructions:
+            // this pins that the wrapper passes `get_info` through, server
+            // info and capabilities included, rather than building an answer
+            // of its own that could drift from the tool layer's.
             assert_eq!(server.get_info(), server.tools.get_info());
             for name in ["read_tree", "act", "key", "type_text"] {
                 let tool = server.get_tool(name);

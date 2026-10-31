@@ -348,8 +348,10 @@ Node::new("save", Role::Button)
     .description("Writes the open file to disk")
     .disabled(!app.dirty);
 
-// A gauge, and a table cell and its table, rows and columns from 1.
+// A gauge, a reading with no range, and a table cell and its table, rows
+// and columns from 1.
 Node::new("cpu", Role::ProgressBar).range(app.cpu, 0.0, 100.0);
+Node::new("temp", Role::Text).label("CPU temperature").value_now(app.celsius);
 Node::new(format!("r{row}c{col}"), Role::Cell).cell(row, col);
 Node::new("results", Role::Table).table_size(app.rows.len() as u32, 4);
 ```
@@ -381,11 +383,13 @@ What each one promises:
   and `column`. A 0 passed to `pos_in_set` or `cell` leaves that field
   unset, so a `row` node passes 0 for its column. Counts, `set_size`,
   `row_count` and `column_count`, may be 0.
-- **Numbers are finite.** `range(now, min, max)` leaves any argument that is
-  not finite unstated, so an open-ended bound is `f64::INFINITY`:
-  `.range(bytes, 0.0, f64::INFINITY)` states a value and a floor and no
-  ceiling. A `NaN` never reaches the wire, which could not spell it, and
-  never stops the adapter from noticing that a frame is unchanged.
+- **Numbers are finite.** `range(now, min, max)` leaves any argument that is not
+  finite unstated, so an open-ended bound is `f64::INFINITY`:
+  `.range(bytes, 0.0, f64::INFINITY)` states a value and a floor and no ceiling.
+  `value_now(now)` states the value alone, leaving the bounds as they are, and a
+  value that is not finite clears it. A `NaN` never reaches the wire, which
+  could not spell it, and never stops the adapter from noticing that a frame is
+  unchanged.
 
 **Hidden is not a field: do not publish it.** A collapsed branch's children,
 a closed panel, the rows scrolled out of view are simply left out of the
@@ -801,18 +805,18 @@ newline. Both peers enforce it.
 The adapter trims every snapshot to fit at publish, after the depth cut, and
 stops as soon as the tree fits. A node that could never fit goes first, with
 everything under it; its siblings are not dropped with it. Then the longest
-values and descriptions are cut to one shared length, then labels with them;
-a string of 256 bytes of JSON or less is never cut. A cut is marked with `…`: a `Role::Log` or
-`Role::Terminal` value keeps its end, because that is where those grow, and
-every other string keeps its start. When more nodes have to go, a list keeps
-its first rows with no gap, and the strings left are cut only as far as the
-smaller tree needs. Rows are chosen as if every string were at the floor, so a
-draft beside a list that had to lose rows ends up near the floor too; it stays
-whole only when the nodes that went were what ran over.
-Ids and custom action names are never touched, so an agent can still act on
-whatever it reads. The stages are in `architecture.md` (Snapshot size). The
-tree is trimmed rather than withheld for the reason it is cut for depth: a
-publish that does not happen leaves the agent on a stale tree.
+values and descriptions are cut to one shared length, then labels with them; a
+string of 256 bytes of JSON or less is never cut. A cut is marked with `…`: a
+`Role::Log` or `Role::Terminal` value keeps its end, because that is where those
+grow, and every other string keeps its start. When more nodes have to go, a list
+keeps its first rows with no gap, and the strings left are cut only as far as
+the smaller tree needs. Rows are chosen as if every string were at the floor, so
+a draft beside a list that had to lose rows ends up near the floor too; it stays
+whole only when the nodes that went were what ran over. Ids and custom action
+names are never touched, so an agent can still act on whatever it reads. The
+stages are in `architecture.md` (Snapshot size). The tree is trimmed rather than
+withheld for the reason it is cut for depth: a publish that does not happen
+leaves the agent on a stale tree.
 
 A frame identical to the one before it is skipped before the trim. A changed
 tree is compared again after it, so an edit past the cut of a trimmed value
@@ -903,8 +907,8 @@ pub fn apply_agent_input(app: &mut App, input: AgentInput) -> InputStatus {
 Neither the `..` nor the wildcard arm is boilerplate to skip, and they answer
 different additions. Twelve types in `taria` are `#[non_exhaustive]`:
 `AgentInput`, `Action`, `Role`, `Node`, `Checked`, `Snapshot`, `InputStatus`,
-the two wire message enums, `key::Key`, `key::Modifiers` and `key::KeyPress`. So are
-six struct-like variants inside them: `AppToBridge::Hello` and `Ack`,
+the two wire message enums, `key::Key`, `key::Modifiers` and `key::KeyPress`.
+So are six struct-like variants inside them: `AppToBridge::Hello` and `Ack`,
 `BridgeToApp::Input`, and `AgentInput`'s `Act`, `Key` and `Text`. The enums
 are where a new variant lands and the variants are where a new field lands,
 and both are things an adapter matches on. Without the attributes, one new

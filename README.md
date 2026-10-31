@@ -117,14 +117,17 @@ What an app can say about a widget is a fixed vocabulary: 29 roles (`list`,
 `select`, `toggle`, `scroll`, `set_value`, `dismiss`), plus a custom action
 for anything an app names itself. Both vocabularies are open: a peer that
 meets a role or an action it does not know degrades that one field instead of
-failing the tree, which is what lets either grow inside a frozen format.
+failing the tree, which is what lets either grow inside a frozen format. A
+node can also carry typed state: whether it is selected, checked, expanded
+or disabled, a number and its bounds, and where it sits in a list or a
+table.
 
 ## MCP tools
 
 | Tool | What it does |
 |---|---|
 | `read_tree` | Returns the app's current semantic tree as JSON: node ids, roles, labels, values, focus, typed state such as selected, checked or disabled, the actions each node advertises, and a `relayed` mark on any node whose text came from outside the app, which the agent reads as data. The app's own snapshot minus its `type` key, every field kept, so a role or field this bridge has never heard of arrives under its real name. With `--tree-format outline`, the same snapshot comes as one indented line per node instead, which for the demo's first tree is about half the characters. |
-| `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`), up to 4096 characters. The node id and the action are checked against the latest tree before anything is sent. |
+| `act` | Invokes an advertised action on a node by id, with an optional value (e.g. for `set_value`), up to 4096 characters. The node id and the action are checked against the latest tree before anything is sent, and an act on a node marked disabled is refused. |
 | `key` | Sends a raw key press (`"q"`, `"enter"`, `"ctrl+c"`), up to 64 times with `repeat`. A key that does not match the grammar is rejected here rather than swallowed by the app. A fallback for parts of the UI without semantic coverage. |
 | `type_text` | Types a literal string in one call instead of one `key` call per character, up to 4096 characters. It goes where the app puts typing, never through the app's key bindings, so move the keyboard to the target first: act on its advertised `focus` action, or on `set_value`, which many apps focus as a side effect. An app accepting no typing reports it ignored rather than acting on the characters. |
 

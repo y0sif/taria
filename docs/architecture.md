@@ -127,8 +127,8 @@ which reports the depth measured and names a node found at it; it enforces
 nothing, because what to do about a deep tree belongs to the adapter.
 
 The ratatui adapter cuts. Over the limit, every node at the limit publishes
-without its children, per branch, and the app is told through
-`stats().truncated_snapshots` and `last_truncation`. The count is of snapshots
+without its children, per branch, and the app is told through `stats()`'s
+`truncated_snapshots` and `last_truncation` fields. The count is of snapshots
 sent, not frames drawn, so a deep tree that sits still while the app redraws
 it sixty times a second counts once. Cutting, because the other two answers
 are the same failure: publishing the tree as built puts a line on the wire the
@@ -189,10 +189,11 @@ focused one. The line is sized for the largest possible `seq`, so the same
 tree is always cut the same way and dedup still works on it: an edit past the
 cut of a trimmed value produces the tree already sent, and nothing goes out.
 
-The app is told through `stats().oversized_snapshots` and `last_oversize`,
-whose `SnapshotTooLarge` carries the size the line would have had and the node
-holding the longest string, ids and custom action names included. Like
-`truncated_snapshots`, the count is of snapshots sent, not frames drawn.
+The app is told through `stats()`'s `oversized_snapshots` and
+`last_oversize` fields, the second a `SnapshotTooLarge` that carries the size
+the line would have had and the node holding the longest string, ids and
+custom action names included. Like `truncated_snapshots`, the count is of
+snapshots sent, not frames drawn.
 Trimming rather than withholding, for the reason the depth cut gives: a
 withheld tree leaves the agent on a stale one.
 
@@ -327,11 +328,11 @@ adapter dispatching `BridgeToApp`, a bridge dispatching `AppToBridge`. So every
 type a version-1 addition can reach is `#[non_exhaustive]`. Twelve of them:
 `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`, `Action`, `Role`,
 `Node`, `Checked`, `Snapshot`, `key::Key`, `key::Modifiers` and
-`key::KeyPress`. Marking a
-type is itself a breaking change, which is why it was done before the first
-release rather than at the first addition. Each costs an outside peer one
-wildcard arm, or one `..` in a pattern, and buys back that a new variant,
-field, role, action or key is a recompile rather than a repair. `Modifiers`
+`key::KeyPress`. Marking a type is itself a breaking change, which is why it
+was done before the first release rather than at the first addition. Each
+costs an outside peer one wildcard arm, or one `..` in a pattern, and buys
+back that a new variant, field, role, action or key is a recompile rather
+than a repair. `Modifiers`
 gains `NONE` and a const `new` in exchange for the struct literal it closes,
 and `KeyPress` already had the const `new` its own marking needs.
 
@@ -382,7 +383,7 @@ the last ack wins.
 |---|---|---|
 | `delivered` | The app's event loop dequeued the input. | The adapter, automatically, as it hands the input over. |
 | `dropped` | The input never reached the app: its queue was full. | The adapter's reader thread. |
-| `ignored` | The app looked at the input and deliberately did nothing. | The app, by returning it from the `layer.drain` handler, or with `layer.ack(id, InputStatus::Ignored)` and the id `try_recv` handed over. |
+| `ignored` | The app looked at the input and deliberately did nothing. | The app, by returning it from the `layer.drain` handler, or with `layer.ack(id, InputStatus::Ignored)` and the id `try_recv` or `recv_timeout` handed over. |
 
 `delivered` says only that the input was dequeued, before the app knows what
 it will do with it. An app that then does nothing (an act a modal dialog
@@ -708,7 +709,8 @@ a bridge and kill it.
 The binary now does two things:
 
 - **It connects on demand.** Starting it, and the MCP `initialize` and
-  `tools/list` that follow, open nothing. The first tool call opens the
+  `tools/list` that follow, or the `server/discover` of the stateless MCP
+  lifecycle, open nothing. The first tool call opens the
   connection and waits for the app's `hello` and its tree, so that call
   still answers with the live tree. The wait is normally milliseconds,
   because the adapter's listener thread writes the `hello` and the latest
@@ -851,8 +853,11 @@ benchmark's recorded runs read it where they always did.
 ## Mapping to AccessKit
 
 taria's vocabulary is close to AccessKit's on purpose, so an exporter from a
-taria tree to AccessKit 0.25, and through it to AT-SPI, UIA and NSAccessibility,
-is a table rather than a design. None ships yet. The fields map one to one:
+taria tree to AccessKit 0.25, and through it to AT-SPI, UIA and
+NSAccessibility, is mostly a table rather than a design. None ships yet. Most
+fields, actions and roles have a direct counterpart. A few have only a best
+fit, marked so below, a judgment rather than a certainty, and `select`,
+`dismiss` and `scroll` have no single counterpart at all:
 
 | taria | AccessKit 0.25 |
 | --- | --- |
@@ -869,12 +874,17 @@ is a table rather than a design. None ships yet. The fields map one to one:
 | `row_count`, `column_count` | `set_row_count`, `set_column_count` |
 | `relayed` | nothing: AccessKit has no mark for text from outside the app |
 | `activate`, `focus`, `set_value`, custom | `Action::Click`, `Action::Focus`, `Action::SetValue`, `set_custom_actions` |
-| roles | by name (`list_item` is `Role::ListItem`, `scrollbar` `Role::ScrollBar`), except `app` `Role::Application`, `tabs` `Role::TabList`, `select` `Role::ComboBox`, `option` `Role::ListBoxOption`, `text` `Role::Label`, `progress_bar` `Role::ProgressIndicator`, `chart` `Role::Figure`, `other` `Role::Unknown` |
+| `toggle` | `Action::Click`: AccessKit has no toggle action, and a checkbox toggles on a click |
+| `select` | none: AccessKit has no select action; `Action::Click` on the item is a best fit |
+| `dismiss` | none: AccessKit has no dismiss action |
+| `scroll` | none single: AccessKit's scrolling is directional (`ScrollUp`, `ScrollDown`, `ScrollLeft`, `ScrollRight`) or aimed (`ScrollIntoView`, `ScrollToPoint`, `SetScrollOffset`), while taria's `scroll` names neither |
+| roles | by name (`list_item` is `Role::ListItem`, `scrollbar` `Role::ScrollBar`), except `app` `Role::Application`, `tabs` `Role::TabList`, `select` `Role::ComboBox`, `option` `Role::ListBoxOption`, `progress_bar` `Role::ProgressIndicator`, `other` `Role::Unknown` |
+| `text`, `chart`, `list` (best fits) | `Role::Label`, `Role::Figure`, and `Role::List`, or `Role::ListBox` when its items can be selected |
 
 AccessKit counts positions, rows and columns from 0, and taria from 1, as a
 person counts rows and as ARIA's `aria-posinset` and `aria-rowindex` do, so
-the exporter subtracts one. A count (`set_size`, `row_count`, `column_count`) needs no
-shift.
+the exporter subtracts one. A count (`set_size`, `row_count`,
+`column_count`) needs no shift.
 
 ## Deferred
 

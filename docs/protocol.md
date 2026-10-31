@@ -469,8 +469,8 @@ A node with nothing set beyond its identity:
 | `relayed` | boolean | no | **omitted when `false`** | `false`: not marked |
 | `selected` | boolean | no | **omitted when unset**; `true` and `false` both sent | not stated |
 | `checked` | `true`, `false` or `"mixed"` | no | **omitted when unset**; all three sent | not stated |
-| `expanded` | boolean | no | **omitted when unset**; `true` and `false` both sent | not stated: the node does not expand |
-| `disabled` | boolean | no | **omitted unless `true`** | not stated: enabled |
+| `expanded` | boolean | no | **omitted when unset**; `true` and `false` both sent | not stated |
+| `disabled` | boolean | no | **omitted unless `true`** | not stated |
 | `value_now` | number | no | **omitted when unset** | not stated |
 | `value_min` | number | no | **omitted when unset** | not stated |
 | `value_max` | number | no | **omitted when unset** | not stated |
@@ -483,9 +483,9 @@ A node with nothing set beyond its identity:
 | `actions` | array | no | **omitted when empty** | no actions advertised |
 | `children` | array | no | **omitted when empty** | a leaf |
 
-`description` and the twelve fields from `selected` to `column_count` are the
-typed state, added in 0.4.0 (section 16.8). Section 6.5 says what each
-means.
+`description` and the thirteen fields from `selected` to `column_count`,
+fourteen in all, are the typed state, added in 0.4.0 (section 16.8). Section
+6.5 says what each means.
 
 Rules a reader has to implement:
 
@@ -529,6 +529,15 @@ Rules a reader has to implement:
   `NaN` or an infinity. A sender **MUST** leave a field unset rather than
   invent one. The reference `taria::Number` cannot hold either, and writes a
   whole number within 2^53 without a fraction (`42`, not `42.0`).
+- A sender **MUST NOT** write a number outside the double range, such as
+  `1e999`. The lenient read above does not cover it: the reference reader
+  fails the whole line over one anywhere in it, in a typed state field or
+  one it does not know, with "number out of range" from `serde_json`, before
+  any field's own rule runs.
+- An integer field (`pos_in_set`, `set_size`, `row`, `column`, `row_count`,
+  `column_count`) written with a fraction or an exponent, `3.0` or `3e0`,
+  reads as not stated, though the value is whole. Python's `json` writes a
+  float as `3.0`, so a Python sender converts with `int()` first.
 
 ### 6.2 Node ids
 
@@ -551,9 +560,9 @@ authors, not a wire rule. See section 18.3.
 
 `children` carries the node's children in order. Depth is bounded
 (section 13.1). No bound is specified on the number of children, on the number
-of nodes in a tree, or on the length of a `label` or a `value`; the 1 MiB line
-cap (section 2.5) bounds all of them together, and crossing it costs the
-connection rather than the tree (section 13.2).
+of nodes in a tree, or on the length of a `label`, a `value` or a
+`description`; the 1 MiB line cap (section 2.5) bounds all of them together,
+and crossing it costs the connection rather than the tree (section 13.2).
 
 ### 6.4 Relayed text
 
@@ -604,25 +613,30 @@ Every field is optional and is a statement only when present: absent means
 the app said nothing, never `false`. An app built before 0.4.0 states
 nothing.
 
-- **`selected`**: whether the node is the selected one among its siblings:
-  the row a list's cursor sits on, the active tab, the chosen option.
-  Selection is not focus (section 15): a cursor sits on a row whether or not
-  the list holds the keyboard. `false` is a statement too, so a list whose
-  rows all say `false` has no selection, while a row without the field says
-  nothing either way.
+- **`selected`**: whether the node is selected among its siblings: the row a
+  list's cursor sits on, the active tab, the chosen option, or each of the rows
+  picked in a list that allows more than one. Selection is not focus (section
+  15): a cursor sits on a row whether or not the list holds the keyboard.
+  `false` is a statement too, so a list whose rows all say `false` has no
+  selection, while a row without the field says nothing either way.
 - **`checked`**: whether a checkable node is checked: `true`, `false`, or
   `"mixed"` for a parent whose children disagree.
-- **`expanded`**: `true` is expanded, `false` collapsed, and absent says the
-  node does not expand at all.
+- **`expanded`**: `true` is expanded and `false` collapsed. Absent says
+  nothing; an app that states expansion omits it only where a node cannot
+  expand.
 - **`disabled`**: the node is shown but takes no action until the app enables
   it. Only `true` is sent. A sender **SHOULD** advertise no actions on a
-  disabled node, and the reference adapter strips every action from one when
-  it publishes. A bridge **SHOULD** refuse an `act` naming a disabled node,
-  and the reference bridge does, before it looks at the action, with an
-  answer that says the node is disabled. A reader **MUST NOT** infer
-  `disabled` from an empty action list: a node advertises nothing for other
-  reasons, such as a modal dialog in front of it, and is not disabled then.
-  Neither `key` nor `text` is affected: they go where the app sends them.
+  disabled node, and the reference adapter strips every action from one when it
+  publishes. A bridge **SHOULD** refuse an `act` naming a disabled node, and the
+  reference bridge does, before it looks at the action, with an answer that says
+  the node is disabled. A reader **MUST NOT** infer `disabled` from an empty
+  action list: a node advertises nothing for other reasons, such as a modal
+  dialog in front of it, and is not disabled then. Neither `key` nor `text` is
+  affected: they go where the app sends them. Like `relayed` (section 6.4), it
+  covers that node alone: a reader **MUST NOT** read a child of a disabled node
+  as disabled, and a sender marks each node it disables. The reference adapter's
+  strip and the reference bridge's refusal both look at the node itself and
+  nothing above it.
 - **`description`**: longer text than the label, in the app's own words: a
   hint, what a setting does, why a button is disabled. `relayed` covers the
   label and the value only, so a sender **MUST NOT** put relayed text in a
@@ -648,9 +662,9 @@ subtracts one (`docs/architecture.md` has the mapping).
 **Hidden** has no field. A node an app hides, a collapsed branch, a
 scrolled-away row, a closed panel, is simply not published. So a node with
 `"expanded":true` and fewer children than its `set_size` has children that
-were not published, cut to fit the line (section 13.2) or off screen, not a
-set that is empty, and a reader **MUST NOT** read the published children as
-all of them.
+were not published: off screen, cut at the depth limit (section 13.1), which
+drops every child of a node at the limit, or cut to fit the line (section
+13.2). A reader **MUST NOT** read the published children as all of them.
 
 ## 7. Role vocabulary
 
@@ -1027,9 +1041,10 @@ snapshot post-dates the input.
 
 `status` has **no** unknown-value fallback, unlike `role` and `action`. A
 status name a reader does not know fails its whole ack line, id included, and
-the reader skips that line. Verified: `{"type":"ack","id":7,"status":"coalesced"}`
-is a parse error, and `"Delivered"` is too, because the names are exactly the
-three lowercase spellings.
+the reader skips that line. Verified:
+`{"type":"ack","id":7,"status":"coalesced"}` is a parse error, and
+`"Delivered"` is too, because the names are exactly the three lowercase
+spellings.
 
 This is deliberate and an implementer needs to understand the consequence. A
 status sits at the top of a message rather than nested inside one, so losing
@@ -1083,8 +1098,8 @@ the ack exists to remove.
 generation, stamps every queued input with the generation it arrived on, and
 retires that generation as the reader thread exits, before the disconnect is
 observable anywhere. An input from a retired generation is discarded at
-dequeue and counted in `stats().stale_inputs`. Input a waiting client wrote before
-the `hello` is counted there too, though it never reaches the queue
+dequeue and counted in `stats().stale_inputs`. Input a waiting client wrote
+before the `hello` is counted there too, though it never reaches the queue
 (section 14.5). The same bookkeeping decides who may still be answered: `ack`
 refuses an id whose connection has ended, and an id also stops being
 answerable once its own connection has delivered a queue's worth (256) of
@@ -1204,13 +1219,13 @@ marking it stale. This is why the obligation sits on the sender.
 **What to do about a tree that is too deep is the sender's choice**, not a
 protocol rule. The reference adapter **cuts**: every node at the limit
 publishes without its children, per branch, and the app is told through
-`stats().truncated_snapshots` and `last_truncation`. Cutting, because the other
-two answers are the same failure: publishing the tree as built puts a line on
-the wire the bridge cannot parse, and skipping the publish is that same stale
-tree chosen deliberately. Only the cut still delivers the part of the tree
-that is fine. The fix is nearly always to publish what the widget draws rather
-than the data behind it: for a deep tree view, the expanded path and the rows
-on screen.
+`stats()`'s `truncated_snapshots` and `last_truncation` fields. Cutting,
+because the other two answers are the same failure: publishing the tree as
+built puts a line on the wire the bridge cannot parse, and skipping the
+publish is that same stale tree chosen deliberately. Only the cut still
+delivers the part of the tree that is fine. The fix is nearly always to
+publish what the widget draws rather than the data behind it: for a deep tree
+view, the expanded path and the rows on screen.
 
 ### 13.2 Line length
 
@@ -1382,8 +1397,8 @@ it would be answered in has not begun. A bridge that writes nothing before the
 already waiting in the backlog when the previous session ended. Just before
 writing that client's `hello`, it reads off whatever is already waiting and
 discards it, counting each complete `input` line, of any kind, in
-`stats().stale_inputs`. If what it read stops partway through a line, the rest of
-that line is skipped when it arrives. More than 1 MiB waiting is treated like
+`stats().stale_inputs`. If what it read stops partway through a line, the rest
+of that line is skipped when it arrives. More than 1 MiB waiting is treated like
 a line over the cap and closes the connection. The first connection of a
 process, and a client that connects to an idle app, waited behind nobody and
 keep what they wrote. The adapter tells the two apart by whether an accept
@@ -1533,17 +1548,18 @@ something it quietly ignores.
 - A new ack **`status`** value.
 - A new **key name** in the grammar (section 12.3).
 
-### 16.3 The three degrade fallbacks
+### 16.3 The four degrade fallbacks
 
 Neither property in 16.1 covers a value nested inside a message the peer does
-want, so the open vocabularies carry their own fallbacks. A reader **MUST**
-implement all three:
+want, so the open vocabularies and the typed state carry their own
+fallbacks. A reader **MUST** implement all four:
 
 | Value | Unknown reads as | Section |
 |---|---|---|
 | `role` | `other` | 7.2 |
 | `action` | a custom action **keeping the name** | 8.4 |
 | `input` `kind` | an unreadable input **keeping the message's id** | 9.5 |
+| a typed state field, such as a `checked` of `"partial"` | not stated, **keeping the node** | 6.1 |
 
 An ack's `status` deliberately has **no** fallback (section 10.5), because it
 sits at the top of a message rather than nested inside one, so losing it loses
@@ -1612,16 +1628,17 @@ a malformed one is still skipped.
 
 The one thing a bridge **SHOULD** remove from the line it passes on is the
 `"type":"snapshot"` framing key, which belongs to the transport rather than to
-the tree. The reference bridge removes it by parsing the line into a JSON
-value and writing that out again, which keeps every other key but not the
-app's spelling of the line: keys come out sorted and whitespace gone, string
-escapes are rewritten (`"\u00e9"` becomes `"é"`), numbers are rewritten
-(`1e3` becomes `1000.0`, `-0` becomes `-0.0`, and an integer outside the
-64-bit range becomes a float, keeping about 17 significant digits), and of a
-key repeated in one object only the last value is kept, though a repeated
-field the bridge knows never gets that far, because it fails the parse
-(section 2.2). A sender **MUST NOT** rely on any of these spellings reaching
-the agent.
+the tree. The reference bridge removes it by parsing the line into a JSON value
+and writing that out again, which keeps every other key but not the app's
+spelling of the line: keys come out sorted and whitespace gone, string escapes
+are rewritten (`"\u00e9"` becomes `"é"`), numbers are rewritten (`1e3` becomes
+`1000.0`, `-0` becomes `-0.0`, and an integer outside the 64-bit range becomes a
+float, keeping about 17 significant digits, while a double in its shortest
+round-trip form, such as `1.4000000000000001`, comes through digit for digit,
+which before 0.4.0 it did not: that one read `1.4`), and of a key repeated in
+one object only the last value is kept, though a repeated field the bridge knows
+never gets that far, because it fails the parse (section 2.2). A sender
+**MUST NOT** rely on any of these spellings reaching the agent.
 
 ### 16.7 What forces a version bump
 
@@ -1637,8 +1654,8 @@ successfully and acts on the old meaning.
 
 ### 16.8 Typed state (0.4.0)
 
-The second addition since version 1 froze, after `relayed` in 0.3.3: thirteen
-optional node fields, `description` and the twelve from `selected` to
+The second addition since version 1 froze, after `relayed` in 0.3.3: fourteen
+optional node fields, `description` and the thirteen from `selected` to
 `column_count` (sections 6.1 and 6.5). Each is a new optional field, omitted
 when unset, so the addition is additive under section 16.2 and
 `PROTOCOL_VERSION` stays 1.
@@ -1646,14 +1663,15 @@ when unset, so the addition is additive under section 16.2 and
 - **An older reader** ignores the fields as unknown (section 2.7) and parses
   every node as before. It reads no state, so to it a node is exactly what a
   0.3.3 app would have sent, `value` and all.
-- **An older reference bridge** (taria-mcp 0.3.x) passes the fields on in the
-  JSON tree with the rest of the app's line (section 16.6). Its outline, in
-  0.3.0 to 0.3.3, shows them among the fields at the end of the line,
-  `checked=false selected=true`, rather than as marks, and its `read_tree`
-  description says nothing about them. It does not refuse `act` on a
-  disabled node, but against the reference adapter there is nothing to send:
-  the node advertises no actions, so its own validation refuses the act as
-  unadvertised.
+- **An older reference bridge** from 0.2.0 to 0.3.3, which hands the agent the
+  app's own line (section 16.6), passes the fields on in the JSON tree with the
+  rest of it. Its outline, in 0.3.0 to 0.3.3, shows them among the fields at the
+  end of the line, `checked=false selected=true`, rather than as marks, and its
+  `read_tree` description says nothing about them. It does not refuse `act` on a
+  disabled node, but against the reference adapter there is nothing to send: the
+  node advertises no actions, so its own validation refuses the act as
+  unadvertised. The 0.1.0 bridge handed the agent its own parse written out
+  again, not the app's line, so it drops every one of the fields.
 - **An older app** sends none of them, so every node reads as stating
   nothing, which is what absent means.
 - **Leniently read.** A field added later fails the node when it is read
@@ -1663,6 +1681,11 @@ when unset, so the addition is additive under section 16.2 and
   clearer about who wrote the text; state is not like that, so every field
   added in 0.4.0 reads a wrong shape as not stated (section 6.1), and
   `relayed` keeps its 0.3.3 rule.
+- **A repeated key now fails the line.** A 0.4.0 reader fails a line whose
+  node repeats one of the new keys, `"checked"` twice, with "duplicate
+  field", where a 0.3.3 reader skipped both copies as unknown. Section 2.2
+  already forbids a sender to repeat a key, so no conforming line changes
+  meaning; only a reader's tolerance of that mistake is gone.
 - **What changed for the demo.** The reference demo now states a task's done
   state as `checked` instead of the value `"todo"` or `"done"`, and the
   active tab and the cursor row as `selected` instead of a tab's value
@@ -1684,9 +1707,9 @@ types.
 So every type a version-1 addition can reach is `#[non_exhaustive]`. There are
 **twelve**: `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`,
 `Action`, `Role`, `Node`, `Checked`, `Snapshot`, `key::Key`, `key::Modifiers`
-and `key::KeyPress`. The key types are on the list even though a key travels as a
-string, because the string is parsed into them and an adapter takes the result
-by value.
+and `key::KeyPress`. The key types are on the list even though a key travels
+as a string, because the string is parsed into them and an adapter takes the
+result by value.
 
 The same reasoning reaches one level in, to the variants. A new optional field
 on an existing message is the format's cheapest additive change and also the
@@ -1757,9 +1780,10 @@ What to read out of it:
   `"selected":true` and every other row `"selected":false` (section 6.5), and
   the list names the row in its own `value` (`task-1`, then `task-2`). That
   is the focus-is-not-selection rule (section 15) in practice.
-- The typed state sits between `focused` and `actions` in the app's line, and
-  every field is omitted where the app states nothing: no node here says
-  `expanded` or `disabled`.
+- `selected`, `checked` and the rest of the typed state sit between
+  `focused` and `actions` in the app's line, while `description` comes before
+  `focused`. Every field is omitted where the app states nothing: no node
+  here says `expanded` or `disabled`.
 
 ### 18.2 The four ack shapes
 

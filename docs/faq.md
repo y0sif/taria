@@ -5,13 +5,13 @@ with.
 
 **Is taria "ARIA for terminals"?**
 
-That is the analogy it is built on. A web page exposes an accessibility tree
-so a screen reader does not have to guess at the pixels, and taria does the
-same thing for a TUI: roles, labels, values, focus, and the actions available
-right now. The similarity is the shape of the idea rather than the standard,
-and taria is not affiliated with the W3C or with ARIA. The vocabulary is
-taria's own: 29 roles and 7 actions, shaped by a census of 15 real ratatui
-apps rather than ported from the ARIA role list.
+That is the analogy it is built on. A web page exposes an accessibility tree so
+a screen reader does not have to guess at the pixels, and taria does the same
+thing for a TUI: roles, labels, values, focus, typed state such as selected,
+checked or disabled, and the actions available right now. The similarity is the
+shape of the idea rather than the standard, and taria is not affiliated with the
+W3C or with ARIA. The vocabulary is taria's own: 29 roles and 7 actions, shaped
+by a census of 15 real ratatui apps rather than ported from the ARIA role list.
 
 **How is taria different from ht or tmux `send-keys`?**
 
