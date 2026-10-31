@@ -31,11 +31,12 @@ caller that has just built and still refuses a `target/debug` older than the
 sources.
 
 CI also runs the tests and both scripts on macOS, and clippy, the tests and
-the build on Windows. The Linux job cross-checks clippy for the Windows target
-and builds the docs with warnings denied, and the MSRV job checks the Windows
-target too, so `cfg(windows)` code is compiled on every push. The scripts
-cannot run on Windows: they drive the demo through a pseudo-terminal, read
-`/proc`, and talk to the app over `AF_UNIX`, none of which Windows has. There,
+the build on Windows, all three with `--locked`. The Linux job cross-checks
+clippy for the Windows target and builds the docs with warnings denied, and
+the MSRV job checks the Windows target too, so `cfg(windows)` code is
+compiled on every push. The scripts cannot run on Windows: they drive the
+demo through a pseudo-terminal, read `/proc`, and talk to the app over
+`AF_UNIX`, none of which Windows has. There,
 `crates/taria-mcp/tests/adapter_e2e.rs` is the end-to-end gate: a real
 `TariaLayer` in a child process, driven by the real `taria-mcp` binary over
 stdio, on every platform.
@@ -63,7 +64,9 @@ scripts/wine-test.sh -p taria-mcp --test adapter_e2e
 Wine is a stand-in, not Windows: its named pipes, process ids and timing are
 its own, so a pass there is a strong hint and the Windows CI job is the final
 word. A test that needs something Wine allows and Windows may not, such as a
-pipe owned by another account, says in its output when it fell back.
+pipe owned by another account, or something Windows enforces and Wine may
+not, such as a DACL that shuts out the pipe's own user, says in its output
+when it fell back.
 
 ## Ground rules
 

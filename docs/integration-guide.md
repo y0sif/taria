@@ -1304,8 +1304,8 @@ identifier (`S-1-5-21-...`, read from the process token), so two users' apps
 with the same label never share a name. `socket_path()` is that pipe name,
 which is what to print. The pipe is owned by you and open to nobody else, it
 refuses clients on other machines, and the bridge checks its owner before it
-reads or writes anything, so none of the directory rules above has anything
-to vet.
+writes anything to it or parses anything it sent, so none of the directory
+rules above has anything to vet.
 
 The label is held to the same rule, and may not contain `\` either.
 `$TARIA_SOCK`, and a name passed to `bind_at` or `bind_or_disabled_at`, must
@@ -1321,9 +1321,12 @@ The failures come back from `bind_error()` in words of their own:
   serving the taria pipe`, names the pipe, and ends with the way out for a
   second copy, a `TARIA_SOCK` of the form `\\.\pipe\<name>`. A pipe lives
   while any handle to it is open, the bridge's end included, so an app
-  restarted while a bridge still holds its old end can see this for a moment,
-  which the message says; taria-mcp lets go as soon as it reads the end of
-  the stream.
+  restarted while a bridge still holds its old end finds the name taken for
+  a moment. The bind waits that out: it retries for 500 ms before it reports
+  `AddrInUse`, and taria-mcp lets go as soon as it reads the end of the
+  stream. A bridge that holds the old end longer than that leaves the error
+  standing, and the message names that case too. So a second copy is
+  refused half a second after it starts, not at once.
 - A name that is not a local pipe, or a label that cannot end one:
   `InvalidInput`, naming the value and what a pipe name may be. For a label
   `a/b`: ``app label "a/b" cannot end a pipe name; it must be a single name,

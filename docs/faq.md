@@ -73,8 +73,9 @@ for byte. The adapter creates `\\.\pipe\taria-<your SID>-<label>`, where the
 SID is the string Windows names your account by, and makes it yours alone:
 owned by you, open to nobody else, refusing clients on other machines.
 `taria-mcp --app <label>` derives the same name, and checks that the pipe is
-owned by you before it reads or writes anything. Install the bridge with
-`cargo install taria-mcp`, or take the Windows `.zip` from the releases page.
+owned by you before it writes anything to it or parses anything it sent.
+Install the bridge with `cargo install taria-mcp`, or take the Windows `.zip`
+from the releases page.
 
 CI runs the Rust suites on Linux, macOS and Windows, including a test that
 drives a real adapter from the real `taria-mcp` binary on each. The two

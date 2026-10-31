@@ -99,15 +99,17 @@ contain `\` either. Windows trims trailing dots and spaces from a name, so
 `taria.` and `taria` are the same pipe on both sides.
 
 The bridge checks that the pipe it opened is owned by your own account before
-it reads or writes anything, and a pipe has no listen backlog, so three
-answers exist only on Windows. Each is quoted as `read_tree` gives it before
-any tree has arrived, and every tool that needs a tree gives the same. After
-a disconnect each keeps the opening callers match on,
+it writes anything to it or parses anything it sent, and a pipe has no listen
+backlog, so three answers exist only on Windows. Each is quoted as `read_tree`
+gives it before any tree has arrived, and every tool that needs a tree gives
+the same. After a disconnect each keeps the opening callers match on,
 `app '<label>' disconnected (last snapshot seq N)`, as noted under it.
 
 - **The app is held by another bridge.** The pipe has one instance and
-  another bridge has it, so the open was refused as busy. With the default
-  `--idle-release`:
+  another bridge has it, so the open was refused as busy. The instance is
+  also busy for a moment between two sessions, while the app retires the
+  last one and listens again, so the bridge retries a busy open for 250 ms
+  before it gives this answer. With the default `--idle-release`:
 
   ```text
   no snapshot from the app yet: the app is held by another bridge. The pipe name is right: the app's pipe refused this bridge as busy, which is what a second bridge gets, because a taria adapter serves one bridge at a time. A taria-mcp lets go of the app after 60 s with no tool calls (its default), and this bridge takes over as soon as it does, with no restart; retry in a minute. If the app stays held, another session is using it, or the holder is a taria-mcp older than 0.3.2, which holds the app until its session ends. Failing that, something other than a taria bridge holds the pipe.
@@ -129,17 +131,32 @@ a disconnect each keeps the opening callers match on,
   After a disconnect the text from `the app accepted` on follows
   `app '<label>' disconnected (last snapshot seq N), and this bridge has
   reconnected: `.
-- **The pipe belongs to another account.** Pipe names are machine-wide, so
-  anything can create one under the app's name. The bridge closes it unread
-  and unwritten and logs the owner's SID:
+- **The pipe is not the app's.** Pipe names are machine-wide, so anything
+  can create one under the app's name. A pipe another account owns is not
+  the app's, and neither is one that refuses your account access when the
+  bridge opens it, which the app's own pipe never does. The bridge parses
+  nothing such a pipe sent and writes nothing to it, and logs the owner's SID
+  when it could read one:
 
   ```text
-  no snapshot from the app yet: the pipe at this name is owned by another account than this bridge's user, so it is not the app's, and this bridge closed it without reading or writing anything. Pipe names are shared by every user on the machine, so something else created this one, before the app or after it exited, perhaps to pose as it. Ask the user to find what serves it (this bridge's log names the owner) and to restart the app once it is gone; this bridge keeps trying and connects to the app's own pipe with no restart.
+  no snapshot from the app yet: the pipe at this name is owned by another account than this bridge's user, or refused this user access, which the app's own pipe never does, so it is not the app's; this bridge parsed nothing it sent and wrote nothing to it. Pipe names are shared by every user on the machine, so something else created this one, before the app or after it exited, perhaps to pose as it. Ask the user to find what serves it (this bridge's log names the owner, where it could read one) and to restart the app once it is gone; this bridge keeps trying and connects to the app's own pipe with no restart.
   ```
 
   After a disconnect the text from `the pipe at this name` on follows
   `app '<label>' disconnected (last snapshot seq N), and `. It outranks every
   other answer.
+
+The answers Windows shares with Linux and macOS keep their texts, except
+that each one naming the app's endpoint says "pipe" where those say
+"socket", and "pipe name" where they say "socket path". Those are the
+answers to nothing connected, a line over 1 MiB, a line the bridge could not
+read, an app that greeted the bridge and has not published, a connection
+younger than the 500 ms grace, and an input the bridge's queue to the app
+could not take. With nothing connected:
+
+```text
+no snapshot from the app yet, and this bridge holds no connection to the pipe: is the taria-enabled app running, and is the pipe name correct? The bridge reconnects automatically; retry once the app is up.
+```
 
 Stopped-app detection reads `/proc` and is Linux only, so on Windows a
 suspended app gets the second answer, without a pid, and the answer to an

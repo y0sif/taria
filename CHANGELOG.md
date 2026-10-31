@@ -86,9 +86,9 @@ for byte, so this is a transport for a platform version 1 did not reach, not
 a change to version 1: `PROTOCOL_VERSION` stays 1. The pipe is created as the
 first and only instance of its name, refuses clients on other machines, and
 is owned by the user with a DACL (the list of who may open it) that lets
-only that user in; the bridge checks the owner before it reads or writes
-anything. On Linux and macOS nothing moves: the command line, every text and
-every behaviour are as they were.
+only that user in; the bridge checks the owner before it writes anything to
+the pipe or parses anything it sent. On Linux and macOS nothing moves: the
+command line, every text and every behaviour are as they were.
 
 ### Upgrading
 
@@ -258,8 +258,10 @@ be answered well by a 0.4.0 `taria-mcp`:
   (`no snapshot from the app yet: `, or after a disconnect
   `app '<label>' disconnected (last snapshot seq N)`):
   - A pipe has no listen backlog, so a held app refuses a second bridge as
-    busy, and that bridge gets the held answer with the pipe's refusal as
-    its evidence: `the app is held by another bridge. The pipe name is
+    busy. The one instance is also busy for a moment between two sessions,
+    so the bridge retries a busy open for 250 ms first, and a bridge it
+    still refuses gets the held answer with the pipe's refusal as its
+    evidence: `the app is held by another bridge. The pipe name is
     right: the app's pipe refused this bridge as busy, which is what a
     second bridge gets, because a taria adapter serves one bridge at a
     time.`, then the same retry advice as on Unix.
@@ -268,12 +270,25 @@ be answered well by a 0.4.0 `taria-mcp`:
     bridge's connection N.Ns ago but has sent nothing, not even the taria
     handshake; it may be suspended or stuck.`, then that this is not another
     bridge holding the app and to check that the app is responsive.
-  - A pipe at the app's name that another account owns is refused unread
-    and unwritten, ahead of every other answer: `the pipe at this name is
-    owned by another account than this bridge's user, so it is not the
-    app's, and this bridge closed it without reading or writing anything.`,
+  - A pipe at the app's name that another account owns, or that refuses
+    this user access at the open, is refused ahead of every other answer,
+    with nothing it sent parsed and nothing written to it: `the pipe at this
+    name is owned by another account than this bridge's user, or refused
+    this user access, which the app's own pipe never does, so it is not the
+    app's; this bridge parsed nothing it sent and wrote nothing to it.`,
     then why that can happen and what the user should do. The log names the
-    owner. `docs/cli.md` quotes all three whole.
+    owner, when the pipe let the bridge read one. `docs/cli.md` quotes all
+    three whole.
+- **On Windows the other answers name the pipe.** Each answer shared with
+  Linux and macOS that names the app's endpoint says "pipe" where they say
+  "socket", and "pipe name" where they say "socket path": nothing connected,
+  a line over 1 MiB, a line the bridge could not read, an app that greeted
+  and has not published, a connection younger than the 500 ms grace, and a
+  full input queue. With nothing connected: `no snapshot from the app yet,
+  and this bridge holds no connection to the pipe: is the taria-enabled app
+  running, and is the pipe name correct? The bridge reconnects
+  automatically; retry once the app is up.` The Linux and macOS texts are
+  unchanged, byte for byte.
 - **Stopped-app detection stays Linux only.** It reads `/proc`. On Windows a
   suspended app gets the silent-pipe answer above, with no pid, and on macOS
   a stopped app still reads as held.
@@ -322,8 +337,11 @@ be answered well by a 0.4.0 `taria-mcp`:
   kept taria behind `#[cfg(unix)]` and `[target.'cfg(unix)'.dependencies]`
   can drop both. On Windows it pulls in `windows-sys` (raw Win32 bindings)
   and nothing else. `socket_path()` is the pipe name there. A second app on
-  a live name is refused with `AddrInUse`, as on Unix, and `bind_error()`
-  says why in words of its own: the name in use, a `$TARIA_SOCK` or a
+  a live name is refused with `AddrInUse`, as on Unix, after the bind has
+  retried for 500 ms: a pipe's name stays taken until the bridge connected
+  to an app that exited closes its end, so an app restarted at once waits
+  that moment out instead of running with taria off. `bind_error()` says why
+  in words of its own: the name in use, a `$TARIA_SOCK` or a
   `bind_at` name that is not a local pipe, a label holding `\`, a SID the
   token would not give, or the system refusing the pipe. The integration
   guide's "Socket paths" section gains "On Windows" with each of them.
@@ -384,12 +402,18 @@ be answered well by a 0.4.0 `taria-mcp`:
   silent connection mean with no backlog, and new section 14.8 the rules:
   the name and the SID in it, `$TARIA_SOCK` honoured only for a local
   `\\.\pipe\` name in any case, the first-instance and reject-remote flags,
-  a DACL that grants only the user, the bridge's owner check before any read
-  or write, one instance reused across sessions, and a pipe that lives while
-  any handle to it is open. The conformance lists in sections 1.3 and 1.4
-  name the pipe and the owner check. `docs/architecture.md` gains
-  Transports: the seam, the overlapped I/O design and its invariants, and
-  why the pipe is written on `windows-sys` rather than `interprocess`.
+  a DACL that grants only the user, the bridge's owner check before it
+  writes or parses anything, an open refused as access denied read as a
+  pipe that is not the app's, one instance reused across sessions, and a
+  pipe that lives while any handle to it is open. Two retries are SHOULDs:
+  the bridge retries a busy open for a moment (the reference bridge for
+  250 ms) before it reads the app as held, and the app retries a create
+  that finds its name in use (the reference adapter for 500 ms) before it
+  reports `AddrInUse`.
+  The conformance lists in sections 1.3 and 1.4 name the pipe and the owner
+  check. `docs/architecture.md` gains Transports: the seam, the overlapped
+  I/O design and its invariants, the two retries, and why the pipe is
+  written on `windows-sys` rather than `interprocess`.
 - **`taria::socket` gains the pipe naming, pure and on every platform:**
   `pipe_name(label, sid)`, `check_pipe_name(name)`,
   `resolve_pipe_name(taria_sock, sid, label)`, `LOCAL_PIPE_PREFIX`
@@ -398,9 +422,6 @@ be answered well by a 0.4.0 `taria-mcp`:
   each carry the value refused. On Windows `MAX_SOCKET_PATH_BYTES` is the
   pipe-name limit, 256 UTF-16 code units rather than bytes, and
   `check_path_len` and `SocketPathTooLong::path_len` count in those units.
-- **`taria_mcp::current_user_sid()` is public on Windows**: the user's SID
-  string from the process token, which is what names the pipe `--app`
-  finds.
 
 ### The gates
 
@@ -455,8 +476,11 @@ be answered well by a 0.4.0 `taria-mcp`:
   owner and DACL read back, a busy second client, the write deadline against
   a bridge that never reads, a shutdown waking a blocked reader, the
   instance reused session after session, the last ack surviving the app's
-  exit, a pipe another account owns refused, and each Windows answer pinned
-  byte for byte.
+  exit, a pipe another account owns refused, a pipe that refuses this user
+  read as foreign, a busy open waited out between two sessions, a bind that
+  waits for a name in use to come free, among them one a bridge still
+  holds after its app exited, and each Windows answer pinned byte for byte.
+  The Windows CI job builds, lints and tests with `--locked`.
 - `scripts/wine-test.sh` runs the Windows build of the tests under Wine from
   Linux; it needs `mingw-w64-gcc`, `wine` and the `x86_64-pc-windows-gnu`
   target (`CONTRIBUTING.md`). Wine is a stand-in, and the Windows CI job is

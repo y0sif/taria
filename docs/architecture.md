@@ -464,7 +464,7 @@ back are read as the credited one alone.
 
 | Outcome | Tool answer |
 |---|---|
-| Nothing could be handed over: the bridge's queue to the app stayed full for 500 ms | Error: this input was not sent; the app is stopped or not reading its socket. |
+| Nothing could be handed over: the bridge's queue to the app stayed full for 500 ms | Error: this input was not sent; the app is stopped or not reading its socket (its pipe, on Windows). |
 | A burst the bridge could not finish sending | Error: how many went out and may already have taken effect, how many did not, and that the effect is partial. |
 | Acks lost (the bridge fell behind its own ack channel) | Error: what became of the inputs cannot be reported in full; call `read_tree`, send fewer inputs per call. |
 | Any input of a multi-input burst `dropped` | Error: how many landed, and that the effect is partial. |
@@ -741,9 +741,12 @@ that path. The input tools ask for a tree before they send anything, so they
 carry whichever of these applies rather than a second vocabulary for it.
 
 On Windows the table has two more rows and one row means something else: a
-pipe another account owns, an open refused as busy, and a silent connection
-that is the app rather than another bridge. What the bridge says to each is
-under Transports, What the bridge says on Windows.
+pipe that is not the app's (another account owns it, or it refused this
+user access), an open refused as busy, and a silent connection that is the
+app rather than another bridge. What the bridge says to each is under
+Transports, What the bridge says on Windows. The rows above get the same
+answers on Windows, except that each names the pipe and the pipe name where
+this table says socket and socket path.
 
 An ack whose `status` this build cannot name fails its whole line, id
 included, so the app answering an input is indistinguishable at the bridge
@@ -937,18 +940,22 @@ only this much more:
 
 | Item | Unix | Windows |
 |---|---|---|
-| `connect` | `UnixStream::connect` | tokio's named-pipe client, then the owner check |
+| `connect` | `UnixStream::connect` | tokio's named-pipe client, a busy open retried for 250 ms, then the owner check |
 | `peer_pid` | `SO_PEERCRED` (`LOCAL_PEERPID` on macOS) | `GetNamedPipeServerProcessId` |
 | `nothing_listens` | `ConnectionRefused` or `NotFound` | `NotFound` |
-| `refusal` | never | `Busy` (`ERROR_PIPE_BUSY`) or `Foreign` (another account's pipe) |
+| `refusal` | never | `Busy` (`ERROR_PIPE_BUSY`) or `Foreign` (another account's pipe, or an open refused with `ERROR_ACCESS_DENIED`) |
 | `BACKLOG` | true: a connect opens before the app accepts it | false: an open succeeds only into a free instance |
 | `check_endpoint` | any path | a local pipe name, by `check_pipe_name` |
+| `ENDPOINT`, `ENDPOINT_ADDRESS` | "socket", "socket path" | "pipe", "pipe name" |
 
 `BACKLOG` is what decides what a connection that stays silent means: a
 bridge waiting behind another where it is true, the app itself where it is
-false. `ensure_supported` is the last item, which the server builders call
-first so that a platform with no transport says so; every platform taria
-builds for has one now.
+false. `ENDPOINT` and `ENDPOINT_ADDRESS` are the words the answers name the
+app's endpoint and what the bridge was given to find it by, so one answer
+reads right on each platform and the Unix bytes do not move.
+`ensure_supported` is the last item, which the server builders call first
+so that a platform with no transport says so; every platform taria builds
+for has one now.
 
 When a connection ends the bridge drops the whole stream, which closes both
 directions. `tokio::io::split` keeps one stream under both halves, so dropping
@@ -978,9 +985,14 @@ There is no stale socket to unlink and no liveness probe: a second app on a
 live name fails to create the first instance, which the adapter reports as
 `AddrInUse`, as on Unix, decided by the system and not by a probe. And there
 is no file to remove at exit. A pipe, and its name, lives while any handle
-to it is open, so an app restarted while a bridge still holds its old end is
-refused until that bridge reads end of stream and closes, which taria-mcp
-does at once.
+to it is open, so an app restarted while a bridge still holds its old end
+finds the name taken until that bridge reads end of stream and closes,
+which taria-mcp does at once. Refused then, the new app would run with taria
+off for the whole of its run, so the bind retries a create that Windows
+refuses as access denied (the first-instance flag's answer while any
+instance exists) or busy, every 20 ms for 500 ms (`BIND_RETRY`), and only
+then reports `AddrInUse`. A second app on a name still served is refused
+all the same, half a second later, and startup stays bounded.
 
 The one instance is reused from session to session. The next accept retires
 the last session: it sets the session's closed event, waits until nothing of
@@ -1000,13 +1012,26 @@ normalises it the same way for each.
 
 The bridge opens the pipe with tokio's named-pipe client, at tokio's default
 `SECURITY_IDENTIFICATION` level, so what serves the pipe can learn who the
-bridge is and cannot act as it. Before it reads or writes anything it reads
-the pipe's owner (`GetSecurityInfo`) and compares it with its own token's
-user SID. Pipe names are machine-wide and any process can create one under
-the app's name first, so a pipe another account owns is closed unread and
-unwritten, refused as `Foreign`, and logged as a warning, when the refusal is
-new, that names the owner. With `--app` the binary derives the name from the
-same token SID, which `taria_mcp::current_user_sid()` exposes on Windows.
+bridge is and cannot act as it. An open refused as busy is retried every
+10 ms for 250 ms (`BUSY_RETRY`) before it stands: between two sessions the
+one instance is busy for a moment, while the adapter retires the last
+session (a 50 ms accept poll and the session's threads ending), disconnects
+it and listens again, and a bridge refused at once in that moment was told
+a free app was held. Before it writes anything or parses anything the pipe
+sent, the bridge reads the pipe's owner (`GetSecurityInfo`) and compares it
+with its own token's user SID. Registering the pipe with tokio starts a read
+into tokio's own buffer at once, so bytes may have been read by then, but
+nothing takes them out of that buffer before the check passes, and a pipe
+that fails it is dropped with them. Pipe names are machine-wide and any
+process can create one under the app's name first, so a pipe another
+account owns is closed with nothing parsed or written, refused as
+`Foreign`, and logged as a warning, when the refusal is new, that names the
+owner. An open refused as access denied is `Foreign` too, and never opened:
+the adapter's DACL lets its own user in, so a pipe that denies that user is
+not the app's. With `--app` the binary derives the name from the same token
+SID, read by `transport/windows_sid.rs`, which the library compiles as part
+of its Windows transport and the binary compiles again through `#[path]`,
+so the SID is not a public item of the library.
 
 ### Overlapped I/O
 
@@ -1078,38 +1103,47 @@ break a promise taria makes:
   so a restarted app cannot create it.
 
 The hand-rolled transport is tested where it can go wrong: a second bind
-refused as in use, the owner and the DACL read back, a second client told
-the pipe is busy, the write deadline against a bridge that never reads, a
-shutdown waking a blocked reader and every later read, the instance reused
-session after session, and what was written before shutdown surviving the
-pipe's close. `crates/taria-mcp/tests/adapter_e2e.rs` then drives a real
-`TariaLayer` in a child process from the real `taria-mcp` binary on every
-platform, Windows included.
+refused as in use once the retry runs out, a bind that waits for a name in
+use to come free, a bridge still holding the last instance included, the
+owner and the DACL read back, a second client told the pipe is busy, the
+write deadline against a bridge that never reads, a shutdown waking a
+blocked reader and every later read, the instance reused session after
+session, and what was written before shutdown surviving the pipe's close.
+On the bridge's side, a busy open between two sessions is waited out, and a
+pipe that refuses this user is read as foreign.
+`crates/taria-mcp/tests/adapter_e2e.rs` then drives a real `TariaLayer` in
+a child process from the real `taria-mcp` binary on every platform, Windows
+included.
 
 ### What the bridge says on Windows
 
 Three answers exist only on Windows, because only the Windows transport
 refuses a connect, and only there does a silent connection mean the app.
-Linux and macOS answers are unchanged, byte for byte.
+The answers Windows shares with Linux and macOS name the pipe and the pipe
+name where those name the socket and the socket path (`ENDPOINT`,
+`ENDPOINT_ADDRESS`), so nothing connected asks whether the pipe name is
+correct. Linux and macOS answers are unchanged, byte for byte.
 
-- **Busy.** The open was refused with `ERROR_PIPE_BUSY`: another bridge has
-  the one instance. The answer is the held answer, with the pipe's refusal
-  as its evidence in place of a silent connection's age, and the same retry
-  advice by this bridge's `--idle-release`. A bridge that let go of the app
-  itself gets the held-after-release answer, as on Unix. A busy refusal
-  forgets the last connection's rejected lines, oversized tree aside, as a
-  connect does.
+- **Busy.** The open was refused with `ERROR_PIPE_BUSY` for the whole of
+  the 250 ms retry: another bridge has the one instance. The answer is the
+  held answer, with the pipe's refusal as its evidence in place of a silent
+  connection's age, and the same retry advice by this bridge's
+  `--idle-release`. A bridge that let go of the app itself gets the
+  held-after-release answer, as on Unix. A busy refusal forgets the last
+  connection's rejected lines, oversized tree aside, as a connect does.
 - **Silent pipe.** A connection opened and has said nothing past the 500 ms
   grace. On Windows that is the app, suspended (a debugger, a process tool)
   or stuck before its `hello`, or something that is not a taria adapter, and
   the answer says so and that it is not another bridge. It replaces the held
   answer that the same silence gets on Unix.
-- **Foreign.** The pipe at the name belongs to another account. The answer
-  says it is not the app, that the bridge closed it untouched, and that the
-  user should find what serves it; the log names the owner. It outranks
-  every other answer, an oversized tree included, since it is not the app
-  whose tree or lines those would be about, and it clears the bridge's
-  record of having let go, as finding nothing listening does.
+- **Foreign.** The pipe at the name belongs to another account, or refused
+  this user access at the open. The answer says it is not the app, that the
+  bridge parsed nothing it sent and wrote nothing to it, and that the user
+  should find what serves it; the log names the owner, where the pipe let
+  the bridge read one. It outranks every other answer, an oversized tree
+  included, since it is not the app whose tree or lines those would be
+  about, and it clears the bridge's record of having let go, as finding
+  nothing listening does.
 
 Stopped-app detection reads `/proc`, so it stays Linux only: on Windows a
 suspended app gets the silent-pipe answer, and the no-ack answer never names

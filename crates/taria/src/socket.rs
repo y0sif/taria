@@ -1,19 +1,21 @@
-//! Where an app's Unix socket lives, and whether the kernel will accept the
-//! path.
+//! Where an app's endpoint lives, and whether the system will accept its
+//! name: a Unix socket path on Linux, macOS and the other unixes, and a named
+//! pipe's name on Windows.
 //!
-//! The app binds the socket and the bridge connects to it, so the two have to
-//! derive the same default path from the same environment or they simply never
-//! meet. This module is that derivation, kept here rather than copied into each
-//! side.
+//! The app binds the socket, or creates the pipe, and the bridge connects to
+//! it, so the two have to derive the same default name from the same
+//! environment or they simply never meet. This module is that derivation,
+//! kept here rather than copied into each side.
 //!
-//! Path building only: nothing here touches the filesystem, so the core crate
-//! stays free of I/O. Creating, vetting, and removing the socket belong to the
-//! adapter.
+//! Name building only: nothing here touches the filesystem or the pipe
+//! namespace, so the core crate stays free of I/O. Creating, vetting, and
+//! removing the socket, and creating the pipe, belong to the adapter.
 //!
-//! On Windows the endpoint will be a named pipe rather than a Unix socket, and
-//! [`pipe_name`], [`check_pipe_name`] and [`resolve_pipe_name`] are what the
-//! Windows transport will use to name it. They are as pure as the rest, so
-//! they build and are tested on every platform.
+//! [`resolve_path`] derives the socket path, and [`check_path_len`] holds an
+//! endpoint's name to the platform's limit. [`pipe_name`], [`check_pipe_name`]
+//! and [`resolve_pipe_name`] name the pipe, and are what both Windows
+//! transports, the adapter's and the bridge's, derive and check it by. They
+//! are as pure as the rest, so they build and are tested on every platform.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -262,8 +264,9 @@ fn endpoint_len(path: &Path) -> usize {
 
 /// The prefix of every named pipe on this machine: `\\.\pipe\`.
 ///
-/// Part of what the Windows transport will use. A pipe name is a path into
-/// the pipe namespace of some machine, and this one is the local machine's.
+/// What the Windows transports require of every pipe name they are given. A
+/// pipe name is a path into the pipe namespace of some machine, and this one
+/// is the local machine's.
 /// `\\host\pipe\name` is the same pipe on another machine, reached over SMB,
 /// so it is not merely another spelling: see [`check_pipe_name`].
 pub const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\";
@@ -271,9 +274,10 @@ pub const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\";
 /// Longest name a Windows named pipe may have, [`LOCAL_PIPE_PREFIX`]
 /// included, in UTF-16 code units (Windows characters).
 ///
-/// Part of what the Windows transport will use. Windows documents the whole
-/// pipe name string as at most 256 characters, so the bound is on the name
-/// as a whole, not on the part after the prefix.
+/// The bound [`pipe_name`] and [`check_pipe_name`] hold every pipe name to,
+/// before either Windows transport hands it to the system. Windows documents
+/// the whole pipe name string as at most 256 characters, so the bound is on
+/// the name as a whole, not on the part after the prefix.
 pub const MAX_PIPE_NAME_CHARS: usize = 256;
 
 /// Build the default pipe name for `app_label`, run by the user whose SID
@@ -292,7 +296,7 @@ pub const MAX_PIPE_NAME_CHARS: usize = 256;
 /// created first, and with `PIPE_REJECT_REMOTE_CLIENTS`, so no other machine
 /// can connect, and gives it a DACL that lets only its own user in; the
 /// bridge checks that the pipe it opened is owned by its own user before it
-/// reads or writes anything.
+/// writes anything to it or parses anything it sent.
 ///
 /// Windows trims trailing dots and spaces from a name as it opens it, so a
 /// label `app.` names the same pipe as `app`. Both peers pass the name to
@@ -323,8 +327,8 @@ pub fn pipe_name(app_label: &str, user: &str) -> Result<String, InvalidPipeName>
 /// Check a pipe name given whole, such as `$TARIA_SOCK`, before binding or
 /// connecting to it.
 ///
-/// Part of what the Windows transport will use, for the override and for an
-/// explicit name passed to the adapter or the bridge. The name is honoured
+/// What both Windows transports hold the override to, and an explicit name
+/// passed to the adapter or the bridge, before using it. The name is honoured
 /// only if it starts with [`LOCAL_PIPE_PREFIX`], in any letter case, since
 /// Windows matches the prefix without regard to case (`\\.\PIPE\name` is the
 /// same pipe as `\\.\pipe\name`): anything else is
@@ -358,7 +362,8 @@ pub fn check_pipe_name(name: &str) -> Result<(), InvalidPipeName> {
 }
 
 /// Resolve the pipe name for `app_label`, the Windows counterpart of
-/// [`resolve_path`] and part of what the Windows transport will use.
+/// [`resolve_path`]: the name the adapter creates its pipe under, and the
+/// one `taria-mcp --app` connects to.
 ///
 /// Precedence, highest first:
 ///
@@ -429,8 +434,9 @@ fn check_pipe_name_len(name: &str) -> Result<(), InvalidPipeName> {
 /// A pipe name that cannot be built or used, from [`pipe_name`],
 /// [`check_pipe_name`] or [`resolve_pipe_name`].
 ///
-/// Part of what the Windows transport will use. Each variant carries the
-/// value refused, so the message can name it.
+/// What a refused name is reported as on Windows, by the adapter through
+/// `bind_error()` and by the bridge's binary as a usage error. Each variant
+/// carries the value refused, so the message can name it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InvalidPipeName {
