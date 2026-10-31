@@ -313,7 +313,9 @@ pub fn pipe_name(app_label: &str, user: &str) -> Result<String, InvalidPipeName>
 ///
 /// Part of what the Windows transport will use, for the override and for an
 /// explicit name passed to the adapter or the bridge. The name is honoured
-/// only if it starts with [`LOCAL_PIPE_PREFIX`], exactly: anything else is
+/// only if it starts with [`LOCAL_PIPE_PREFIX`], in any letter case, since
+/// Windows matches the prefix without regard to case (`\\.\PIPE\name` is the
+/// same pipe as `\\.\pipe\name`): anything else is
 /// [`InvalidPipeName::NotLocal`], `\\host\pipe\name` included, because
 /// opening a pipe on another machine goes over SMB, which hands that machine
 /// the user's credentials and puts the agent's input on the network.
@@ -326,7 +328,14 @@ pub fn pipe_name(app_label: &str, user: &str) -> Result<String, InvalidPipeName>
 /// passing a prefix check, and a NUL would end the name early. A name over
 /// [`MAX_PIPE_NAME_CHARS`] is [`InvalidPipeName::TooLong`].
 pub fn check_pipe_name(name: &str) -> Result<(), InvalidPipeName> {
-    let Some(own) = name.strip_prefix(LOCAL_PIPE_PREFIX) else {
+    // The prefix is ASCII, so a name whose first bytes split a character
+    // cannot start with it, and `get` says so by returning `None`.
+    let prefix_len = LOCAL_PIPE_PREFIX.len();
+    let Some(own) = name
+        .get(..prefix_len)
+        .filter(|prefix| prefix.eq_ignore_ascii_case(LOCAL_PIPE_PREFIX))
+        .map(|_| &name[prefix_len..])
+    else {
         return Err(InvalidPipeName::NotLocal(name.to_string()));
     };
     let separated = own.contains(['\\', '/', '\0']);
@@ -801,13 +810,57 @@ mod tests {
             r"\\host\pipe\taria",
             r"\\192.168.0.7\pipe\taria",
             r"\\?\pipe\taria",
-            r"\\.\PIPE\taria",
             "//./pipe/taria",
             r"\\.\pipetaria",
             r"\\.\pipe",
             r"C:\Users\me\taria.sock",
             "/run/user/1000/taria/demo.sock",
             "",
+        ] {
+            assert_eq!(
+                check_pipe_name(name),
+                Err(InvalidPipeName::NotLocal(name.to_string())),
+                "name: {name:?}"
+            );
+        }
+    }
+
+    /// Windows matches the prefix in any letter case, so `\\.\PIPE\taria` is
+    /// the local pipe `\\.\pipe\taria` and is honoured as one, rather than
+    /// refused as a pipe on another machine, which it is not. The rest of the
+    /// name is held to the same rules whatever the prefix's case, and a
+    /// prefix that only looks alike in some other script is still refused.
+    #[test]
+    fn the_local_prefix_is_matched_in_any_letter_case() {
+        for name in [r"\\.\PIPE\taria", r"\\.\Pipe\taria", r"\\.\pIpE\taria"] {
+            assert_eq!(check_pipe_name(name), Ok(()), "name: {name:?}");
+            assert_eq!(
+                resolve_pipe_name(Some(name.into()), SID, "demo"),
+                Ok(name.to_string()),
+                "an override is used as given: {name:?}"
+            );
+        }
+        for name in [r"\\.\PIPE\a\b", r"\\.\PIPE\..", r"\\.\PIPE\"] {
+            assert_eq!(
+                check_pipe_name(name),
+                Err(InvalidPipeName::Name(name.to_string())),
+                "name: {name:?}"
+            );
+        }
+        let long = format!(r"\\.\PIPE\{}", "x".repeat(MAX_PIPE_NAME_CHARS));
+        assert!(matches!(
+            check_pipe_name(&long),
+            Err(InvalidPipeName::TooLong { .. })
+        ));
+        // Not the prefix in another case: a Cyrillic `р` is not `p`, an `é`
+        // is not `e`, and `\\?\` is another prefix altogether. A character
+        // that straddles the prefix's length is refused too, not sliced
+        // through.
+        for name in [
+            "\\\\.\\\u{440}ipe\\taria",
+            "\\\\.\\pip\u{e9}\\taria",
+            r"\\?\PIPE\taria",
+            "\\\\.\\pipe\u{212A}taria",
         ] {
             assert_eq!(
                 check_pipe_name(name),

@@ -23,11 +23,38 @@
 //!   [`Reader`] blocked on the same connection;
 //! - [`user_identity`], which namespaces the default path between users.
 //!
-//! Unix has the real thing, a Unix domain socket in a private directory.
-//! Windows has a stub for now: its [`Listener::bind`] fails with
-//! [`Unsupported`](std::io::ErrorKind::Unsupported), so
-//! [`TariaLayer::bind_or_disabled`](crate::TariaLayer::bind_or_disabled)
-//! hands back a disabled layer that says why, and the app runs without taria.
+//! # Shutting a connection down
+//!
+//! [`Writer::shutdown`] is called once the writer is done with the
+//! connection, the acks flushed at shutdown included, and every transport
+//! keeps the same three promises for it:
+//!
+//! - **What was written stays written.** Every byte a
+//!   [`write_all_before`](Writer::write_all_before) finished putting on the
+//!   connection is still readable by the bridge after the shutdown, and after
+//!   the listener closes, until the bridge has read it. Nothing in the
+//!   shutdown throws away what the bridge has not read yet, and nothing in it
+//!   waits for the bridge to read it, which could wait forever.
+//! - **It wakes the reader.** A [`Reader`] blocked in a read on the same
+//!   connection returns end of stream (`Ok(0)`) at once.
+//! - **It stays shut.** Every read started after it returns end of stream at
+//!   once rather than waiting, so a reader that was between two reads when
+//!   the shutdown came cannot start one that never ends. A one-shot wake-up,
+//!   such as cancelling the read in flight, does not keep this promise by
+//!   itself; a transport that uses one also sets something every read checks
+//!   before it starts and waits on while it runs.
+//!
+//! Unix has it from the kernel: `shutdown(Both)` on the socket is sticky and
+//! leaves data already sent readable. Windows has it from a closed event per
+//! session, which every read and write checks and waits on, and from never
+//! disconnecting a pipe at shutdown, only closing it.
+//!
+//! # The platforms
+//!
+//! Unix serves a Unix domain socket in a private directory. Windows serves a
+//! named pipe, `\\.\pipe\taria-<SID>-<label>` by default, named by
+//! [`taria::socket::resolve_pipe_name`], owned by the user and closed to
+//! everyone else, one instance reused from one session to the next.
 
 #[cfg(unix)]
 mod unix;

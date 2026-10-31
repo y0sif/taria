@@ -1969,6 +1969,7 @@ fn flush_acks(stream: &mut Writer, acks: impl IntoIterator<Item = (InputId, Inpu
 /// bridge so the two sides cannot look for the socket in different places,
 /// including its refusal of a label that is not a plain file name. Reading the
 /// environment stays here, where the process actually is.
+#[cfg(not(windows))]
 fn resolve_socket_path(app_label: &str) -> Result<PathBuf, taria::socket::InvalidAppLabel> {
     taria::socket::resolve_path(
         env::var_os("TARIA_SOCK"),
@@ -1984,8 +1985,39 @@ fn resolve_socket_path(app_label: &str) -> Result<PathBuf, taria::socket::Invali
 /// `InvalidInput` because the label is one: the same kind
 /// [`bind_at`](TariaLayer::bind_at) gives an over-long path, and the message
 /// is the label error's own, which names the label and what a label may be.
+#[cfg(not(windows))]
 fn invalid_label(err: taria::socket::InvalidAppLabel) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
+}
+
+/// Resolve the default pipe name for `app_label` from the environment: the
+/// Windows counterpart of the function above, by
+/// [`taria::socket::resolve_pipe_name`], shared with the bridge, with the
+/// user's SID from the process token.
+///
+/// A refused label or `$TARIA_SOCK` is `InvalidInput`, with the refusal's own
+/// message. The SID is needed only when `$TARIA_SOCK` does not name the pipe,
+/// so a token that cannot be read is reported only then, in place of the
+/// refusal of the empty user it stands in for.
+#[cfg(windows)]
+fn resolve_socket_path(app_label: &str) -> io::Result<PathBuf> {
+    let user = transport::user_identity();
+    let resolved = taria::socket::resolve_pipe_name(
+        env::var_os("TARIA_SOCK"),
+        user.as_deref().unwrap_or_default(),
+        app_label,
+    );
+    match (resolved, user) {
+        (Ok(name), _) => Ok(PathBuf::from(name)),
+        (Err(taria::socket::InvalidPipeName::User(_)), Err(err)) => Err(err),
+        (Err(err), _) => Err(io::Error::new(io::ErrorKind::InvalidInput, err.to_string())),
+    }
+}
+
+/// On Windows the resolution's error is an `io::Error` already.
+#[cfg(windows)]
+fn invalid_label(err: io::Error) -> io::Error {
+    err
 }
 
 #[cfg(test)]
