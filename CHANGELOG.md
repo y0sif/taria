@@ -15,10 +15,11 @@ a format bump would not wait for one.
 
 ## [Unreleased]
 
-0.4.0 is the first alpha. It breaks the Rust API once, before an alpha
-freezes it, and brings four headline changes. The wire gains only optional
-fields, so `PROTOCOL_VERSION` stays 1, and peers of 0.3.3 and 0.4.0 read
-each other. All three crates move to 0.4.0 together.
+0.4.0 is the first alpha. It reshapes the Rust API in one pass; later 0.x
+minors may still change it, each with an upgrade note. It brings four
+headline changes. The wire gains only optional fields, so
+`PROTOCOL_VERSION` stays 1, and peers of 0.3.3 and 0.4.0 read each other.
+All three crates move to 0.4.0 together.
 
 **The Rust API is cut to what a caller needs.** Each crate had grown entry
 points that did one thing several ways, or that exposed internals: a
@@ -95,11 +96,11 @@ the 500 ms window are as in 0.3.3.
   can drop both. On Windows it pulls in `windows-sys` (raw Win32 bindings)
   and nothing else, and `socket_path()` is the pipe name. A second app on a
   live name is refused with `AddrInUse`, as on Unix, after the bind has
-  retried for 500 ms: a pipe's name stays taken until the bridge connected
-  to an app that exited closes its end, so an app restarted at once waits
-  that out instead of running with taria off. `bind_error()` says why a bind
-  failed, and the integration guide's "Socket paths" section gains "On
-  Windows" with each reason.
+  retried for 500 ms. The retry is for a restart. When an app exits, its
+  pipe's name stays taken until the bridge that was connected to it closes
+  its end. An app restarted at once waits that out instead of running with
+  taria off. `bind_error()` says why a bind failed, and the integration
+  guide's "Socket paths" section gains "On Windows" with each reason.
 
 ### For whoever drives an app
 
@@ -266,14 +267,14 @@ the connection, so `PROTOCOL_VERSION` stays 1. `docs/protocol.md` sections
   units. The app creates the pipe as the first and only instance of its
   name, rejecting remote clients, owned by the user with a DACL (the list of
   who may open it) that grants only that user. The bridge checks the owner
-  before it writes anything or parses anything the pipe sent, and reads an
-  open refused as access denied as a pipe it cannot use, not surely an
-  impostor. A refused pipe stands over later busy refusals until a connect
-  passes the owner check, finds nothing listening, or the bridge stops
-  trying. Two retries are SHOULDs: of a busy open (250 ms in the reference
-  bridge), and of a create that finds the name in use (500 ms in the
-  reference adapter). The conformance lists in sections 1.3 and 1.4 name
-  the pipe's MUSTs.
+  before it writes anything or parses anything the pipe sent. When the open
+  itself is refused as access denied, the bridge treats the pipe as one it
+  cannot use. It does not conclude that an impostor serves it. A refused
+  pipe stands over later busy refusals until a connect passes the owner
+  check, finds nothing listening, or the bridge stops trying. Two retries
+  are SHOULDs: of a busy open (250 ms in the reference bridge), and of a
+  create that finds the name in use (500 ms in the reference adapter). The
+  conformance lists in sections 1.3 and 1.4 name the pipe's MUSTs.
 - **New in `taria`.** `Number` is a finite-only `f64` with `Eq` and `Hash`,
   so `Node` and `Snapshot` keep `Eq`; it writes a whole number within 2^53
   as an integer. `Checked` is `#[non_exhaustive]`, the twelfth type marked
@@ -364,6 +365,11 @@ the connection, so `PROTOCOL_VERSION` stays 1. `docs/protocol.md` sections
 - **An `InputId` is no longer a number in Rust.** The JSON is the same bare
   integer. A `tracing` field that logged the id as a number needs
   `id = id.get()`.
+- **`Node::disabled` is a plain `bool`, unlike the other state fields.**
+  They are `Option`s, because for them absent means not stated. For
+  `disabled`, absent and `false` say the same thing, so the field reads
+  `false` for both, and for a value of any other shape. It is written only
+  when `true`, so the wire is as protocol section 6.5 states it.
 - **`taria-mcp` is reached through its root, and its tools through rmcp.**
   Its modules are private, and `TariaMcpServer::builder` is the only way to
   build a server: it returns a `TariaMcpServerBuilder`, finished with

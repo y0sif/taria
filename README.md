@@ -5,27 +5,36 @@
 [![taria-mcp on crates.io](https://img.shields.io/crates/v/taria-mcp?label=taria-mcp)](https://crates.io/crates/taria-mcp)
 [![docs.rs](https://img.shields.io/docsrs/taria-ratatui?label=docs.rs)](https://docs.rs/taria-ratatui)
 
-**ARIA for terminals.** taria is an agent accessibility layer for terminal
-user interfaces. A TUI app declares its live widget tree, focus state, and
-available actions through a small protocol. An MCP bridge exposes that tree
-to any agent harness (Claude Code, OpenCode, Cursor): the harness drives the
-app through ordinary MCP tools, with no taria-specific code of its own.
+**ARIA for terminals.** ARIA is the set of attributes a web page uses to
+tell screen readers what each element is and does. taria brings that idea to
+terminal user interfaces (TUIs), with AI agents as the readers. A TUI app
+declares its live widget tree, focus state, and available actions through a
+small protocol. A bridge serves that tree to any agent harness, the program
+that runs a model and hands it tools (Claude Code, OpenCode, Cursor), over
+MCP, the Model Context Protocol that harnesses use to call tools. The
+harness drives the app through ordinary MCP tools, with no taria-specific
+code of its own.
 
-![An MCP client driving the taria demo app](demo/demo.gif)
+![An MCP client driving the taria demo app](https://raw.githubusercontent.com/y0sif/taria/main/demo/demo.gif)
 
 The client on the right is a script, `demo/drive.py`, not a model: it makes
 six fixed tool calls through the real `taria-mcp` bridge.
 
+Try it: `cargo run -p taria-demo` in a clone of this repository, then the
+[Quick start](#quick-start). In your app: one dependency, a `publish` after
+each draw, and a `drain` in your event loop.
+
 Agents today reach TUIs by scraping rendered screens through tmux or headless
 terminals and guessing at structure. taria works on the other side of the
-terminal: the app publishes what is on screen semantically, the way
-accessibility trees transformed GUI automation.
+terminal: the app publishes what is on screen semantically, the way a GUI app
+hands its accessibility tree to screen readers and test tools.
 
 > Status: alpha, at 0.4.0. The wire format is frozen at `PROTOCOL_VERSION` 1,
 > so an app and a bridge built months apart still work together. The Rust
 > API may still change in a 0.x minor release, and each such change gets an
-> upgrade note in [CHANGELOG.md](CHANGELOG.md). CI tests Linux, macOS and
-> Windows.
+> upgrade note in
+> [CHANGELOG.md](https://github.com/y0sif/taria/blob/main/CHANGELOG.md). CI
+> tests Linux, macOS and Windows.
 
 ## Why taria
 
@@ -44,13 +53,13 @@ accessibility trees transformed GUI automation.
   returns errors instead of panicking, and if it cannot start, your app runs
   as before.
 
-In a benchmark on 2026-10-12, against the 0.3.0 demo, Claude Haiku 5.5
-passed 30 of 30 runs reading taria's JSON tree, with a median of 14,045
-tokens read and 3 tool calls per run, and 29 of 30 reading the screen
-through tmux, with 26,722 tokens and 6.5 tool calls. On Sonnet 5.5 the two
-were close: tmux used 7.7% fewer tokens than taria's JSON tree, and 1.7%
-more than its outline format. Method and caveats:
-[bench/RESULTS.md](bench/RESULTS.md).
+In a benchmark on 2026-10-12, at commit 3e66fbb, shortly before 0.3.0,
+Claude Haiku 5.5 passed 30 of 30 runs reading taria's JSON tree, with a
+median of 14,045 tokens read and 3 tool calls per run, and 29 of 30 reading
+the screen through tmux, with 26,722 tokens and 6.5 tool calls. On Sonnet
+5.5 the two were close: tmux used 7.7% fewer tokens than taria's JSON tree,
+and 1.7% more than its outline format. Method and caveats:
+[bench/RESULTS.md](https://github.com/y0sif/taria/blob/main/bench/RESULTS.md).
 
 ## In your app
 
@@ -77,8 +86,9 @@ loop {
 }
 ```
 
-[docs/integration-guide.md](docs/integration-guide.md) walks through adding
-taria to an app you already have, including the loop's timing rules.
+[docs/integration-guide.md](https://github.com/y0sif/taria/blob/main/docs/integration-guide.md)
+walks through adding taria to an app you already have, including the loop's
+timing rules.
 
 ## Install
 
@@ -92,7 +102,6 @@ cargo add taria-ratatui
 
 It re-exports the protocol crate, so `taria::{Action, IdSpace, Node, Role}`
 is reachable as `taria_ratatui::taria::{...}` without a second dependency.
-`docs/integration-guide.md` walks through the retrofit.
 
 **Driving an app that already speaks taria.** Install the bridge binary:
 
@@ -105,7 +114,10 @@ Or take a prebuilt build from the
 `taria-mcp` as a tarball for x86_64 and aarch64 Linux and for both macOS
 architectures, and as a `.zip` for x86_64 Windows
 (`taria-mcp-x86_64-pc-windows-msvc.zip`, holding `taria-mcp.exe`), each with
-its sha256. Then point your harness at it, with the app's label:
+its sha256. On macOS, if Gatekeeper (the check macOS runs on downloaded
+programs) blocks the binary, clear its quarantine flag with
+`xattr -d com.apple.quarantine taria-mcp`. Then point your harness at it,
+with the app's label:
 
 ```bash
 claude mcp add taria -- taria-mcp --app <label>
@@ -122,7 +134,9 @@ needs nothing installed.
 ## Quick start
 
 Prerequisites: a Rust toolchain (1.88 or newer) and, for step 2, the
-`claude` CLI. Three steps, two terminals.
+`claude` CLI. Three steps, two terminals. The commands are written for Linux
+and macOS. On Windows, steps 1 and 3 are the same, and step 2 says what
+changes.
 
 1. Run the demo app in one terminal. It prints its taria socket path on
    startup and then behaves like a normal task-manager TUI:
@@ -139,6 +153,10 @@ Prerequisites: a Rust toolchain (1.88 or newer) and, for step 2, the
    claude mcp add taria -- $(pwd)/target/debug/taria-mcp --app taria-demo
    ```
 
+   On Windows, run the same build, then give `claude mcp add` the full path
+   of `target\debug\taria-mcp.exe` in place of
+   `$(pwd)/target/debug/taria-mcp`.
+
    Working inside this repo, you can skip `claude mcp add`: the committed
    `.mcp.json` registers the same server, and Claude Code picks it up here
    once you approve it.
@@ -150,8 +168,8 @@ Prerequisites: a Rust toolchain (1.88 or newer) and, for step 2, the
 
 ### Running the demo headless
 
-Backgrounding the demo with plain `&` fails. Give it a terminal with tmux
-instead:
+On Linux and macOS, backgrounding the demo with plain `&` fails. Give it a
+terminal with tmux instead:
 
 ```bash
 cargo build -p taria-demo
@@ -159,6 +177,9 @@ tmux new-session -d -s taria-demo -x 120 -y 34 './target/debug/taria-demo'
 tmux capture-pane -p -t taria-demo   # peek at the screen without attaching
 tmux kill-session -t taria-demo      # stop it when you are done
 ```
+
+Windows has no tmux. There, run the demo in one terminal and start the
+harness in another.
 
 ## How it works
 
@@ -220,7 +241,8 @@ when binding. `--tree-format outline` serves the tree as an indented outline
 instead of JSON. `--idle-release <SECS>` sets how long the bridge waits with
 no tool calls before it lets the app go: 60 by default, `0` for never. The
 flags, the environment variables, the resolution order, the rule on labels
-and the outline's grammar: [docs/cli.md](docs/cli.md).
+and the outline's grammar:
+[docs/cli.md](https://github.com/y0sif/taria/blob/main/docs/cli.md).
 
 ## Workspace layout
 
@@ -236,9 +258,13 @@ bench/                Benchmark harness and results: taria against tmux
 demo/                 The GIF above and the scripted client that records it
 ```
 
-In `docs/`: `protocol.md` specifies the wire format message by message,
-`architecture.md` explains why it is shaped that way, and `landscape.md` is
-the research behind both.
+In `docs/`:
+[protocol.md](https://github.com/y0sif/taria/blob/main/docs/protocol.md)
+specifies the wire format message by message,
+[architecture.md](https://github.com/y0sif/taria/blob/main/docs/architecture.md)
+explains why it is shaped that way, and
+[landscape.md](https://github.com/y0sif/taria/blob/main/docs/landscape.md)
+is the research behind both.
 
 ## Development
 
@@ -251,33 +277,35 @@ python3 scripts/e2e.py           # end-to-end: 27 steps, demo app + bridge + MCP
 python3 scripts/adversarial.py   # 24 edge-case probes
 ```
 
-[CONTRIBUTING.md](CONTRIBUTING.md) covers the rest: the setup, the CI gate,
-the commit style, and what a change has to clear while version 1 of the wire
-format is frozen.
+[CONTRIBUTING.md](https://github.com/y0sif/taria/blob/main/CONTRIBUTING.md)
+covers the rest: the setup, the CI gate, the commit style, and what a change
+has to clear while version 1 of the wire format is frozen.
 
 ## Compatibility
 
-See [docs/compatibility.md](docs/compatibility.md) for the full list. The
-three that decide whether taria fits at all:
+See
+[docs/compatibility.md](https://github.com/y0sif/taria/blob/main/docs/compatibility.md)
+for the full list. The three that decide whether taria fits at all:
 
 - **Linux, macOS and Windows**: a Unix socket on the first two, a named pipe
   on Windows, and CI runs the Rust suites on all three. Windows has no
   stopped-app detection, and the Python e2e and adversarial scripts run on
-  Linux and macOS only. [Limitations](docs/compatibility.md#limitations).
+  Linux and macOS only.
+  [Limitations](https://github.com/y0sif/taria/blob/main/docs/compatibility.md#limitations).
 - **One bridge client per app at a time**: the adapter serves one, so two
   agents cannot drive the same app at once. They can take turns: an idle
   bridge lets the app go after 60 s by default.
-  [Limitations](docs/compatibility.md#limitations).
+  [Limitations](https://github.com/y0sif/taria/blob/main/docs/compatibility.md#limitations).
 - **The wire format is frozen at `PROTOCOL_VERSION` 1**: changes within
   version 1 are additive, so a version difference costs a degraded field
   rather than the whole tree.
-  [What the freeze promises](docs/compatibility.md#compatibility).
+  [What the freeze promises](https://github.com/y0sif/taria/blob/main/docs/compatibility.md#compatibility).
 
 ---
 
-## [How taria compares](docs/comparison.md)
+## [How taria compares](https://github.com/y0sif/taria/blob/main/docs/comparison.md)
 
-## [FAQ](docs/faq.md)
+## [FAQ](https://github.com/y0sif/taria/blob/main/docs/faq.md)
 
 ---
 

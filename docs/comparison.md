@@ -23,7 +23,7 @@ at all.
 | [tui-use](https://github.com/onesuper/tui-use) | Screen capture plus keystrokes, packaged for agents. | Outside | Any program |
 | [agent-terminal](https://github.com/jasonkneen/agent-terminal) | Headless terminal automation built on node-pty. | Outside | Any program |
 | [Termwright](https://github.com/gorce-ai/termwright) | End-to-end tests for CLIs and TUIs in the style of Playwright (a browser test framework): runs the program under a PTY, sends input, asserts on the screen, and has an MCP server. Optional probes for Ratatui, Ink, Textual, Bubble Tea and others report roles, labels and state; the Ratatui one patches ratatui-core. A probe's actions still resolve through terminal input. | Outside, with an optional probe inside | Any program; roles and state where a probe is installed |
-| [molerat](https://github.com/orhun/molerat) | The app builds an AccessKit tree (AccessKit is an accessibility toolkit for Rust UIs). Optional features serve it to agents over MCP and to Linux screen readers over AT-SPI, the Linux desktop's accessibility bus, which taria does not reach. Version 0.1.0, not on crates.io. | Inside | Rust apps whose authors adopted it |
+| [molerat](https://github.com/orhun/molerat) | The app builds an AccessKit tree (AccessKit is an accessibility toolkit for Rust UIs). Optional features serve it to agents over MCP and to Linux screen readers over AT-SPI, the Linux desktop's accessibility bus, which taria does not reach. As of 2026-10-30, version 0.1.0 and not on crates.io. | Inside | Rust apps whose authors adopted it |
 | **taria** | The app publishes its widget tree, focus, and the actions available right now. An MCP bridge hands that tree to a harness and carries input back, with a per-input acknowledgement saying what the app did with it. | Inside | Apps whose authors adopted it |
 
 ## What the line costs on each side
@@ -106,8 +106,8 @@ from an app that publishes one.
 ## Partial adoption is the normal case
 
 Annotating an app is incremental and is meant to be. Publish the three nodes
-an agent actually needs and stop. Anything you have not annotated is simply
-absent from the tree: it still renders, a person still uses it, and an agent
+an agent actually needs and stop. Anything you have not annotated is absent
+from the tree: it still renders, a person still uses it, and an agent
 reaching it falls back to the raw `key` tool, which lowers a keystroke into
 your key handler exactly as a person's would. That fallback is why an app with
 one annotated widget is already more useful to an agent than an app with none.

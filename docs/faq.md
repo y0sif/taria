@@ -22,8 +22,8 @@ inside the app: the app itself publishes its widget tree, so an agent acts on
 a node id and an advertised action rather than a guessed keymap, and the app
 acknowledges each input instead of the agent diffing two screens. The tradeoff
 is total: taria reaches only apps whose authors adopted it.
-`docs/comparison.md` does this properly, including when to use the other
-thing.
+[docs/comparison.md](comparison.md) does this properly, including when to use
+the other thing.
 
 **Can AI agents drive a TUI I did not write?**
 
@@ -38,16 +38,16 @@ MCP is a convenience. `taria-mcp` is one client of a plain protocol: ndjson
 over a Unix domain socket, or a named pipe (Windows' local IPC channel) on
 Windows, one JSON object per line. Anything that can open one can read
 snapshots and send input without MCP in the picture.
-`docs/protocol.md` specifies every message, so an MCP TUI bridge of your own,
-in another language, is a matter of writing one.
+[docs/protocol.md](protocol.md) specifies every message, so an MCP TUI bridge
+of your own, in another language, is a matter of writing one.
 
 **Does my app have to be ratatui?**
 
 The adapter that exists today is `taria-ratatui`, so ratatui is the path with
 no work in front of it. The protocol itself knows nothing about ratatui or
-Rust, and `docs/protocol.md` is written for someone building an adapter for
-another framework. Adapters for Bubble Tea, Textual and Ink are wanted and
-not written.
+Rust, and [docs/protocol.md](protocol.md) is written for someone building an
+adapter for another framework. Adapters for Bubble Tea, Textual and Ink are
+wanted and not written.
 
 **What does adopting taria cost an app author?**
 
@@ -61,8 +61,8 @@ dependency: `taria-ratatui` pulls in the core crate and its one dependency
 macOS and Windows, so nothing needs a `cfg` around it. If taria cannot bind
 its socket, or its pipe on Windows, the layer is inert and the app runs
 exactly as it did before, so taria cannot keep your app from starting.
-`docs/integration-guide.md` is the walkthrough, with the mistakes two real
-retrofits made.
+[docs/integration-guide.md](integration-guide.md) is the walkthrough, with the
+mistakes two real retrofits made.
 
 **Does taria work on Windows?**
 
@@ -82,8 +82,8 @@ drives a real adapter from the real `taria-mcp` binary on each. The two
 Python scripts, `scripts/e2e.py` and `scripts/adversarial.py`, drive the demo
 through a pseudo-terminal and run on Linux and macOS only. Locally the
 Windows build was run under Wine (`scripts/wine-test.sh`, see
-`CONTRIBUTING.md`), which is a stand-in: the Windows CI job is the word that
-counts.
+[CONTRIBUTING.md](../CONTRIBUTING.md)), which is a stand-in: the Windows CI
+job is the word that counts.
 
 What Windows lacks is the stopped-app diagnosis. On Linux the bridge reads
 `/proc` to tell an app stopped by Ctrl-Z, a signal or a debugger from one
@@ -109,7 +109,8 @@ it was written before it had seen a tree. taria-mcp sends nothing until it has
 a tree, so a second agent loses nothing. On Windows a pipe has no such queue:
 the second bridge's open is refused as busy, it has nothing to write into,
 and `read_tree` says the app is held, with the same retry advice. Multiple
-simultaneous clients are on the deferred list in `docs/architecture.md`.
+simultaneous clients are on the deferred list in
+[docs/architecture.md](architecture.md).
 
 They can take turns, though. Since 0.3.2, taria-mcp opens no connection until
 its first tool call, and lets the app go after 60 s with no tool calls. A
@@ -119,14 +120,14 @@ from the one that wants it. The waiting bridge's answer says when the holder
 lets go, so the agent retries rather than asking you to kill a process: after
 60 s idle on the default, and after the waiting bridge's own window when it
 was started with another, since a holder started from the same `.mcp.json` has
-the same one. `--idle-release` changes the 60 s (`docs/cli.md`). A bridge that
-let go and came back says, in every answer it gives once reconnected (the app
-taken, stopped, not publishing yet, or sending a line it cannot read), that
-its own disconnect was that release, not a fault, after its window or up to
-30 s more if an input was awaiting its ack. A bridge older than 0.3.2 still
-holds the app until its session ends; until every session runs the new one,
-disable taria with `/mcp` in the Claude Code sessions that do not drive the
-app.
+the same one. `--idle-release` changes the 60 s ([docs/cli.md](cli.md)). A
+bridge that let go and came back says, in every answer it gives once
+reconnected (the app taken, stopped, not publishing yet, or sending a line it
+cannot read), that its own disconnect was that release, not a fault, after its
+window or up to 30 s more if an input was awaiting its ack. A bridge older
+than 0.3.2 still holds the app until its session ends; until every session
+runs the new one, disable taria with `/mcp` in the Claude Code sessions that
+do not drive the app.
 
 **Is the protocol stable?**
 
@@ -134,12 +135,16 @@ The wire format is. It is frozen at `PROTOCOL_VERSION` 1 and only grows: new
 optional fields, new message variants, new roles, new action names. A peer
 that meets one it does not know degrades that one field, not the tree, so an
 app and a bridge built months apart still work together.
-`docs/compatibility.md` says what each version pairing gets.
+[docs/compatibility.md](compatibility.md) says what each version pairing
+gets.
 
 The Rust API is not frozen. taria is alpha and the crates are 0.x, so a
 minor release, such as 0.4 to 0.5, may rename or remove a method. When one
 does, its CHANGELOG entry says what to change. A patch release, such as
-0.4.0 to 0.4.1, never breaks your build.
+0.4.0 to 0.4.1, never breaks your build. The same goes for the Rust
+toolchain. The oldest Rust the crates support (their MSRV, minimum supported
+Rust version) is 1.88. A patch release keeps it, and only a minor release
+raises it.
 
 Few apps use taria yet, so expect rough edges, and please
 [file them](https://github.com/y0sif/taria/issues).
@@ -147,7 +152,7 @@ Few apps use taria yet, so expect rough edges, and please
 **What happens to the parts of my UI I have not annotated?**
 
 Nothing, which is the point. They render as they always did, a person uses
-them as they always did, and they are simply absent from the tree. An agent
+them as they always did, and they are absent from the tree. An agent
 reaching one falls back to the raw `key` tool, which the integration guide
 wires into the same handler a person's keystroke takes, so it lands wherever
 focus is. That is why an app with three annotated nodes is already useful,
