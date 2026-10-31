@@ -284,9 +284,15 @@ fn resolve_pipe(
             )
         })?
     };
+    // The refusal does not say where its name came from, so an override's
+    // says it was the variable's, as `--socket`'s says it was the flag's.
     taria::socket::resolve_pipe_name(taria_sock, &user, app_label)
         .map(PathBuf::from)
-        .map_err(|err| err.to_string())
+        .map_err(|err| match err {
+            taria::socket::InvalidPipeName::Label(_) => err.to_string(),
+            _ if overridden => format!("$TARIA_SOCK takes a pipe name on Windows: {err}"),
+            _ => err.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -564,7 +570,9 @@ mod tests {
         ] {
             let err = parse_strs(&["--socket", name]).unwrap_err();
             assert!(
-                err.starts_with("--socket takes a pipe name on Windows: ") && err.contains(name),
+                err.starts_with("--socket takes a pipe name on Windows: ")
+                    && err.contains(name)
+                    && !err.contains("TARIA_SOCK"),
                 "{err}"
             );
         }
@@ -589,7 +597,8 @@ mod tests {
         );
         let err = resolve_pipe(Some(r"\\host\pipe\x".into()), sid, "demo").unwrap_err();
         assert!(
-            err.contains(r"\\host\pipe\x") && err.contains("TARIA_SOCK"),
+            err.starts_with("$TARIA_SOCK takes a pipe name on Windows: ")
+                && err.contains(r"\\host\pipe\x"),
             "{err}"
         );
         let err = resolve_pipe(None, no_sid, "demo").unwrap_err();

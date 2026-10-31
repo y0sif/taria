@@ -2027,21 +2027,32 @@ fn invalid_label(err: taria::socket::InvalidAppLabel) -> io::Error {
 /// user's SID from the process token.
 ///
 /// A refused label or `$TARIA_SOCK` is `InvalidInput`, with the refusal's own
-/// message. The SID is needed only when `$TARIA_SOCK` does not name the pipe,
-/// so a token that cannot be read is reported only then, in place of the
-/// refusal of the empty user it stands in for.
+/// message, after `$TARIA_SOCK` when the name refused is the variable's,
+/// since the refusal does not say where its name came from. The SID is
+/// needed only when `$TARIA_SOCK` does not name the pipe, so a token that
+/// cannot be read is reported only then, in place of the refusal of the empty
+/// user it stands in for.
 #[cfg(windows)]
 fn resolve_socket_path(app_label: &str) -> io::Result<PathBuf> {
     let user = transport::user_identity();
+    let taria_sock = env::var_os("TARIA_SOCK");
+    let overridden = taria_sock.as_ref().is_some_and(|name| !name.is_empty());
     let resolved = taria::socket::resolve_pipe_name(
-        env::var_os("TARIA_SOCK"),
+        taria_sock,
         user.as_deref().unwrap_or_default(),
         app_label,
     );
     match (resolved, user) {
         (Ok(name), _) => Ok(PathBuf::from(name)),
         (Err(taria::socket::InvalidPipeName::User(_)), Err(err)) => Err(err),
-        (Err(err), _) => Err(io::Error::new(io::ErrorKind::InvalidInput, err.to_string())),
+        (Err(err), _) => {
+            let message = match err {
+                taria::socket::InvalidPipeName::Label(_) => err.to_string(),
+                _ if overridden => format!("$TARIA_SOCK takes a pipe name on Windows: {err}"),
+                _ => err.to_string(),
+            };
+            Err(io::Error::new(io::ErrorKind::InvalidInput, message))
+        }
     }
 }
 

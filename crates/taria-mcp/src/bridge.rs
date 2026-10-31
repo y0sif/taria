@@ -1040,6 +1040,9 @@ async fn manager_loop(
         loop {
             match transport::connect(&path).await {
                 Ok(stream) => {
+                    // "socket" on Windows too, where the endpoint is a pipe:
+                    // scripts/e2e.py waits on this line (`CONNECTED_LOG`),
+                    // so its bytes stay as they are on every platform.
                     tracing::info!(path = %path.display(), "connected to app socket");
                     drain_stale_inputs(&mut input_rx);
                     // A reason a line was rejected belongs to the connection
@@ -1201,9 +1204,10 @@ async fn manager_loop(
                         // before the outcome is counted, which is what a
                         // waiting call reads it after. A pipe at the path
                         // that is not the app's says the same: the app is
-                        // not what is there.
+                        // not what is there, for as long as the link says
+                        // so (see `note_refusal`).
                         if transport::nothing_listens(&err)
-                            || transport::refusal(&err) == Some(Refusal::Foreign)
+                            || *link_tx.borrow() == LinkState::Refused(Refusal::Foreign)
                         {
                             idle.note(|activity| activity.released = false);
                         }
@@ -1350,13 +1354,25 @@ fn forget_oversized_if_nothing_listens(
 /// user) is not the app, so everything the app's lines failed on goes, the
 /// oversized tree included, and the refusal is logged as a warning when it
 /// is new, with what the error names: the owner, or the refusal.
+///
+/// A foreign refusal stands until a connect passes the owner check or finds
+/// nothing listening, whatever fails in between. A pipe that takes one open
+/// and fails the check stays busy until its server disconnects that open,
+/// which an impostor need never do. Read as busy, those refusals turned "not
+/// the app" into the app held by another bridge, about a pipe the app never
+/// made.
 fn note_refusal(
     path: &std::path::Path,
     err: &io::Error,
     link_tx: &watch::Sender<LinkState>,
     rejected_tx: &watch::Sender<Option<String>>,
 ) {
-    let refusal = transport::refusal(err);
+    let was_foreign = *link_tx.borrow() == LinkState::Refused(Refusal::Foreign);
+    let refusal = if was_foreign && !transport::nothing_listens(err) {
+        Some(Refusal::Foreign)
+    } else {
+        transport::refusal(err)
+    };
     let now = refusal.map_or(LinkState::Down, LinkState::Refused);
     let changed = link_tx.send_if_modified(|link| {
         if *link == now {

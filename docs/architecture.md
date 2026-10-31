@@ -1121,16 +1121,20 @@ Three answers exist only on Windows, because only the Windows transport
 refuses a connect, and only there does a silent connection mean the app.
 The answers Windows shares with Linux and macOS name the pipe and the pipe
 name where those name the socket and the socket path (`ENDPOINT`,
-`ENDPOINT_ADDRESS`), so nothing connected asks whether the pipe name is
-correct. Linux and macOS answers are unchanged, byte for byte.
+`ENDPOINT_ADDRESS`), or the path, in the answer to a connection inside the
+grace, so nothing connected asks whether the pipe name is correct. Linux
+and macOS answers are unchanged, byte for byte.
 
 - **Busy.** The open was refused with `ERROR_PIPE_BUSY` for the whole of
   the 250 ms retry: another bridge has the one instance. The answer is the
   held answer, with the pipe's refusal as its evidence in place of a silent
   connection's age, and the same retry advice by this bridge's
-  `--idle-release`. A bridge that let go of the app itself gets the
-  held-after-release answer, as on Unix. A busy refusal forgets the last
-  connection's rejected lines, oversized tree aside, as a connect does.
+  `--idle-release`. It ends by allowing that the app may instead be
+  suspended or stuck: an app stopped after a session cannot retire it and
+  listen again, so its one instance stays busy. A bridge that let go of the
+  app itself gets the held-after-release answer, as on Unix. A busy refusal
+  forgets the last connection's rejected lines, oversized tree aside, as a
+  connect does.
 - **Silent pipe.** A connection opened and has said nothing past the 500 ms
   grace. On Windows that is the app, suspended (a debugger, a process tool)
   or stuck before its `hello`, or something that is not a taria adapter, and
@@ -1143,11 +1147,15 @@ correct. Linux and macOS answers are unchanged, byte for byte.
   the bridge read one. It outranks every other answer, an oversized tree
   included, since it is not the app whose tree or lines those would be
   about, and it clears the bridge's record of having let go, as finding
-  nothing listening does.
+  nothing listening does. It stands until a connect passes the owner check
+  or finds nothing listening: a pipe that takes one open, fails the check
+  and then stays busy is still not the app, not the app held.
 
-Stopped-app detection reads `/proc`, so it stays Linux only: on Windows a
-suspended app gets the silent-pipe answer, and the no-ack answer never names
-a stopped app. `docs/cli.md` quotes the three texts.
+Stopped-app detection reads `/proc`, so it stays Linux only. On Windows an
+app suspended while its pipe listens gets the silent-pipe answer, and one
+suspended after a session, which cannot listen again, gets the busy answer,
+which allows for it; the no-ack answer never names a stopped app.
+`docs/cli.md` quotes the three texts.
 
 ## Focus contract
 

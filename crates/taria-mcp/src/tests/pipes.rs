@@ -16,6 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer};
 use tokio::sync::watch;
 use tokio::time::timeout;
+use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
 use crate::TariaMcpServer;
 use crate::bridge::{self, BridgeState, LinkState};
@@ -289,6 +290,51 @@ async fn a_pipe_another_account_owns_is_closed_unwritten_and_named() {
         "the bridge wrote to it: {read:?} {sent:?}"
     );
     assert!(sent.is_empty());
+}
+
+/// A pipe another account owns that takes one open, fails the owner check
+/// and then stays busy is still not the app: the busy refusals after the
+/// first open keep the foreign answer, and never read as the app held by
+/// another bridge. Only a connect that passes the owner check, or finds
+/// nothing listening, retires it. Only where the test can make such a pipe,
+/// as above.
+#[tokio::test]
+async fn a_foreign_pipe_that_then_stays_busy_is_still_not_the_app() {
+    const FOREIGN: &str = "no snapshot from the app yet: the pipe at this name is owned by \
+                           another account than this bridge's user";
+    let name = unique_pipe_name("foreignbusy");
+    let _pipe = match pipe_owned_by(&name, "BA") {
+        Ok(pipe) => pipe,
+        Err(err) => {
+            eprintln!("no pipe another account owns here ({err}); nothing to refuse");
+            return;
+        }
+    };
+    let tools = on_demand(&name);
+    let refused = tools.read_tree().await.expect_err("not the app");
+    assert!(refused.message.starts_with(FOREIGN), "{}", refused.message);
+
+    // The pipe's one instance stays taken: on Windows by the bridge's closed
+    // open until the server disconnects it, which this one never does, and
+    // here by a client of the test's own where the instance came free.
+    let _squatter = match ClientOptions::new().open(&name) {
+        Ok(client) => Some(client),
+        Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => None,
+        Err(err) => panic!("neither opened nor busy: {err}"),
+    };
+    let busy = ClientOptions::new()
+        .open(&name)
+        .expect_err("the pipe stays busy");
+    assert_eq!(busy.raw_os_error(), Some(ERROR_PIPE_BUSY as i32), "{busy}");
+
+    // Long enough for several reconnects, each refused as busy, while the
+    // calls keep the bridge wanting the app.
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < until {
+        let answer = tools.read_tree().await.expect_err("still not the app");
+        assert!(answer.message.starts_with(FOREIGN), "{}", answer.message);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// The pid at the other end of the pipe is the process serving it, here

@@ -476,7 +476,7 @@ impl fmt::Display for InvalidPipeName {
             Self::NotLocal(name) => write!(
                 f,
                 "`{name}` does not start with {LOCAL_PIPE_PREFIX}, so it is not taken for a pipe \
-                 on this machine; $TARIA_SOCK must name one that way. A pipe on another machine \
+                 on this machine, and a pipe name must start that way. A pipe on another machine \
                  (\\\\host\\pipe\\...) is refused, because opening it goes over SMB"
             ),
             Self::Name(name) => write!(
@@ -1022,6 +1022,9 @@ mod tests {
         );
         assert!(message.contains(LOCAL_PIPE_PREFIX), "message: {message}");
         assert!(message.contains("SMB"), "message: {message}");
+        // The name may come from `--socket` or `bind_at` as well as from
+        // $TARIA_SOCK, so the message does not guess which.
+        assert!(!message.contains("TARIA_SOCK"), "message: {message}");
 
         let message = check_pipe_name(r"\\.\pipe\a\b").unwrap_err().to_string();
         assert!(message.contains(r"`\\.\pipe\a\b`"), "message: {message}");

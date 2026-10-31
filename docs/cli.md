@@ -112,11 +112,13 @@ the same. After a disconnect each keeps the opening callers match on,
   before it gives this answer. With the default `--idle-release`:
 
   ```text
-  no snapshot from the app yet: the app is held by another bridge. The pipe name is right: the app's pipe refused this bridge as busy, which is what a second bridge gets, because a taria adapter serves one bridge at a time. A taria-mcp lets go of the app after 60 s with no tool calls (its default), and this bridge takes over as soon as it does, with no restart; retry in a minute. If the app stays held, another session is using it, or the holder is a taria-mcp older than 0.3.2, which holds the app until its session ends. Failing that, something other than a taria bridge holds the pipe.
+  no snapshot from the app yet: the app is held by another bridge. The pipe name is right: the app's pipe refused this bridge as busy, which is what a second bridge gets, because a taria adapter serves one bridge at a time. A taria-mcp lets go of the app after 60 s with no tool calls (its default), and this bridge takes over as soon as it does, with no restart; retry in a minute. If the app stays held, another session is using it, or the holder is a taria-mcp older than 0.3.2, which holds the app until its session ends. Failing that, the app may instead be suspended or stuck and unable to reopen its pipe, or something other than a taria bridge holds the pipe.
   ```
 
   The retry sentence follows `--idle-release` as it does on Linux and macOS.
-  After a disconnect the text from `The pipe name is right` on follows
+  The last sentence allows for an app suspended or stuck after a session,
+  which cannot listen again, so its pipe stays busy too. After a disconnect
+  the text from `The pipe name is right` on follows
   `app '<label>' disconnected (last snapshot seq N), and the app is now held
   by another bridge. `, or, if this bridge had let go of the app itself, the
   held-after-release answer replaces it, as on Linux and macOS.
@@ -144,11 +146,13 @@ the same. After a disconnect each keeps the opening callers match on,
 
   After a disconnect the text from `the pipe at this name` on follows
   `app '<label>' disconnected (last snapshot seq N), and `. It outranks every
-  other answer.
+  other answer, and stands until a connect passes the owner check or finds
+  nothing listening, so a pipe that then stays busy does not read as held.
 
 The answers Windows shares with Linux and macOS keep their texts, except
 that each one naming the app's endpoint says "pipe" where those say
-"socket", and "pipe name" where they say "socket path". Those are the
+"socket", and "pipe name" where they say "socket path" (or "path", in the
+answer to a connection younger than the grace). Those are the
 answers to nothing connected, a line over 1 MiB, a line the bridge could not
 read, an app that greeted the bridge and has not published, a connection
 younger than the 500 ms grace, and an input the bridge's queue to the app
@@ -158,10 +162,11 @@ could not take. With nothing connected:
 no snapshot from the app yet, and this bridge holds no connection to the pipe: is the taria-enabled app running, and is the pipe name correct? The bridge reconnects automatically; retry once the app is up.
 ```
 
-Stopped-app detection reads `/proc` and is Linux only, so on Windows a
-suspended app gets the second answer, without a pid, and the answer to an
-input that is never acknowledged does not name a stopped app. Every answer
-on Linux and macOS is as it was.
+Stopped-app detection reads `/proc` and is Linux only, so on Windows an
+app suspended while its pipe listens gets the second answer, without a pid,
+one suspended after a session gets the first, and the answer to an input
+that is never acknowledged does not name a stopped app. Every answer on
+Linux and macOS is as it was.
 
 ## The outline
 

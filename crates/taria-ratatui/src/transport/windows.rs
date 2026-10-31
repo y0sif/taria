@@ -1279,10 +1279,16 @@ mod tests {
     }
 
     /// The restart the retry is for: the app's instance is gone, and the
-    /// bridge it served still holds its end of the pipe for a moment. The
-    /// next app's bind outlasts it.
+    /// bridge it served still holds its end of the pipe for 150 ms. The next
+    /// app's bind succeeds, within the retry.
+    ///
+    /// That is all this can assert. On Windows the bridge's handle keeps the
+    /// name in use until it closes, so the bind waits for it; Wine frees the
+    /// name with the server's handles, so there the bind succeeds at once,
+    /// and a test that also runs under Wine cannot require the wait. The wait
+    /// itself is exercised only on real Windows (the windows-latest CI job).
     #[test]
-    fn a_bind_outlasts_a_bridge_still_holding_the_last_instance() {
+    fn a_bind_succeeds_in_time_while_a_bridge_holds_the_last_instance() {
         let (listener, connection, client) = session("lingering");
         let name = name_of(&listener);
         // The app exits: everything of its side of the pipe goes.
@@ -1293,7 +1299,7 @@ mod tests {
         });
 
         let tried = Instant::now();
-        let next = Listener::bind(PathBuf::from(&name)).expect("the bridge let go in time");
+        let next = Listener::bind(PathBuf::from(&name)).expect("bound within the retry");
         let took = tried.elapsed();
         bridge.join().expect("the bridge thread");
         assert!(took < BIND_RETRY, "bound only after {took:?}");
@@ -1587,6 +1593,8 @@ mod tests {
             panic!("a remote pipe was bound");
         };
         assert!(err.to_string().contains("SMB"), "err: {err}");
+        // A name passed to `bind_at` is not the variable's.
+        assert!(!err.to_string().contains("TARIA_SOCK"), "err: {err}");
     }
 
     #[test]

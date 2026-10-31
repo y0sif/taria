@@ -105,6 +105,16 @@ const QUEUE_WAIT: Duration = Duration::from_millis(500);
 /// so a held app is diagnosed on the first call rather than the second.
 pub(crate) const SILENT_LINK_GRACE: Duration = Duration::from_millis(500);
 
+/// What the answers to a connection younger than [`SILENT_LINK_GRACE`] say
+/// is right: "path" on Linux and macOS, the word those answers have always
+/// used, and the [`ENDPOINT_ADDRESS`], "pipe name", on Windows, as every
+/// other Windows answer names it.
+const GRACE_ADDRESS: &str = if cfg!(windows) {
+    ENDPOINT_ADDRESS
+} else {
+    "path"
+};
+
 /// Most presses one `key` call may send.
 ///
 /// The point of `repeat` is to spend one call on "move down five rows", not to
@@ -1240,8 +1250,8 @@ fn reconnected_reason(
     if open_for < SILENT_LINK_GRACE {
         return format!(
             "{departed}, and this bridge reconnected to the {ENDPOINT} {}ms ago; no handshake has \
-             arrived yet. The path is right, so this is worth one retry; a connection that is \
-             still silent on the next call is diagnosed rather than waited on.",
+             arrived yet. The {GRACE_ADDRESS} is right, so this is worth one retry; a connection \
+             that is still silent on the next call is diagnosed rather than waited on.",
             open_for.as_millis()
         );
     }
@@ -1414,8 +1424,8 @@ fn no_snapshot_reason(report: LinkReport) -> String {
     if open_for < SILENT_LINK_GRACE {
         return format!(
             "no snapshot from the app yet: this bridge connected to the {ENDPOINT} {}ms ago and no \
-             handshake has arrived yet. The path is right, so this is worth one retry; a \
-             connection that is still silent on the next call is diagnosed rather than waited \
+             handshake has arrived yet. The {GRACE_ADDRESS} is right, so this is worth one retry; \
+             a connection that is still silent on the next call is diagnosed rather than waited \
              on.",
             open_for.as_millis()
         );
@@ -1460,11 +1470,17 @@ fn held_by_another_bridge(open_for: Duration, idle_release: Option<Duration>) ->
 /// pipe refusing this bridge as busy, the only sign Windows gives: the same
 /// cause and the same way out as [`held_by_another_bridge`], with the
 /// evidence a pipe gives in place of a silent connection's age.
+///
+/// A busy pipe is also what an app suspended or stuck after a session leaves:
+/// its one instance stays taken until the app retires the session and listens
+/// again, which an app that is not running cannot do. Only an app suspended
+/// while it listens takes the connection and gets [`silent_pipe`]'s answer.
 fn held_busy(idle_release: Option<Duration>) -> String {
     format!(
         "The pipe name is right: the app's pipe refused this bridge as busy, which is what a \
          second bridge gets, because a taria adapter serves one bridge at a time. {} {STAYS_HELD} \
-         Failing that, something other than a taria bridge holds the pipe.",
+         Failing that, the app may instead be suspended or stuck and unable to reopen its pipe, \
+         or something other than a taria bridge holds the pipe.",
         retry_guidance(idle_release)
     )
 }
@@ -3145,15 +3161,27 @@ mod tests {
             .map(|(ms, _)| ms.parse::<u64>().expect("a whole number of ms"))
             .unwrap_or_else(|| panic!("{}", young.message));
         assert!((120..500).contains(&ms), "{}", young.message);
+        // "path" on Linux and macOS, as since 0.3.1, and the pipe name on
+        // Windows, as every other Windows answer says it.
+        let right = if cfg!(windows) {
+            "The pipe name is right"
+        } else {
+            "The path is right"
+        };
+        let tail = format!(
+            "no handshake has arrived yet. {right}, so this is worth one retry; a connection \
+             that is still silent on the next call is diagnosed rather than waited on."
+        );
         assert!(
-            young.message.ends_with(
-                "ms ago; no handshake has arrived yet. The path is right, so this is worth one \
-                 retry; a connection that is still silent on the next call is diagnosed rather \
-                 than waited on."
-            ),
+            young.message.ends_with(&format!("ms ago; {tail}")),
             "{}",
             young.message
         );
+        let fresh = no_snapshot_reason(LinkReport {
+            link: open_for(10),
+            ..silent_link()
+        });
+        assert!(fresh.ends_with(&format!("ms ago and {tail}")), "{fresh}");
 
         for (name, message) in [("greeted", &greeted.message), ("young", &young.message)] {
             assert!(
@@ -3853,8 +3881,9 @@ mod tests {
                              no tool calls (its default), and this bridge takes over as soon as it \
                              does, with no restart; retry in a minute. If the app stays held, \
                              another session is using it, or the holder is a taria-mcp older than \
-                             0.3.2, which holds the app until its session ends. Failing that, \
-                             something other than a taria bridge holds the pipe.";
+                             0.3.2, which holds the app until its session ends. Failing that, the \
+                             app may instead be suspended or stuck and unable to reopen its pipe, \
+                             or something other than a taria bridge holds the pipe.";
 
     /// A pipe busy with another client is the one sign Windows gives of an
     /// app held by another bridge, and gets the held answer: the same

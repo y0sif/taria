@@ -1652,9 +1652,11 @@ the app held, not as a wrong pipe name or an app that has gone, and
 **Reference implementation.** The reference bridge retries a busy open for
 250 ms (section 14.8), and answers a refusal that outlasts that with the held
 answer, in the same words and the same retry advice as on a unix, with the
-pipe's refusal as the evidence in place of the silent connection's age. It
-answers the silent pipe with the app suspended or stuck, the pipe name
-right, and a retry once the app responds. Stopped-app detection needs
+pipe's refusal as the evidence in place of the silent connection's age, and
+last that the app may instead be suspended or stuck: an app stopped after a
+session cannot listen again, so its pipe stays busy. It answers the silent
+pipe with the app suspended or stuck, the pipe name right, and a retry once
+the app responds. Stopped-app detection needs
 `/proc`, so on Windows a suspended app is named only as possibly suspended,
 never with its pid's state. Every answer that names the endpoint names the
 pipe and the pipe name where a unix answer names the socket and the socket

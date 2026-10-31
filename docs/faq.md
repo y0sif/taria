@@ -88,9 +88,11 @@ counts.
 What Windows lacks is the stopped-app diagnosis. On Linux the bridge reads
 `/proc` to tell an app stopped by Ctrl-Z, a signal or a debugger from one
 held by another bridge, and names it with its pid. Windows has no `/proc`:
-there a suspended app shows as a connection that stays silent, which the
-bridge reports as the app suspended or stuck, without a pid. macOS has no
-`/proc` either, and reports a stopped app as held.
+there an app suspended while it listens shows as a connection that stays
+silent, which the bridge reports as the app suspended or stuck, without a
+pid, and one suspended after a session cannot listen again, so its pipe
+reads as busy, and the held answer allows that it may be suspended or
+stuck. macOS has no `/proc` either, and reports a stopped app as held.
 
 **Can two agents connect to the same app at once?**
 

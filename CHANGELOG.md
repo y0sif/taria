@@ -264,7 +264,8 @@ be answered well by a 0.4.0 `taria-mcp`:
     evidence: `the app is held by another bridge. The pipe name is
     right: the app's pipe refused this bridge as busy, which is what a
     second bridge gets, because a taria adapter serves one bridge at a
-    time.`, then the same retry advice as on Unix.
+    time.`, then the same retry advice as on Unix, and last that the app
+    may instead be suspended or stuck and unable to reopen its pipe.
   - A connection that opens and stays silent past the 500 ms grace is
     therefore the app itself, not another bridge: `the app accepted this
     bridge's connection N.Ns ago but has sent nothing, not even the taria
@@ -277,21 +278,26 @@ be answered well by a 0.4.0 `taria-mcp`:
     this user access, which the app's own pipe never does, so it is not the
     app's; this bridge parsed nothing it sent and wrote nothing to it.`,
     then why that can happen and what the user should do. The log names the
-    owner, when the pipe let the bridge read one. `docs/cli.md` quotes all
-    three whole.
+    owner, when the pipe let the bridge read one. It stands until a connect
+    passes the owner check or finds nothing listening, so a pipe that then
+    stays busy does not read as held. `docs/cli.md` quotes all three whole.
 - **On Windows the other answers name the pipe.** Each answer shared with
   Linux and macOS that names the app's endpoint says "pipe" where they say
-  "socket", and "pipe name" where they say "socket path": nothing connected,
-  a line over 1 MiB, a line the bridge could not read, an app that greeted
-  and has not published, a connection younger than the 500 ms grace, and a
-  full input queue. With nothing connected: `no snapshot from the app yet,
+  "socket", and "pipe name" where they say "socket path" (or "path", in the
+  answer to a connection inside the grace): nothing connected, a line over
+  1 MiB, a line the bridge could not read, an app that greeted and has not
+  published, a connection younger than the 500 ms grace, and a full input
+  queue. With nothing connected: `no snapshot from the app yet,
   and this bridge holds no connection to the pipe: is the taria-enabled app
   running, and is the pipe name correct? The bridge reconnects
   automatically; retry once the app is up.` The Linux and macOS texts are
   unchanged, byte for byte.
-- **Stopped-app detection stays Linux only.** It reads `/proc`. On Windows a
-  suspended app gets the silent-pipe answer above, with no pid, and on macOS
-  a stopped app still reads as held.
+- **Stopped-app detection stays Linux only.** It reads `/proc`. On Windows
+  an app suspended while its pipe listens gets the silent-pipe answer above,
+  with no pid, and one suspended after a session, which cannot listen again,
+  gets the held answer, which ends by allowing that the app may instead be
+  suspended or stuck and unable to reopen its pipe. On macOS a stopped app
+  still reads as held.
 
 ### For an app author adopting taria
 

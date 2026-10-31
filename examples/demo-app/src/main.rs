@@ -46,10 +46,16 @@ fn main() -> io::Result<()> {
     // frame, and disappears with the alternate screen on exit. Printed to the
     // primary buffer it is still there when the demo quits, which is where an
     // agent operator goes looking for the socket path.
+    // A pipe on Windows. Named apart there only, so the Linux and macOS line
+    // keeps its bytes.
+    #[cfg(windows)]
+    const ENDPOINT: &str = "pipe";
+    #[cfg(not(windows))]
+    const ENDPOINT: &str = "socket";
     match layer.bind_error() {
         Some(err) => eprintln!("taria-demo: taria disabled: {err}"),
         None => eprintln!(
-            "taria-demo: taria socket at {}",
+            "taria-demo: taria {ENDPOINT} at {}",
             layer.socket_path().display()
         ),
     }
