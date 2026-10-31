@@ -10,7 +10,8 @@
 //! connects at once and never lets go.
 //!
 //! The binary speaks MCP over stdio to the harness and the taria ndjson
-//! protocol over a Unix domain socket to the app. It exposes four tools:
+//! protocol to the app, over a Unix domain socket, or a named pipe on
+//! Windows. It exposes four tools:
 //! `read_tree` (latest semantic snapshot), `act` (invoke an advertised
 //! action on a node), `type_text` (a literal string in one call), and `key`
 //! (raw key fallback, with a repeat count).
@@ -37,6 +38,8 @@ mod transport;
 mod tree_format;
 
 pub use server::{DEFAULT_IDLE_RELEASE, TariaMcpServer, TariaMcpServerBuilder};
+#[cfg(windows)]
+pub use transport::current_user_sid;
 pub use tree_format::TreeFormat;
 
 #[cfg(test)]

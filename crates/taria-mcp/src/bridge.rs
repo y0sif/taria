@@ -1,4 +1,5 @@
-//! Socket manager: owns the connection to the app's taria Unix socket.
+//! Socket manager: owns the connection to the app's taria Unix socket (a
+//! named pipe on Windows; see [`transport`]).
 //!
 //! A single background task connects, retrying with capped backoff for as long
 //! as it wants the app. [`spawn`] wants it from the start and for good: it
@@ -63,7 +64,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant as TokioInstant;
 
 use crate::server::{MAX_KEY_REPEAT, SILENT_LINK_GRACE};
-use crate::transport;
+use crate::transport::{self, Refusal};
 
 /// First reconnect delay after a failed connect attempt.
 const RETRY_MIN: Duration = Duration::from_millis(250);
@@ -281,13 +282,19 @@ pub(crate) enum LinkState {
         /// arriving, and one open far longer is a socket nobody is reading.
         since: Instant,
     },
+    /// No connection is open because the last connect was turned away by
+    /// something listening at the path, for this reason. Only the Windows
+    /// transport refuses a connect this way: a pipe busy with another bridge
+    /// is the app held, as an open, silent connection is on Unix, and a pipe
+    /// another account owns is not the app at all.
+    Refused(Refusal),
 }
 
 impl LinkState {
     /// How long the open connection has been up, or `None` when none is.
     pub(crate) fn open_for(self) -> Option<Duration> {
         match self {
-            Self::Down => None,
+            Self::Down | Self::Refused(_) => None,
             Self::Open { since } => Some(since.elapsed()),
         }
     }
@@ -1177,6 +1184,7 @@ async fn manager_loop(
                         retry_in_ms = backoff.as_millis() as u64,
                         "connect failed; is the app running?"
                     );
+                    note_refusal(&path, &err, &link_tx, &rejected_tx);
                     // An app that overflowed and then exited leaves its reason
                     // behind, and the tools would go on telling the agent that
                     // a running app resends the same tree to every reconnect,
@@ -1190,8 +1198,12 @@ async fn manager_loop(
                         // describes what happened to it, and a held answer
                         // about the next instance must not say it. Cleared
                         // before the outcome is counted, which is what a
-                        // waiting call reads it after.
-                        if transport::nothing_listens(&err) {
+                        // waiting call reads it after. A pipe another account
+                        // owns at the path says the same: the app is not
+                        // what is there.
+                        if transport::nothing_listens(&err)
+                            || transport::refusal(&err) == Some(Refusal::Foreign)
+                        {
                             idle.note(|activity| activity.released = false);
                         }
                         idle.settled();
@@ -1322,6 +1334,48 @@ fn forget_oversized_if_nothing_listens(
     }
 }
 
+/// Publish what a failed connect says about the link, before the outcome is
+/// counted, so a tool call answered by that outcome reads it: a refusal as
+/// [`LinkState::Refused`], anything else as [`LinkState::Down`].
+///
+/// Changed only when it changes, so where connects are never refused (Unix)
+/// a failed connect leaves the link exactly as it was, unsent: down since
+/// the last connection ended.
+///
+/// A busy pipe is the Windows form of a connect into the backlog, the app
+/// there and serving another bridge, so what the last connection's lines
+/// failed on is forgotten, as a connect forgets it, oversized tree aside. A
+/// pipe another account owns is not the app, so everything the app's lines
+/// failed on goes, the oversized tree included, and the refusal is logged
+/// as a warning when it is new, with the owner the error names.
+fn note_refusal(
+    path: &std::path::Path,
+    err: &io::Error,
+    link_tx: &watch::Sender<LinkState>,
+    rejected_tx: &watch::Sender<Option<String>>,
+) {
+    let refusal = transport::refusal(err);
+    let now = refusal.map_or(LinkState::Down, LinkState::Refused);
+    let changed = link_tx.send_if_modified(|link| {
+        if *link == now {
+            false
+        } else {
+            *link = now;
+            true
+        }
+    });
+    match refusal {
+        Some(Refusal::Busy) => forget_rejected_except_oversized(rejected_tx),
+        Some(Refusal::Foreign) => {
+            if changed {
+                tracing::warn!(path = %path.display(), %err, "refused the app's endpoint");
+            }
+            rejected_tx.send_if_modified(|rejected| rejected.take().is_some());
+        }
+        None => {}
+    }
+}
+
 /// Retire every reason but [`OVERSIZED_LINE`], the counterpart of
 /// [`forget_oversized`], for a connection that has just opened: what the last
 /// connection's lines failed on says nothing about this one's, while an
@@ -1414,7 +1468,7 @@ async fn read_line_capped(
 
 /// [`serve_connection`] for a manager that never lets go, which is how the
 /// tests below drive one connection by hand.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 async fn run_connection(
     stream: impl AsyncRead + AsyncWrite + Unpin,
     state_tx: &watch::Sender<BridgeState>,
@@ -1765,6 +1819,32 @@ mod tests {
 
     use super::*;
 
+    /// Both ends of one connection over this platform's transport, the
+    /// bridge's first: a socket pair on Unix, and on Windows a pipe made the
+    /// way the adapter makes the app's, connected through the transport's own
+    /// [`connect`](transport::connect), owner check and all.
+    #[cfg(unix)]
+    async fn stream_pair() -> (
+        impl AsyncRead + AsyncWrite + Unpin,
+        impl AsyncRead + AsyncWrite + Unpin,
+    ) {
+        UnixStream::pair().expect("a socket pair")
+    }
+
+    #[cfg(windows)]
+    async fn stream_pair() -> (
+        impl AsyncRead + AsyncWrite + Unpin,
+        impl AsyncRead + AsyncWrite + Unpin,
+    ) {
+        let name = transport::testing::unique_pipe_name("pair");
+        let app_end = transport::testing::app_pipe(&name).expect("create the app's pipe");
+        let bridge_end = transport::connect(std::path::Path::new(&name))
+            .await
+            .expect("connect to the app's pipe");
+        app_end.connect().await.expect("the app takes the bridge");
+        (bridge_end, app_end)
+    }
+
     /// The reason is a fixed string, so nothing else keeps its number in step
     /// with the cap the reader enforces.
     #[test]
@@ -1780,10 +1860,9 @@ mod tests {
     /// before `run_connection` returns: the manager demotes the state as soon
     /// as it does, and a tool call that sees the demotion has to find the
     /// reason already there.
-    #[cfg(unix)]
     #[tokio::test]
     async fn an_oversized_line_is_recorded_before_the_connection_ends() {
-        let (bridge_end, mut app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, mut app_end) = stream_pair().await;
         let (state_tx, _state_rx) = watch::channel(BridgeState::Never);
         // Held open, so the end of the session cannot be what ends the call.
         let (_input_tx, mut input_rx) = mpsc::channel(1);
@@ -1859,22 +1938,38 @@ mod tests {
     /// A `connect` that finds nothing listening retires the oversized reason,
     /// because the app that resent that tree on every reconnect has gone.
     /// The errors are the ones this platform really returns for a socket file
-    /// nobody is bound to and for a path with no file, so a kind the matcher
-    /// misses fails here rather than leaving the reason in place for good.
-    #[cfg(unix)]
+    /// nobody is bound to and for a path with no file (on Windows, a pipe
+    /// name nobody serves), so a kind the matcher misses fails here rather
+    /// than leaving the reason in place for good.
     #[tokio::test]
     async fn a_connect_that_finds_nothing_listening_forgets_the_oversized_reason() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let stale = dir.path().join("stale.sock");
-        // Bound, then dropped: the file stays and nothing listens on it, which
-        // is what an app that crashed leaves behind.
-        drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
-        let gone = dir.path().join("gone.sock");
-
-        for (name, path) in [("stale socket", &stale), ("no socket", &gone)] {
-            let err = UnixStream::connect(path)
+        #[cfg(unix)]
+        let (_dir, failures) = {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let stale = dir.path().join("stale.sock");
+            // Bound, then dropped: the file stays and nothing listens on it,
+            // which is what an app that crashed leaves behind.
+            drop(std::os::unix::net::UnixListener::bind(&stale).expect("bind"));
+            let gone = dir.path().join("gone.sock");
+            let mut failures = Vec::new();
+            for (name, path) in [("stale socket", &stale), ("no socket", &gone)] {
+                let err = UnixStream::connect(path)
+                    .await
+                    .expect_err("nothing listens here");
+                failures.push((name, err));
+            }
+            (dir, failures)
+        };
+        #[cfg(windows)]
+        let failures = {
+            let name = transport::testing::unique_pipe_name("gone");
+            let err = transport::connect(std::path::Path::new(&name))
                 .await
-                .expect_err("nothing listens here");
+                .expect_err("nothing serves this pipe");
+            vec![("no pipe", err)]
+        };
+
+        for (name, err) in failures {
             let (rejected_tx, rejected_rx) = watch::channel(Some(OVERSIZED_LINE.to_string()));
             forget_oversized_if_nothing_listens(&err, &rejected_tx);
             assert_eq!(
@@ -2067,16 +2162,15 @@ mod tests {
     /// A connection that serves a tree retires the release flag at once, so
     /// it cannot outlive the departure it was about, whatever ends the
     /// connection later.
-    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn a_connection_that_serves_a_tree_retires_the_release_flag() {
         let (mut idle, demand) = idle_and_demand(Duration::from_secs(1));
         let mut wiring = Wiring::new();
         idle.note(|activity| activity.released = true);
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
         drop(demand.begin());
         let app = async {
-            let (read, mut write) = app_end.into_split();
+            let (read, mut write) = tokio::io::split(app_end);
             let mut snapshot = serde_json::to_string(&AppToBridge::Snapshot(Snapshot::new(
                 1,
                 Node::new("app", Role::App),
@@ -2139,7 +2233,6 @@ mod tests {
 
     /// The channels one connection is served with, for driving
     /// [`serve_connection`] by hand.
-    #[cfg(unix)]
     struct Wiring {
         state_tx: watch::Sender<BridgeState>,
         input_tx: mpsc::Sender<(InputId, AgentInput)>,
@@ -2149,7 +2242,6 @@ mod tests {
         rejected_tx: watch::Sender<Option<String>>,
     }
 
-    #[cfg(unix)]
     impl Wiring {
         fn new() -> Self {
             let (state_tx, _) = watch::channel(BridgeState::Never);
@@ -2171,7 +2263,7 @@ mod tests {
         /// tokio's clock.
         async fn serve(
             &mut self,
-            stream: UnixStream,
+            stream: impl AsyncRead + AsyncWrite + Unpin,
             idle: &mut Idle,
         ) -> (ConnectionEnd, TokioInstant) {
             let mut label = None;
@@ -2193,8 +2285,7 @@ mod tests {
     }
 
     /// The app's end of a connection, held open until the bridge closes it.
-    #[cfg(unix)]
-    async fn hold_open(app_end: UnixStream) {
+    async fn hold_open(app_end: impl AsyncRead + Unpin) {
         let mut rest = Vec::new();
         let mut app_end = app_end;
         app_end
@@ -2218,7 +2309,6 @@ mod tests {
     /// [`SMALL_STEPS_BOUND`] of the paused clock never will be (a bridge that
     /// stopped reading, say), and fails the test rather than stepping the
     /// clock forever.
-    #[cfg(unix)]
     async fn in_small_steps<T>(io: impl Future<Output = T>) -> T {
         let bound = TokioInstant::now() + SMALL_STEPS_BOUND;
         tokio::pin!(io);
@@ -2236,11 +2326,9 @@ mod tests {
     /// How long [`in_small_steps`] steps the paused clock before giving up:
     /// far longer than anything it waits on takes, and far shorter than
     /// [`UNACKED_HOLD`], so a missed ack fails before the hold ends.
-    #[cfg(unix)]
     const SMALL_STEPS_BOUND: Duration = Duration::from_secs(5);
 
     /// The id of the next input the bridge writes on `reader`.
-    #[cfg(unix)]
     async fn next_input_id<R: tokio::io::AsyncRead + Unpin>(reader: &mut BufReader<R>) -> InputId {
         let mut line = String::new();
         in_small_steps(reader.read_line(&mut line))
@@ -2253,7 +2341,6 @@ mod tests {
     }
 
     /// The release of `end`, failing the test for any other ending.
-    #[cfg(unix)]
     fn released(end: ConnectionEnd) -> Release {
         match end {
             ConnectionEnd::Released(release) => release,
@@ -2264,7 +2351,6 @@ mod tests {
 
     /// `at` is `want` after `from`, give or take the milliseconds tokio's
     /// timers round their deadlines up to and [`in_small_steps`] leaves.
-    #[cfg(unix)]
     fn assert_at(from: TokioInstant, at: TokioInstant, want: Duration) {
         let took = at - from;
         assert!(
@@ -2277,7 +2363,6 @@ mod tests {
     /// window runs from the end of the last call: one that ends just before
     /// the window closes starts it again, and one still running when it
     /// would close holds it open until it ends.
-    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn the_window_runs_from_the_end_of_the_last_call() {
         let window = Duration::from_secs(1);
@@ -2286,7 +2371,7 @@ mod tests {
         let wall = Instant::now();
 
         // One call, and nothing after it.
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
         let t0 = TokioInstant::now();
         drop(demand.begin());
         let ((end, at), ()) = tokio::join!(wiring.serve(bridge_end, &mut idle), hold_open(app_end));
@@ -2296,7 +2381,7 @@ mod tests {
         assert_at(t0, at, window);
 
         // A call that ends a millisecond before the window closes.
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
         let t1 = TokioInstant::now();
         drop(demand.begin());
         let late_call = async {
@@ -2313,7 +2398,7 @@ mod tests {
 
         // A call that is still running when the window would close, and ends
         // three seconds in.
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
         let t2 = TokioInstant::now();
         drop(demand.begin());
         let long_call = async {
@@ -2343,14 +2428,13 @@ mod tests {
     /// for [`UNACKED_HOLD`] past it, not for good: an adapter older than the
     /// ack contract never acks anything, and a bridge that held such an app
     /// forever is the lock-out the release exists to end.
-    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn an_input_never_acked_holds_the_app_for_the_cap_and_no_longer() {
         let window = Duration::from_secs(1);
         let (mut idle, demand) = idle_and_demand(window);
         let mut wiring = Wiring::new();
         let wall = Instant::now();
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
 
         // Sent while a call is in flight, as every input is.
         let call = demand.begin();
@@ -2388,7 +2472,6 @@ mod tests {
     /// An ack that arrives during the hold ends it at once, and the release
     /// says the hold delayed it; an ack before the window closed held
     /// nothing.
-    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn an_ack_during_the_hold_releases_at_once() {
         let window = Duration::from_secs(1);
@@ -2400,7 +2483,7 @@ mod tests {
             (Duration::from_secs(5), Hold::UntilAcked),
             (window / 2, Hold::None),
         ] {
-            let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+            let (bridge_end, app_end) = stream_pair().await;
             let call = demand.begin();
             wiring
                 .input_tx
@@ -2411,7 +2494,7 @@ mod tests {
             drop(call);
             let mut acks = wiring.ack_tx.subscribe();
             let app = async move {
-                let (read, mut write) = app_end.into_split();
+                let (read, mut write) = tokio::io::split(app_end);
                 let mut reader = BufReader::new(read);
                 assert_eq!(next_input_id(&mut reader).await, InputId::new(9));
                 tokio::time::sleep_until(t0 + acked_after).await;
@@ -2450,14 +2533,13 @@ mod tests {
     /// the connection with the inputs still unacked counted, which is how
     /// the release that follows is logged as the hold cut short rather than
     /// as a plain end of the window.
-    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn the_app_leaving_during_the_hold_is_reported_with_the_inputs_it_held() {
         let window = Duration::from_secs(1);
         let (mut idle, demand) = idle_and_demand(window);
         let mut wiring = Wiring::new();
         let wall = Instant::now();
-        let (bridge_end, app_end) = UnixStream::pair().expect("a socket pair");
+        let (bridge_end, app_end) = stream_pair().await;
 
         let call = demand.begin();
         wiring

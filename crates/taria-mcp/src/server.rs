@@ -37,7 +37,7 @@ use crate::bridge::{
     self, AppSnapshot, BridgeHandle, BridgeState, Call, Demand, LinkState, OVERSIZED_LINE,
     SendError, UNACKED_HOLD,
 };
-use crate::transport;
+use crate::transport::{self, Refusal};
 use crate::tree_format::TreeFormat;
 
 /// How long the bridge keeps the app with no tool calls before it lets go,
@@ -418,11 +418,15 @@ impl TariaMcpServerBuilder {
     /// drivers, as [`enable_all`](tokio::runtime::Builder::enable_all) turns
     /// on.
     ///
-    /// On Windows, which has no taria transport yet, it returns an
-    /// [`Unsupported`](io::ErrorKind::Unsupported) error and spawns nothing.
+    /// On Windows, where the app's endpoint is a named pipe, a path that is
+    /// not a pipe on this machine (`\\.\pipe\<name>`, one name, see
+    /// [`taria::socket::check_pipe_name`]) is an
+    /// [`InvalidInput`](io::ErrorKind::InvalidInput) error, and nothing is
+    /// spawned: such a path would open a file, or a pipe on another machine.
     pub fn on_demand(self) -> io::Result<TariaMcpServer> {
         require_runtime("on_demand")?;
         transport::ensure_supported()?;
+        transport::check_endpoint(&self.socket)?;
         let (handle, demand) = bridge::spawn_on_demand(self.socket, self.idle_release);
         let tools = Tools {
             demand: Some(demand),
@@ -447,11 +451,12 @@ impl TariaMcpServerBuilder {
     /// # Errors
     ///
     /// As [`on_demand`](Self::on_demand): outside a tokio runtime this
-    /// returns an error and spawns nothing, and so it does on Windows, which
-    /// has no taria transport yet.
+    /// returns an error and spawns nothing, and so it does on Windows for a
+    /// path that is not a pipe on this machine.
     pub fn connected(self) -> io::Result<TariaMcpServer> {
         require_runtime("connected")?;
         transport::ensure_supported()?;
+        transport::check_endpoint(&self.socket)?;
         let tools = Tools::with_tree_format(bridge::spawn(self.socket), self.tree_format);
         Ok(TariaMcpServer { tools })
     }
@@ -632,7 +637,7 @@ impl Tools {
         let claimed = *self.bridge.stamps_rx.borrow();
         let link = match *self.bridge.link_rx.borrow() {
             LinkState::Open { since } => Some(since),
-            LinkState::Down => None,
+            LinkState::Down | LinkState::Refused(_) => None,
         };
         let (stamped, settled) = match link {
             Some(link) if claimed => {
@@ -753,6 +758,7 @@ impl Tools {
             released: self.demand.as_ref().is_some_and(Demand::released),
             peer_pid: self.demand.as_ref().and_then(Demand::peer_pid),
             idle_release: self.idle_release,
+            backlog: transport::BACKLOG,
         }
     }
 
@@ -1080,6 +1086,7 @@ fn resolve_action(action: &str, target: &Node) -> Option<Action> {
 /// reads `rejected` only for [`OVERSIZED_LINE`]; with a connection open again
 /// it reads every reason, and the link, the handshake and the rest: see
 /// [`available_snapshot`].
+#[derive(Clone)]
 struct LinkReport {
     /// Whether a connection is open, and since when.
     link: LinkState,
@@ -1107,6 +1114,13 @@ struct LinkReport {
     /// This bridge's idle window, or `None` for a bridge handed in already
     /// spawned.
     idle_release: Option<Duration>,
+    /// Whether this platform's connect can open into the app's listen
+    /// backlog before the app accepts it ([`transport::BACKLOG`]), which is
+    /// what a connection that stays silent means: a bridge waiting behind
+    /// another on Unix, where it is true, and on Windows, where it is false
+    /// and a held app refuses the connect as busy instead, an app that took
+    /// the connection and is not answering.
+    backlog: bool,
 }
 
 /// Extract the live snapshot from a [`BridgeState`], or the error explaining
@@ -1131,13 +1145,26 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
                 "app '{}' disconnected (last snapshot seq {last_seq})",
                 app_label.as_deref().unwrap_or("unknown")
             );
-            let message = if is_oversized(report.rejected.as_deref()) {
+            // A pipe another account owns comes first, and a busy one after
+            // an open connection: only the Windows transport refuses a
+            // connect, so on Unix neither is ever the answer.
+            let message = if report.link == LinkState::Refused(Refusal::Foreign) {
+                format!("{gone}, and {FOREIGN_PIPE}")
+            } else if is_oversized(report.rejected.as_deref()) {
                 format!(
                     "{gone}; its latest snapshot was over 1 MiB ({MAX_LINE_BYTES} bytes), this \
                      bridge's line limit, so the bridge closed the connection. {OVERSIZED_REPEATS}"
                 )
             } else if let Some(open_for) = report.link.open_for() {
                 reconnected_reason(&gone, open_for, report, stopped_peer)
+            } else if report.link == LinkState::Refused(Refusal::Busy) {
+                // The held answer, from the one sign a pipe gives of it.
+                let explanation = if report.released {
+                    held_after_release(report.idle_release)
+                } else {
+                    held_busy(report.idle_release)
+                };
+                format!("{gone}, and the app is now held by another bridge. {explanation}")
             } else {
                 // Only with no connection open: the one state in which this
                 // bridge cannot tell an app that is gone from one between
@@ -1223,6 +1250,12 @@ fn reconnected_reason(
             "{departed}, and this bridge has reconnected: {} {}",
             stopped.cannot_answer(),
             stopped_evidence(open_for)
+        );
+    }
+    if !report.backlog {
+        return format!(
+            "{departed}, and this bridge has reconnected: {}",
+            silent_pipe(open_for)
         );
     }
     // The opening and this first sentence are what callers match on to tell
@@ -1314,10 +1347,18 @@ fn is_oversized(rejected: Option<&str>) -> bool {
 ///   into the listen backlog, which the app does not accept until the first
 ///   bridge leaves, or lets go of the app after its idle window. An app that
 ///   is stopped (a signal, a shell's Ctrl-Z, a debugger) leaves the same
-///   silence, and on Linux the bridge can tell it apart.
+///   silence, and on Linux the bridge can tell it apart. On Windows a pipe
+///   has no backlog, so the same silence is the app itself, suspended or
+///   stuck, and a held app refuses the connect as busy instead.
 /// - Nothing is connected. Here, and only here, the path and whether the app
 ///   is running are the questions.
+///
+/// A pipe another account owns, which the Windows transport refuses, is
+/// none of these, and outranks them all: it is not the app.
 fn no_snapshot_reason(report: LinkReport) -> String {
+    if report.link == LinkState::Refused(Refusal::Foreign) {
+        return format!("no snapshot from the app yet: {FOREIGN_PIPE}");
+    }
     // An oversized line outranks everything, the rejected-line answer below
     // included: that one's depth and version hints are about a line that
     // arrived whole and failed to parse, and this one never arrived whole. It
@@ -1346,6 +1387,12 @@ fn no_snapshot_reason(report: LinkReport) -> String {
         );
     }
     let Some(open_for) = report.link.open_for() else {
+        if report.link == LinkState::Refused(Refusal::Busy) {
+            return format!(
+                "no snapshot from the app yet: the app is held by another bridge. {}",
+                held_busy(report.idle_release)
+            );
+        }
         return "no snapshot from the app yet, and this bridge holds no connection to the \
                 socket: is the taria-enabled app running, and is the socket path correct? The \
                 bridge reconnects automatically; retry once the app is up."
@@ -1377,6 +1424,9 @@ fn no_snapshot_reason(report: LinkReport) -> String {
             stopped_evidence(open_for)
         );
     }
+    if !report.backlog {
+        return format!("no snapshot from the app yet: {}", silent_pipe(open_for));
+    }
     format!(
         "no snapshot from the app yet: the app is held by another bridge. {}",
         held_by_another_bridge(open_for, report.idle_release)
@@ -1402,6 +1452,52 @@ fn held_by_another_bridge(open_for: Duration, idle_release: Option<Duration>) ->
         retry_guidance(idle_release)
     )
 }
+
+/// What follows "held by another bridge" when the sign of it was the app's
+/// pipe refusing this bridge as busy, the only sign Windows gives: the same
+/// cause and the same way out as [`held_by_another_bridge`], with the
+/// evidence a pipe gives in place of a silent connection's age.
+fn held_busy(idle_release: Option<Duration>) -> String {
+    format!(
+        "The pipe name is right: the app's pipe refused this bridge as busy, which is what a \
+         second bridge gets, because a taria adapter serves one bridge at a time. {} {STAYS_HELD} \
+         Failing that, something other than a taria bridge holds the pipe.",
+        retry_guidance(idle_release)
+    )
+}
+
+/// What a connection that opened and stayed silent past the grace is on
+/// Windows, after the answer's opening: the app, not another bridge.
+///
+/// A pipe has no backlog. A held app refuses the connect as busy, so a
+/// connection that opens was taken by the app's own pipe, and an adapter
+/// greets a bridge the moment it takes one. Silence after that is the app
+/// suspended, paused in a debugger or stuck, and the held answer sent an
+/// agent to wait for a release that would never come.
+fn silent_pipe(open_for: Duration) -> String {
+    format!(
+        "the app accepted this bridge's connection {:.1}s ago but has sent nothing, not even the \
+         taria handshake; it may be suspended or stuck. The pipe name is right, and this is not \
+         another bridge holding the app, which is refused as busy instead. Check that the app is \
+         responsive (not suspended, or paused in a debugger), then retry; this bridge needs no \
+         restart. Failing that, what serves this pipe is not a taria adapter.",
+        open_for.as_secs_f64()
+    )
+}
+
+/// What a pipe at the app's name that another account owns is, after the
+/// answer's opening: not the app, and refused for that.
+///
+/// Pipe names are machine-wide, so any process can create a pipe under the
+/// app's name before the app does, or after it exits, and an agent that read
+/// it would take its tree for the app's and send it input. The bridge closes
+/// such a pipe unread and unwritten, and says so; its log names the owner.
+const FOREIGN_PIPE: &str = "the pipe at this name is owned by another account than this \
+bridge's user, so it is not the app's, and this bridge closed it without reading or writing \
+anything. Pipe names are shared by every user on the machine, so something else created this one, \
+before the app or after it exited, perhaps to pose as it. Ask the user to find what serves it \
+(this bridge's log names the owner) and to restart the app once it is gone; this bridge keeps \
+trying and connects to the app's own pipe with no restart.";
 
 /// What follows "held by another bridge" for a bridge whose own departure was
 /// letting go after its idle window: that the disconnect the answer opens
@@ -2812,6 +2908,9 @@ mod tests {
             released: false,
             peer_pid: None,
             idle_release: None,
+            // Unix's transport, whose answers the cases below pin on every
+            // platform; the pipe's are pinned where `backlog` is false.
+            backlog: true,
         }
     }
 
@@ -3553,6 +3652,240 @@ mod tests {
             .strip_prefix("no snapshot from the app yet: the app is held by another bridge. ")
             .expect("the held opening")
             .to_string()
+    }
+
+    /// A link as the Windows transport reports it: no backlog, so silence on
+    /// an open connection is the app's own.
+    fn pipe_link(link: LinkState) -> LinkReport {
+        LinkReport {
+            link,
+            backlog: false,
+            idle_release: Some(DEFAULT_IDLE_RELEASE),
+            ..silent_link()
+        }
+    }
+
+    /// What a silent pipe connection four seconds old is, after the opening.
+    const SILENT_PIPE: &str = "the app accepted this bridge's connection 4.0s ago but has sent \
+                               nothing, not even the taria handshake; it may be suspended or \
+                               stuck. The pipe name is right, and this is not another bridge \
+                               holding the app, which is refused as busy instead. Check that the \
+                               app is responsive (not suspended, or paused in a debugger), then \
+                               retry; this bridge needs no restart. Failing that, what serves this \
+                               pipe is not a taria adapter.";
+
+    /// On Windows a connection that opens was taken by the app's own pipe:
+    /// there is no backlog, and a held app refuses the connect as busy. So
+    /// the silence the held answer explains on Unix is the app suspended or
+    /// stuck there, and it is answered as that, in the opening and the
+    /// reconnected sentence every no-tree answer keeps, the release's words
+    /// included. Every other link state answers as it does over a socket.
+    #[test]
+    fn a_silent_pipe_is_the_app_and_not_another_bridge() {
+        let silent = pipe_link(open_for(4_000));
+        let never = no_snapshot_reason(silent.clone());
+        assert_eq!(
+            never,
+            format!("no snapshot from the app yet: {SILENT_PIPE}")
+        );
+        assert!(
+            !never.contains("held by another bridge") && !never.contains('\u{2014}'),
+            "{never}"
+        );
+        let gone = available_snapshot(gone_demo(), silent.clone()).expect_err("no tree");
+        assert_eq!(
+            gone.message,
+            format!(
+                "app 'demo' disconnected (last snapshot seq 7), and this bridge has reconnected: \
+                 {SILENT_PIPE}"
+            )
+        );
+        let released = available_snapshot(
+            gone_demo(),
+            LinkReport {
+                released: true,
+                ..silent
+            },
+        )
+        .expect_err("no tree");
+        assert_eq!(
+            released.message,
+            format!(
+                "app 'demo' disconnected (last snapshot seq 7) when this bridge let go of it on \
+                 purpose, not as a fault, after 60 s with no tool calls, or up to 30 s later while \
+                 an input awaited its ack, and this bridge has reconnected: {SILENT_PIPE}"
+            )
+        );
+
+        // Within the grace it is a handshake still arriving, as anywhere.
+        let young = no_snapshot_reason(pipe_link(open_for(10)));
+        assert!(
+            young.contains("worth one retry") && !young.contains("suspended"),
+            "{young}"
+        );
+
+        // Only what silence means differs: the greeting, a rejected line, an
+        // oversized tree and a link that is down answer as over a socket.
+        for (name, link, peer_protocol, rejected) in [
+            ("greeted", open_for(4_000), Some(PROTOCOL_VERSION), None),
+            (
+                "rejected",
+                open_for(4_000),
+                None,
+                Some("expected value at line 1"),
+            ),
+            ("oversized", open_for(4_000), None, Some(OVERSIZED_LINE)),
+            ("down", LinkState::Down, None, None),
+        ] {
+            let report = |backlog| LinkReport {
+                link,
+                peer_protocol,
+                rejected: rejected.map(str::to_string),
+                backlog,
+                ..silent_link()
+            };
+            assert_eq!(
+                no_snapshot_reason(report(false)),
+                no_snapshot_reason(report(true)),
+                "{name}"
+            );
+            let pipe = available_snapshot(gone_demo(), report(false)).expect_err("no tree");
+            let socket = available_snapshot(gone_demo(), report(true)).expect_err("no tree");
+            assert_eq!(pipe.message, socket.message, "{name}");
+        }
+    }
+
+    /// The tail of the held answer a busy pipe gets, on the default window.
+    const HELD_BUSY: &str = "The pipe name is right: the app's pipe refused this bridge as busy, \
+                             which is what a second bridge gets, because a taria adapter serves \
+                             one bridge at a time. A taria-mcp lets go of the app after 60 s with \
+                             no tool calls (its default), and this bridge takes over as soon as it \
+                             does, with no restart; retry in a minute. If the app stays held, \
+                             another session is using it, or the holder is a taria-mcp older than \
+                             0.3.2, which holds the app until its session ends. Failing that, \
+                             something other than a taria bridge holds the pipe.";
+
+    /// A pipe busy with another client is the one sign Windows gives of an
+    /// app held by another bridge, and gets the held answer: the same
+    /// opening and the same way out, by this bridge's window, with the
+    /// evidence a pipe gives in place of a silent connection's age. After a
+    /// release it says the disconnect was that, in the words a socket's held
+    /// answer uses. An oversized tree still outranks it.
+    #[test]
+    fn a_busy_pipe_is_the_app_held_by_another_bridge() {
+        let busy = || pipe_link(LinkState::Refused(Refusal::Busy));
+        let held = no_snapshot_reason(busy());
+        assert_eq!(
+            held,
+            format!("no snapshot from the app yet: the app is held by another bridge. {HELD_BUSY}")
+        );
+        assert_eq!(
+            no_snapshot_reason(LinkReport {
+                idle_release: None,
+                ..busy()
+            }),
+            held,
+            "a bridge handed in already spawned names the default"
+        );
+        assert_eq!(
+            no_snapshot_reason(LinkReport {
+                idle_release: Some(Duration::from_secs(2)),
+                ..busy()
+            }),
+            held.replace(
+                DEFAULT_RETRY,
+                "A taria-mcp started like this one lets go of the app after 2 s with no tool \
+                 calls (one on the default, after 60 s), and this bridge takes over as soon as \
+                 the holder does, with no restart; retry in 2 s."
+            )
+        );
+
+        let gone = available_snapshot(gone_demo(), busy()).expect_err("no tree");
+        assert_eq!(
+            gone.message,
+            format!(
+                "app 'demo' disconnected (last snapshot seq 7), and the app is now held by \
+                 another bridge. {HELD_BUSY}"
+            )
+        );
+        let released = |link| {
+            available_snapshot(
+                gone_demo(),
+                LinkReport {
+                    link,
+                    released: true,
+                    idle_release: Some(DEFAULT_IDLE_RELEASE),
+                    ..silent_link()
+                },
+            )
+            .expect_err("no tree")
+            .message
+        };
+        assert_eq!(
+            released(LinkState::Refused(Refusal::Busy)),
+            released(open_for(4_000)),
+            "a release is said the same way over a pipe as over a socket"
+        );
+
+        let oversized = no_snapshot_reason(LinkReport {
+            rejected: Some(OVERSIZED_LINE.to_string()),
+            ..busy()
+        });
+        assert!(
+            oversized.contains(OVER_THE_LIMIT) && !oversized.contains("held by another"),
+            "{oversized}"
+        );
+        let oversized = available_snapshot(
+            gone_demo(),
+            LinkReport {
+                rejected: Some(OVERSIZED_LINE.to_string()),
+                ..busy()
+            },
+        )
+        .expect_err("no tree");
+        assert!(
+            oversized.message.contains(OVER_THE_LIMIT),
+            "{}",
+            oversized.message
+        );
+    }
+
+    /// A pipe at the app's name that another account owns is not the app,
+    /// and is named as that ahead of everything else, whether or not this
+    /// bridge had the app before. The reasons a refusal clears in the bridge
+    /// cannot outrank it either.
+    #[test]
+    fn a_pipe_another_account_owns_is_named_as_not_the_app() {
+        let pinned = "the pipe at this name is owned by another account than this bridge's user, \
+                      so it is not the app's, and this bridge closed it without reading or \
+                      writing anything. Pipe names are shared by every user on the machine, so \
+                      something else created this one, before the app or after it exited, \
+                      perhaps to pose as it. Ask the user to find what serves it (this bridge's \
+                      log names the owner) and to restart the app once it is gone; this bridge \
+                      keeps trying and connects to the app's own pipe with no restart.";
+        for rejected in [None, Some(OVERSIZED_LINE.to_string())] {
+            let foreign = LinkReport {
+                rejected,
+                ..pipe_link(LinkState::Refused(Refusal::Foreign))
+            };
+            assert_eq!(
+                no_snapshot_reason(foreign.clone()),
+                format!("no snapshot from the app yet: {pinned}")
+            );
+            assert_eq!(
+                available_snapshot(gone_demo(), foreign)
+                    .expect_err("no tree")
+                    .message,
+                format!("app 'demo' disconnected (last snapshot seq 7), and {pinned}")
+            );
+        }
+    }
+
+    /// What silence on an open connection means is the transport's: a
+    /// bridge waiting in the backlog on Unix, the app itself on Windows.
+    #[test]
+    fn silence_means_what_this_platforms_transport_makes_it() {
+        assert_eq!(detached_server().link_report().backlog, !cfg!(windows));
     }
 
     /// The state field of `/proc/<pid>/stat` comes after the command name,
@@ -5135,8 +5468,13 @@ mod tests {
         );
     }
 
-    /// A socket path nothing listens on, for servers that never call a tool.
-    const NOWHERE: &str = "/nonexistent/taria-mcp-test.sock";
+    /// A socket path nothing listens on, for servers that never call a tool:
+    /// on Windows a pipe name, which the builders hold the path to.
+    const NOWHERE: &str = if cfg!(windows) {
+        r"\\.\pipe\taria-mcp-test-nowhere"
+    } else {
+        "/nonexistent/taria-mcp-test.sock"
+    };
 
     /// The public server answers from the tool layer it wraps, in either
     /// format: the same instructions and the same four tools, so the pinned
