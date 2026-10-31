@@ -153,8 +153,8 @@ pub(crate) fn nothing_listens(err: &io::Error) -> bool {
 /// because another account owns it or it refused this user access.
 ///
 /// Access denied is read as foreign whether [`connect`] wrapped it or not:
-/// the adapter's pipe grants its user read and write access, so a pipe at the name that
-/// denies this user is not one the adapter made for it.
+/// the adapter's pipe grants its user read and write access, so a pipe at the
+/// name that denies this user is not one the adapter made for it.
 pub(crate) fn refusal(err: &io::Error) -> Option<Refusal> {
     if is_busy(err) {
         return Some(Refusal::Busy);
