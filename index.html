@@ -28,18 +28,18 @@
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "taria",
-    "description": "Agent accessibility layer for terminal user interfaces. A TUI app publishes its widget tree, focus state and available actions over a Unix domain socket, and an MCP bridge exposes that tree to AI agent harnesses, so an agent acts on a node id and an advertised action instead of scraping a rendered screen. Ships a ratatui adapter, an MCP bridge binary, and a frozen ndjson wire protocol.",
+    "description": "Agent accessibility layer for terminal user interfaces. A TUI app publishes its widget tree, focus state and available actions over a Unix domain socket (a named pipe on Windows), and an MCP bridge exposes that tree to AI agent harnesses, so an agent acts on a node id and an advertised action instead of scraping a rendered screen. Ships a ratatui adapter, an MCP bridge binary, and a frozen ndjson wire protocol.",
     "applicationCategory": "DeveloperApplication",
-    "operatingSystem": "Linux, macOS",
+    "operatingSystem": "Linux, macOS, Windows",
     "offers": {
       "@type": "Offer",
       "price": "0",
       "priceCurrency": "USD"
     },
-    "license": "https://opensource.org/licenses/MIT",
+    "license": ["https://opensource.org/licenses/MIT", "https://opensource.org/licenses/Apache-2.0"],
     "url": "https://y0sif.github.io/taria/",
     "downloadUrl": "https://github.com/y0sif/taria/releases",
-    "softwareVersion": "0.3.3",
+    "softwareVersion": "0.4.0",
     "author": {
       "@type": "Person",
       "name": "y0sif",
@@ -85,7 +85,7 @@
         "name": "Do I have to use MCP, or can I speak the taria protocol directly?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "MCP is a convenience. taria-mcp is one client of a plain protocol: ndjson over a Unix domain socket, one JSON object per line. Anything that can open a socket can read snapshots and send input without MCP in the picture, and docs/protocol.md specifies every message."
+          "text": "MCP is a convenience. taria-mcp is one client of a plain protocol: ndjson over a Unix domain socket (a named pipe on Windows), one JSON object per line. Anything that can open one can read snapshots and send input without MCP in the picture, and docs/protocol.md specifies every message."
         }
       },
       {
@@ -101,7 +101,7 @@
         "name": "Does taria work on Windows?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "No. The adapter is built on unix-only APIs, and the transport is a Unix domain socket bound through them. Linux is the tested platform and the only one CI runs the suites on. Windows is not supported."
+          "text": "Yes, from 0.4.0. On Windows the adapter and the bridge talk over a named pipe that only its own user can open and that refuses remote clients; on Linux and macOS over a Unix domain socket. CI runs the test suites on Linux, macOS and Windows."
         }
       },
       {
@@ -109,7 +109,7 @@
         "name": "Is the taria protocol stable?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "The wire format is frozen at PROTOCOL_VERSION 1, and changes within it are additive: new optional fields, new message variants, new roles, new action names. A peer that meets a role or action it does not know degrades that one field instead of failing the tree. The crates are pre-alpha and their Rust APIs can still move under semantic versioning; the format is the part that made a promise."
+          "text": "The wire format is frozen at PROTOCOL_VERSION 1, and changes within it are additive: new optional fields, new message variants, new roles, new action names. A peer that meets a role or action it does not know degrades that one field instead of failing the tree. The Rust API is not frozen: taria is alpha, so a 0.x minor release may change it, with an upgrade note in CHANGELOG.md, while a patch release never breaks your build."
         }
       }
     ]
@@ -326,7 +326,7 @@
     <p class="who">Install the bridge your agent harness talks to.</p>
     <code class="cmd"><span class="p">$ </span>curl -sSf https://y0sif.github.io/taria/install.sh | sh</code>
     <code class="cmd"><span class="p">$ </span>claude mcp add taria -- taria-mcp --app &lt;label&gt;</code>
-    <p class="alt">Also on crates.io: <code>cargo install taria-mcp --locked</code>. Prebuilt binaries for x86_64 and aarch64 Linux and both macOS architectures are attached to every <a href="https://github.com/y0sif/taria/releases">release</a>, each with its sha256.</p>
+    <p class="alt">Also on crates.io: <code>cargo install taria-mcp --locked</code>. Prebuilt binaries for x86_64 and aarch64 Linux, both macOS architectures and x86_64 Windows are attached to every <a href="https://github.com/y0sif/taria/releases">release</a>, each with its sha256.</p>
   </div>
 
   <div class="install">
@@ -356,11 +356,11 @@
 
   <section>
     <h2>How it works</h2>
-    <pre class="block">+---------------+   Unix socket  +-----------+  MCP over stdio  +---------------+
+    <pre class="block">+---------------+  socket/pipe   +-----------+  MCP over stdio  +---------------+
 |    TUI app    | &lt;------------&gt; | taria-mcp | &lt;--------------&gt; | agent harness |
 | taria-ratatui |    (ndjson)    |  bridge   |                  | (Claude Code) |
 +---------------+                +-----------+                  +---------------+</pre>
-    <p>The app publishes a semantic snapshot of its widget tree over a Unix domain socket, one JSON object per line, on every meaningful change. The bridge holds the latest snapshot and exposes it, plus input back into the app, as MCP tools. The app acknowledges each input by id, so the bridge can tell an input the app acted on from one it never saw.</p>
+    <p>The app publishes a semantic snapshot of its widget tree over a Unix domain socket (a named pipe on Windows), one JSON object per line, on every meaningful change. The bridge holds the latest snapshot and exposes it, plus input back into the app, as MCP tools. The app acknowledges each input by id, so the bridge can tell an input the app acted on from one it never saw.</p>
     <p>What an app can say about a widget is a fixed vocabulary: <strong>29 roles</strong> and <strong>7 actions</strong>, plus a custom action for anything an app names itself. Both vocabularies are open: a peer that meets a role or action it does not know degrades that one field instead of failing the tree, which is what lets either grow inside a frozen format.</p>
   </section>
 
@@ -394,7 +394,7 @@
 
     <details>
       <summary>Do I have to use MCP, or can I speak the protocol directly?</summary>
-      <p>MCP is a convenience. <code>taria-mcp</code> is one client of a plain protocol: ndjson over a Unix domain socket, one JSON object per line. Anything that can open a socket can read snapshots and send input with no MCP in the picture. <a href="https://github.com/y0sif/taria/blob/main/docs/protocol.md">The specification</a> covers every message.</p>
+      <p>MCP is a convenience. <code>taria-mcp</code> is one client of a plain protocol: ndjson over a Unix domain socket (a named pipe on Windows), one JSON object per line. Anything that can open one can read snapshots and send input with no MCP in the picture. <a href="https://github.com/y0sif/taria/blob/main/docs/protocol.md">The specification</a> covers every message.</p>
     </details>
 
     <details>
@@ -409,12 +409,12 @@
 
     <details>
       <summary>Does it work on Windows?</summary>
-      <p>No. The adapter is built on unix-only APIs, and the transport is a Unix domain socket bound through them. Linux is the tested platform and the only one CI runs the suites on. macOS binaries are built but nothing exercises them end to end.</p>
+      <p>Yes, from 0.4.0. On Windows the adapter and the bridge talk over a named pipe that only its own user can open and that refuses remote clients; on Linux and macOS over a Unix domain socket. CI runs the test suites on Linux, macOS and Windows, and releases include a Windows zip.</p>
     </details>
 
     <details>
       <summary>Is the protocol stable?</summary>
-      <p>The wire format is frozen at <code>PROTOCOL_VERSION</code> 1, and changes within it are additive: new optional fields, new message variants, new roles, new action names. A peer that meets a role or action it does not know degrades that one field instead of failing the tree. The crates are pre-alpha and their Rust APIs can still move under semantic versioning; the format is the part that made a promise.</p>
+      <p>The wire format is frozen at <code>PROTOCOL_VERSION</code> 1, and changes within it are additive: new optional fields, new message variants, new roles, new action names. A peer that meets a role or action it does not know degrades that one field instead of failing the tree. The Rust API is not frozen: taria is alpha, so a 0.x minor release may change it, with an upgrade note in CHANGELOG.md, while a patch release never breaks your build.</p>
     </details>
 
     <p style="margin-top:18px"><a href="https://github.com/y0sif/taria/blob/main/docs/faq.md">The rest of the FAQ</a>, including what happens to the parts of your UI you have not annotated.</p>
@@ -428,7 +428,7 @@
       <a href="https://github.com/y0sif/taria/blob/main/docs/protocol.md">Protocol</a>
       <a href="https://github.com/y0sif/taria/blob/main/docs/integration-guide.md">Integration guide</a>
     </p>
-    <p style="margin-top:12px">Pre-alpha. Dual-licensed under MIT or Apache-2.0.</p>
+    <p style="margin-top:12px">Alpha. Dual-licensed under MIT or Apache-2.0.</p>
   </footer>
 
 </div>
