@@ -13,12 +13,21 @@ cargo clippy --all-targets -- -D warnings   # zero warnings policy
 cargo fmt --check
 python3 scripts/e2e.py                      # end-to-end gate, 27 steps
 python3 scripts/adversarial.py              # edge-case probes, 24 of them
+scripts/wine-test.sh --workspace            # Windows build of the tests, Wine
 ```
 
-Run all six before pushing. CI runs the same gate with `cargo build
---workspace` in place of `cargo check`. Both scripts build the debug binaries
-they test; `--no-build` skips the build and keeps the freshness check, which
-refuses a `target/debug` older than the sources.
+Run the first six before pushing. CI runs the same gate with `cargo build
+--workspace` in place of `cargo check`, on Linux, plus clippy for the
+Windows target and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+--workspace`; macOS runs the tests and both scripts, and Windows clippy, the
+tests and the build (the scripts need a pty, `/proc` and `AF_UNIX`, so
+`crates/taria-mcp/tests/adapter_e2e.rs` is the Windows end-to-end gate).
+Both scripts build the debug binaries they test; `--no-build` skips the
+build and keeps the freshness check, which refuses a `target/debug` older
+than the sources. `scripts/wine-test.sh` cross-compiles for
+`x86_64-pc-windows-gnu` and runs each test binary under Wine; it needs
+`mingw-w64-gcc`, `wine` and that rustup target. Wine is a stand-in: the
+Windows CI job is the word that counts.
 
 ## Architecture
 
@@ -27,42 +36,55 @@ refuses a `target/debug` older than the sources.
   messages, `InputId`, `InputStatus`, and `MAX_LINE_BYTES`, the 1 MiB line
   limit both peers enforce), and three modules both peers share: `key` (the
   key-string grammar), `IdSpace` (prefixed node ids, re-exported at the root),
-  `socket` (path resolution, plus the per-platform AF_UNIX path limit: 107
-  bytes on Linux, 103 on macOS and the BSDs, and a label that is not a plain
-  file name is refused). No I/O, no framework deps, exactly one dependency
-  (serde); `serde_json` is dev-only. 29 roles, 7 actions plus `Custom`, whose
-  envelope folds back onto the built-ins on the way in. Version 1 is frozen:
-  additive changes only (new optional fields, new message variants, new roles
-  and actions, which peers degrade to `other` / `Custom` instead of failing
-  the snapshot). The twelve types such an addition can reach are
-  `#[non_exhaustive]`, and so are the six struct-like variants inside them
-  (`AppToBridge::Hello`/`Ack`, `BridgeToApp::Input`, `AgentInput::Act`/`Key`/
-  `Text`), which is why peers build through constructors and destructure with
-  `..`; `AgentInput::Unknown` is the `#[serde(other)]` fallback that keeps an
-  unreadable input's id, so it can still be acked. So additive on the wire is
-  additive in Rust too. `MAX_NODE_DEPTH` is 32, against a measured ceiling of
-  63 nested nodes before a JSON parser refuses; `Node::check_depth` reports a
-  violation and names a node at the offending depth. Anything else bumps
-  `PROTOCOL_VERSION`. Version 1 has had three additions since it froze in
-  0.1.0. First `relayed` (0.3.3, issue #6): a node marks its label and value
-  as text from outside the app, data and never instructions; strictly per
-  node, never inherited, and absent means not marked, not vouched for. Then
-  typed state (0.4.0), flat optional node fields: `selected`, `checked`
-  (`true`, `false` or `"mixed"`, `taria::Checked`), `expanded`, `disabled`
-  (only `true` is sent), `description` (the app's own words, never relayed
-  text), `value_now`/`value_min`/`value_max` (`taria::Number`, finite only, so
-  `Node` keeps `Eq`), `pos_in_set`/`set_size`, `row`/`column` and
-  `row_count`/`column_count` (positions from 1). Absent means not stated,
-  never `false`, and a wrong shape reads as not stated rather than failing the
-  node (`relayed` stays strict). Hidden has no field: it is not published. A
-  node setting none of them serializes as in 0.3.3. Then stamps (0.4.0, issue
-  #17): `Snapshot::after_input`, the newest input the app had dequeued on the
-  connection, written before `root` and omitted when unset, and `stamps: true`
-  on the hello (`.stamps(true)`); both read leniently.
-- `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket, refuses a
-  label that is not a plain file name (it binds and unlinks what the label
-  resolves to), vets the socket directory, and serves one bridge client at a
-  time from background threads (listener plus per-connection reader/writer).
+  `socket` (path resolution and per-platform endpoint limits: the AF_UNIX
+  path limit, 107 bytes on Linux and 103 on macOS and the BSDs, and on
+  Windows the pipe name, `\\.\pipe\taria-<SID>-<label>` from `pipe_name`,
+  `resolve_pipe_name` for `$TARIA_SOCK` first, `check_pipe_name` refusing
+  anything but a local `\\.\pipe\` name in any case, 256 UTF-16 units in
+  all, which is what `MAX_SOCKET_PATH_BYTES` means there; a label that is not
+  a plain file name is refused, and on Windows one holding `\` too). These
+  are pure and tested on every platform. No I/O, no framework deps, exactly
+  one dependency (serde); `serde_json` is dev-only. 29 roles, 7 actions plus
+  `Custom`, whose envelope folds back onto the built-ins on the way in.
+  Version 1 is frozen: additive changes only (new optional fields, new
+  message variants, new roles and actions, which peers degrade to `other` /
+  `Custom` instead of failing the snapshot). The twelve types such an
+  addition can reach are `#[non_exhaustive]`, and so are the six struct-like
+  variants inside them (`AppToBridge::Hello`/`Ack`, `BridgeToApp::Input`,
+  `AgentInput::Act`/`Key`/`Text`), which is why peers build through
+  constructors and destructure with `..`; `AgentInput::Unknown` is the
+  `#[serde(other)]` fallback that keeps an unreadable input's id, so it can
+  still be acked. So additive on the wire is additive in Rust too.
+  `MAX_NODE_DEPTH` is 32, against a measured ceiling of 63 nested nodes before a
+  JSON parser refuses; `Node::check_depth` reports a violation and names a node
+  at the offending depth. Anything else bumps `PROTOCOL_VERSION`. Version 1 has
+  had three additions since it froze in 0.1.0. First `relayed` (0.3.3, issue
+  #6): a node marks its label and value as text from outside the app, data and
+  never instructions; strictly per node, never inherited, and absent means not
+  marked, not vouched for. Then typed state (0.4.0), flat optional node fields:
+  `selected`, `checked` (`true`, `false` or `"mixed"`, `taria::Checked`),
+  `expanded`, `disabled` (only `true` is sent), `description` (the app's own
+  words, never relayed text), `value_now`/`value_min`/`value_max`
+  (`taria::Number`, finite only, so `Node` keeps `Eq`), `pos_in_set`/`set_size`,
+  `row`/`column` and `row_count`/`column_count` (positions from 1). Absent means
+  not stated, never `false`, and a wrong shape reads as not stated rather than
+  failing the node (`relayed` stays strict). Hidden has no field: it is not
+  published. A node setting none of them serializes as in 0.3.3. Then stamps
+  (0.4.0, issue #17): `Snapshot::after_input`, the newest input the app had
+  dequeued on the connection, written before `root` and omitted when unset, and
+  `stamps: true` on the hello (`.stamps(true)`); both read leniently.
+- `crates/taria-ratatui`: `TariaLayer` binds the app's Unix socket or, on
+  Windows, its named pipe, refuses a label that is not a plain file name (it
+  binds and unlinks what the label resolves to), vets the socket directory,
+  and serves one bridge client at a time from background threads (listener
+  plus per-connection reader/writer). The platform half sits behind
+  `transport/` (`Listener`, `Connection`, `Reader`, `Writer`,
+  `user_identity`); the Windows half is hand-rolled on `windows-sys`
+  (overlapped I/O, a closed event per session; see docs/architecture.md,
+  Transports): one instance, `FILE_FLAG_FIRST_PIPE_INSTANCE`,
+  `PIPE_REJECT_REMOTE_CLIENTS`, owned by the user with a DACL granting only
+  that user, reused across sessions, closed and never disconnected at
+  shutdown; a live name is `AddrInUse`, as on Unix.
   `bind_or_disabled` never fails, so taria cannot block startup; the layer
   never prints (the app reports `bind_error()` outside the alternate screen).
   Nodes come from `publish(nodes)` or `FrameRecorder`/`sem`; a node marked
@@ -175,6 +197,17 @@ refuses a `target/debug` older than the sources.
   app resumes within the window plus 30 s of the last tool call, since a
   bridge that lets go leaves the adapter to discard it. An app that never
   sends `hello` is held to the `protocol_version` its first snapshot states.
+  On Windows (`transport/windows.rs`) it opens the pipe with tokio's client
+  and refuses one whose owner is not its own token's SID (`Refusal::Foreign`,
+  closed unread, logged with the owner); `--app` derives the name from that
+  SID (`taria_mcp::current_user_sid()`, public on Windows only), and
+  `--socket` takes only a local pipe name. A pipe has no backlog
+  (`BACKLOG` false): a held app refuses the open as busy (`Refusal::Busy`),
+  answered "held by another bridge" with "the app's pipe refused this bridge
+  as busy" as the evidence, and a connection silent past the grace is the
+  app "suspended or stuck", not held. A pipe another account owns outranks
+  every answer. The pid comes from `GetNamedPipeServerProcessId`; stopped-app
+  detection stays Linux only. Linux and macOS texts are unchanged.
 - `examples/demo-app` (`taria-demo`): ratatui task manager (tabs, list, text
   input, confirm-delete dialog) an agent drives end to end. Task ids are
   identities (`IdSpace`), stable across deletes and restarts; a task's done

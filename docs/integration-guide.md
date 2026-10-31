@@ -50,6 +50,15 @@ spelled here:
 cargo add taria
 ```
 
+The same line works on every platform taria supports. On Linux and macOS
+the layer serves a Unix domain socket; on Windows, since 0.4.0, a named pipe
+(a kernel object named under `\\.\pipe\`, which two processes open like a
+file). Your code is the same on all three, so there is nothing to fence: an
+app that kept taria behind `#[cfg(unix)]`, with the dependency under
+`[target.'cfg(unix)'.dependencies]`, because 0.3 did not build on Windows,
+can drop both and take the one dependency everywhere. On Windows it pulls in
+`windows-sys`, the raw Win32 bindings, and nothing else.
+
 To track `main` instead of a release, take either crate from the repository.
 A git dependency resolves to whatever the branch holds the day you build it,
 so pin a revision if you want the same build twice.
@@ -73,8 +82,8 @@ the bridge from the same checkout is how you stop having to think about it.
 use taria_ratatui::TariaLayer;
 
 fn main() -> std::io::Result<()> {
-    // Never fails. If the socket cannot be bound the layer is inert and the
-    // app runs exactly as it would without taria.
+    // Never fails. If the socket (a named pipe on Windows) cannot be bound,
+    // the layer is inert and the app runs exactly as it would without taria.
     let mut layer = TariaLayer::bind_or_disabled("my-app");
 
     // Print here, before `ratatui::init()` takes the alternate screen. A
@@ -1218,6 +1227,9 @@ the app: the input landed and the caller was answered nowhere.
 
 ## Socket paths
 
+This section is about Linux and macOS; Windows, which serves a named pipe
+instead of a socket file, is [at its end](#on-windows).
+
 By default the socket is `$XDG_RUNTIME_DIR/taria/<label>.sock`, falling back
 to `<temp dir>/taria-<user>/<label>.sock`, where `<user>` is the effective uid
 where it is available (through `/proc/self` on Linux), else `$USER`, else
@@ -1283,6 +1295,49 @@ a shutdown flag rather than waiting to be woken by a connection to its own
 path, which is what used to hang the first copy: by the time the wake-up was
 sent, the path held the second copy's socket, whose listener took it while the
 first stayed parked.
+
+### On Windows
+
+There is no socket file. The layer creates the named pipe
+`\\.\pipe\taria-<SID>-<label>`, where `<SID>` is your account's security
+identifier (`S-1-5-21-...`, read from the process token), so two users' apps
+with the same label never share a name. `socket_path()` is that pipe name,
+which is what to print. The pipe is owned by you and open to nobody else, it
+refuses clients on other machines, and the bridge checks its owner before it
+reads or writes anything, so none of the directory rules above has anything
+to vet.
+
+The label is held to the same rule, and may not contain `\` either.
+`$TARIA_SOCK`, and a name passed to `bind_at` or `bind_or_disabled_at`, must
+be a pipe on this machine, `\\.\pipe\<name>` with one name after the prefix.
+A file path, or a pipe on another machine (`\\host\pipe\<name>`, reached
+over SMB, Windows file sharing), is refused rather than opened. The whole
+name is limited to 256 characters, counted in UTF-16 code units.
+
+The failures come back from `bind_error()` in words of their own:
+
+- Another copy of the app is serving the name, or something else holds it:
+  `AddrInUse`, as on Unix. The message opens `another instance is already
+  serving the taria pipe`, names the pipe, and ends with the way out for a
+  second copy, a `TARIA_SOCK` of the form `\\.\pipe\<name>`. A pipe lives
+  while any handle to it is open, the bridge's end included, so an app
+  restarted while a bridge still holds its old end can see this for a moment,
+  which the message says; taria-mcp lets go as soon as it reads the end of
+  the stream.
+- A name that is not a local pipe, or a label that cannot end one:
+  `InvalidInput`, naming the value and what a pipe name may be. For a label
+  `a/b`: ``app label "a/b" cannot end a pipe name; it must be a single name,
+  so no `/` or `\`, and not `.`, `..` or empty.``, then how to use a name of
+  your own.
+- Your SID could not be read from the process token, which does not happen
+  to a process running normally: `cannot read this user's SID from the
+  process token, which names the default taria pipe`, the reason, and how to
+  bind without it, a `TARIA_SOCK` naming the pipe.
+- Anything else the system refuses: `cannot create the taria pipe`, the
+  name, and the system's own error.
+
+As everywhere, `bind_or_disabled` turns each of these into a disabled layer,
+and the app starts.
 
 ## Checking your work
 

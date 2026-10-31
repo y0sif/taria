@@ -58,10 +58,6 @@ for anything about appearance.
 their output, pasting into a REPL, moving through a pipeline: that is a
 terminal session, not a widget tree. tmux is good at it.
 
-**You are on Windows.** The adapter is built on unix-only APIs and the
-transport is a Unix domain socket bound through them. Linux is the tested
-platform, and Windows is not supported.
-
 **You need several agents on one app.** The adapter serves one bridge client
 at a time.
 
@@ -121,9 +117,10 @@ accepts right now, so it is wrong only if the app says something wrong.
 ## What taria is not
 
 It does not spawn your app, own its PTY, read its screen, or sit between it
-and the terminal. It binds a Unix socket, publishes a tree after each frame,
-and hands agent input to your event loop like any other input source. If taria
-cannot bind, the layer is inert and the app runs exactly as it did before.
+and the terminal. It binds a Unix socket, or a named pipe on Windows,
+publishes a tree after each frame, and hands agent input to your event loop
+like any other input source. If taria cannot bind, the layer is inert and the
+app runs exactly as it did before.
 
 Today the adapter is for [ratatui](https://ratatui.rs). The protocol itself is
 framework-agnostic and specified independently of Rust in

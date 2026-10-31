@@ -40,14 +40,21 @@ is reachable as `taria_ratatui::taria::{...}` without a second dependency.
 cargo install taria-mcp
 ```
 
-Or take a prebuilt tarball from the
+Or take a prebuilt build from the
 [releases page](https://github.com/y0sif/taria/releases): a tag builds
-`taria-mcp` for x86_64 and aarch64 Linux and for both macOS architectures,
-each with its sha256. Then point your harness at it, with the app's label:
+`taria-mcp` as a tarball for x86_64 and aarch64 Linux and for both macOS
+architectures, and as a `.zip` for x86_64 Windows
+(`taria-mcp-x86_64-pc-windows-msvc.zip`, holding `taria-mcp.exe`), each with
+its sha256. Then point your harness at it, with the app's label:
 
 ```bash
 claude mcp add taria -- taria-mcp --app <label>
 ```
+
+On Windows both sides work the same way, from the same commands: the app
+and the bridge meet over a named pipe instead of a Unix socket, and neither
+needs a `cfg` or a flag of its own. Put `taria-mcp.exe` somewhere on your
+`PATH`, or give the harness its full path.
 
 The quick start below uses the demo app in this repository instead, which
 needs nothing installed.
@@ -96,7 +103,8 @@ tmux kill-session -t taria-demo      # stop it when you are done
 ## How it works
 
 The app publishes a semantic snapshot of its widget tree over a Unix domain
-socket, one JSON object per line (ndjson), on every meaningful change. The
+socket, or a named pipe on Windows, one JSON object per line (ndjson), on
+every meaningful change. The
 bridge holds the latest snapshot and exposes it, plus input back into the
 app, as MCP tools. Agent input reaches the app's event loop like any other
 input source, and the app acknowledges each input by id, so the bridge can
@@ -107,7 +115,9 @@ default, so an idle agent session does not keep the app from another.
 ```text
 +---------------+   Unix socket  +-----------+  MCP over stdio  +---------------+
 |    TUI app    | <------------> | taria-mcp | <--------------> | agent harness |
-| taria-ratatui |    (ndjson)    |  bridge   |                  | (Claude Code) |
+| taria-ratatui |  or Windows    |  bridge   |                  | (Claude Code) |
+|               |  named pipe    |           |                  |               |
+|               |    (ndjson)    |           |                  |               |
 +---------------+                +-----------+                  +---------------+
 ```
 
@@ -188,8 +198,10 @@ format is frozen.
 See [docs/compatibility.md](docs/compatibility.md) for the full list. The
 three that decide whether taria fits at all:
 
-- **Unix only for now**: the adapter is built on unix-only APIs, and Linux is
-  the tested platform. [Limitations](docs/compatibility.md#limitations).
+- **Linux, macOS and Windows**: a Unix socket on the first two, a named pipe
+  on Windows, and CI runs the Rust suites on all three. Windows has no
+  stopped-app detection, and the Python e2e and adversarial scripts run on
+  Linux and macOS only. [Limitations](docs/compatibility.md#limitations).
 - **One bridge client per app at a time**: the adapter serves one, so two
   agents cannot drive the same app at once. They can take turns: an idle
   bridge lets the app go after 60 s by default.

@@ -92,8 +92,9 @@ const ACKABLE_INPUTS: usize = INPUT_QUEUE;
 
 /// The embeddable taria endpoint for a ratatui app.
 ///
-/// Binding a layer opens a Unix domain socket and spawns a listener thread
-/// that serves one bridge client at a time: on connect it sends an
+/// Binding a layer opens the app's endpoint, a Unix domain socket on Linux and
+/// macOS or a named pipe on Windows, and spawns a listener thread that serves
+/// one bridge client at a time: on connect it sends an
 /// [`AppToBridge::Hello`] handshake plus the latest snapshot, then streams
 /// every newly published snapshot and forwards incoming [`AgentInput`]
 /// messages to the app via [`try_recv`](Self::try_recv) /
@@ -113,7 +114,9 @@ const ACKABLE_INPUTS: usize = INPUT_QUEUE;
 /// Dropping the layer shuts the threads down and removes the socket file, but
 /// only while that file is still the one this layer bound: a second instance
 /// that took the path over is serving a socket of its own there, and unlinking
-/// it would leave that instance running and unreachable.
+/// it would leave that instance running and unreachable. A pipe leaves no
+/// file: on Windows the layer closes its end, and the pipe and its name go
+/// once no bridge holds the other end either.
 pub struct TariaLayer {
     app_label: String,
     socket_path: PathBuf,
@@ -366,6 +369,21 @@ impl TariaLayer {
     ///
     /// Apps that would rather run without taria than not run at all should
     /// use [`bind_or_disabled`](Self::bind_or_disabled).
+    ///
+    /// # On Windows
+    ///
+    /// The endpoint is a named pipe, and its name is resolved by
+    /// [`taria::socket::resolve_pipe_name`]: `$TARIA_SOCK` if set and
+    /// non-empty, which must then be a pipe on this machine
+    /// (`\\.\pipe\<name>`) or the bind is refused, else
+    /// `\\.\pipe\taria-<SID>-<app_label>`, with the SID of the user the
+    /// process runs as, read from its token. The label may not contain `\`
+    /// either. There is no directory to vet and no file to clear: the pipe is
+    /// created as the first and only instance of its name, refuses clients on
+    /// other machines, and is owned by the current user with a DACL that lets
+    /// only that user in. A name another instance is serving, or that
+    /// something else holds, is refused with
+    /// [`AddrInUse`](io::ErrorKind::AddrInUse), as on Unix.
     pub fn bind(app_label: &str) -> io::Result<Self> {
         let socket_path = resolve_socket_path(app_label).map_err(invalid_label)?;
         Self::bind_at(app_label, socket_path)
@@ -397,6 +415,18 @@ impl TariaLayer {
     ///   [`AlreadyExists`](io::ErrorKind::AlreadyExists), the file untouched.
     ///   The path can come verbatim from `$TARIA_SOCK`, and a typo there is
     ///   not a reason to delete a file the user meant to keep.
+    ///
+    /// # On Windows
+    ///
+    /// `socket_path` is a pipe name, and must be a pipe on this machine,
+    /// `\\.\pipe\<name>` in any letter case with one name after the prefix,
+    /// as [`taria::socket::check_pipe_name`] holds it; anything else, a file
+    /// path or a pipe on another machine included, is refused with
+    /// [`InvalidInput`](io::ErrorKind::InvalidInput) before anything is
+    /// opened. Nothing is ever cleared from a name: one another instance is
+    /// serving, or that something else holds, is refused with
+    /// [`AddrInUse`](io::ErrorKind::AddrInUse). See [`bind`](Self::bind) for
+    /// how the pipe is protected.
     pub fn bind_at(app_label: &str, socket_path: impl Into<PathBuf>) -> io::Result<Self> {
         // The transport vets the path, frees it of a dead socket and binds
         // there, or says why it will not. It cleans up after itself when
@@ -510,8 +540,9 @@ impl TariaLayer {
         self.bind_error.as_ref()
     }
 
-    /// The path of the Unix socket this layer is serving on, or the path it
-    /// tried to bind if it is disabled, so an app can print either.
+    /// The endpoint this layer is serving on, or the one it tried to bind if
+    /// it is disabled, so an app can print either: the Unix socket's path on
+    /// Linux and macOS, the named pipe's name (`\\.\pipe\...`) on Windows.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }

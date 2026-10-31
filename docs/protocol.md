@@ -65,7 +65,8 @@ the app is the one that speaks first (section 3).
 ### 1.3 What a conforming app MUST do
 
 1. Bind an `AF_UNIX` `SOCK_STREAM` socket at a path a bridge can find
-   (section 14).
+   (section 14), or on Windows create a named pipe a bridge can find, owned
+   by its user and open to that user alone (section 14.8).
 2. Send exactly one `hello` as the first message on every accepted connection,
    before any other message (section 3).
 3. Publish `snapshot` messages whose `protocol_version` is 1, whose `seq`
@@ -92,6 +93,9 @@ bridge connection at a time.
 ### 1.4 What a conforming bridge MUST do
 
 1. Connect to the app's socket and read `hello`, `snapshot` and `ack` lines.
+   On Windows, open the app's pipe only by a local name, and check that the
+   pipe's owner is the bridge's own user before reading or writing anything
+   (section 14.8).
 2. Give every `input` an `id` that does not repeat for the lifetime of the
    bridge **process**, not merely of one connection (section 10.1).
 3. Skip a line it cannot parse and keep the connection (section 2.6).
@@ -127,9 +131,30 @@ literal line in this document is real serializer output or a real capture
 
 ### 2.1 Transport
 
-The transport is a Unix domain socket, `AF_UNIX` with type `SOCK_STREAM`. The
-app binds and listens; the bridge connects. Nothing about the protocol depends
-on a particular socket path, but discovery does (section 14).
+The transport is a bidirectional byte stream between the two processes, and
+which one depends on the platform:
+
+| Platform | Transport |
+|---|---|
+| Linux, macOS and the other unixes | A Unix domain socket, `AF_UNIX` with type `SOCK_STREAM`. |
+| Windows | A named pipe (a kernel object, named under `\\.\pipe\`, that two processes open like a file) in byte mode both ways: `PIPE_TYPE_BYTE` and `PIPE_READMODE_BYTE`. |
+
+The pipe carries the same ndjson as the socket, byte for byte: everything in
+this document from section 2.2 on applies to it unchanged. An app **MUST**
+create the pipe in byte mode, so the stream holds no message boundaries a
+peer could take for framing. A line may span several pipe writes and one
+write may hold several lines, exactly as on a socket.
+
+The app binds and listens, or on Windows creates the pipe and waits for a
+client; the bridge connects. This document says *socket* for either where
+the two do not differ. Nothing about the protocol depends on a particular
+socket path or pipe name, but discovery does (section 14, and section 14.8 on
+Windows).
+
+The named pipe is a new transport for a platform version 1 did not reach,
+not a change to version 1. A peer on a unix sees no difference, and a peer
+that implements only the socket is still conforming there. Adding it is
+additive in the sense of section 16: `PROTOCOL_VERSION` stays 1.
 
 ### 2.2 Framing
 
@@ -1402,21 +1427,31 @@ other string keeps its start. Ids and custom action names are never changed,
 so whatever an agent can read it can still act on. `docs/architecture.md`
 (Snapshot size) gives the order the adapter cuts in and how it tells the app.
 
-### 13.3 Socket path length
+### 13.3 Socket path and pipe name length
 
 `sockaddr_un.sun_path` has to hold the path and its terminating NUL, so the
 limit is that buffer minus one, and the buffer is not the same size
-everywhere.
+everywhere. Windows has no `sun_path`: its endpoint is a named pipe (section
+14.8), and the limit is on the pipe's whole name.
 
-| Platform | `sun_path` | Longest path, bytes |
+| Platform | Buffer | Longest endpoint |
 |---|---|---|
-| Linux and other unixes | 108 | **107** |
-| macOS, FreeBSD, NetBSD, OpenBSD, DragonFly | 104 | **103** |
+| Linux and other unixes | `sun_path`, 108 | **107** bytes |
+| macOS, FreeBSD, NetBSD, OpenBSD, DragonFly | `sun_path`, 104 | **103** bytes |
+| Windows | none | **256** UTF-16 code units, the whole pipe name, `\\.\pipe\` included |
 
-Length is the byte length of the path, the same count the kernel applies. A
-path in the band between the two binds on Linux and is refused on macOS, which
-is not hypothetical: the macOS temp dir is around 49 bytes, so the fallback
-path plus a long app label lands in it.
+On a unix, length is the byte length of the path, the same count the kernel
+applies. A path in the band between the two binds on Linux and is refused on
+macOS, which is not hypothetical: the macOS temp dir is around 49 bytes, so
+the fallback path plus a long app label lands in it.
+
+On Windows, length is counted the way Windows counts the name, in UTF-16 code
+units (a character outside the Basic Multilingual Plane, such as most emoji,
+counts two). The 256 covers the prefix, so the default name
+`\\.\pipe\taria-<SID>-<label>` spends 16 units on its fixed parts and the
+SID's own length on the user: a typical account's SID is around 45
+characters, which leaves a label about 190. A label that holds `\` is refused
+before the length is counted (section 14.8).
 
 Both peers **SHOULD** check this before binding or connecting rather than
 letting the kernel refuse. The kernel's own refusal names neither the path,
@@ -1462,6 +1497,10 @@ where it is available (through `/proc/self` on Linux), else `$USER`, else
 rather than in the shared crate, so a third-party adapter that wants to be
 discoverable through the fallback branch **MUST** match it.
 
+This resolution, sections 14.3 and 14.4, and the socket file of section 14.6
+are about a file on a unix. On Windows the endpoint is a named pipe, which is
+named, protected and freed differently; section 14.8 says how.
+
 ### 14.2 The label rule
 
 The label is formatted into a file name, so it has to be one. A label that is
@@ -1486,6 +1525,10 @@ rejects passes the path itself.
 
 The reference bridge refuses the same labels while parsing `--app`, where
 `--socket` remains the way to name a path.
+
+On Windows the label ends a pipe name rather than a file name, and a label
+that also contains `\` **MUST** be refused, since Windows reads `\` as a
+separator there too (section 14.8).
 
 ### 14.3 Directory vetting
 
@@ -1565,7 +1608,7 @@ has found the backlog empty since the last session ended, so a client that
 connects the instant a session ends counts as one that waited.
 
 **Not specified.** What a second bridge should do while its connection waits,
-beyond reporting it.
+or on Windows after its open is refused as busy, beyond reporting it.
 
 **Reference implementation.** The reference bridge takes turns, which is its
 own policy and not a rule. It opens no connection until its first tool call,
@@ -1588,7 +1631,31 @@ terminal's foreground process group, resumes only with `fg` there:
 `kill -CONT` resumes it only in the background, where its next use of the
 terminal stops it again. A tracing stop (state `t`) ends from the debugger,
 and any other stop with `kill -CONT`. Nothing on the wire carries any of it,
-and elsewhere a stopped app reads as held.
+and on macOS and the other unixes a stopped app reads as held.
+
+**On Windows there is no backlog**, and both of the silences above mean
+something else. A one-instance pipe (section 14.8) has no queue to wait in:
+while a bridge is served, a second bridge's open fails at once with
+`ERROR_PIPE_BUSY`, and no connection opens at all. That refusal is the only
+sign of an app held by another bridge, and a bridge **SHOULD** report it as
+the app held, not as a wrong pipe name or an app that has gone, and
+**SHOULD** retry it as it retries any connect (section 14.7). So:
+
+- A second bridge never has a connection to write into before its turn, and
+  the discard of input written before the `hello`, above, never applies.
+- An open connection that stays silent is not a bridge waiting its turn: the
+  app's pipe took it, and an app greets a bridge as soon as it takes one. A
+  bridge **SHOULD NOT** report that silence as the app held. It is the app
+  itself, suspended (by a debugger or a process tool), or stuck before its
+  `hello`, or a pipe that is not a taria app at all.
+
+**Reference implementation.** The reference bridge answers the busy refusal
+with the held answer, in the same words and the same retry advice as on a
+unix, with the pipe's refusal as the evidence in place of the silent
+connection's age. It answers the silent pipe with the app suspended or stuck,
+the pipe name right, and a retry once the app responds. Stopped-app
+detection needs `/proc`, so on Windows a suspended app is named only as
+possibly suspended, never with its pid's state.
 
 ### 14.6 Shutdown
 
@@ -1649,6 +1716,128 @@ in each of these answers, that the disconnect was its own release, not a fault,
 unless it has seen signs of a new instance since: nothing listening, or another
 pid listening than the one it let go of. None of this is a protocol rule. To
 the app, a bridge that let go is one that left.
+
+On Windows the same bridge reads a reconnect refused as busy as the app held
+by another bridge, the Windows form of landing in the backlog, and a
+reconnect that opens and stays silent as the app suspended or stuck (section
+14.5). It takes the peer's pid from `GetNamedPipeServerProcessId` rather
+than `SO_PEERCRED`, for telling one instance from the next. Since a pipe's
+name lives while any handle to the pipe is open (section 14.8), the bridge
+closes its end as soon as it reads end of stream, so that a restarted app can
+create the pipe again.
+
+### 14.8 Windows discovery
+
+On Windows the endpoint is a named pipe (section 2.1), and this section
+replaces sections 14.1, 14.3 and 14.4 there, and the socket file of section
+14.6. Sections 14.2, 14.5, 14.6 and 14.7 otherwise apply, with the
+differences they and this section state. Nothing here changes a byte on the
+connection: it is a transport a peer adds, and version 1 is unchanged.
+
+Two Windows terms recur. A **SID** (security identifier) is the string that
+names an account, `S-1-5-21-...`. A **DACL** (discretionary access control
+list) is the part of an object's security descriptor that lists who may open
+it and how.
+
+**The name.** Both peers derive the same default name, or they never meet:
+
+1. **`$TARIA_SOCK`**, when set and non-empty, if it passes the rule below.
+2. **`\\.\pipe\taria-<SID>-<label>`**, where `<SID>` is the SID string of the
+   user the process runs as, read from the process token (not a thread's
+   impersonation token) and written as `ConvertSidToStringSidW` writes it.
+
+Pipe names share one namespace per machine rather than living in a per-user
+directory, so the SID is in the name to keep one user's pipes apart from
+another's. A peer that wants to be found by the default **MUST** derive it
+exactly this way. The name only keeps users apart; it does not keep anyone
+out. What does is four things below, together: the first-instance flag, the
+reject-remote flag, the DACL, and the bridge's owner check.
+
+**The override.** A peer **MUST** honour `$TARIA_SOCK` only when it names a
+pipe on the local machine: it starts with `\\.\pipe\`, in any letter case,
+since Windows matches the prefix without regard to case (`\\.\PIPE\x` is
+`\\.\pipe\x`), and what follows is one name, with no `\` or `/`, no NUL, and
+not empty or only dots and spaces. Anything else **MUST** be refused, not
+fallen back from: the user named an endpoint, and serving or connecting
+somewhere else would leave the two peers apart with nothing said. A remote
+name, `\\host\pipe\x`, is the reason for the rule. Opening a pipe on another
+machine goes over SMB (Windows file sharing), which sends that machine the
+user's credentials and puts the agent's input on the network. The other
+refusals close the ways around the prefix: Windows normalises a `\\.\` name
+before opening it, folding `/` into `\` and resolving `..`, so
+`\\.\pipe\..\UNC\host\share` passes a plain prefix check and leaves for SMB.
+The same rule holds for a name passed whole, such as the reference bridge's
+`--socket` and the adapter's `bind_at`.
+
+That normalisation also trims trailing dots and spaces, so `\\.\pipe\taria.`
+and `\\.\pipe\taria` name the same pipe, and a label `app.` the same pipe as
+`app`. Both peers pass the name to Windows, which normalises it alike for
+each, so they still meet. A peer **SHOULD** pass the name as UTF-16 to the
+wide-character (`W`) functions: the ANSI ones convert it through the code
+page first, and a best-fit conversion can turn a character the rule allowed
+into a `\`.
+
+**The label** is held to section 14.2's rule, and **MUST** also be refused if
+it contains `\`. The whole name is limited to 256 UTF-16 code units (section
+13.3).
+
+**Creating the pipe.** The app:
+
+- **MUST** create it as the first instance of its name
+  (`FILE_FLAG_FIRST_PIPE_INSTANCE`), which fails while any instance of that
+  name exists. That is what refuses a second app on a live name, as section
+  14.4's `AddrInUse` does on a unix, and what keeps an app from joining, as a
+  second instance, a pipe something else created first under its name.
+  Taking a name over is impossible here, so there is nothing to free.
+- **MUST** reject remote clients (`PIPE_REJECT_REMOTE_CLIENTS`).
+- **MUST** create it with a security descriptor whose owner is the user, and
+  whose DACL grants that user alone, protected from inherited entries. This
+  is section 14.3's private directory in another form: it decides who can
+  open the app's pipe.
+- **SHOULD** allow one instance (`nMaxInstances` 1). A second instance would
+  let a second bridge connect into it and wait unserved, which section 14.5
+  says a bridge reads as a stuck app, not a held one.
+- **MAY** reuse the one instance across sessions: disconnect the last client
+  (`DisconnectNamedPipe`) and listen again (`ConnectNamedPipe`). The
+  reference adapter does.
+
+**Opening the pipe.** The bridge:
+
+- **MUST** check, after the open and before it reads or writes anything,
+  that the pipe's owner is its own user's SID, and close it unread and
+  unwritten otherwise. Any process can create a pipe under the app's name
+  before the app does, or after it exits, and an agent that read it would
+  take its tree for the app's and send it input. An owner that is a group the
+  user belongs to is not the user.
+- **SHOULD** open it at the `SECURITY_IDENTIFICATION` impersonation level, so
+  that what serves the pipe can learn who the bridge is but cannot act as it.
+- **SHOULD** read a refusal as busy (`ERROR_PIPE_BUSY`) as the app held by
+  another bridge, and a missing name (`ERROR_FILE_NOT_FOUND`) as no app
+  there (section 14.5).
+
+**The pipe's lifetime.** A pipe, and its name with it, lives while any handle
+to it is open, on either end. An app that exits while a bridge still holds
+its end leaves the name taken until that bridge closes, and a restarted app
+is refused as if the old one were still serving. A bridge **SHOULD** close
+its end as soon as it reads end of stream.
+
+**Shutdown.** A pipe leaves no file behind, so section 14.6's rule on removing
+the socket file has nothing to act on. The acks flushed at shutdown (section
+14.6) still have to reach the bridge: an app **SHOULD** close its end at
+shutdown rather than disconnect the client, since closing leaves what the
+app wrote readable by the bridge until it has read it, and
+`DisconnectNamedPipe` discards it. It **SHOULD NOT** wait for the bridge to
+read it either (`FlushFileBuffers`), which can wait forever and so park the
+app's exit.
+
+**Reference implementation.** `taria::socket` holds the pure parts both
+reference peers use: `pipe_name` builds the default name, `check_pipe_name`
+holds a name given whole to the override rule, and `resolve_pipe_name` is the
+precedence above. They build and are tested on every platform. The adapter
+creates the pipe with `PIPE_ACCESS_DUPLEX`, byte mode, one instance, the
+first-instance and reject-remote flags, and a DACL granting the user
+`GENERIC_READ | GENERIC_WRITE`. The bridge opens it with tokio's named-pipe
+client and checks the owner with `GetSecurityInfo`.
 
 ## 15. Focus contract
 

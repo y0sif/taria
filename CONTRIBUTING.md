@@ -21,13 +21,49 @@ python3 scripts/e2e.py           # end-to-end: 27 steps, demo app + bridge + MCP
 python3 scripts/adversarial.py   # 24 edge-case probes
 ```
 
-CI runs all six; zero warnings is the bar. The two scripts use nothing outside
-the Python standard library, and are where a change that breaks the
-agent-facing contract shows up: several of their assertions are the bridge's
-error strings verbatim, so rewording one is a deliberate edit in both places.
-Both build the debug binaries they test, because two reviews were once scored
-against stale ones without noticing. `--no-build` skips the build for a caller
-that has just built and still refuses a `target/debug` older than the sources.
+CI runs all six on Linux; zero warnings is the bar. The two scripts use
+nothing outside the Python standard library, and are where a change that
+breaks the agent-facing contract shows up: several of their assertions are the
+bridge's error strings verbatim, so rewording one is a deliberate edit in both
+places. Both build the debug binaries they test, because two reviews were once
+scored against stale ones without noticing. `--no-build` skips the build for a
+caller that has just built and still refuses a `target/debug` older than the
+sources.
+
+CI also runs the tests and both scripts on macOS, and clippy, the tests and
+the build on Windows. The Linux job cross-checks clippy for the Windows target
+and builds the docs with warnings denied, and the MSRV job checks the Windows
+target too, so `cfg(windows)` code is compiled on every push. The scripts
+cannot run on Windows: they drive the demo through a pseudo-terminal, read
+`/proc`, and talk to the app over `AF_UNIX`, none of which Windows has. There,
+`crates/taria-mcp/tests/adapter_e2e.rs` is the end-to-end gate: a real
+`TariaLayer` in a child process, driven by the real `taria-mcp` binary over
+stdio, on every platform.
+
+## Testing the Windows build from Linux
+
+`scripts/wine-test.sh` cross-compiles the tests for Windows and runs each test
+binary under Wine (a layer that runs Windows programs on Linux). It needs
+MinGW-w64, the cross toolchain that links them, Wine itself, and the rustup
+target:
+
+```bash
+sudo pacman -S mingw-w64-gcc wine              # Arch
+sudo apt install gcc-mingw-w64-x86-64 wine64   # Debian, Ubuntu
+rustup target add x86_64-pc-windows-gnu
+```
+
+Arguments go to `cargo test` as they are:
+
+```bash
+scripts/wine-test.sh --workspace
+scripts/wine-test.sh -p taria-mcp --test adapter_e2e
+```
+
+Wine is a stand-in, not Windows: its named pipes, process ids and timing are
+its own, so a pass there is a strong hint and the Windows CI job is the final
+word. A test that needs something Wine allows and Windows may not, such as a
+pipe owned by another account, says in its output when it fell back.
 
 ## Ground rules
 

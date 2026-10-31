@@ -12,7 +12,7 @@ compares with the screen-level tools, see `comparison.md`.
 | Component | Location | Role |
 |---|---|---|
 | Protocol types | `crates/taria` | `Snapshot`, `Node`, `Role`, `Action`, `AgentInput`, the `wire` messages, and the three modules both peers share: `key`, `id`, `socket`. Pure, no I/O, one dependency (serde). |
-| Ratatui adapter | `crates/taria-ratatui` | `TariaLayer` serves the app's Unix socket, publishes snapshots, feeds agent input into the event loop, and acknowledges every input. `FrameRecorder` and `sem` record nodes per rendered frame. |
+| Ratatui adapter | `crates/taria-ratatui` | `TariaLayer` serves the app's Unix socket, or on Windows its named pipe, publishes snapshots, feeds agent input into the event loop, and acknowledges every input. `FrameRecorder` and `sem` record nodes per rendered frame. |
 | MCP bridge | `crates/taria-mcp` | Stdio MCP server (rmcp) exposing `read_tree`, `act`, `key`, and `type_text`. A socket-manager task owns the connection to the app and republishes its acks. The binary opens that connection on its first tool call and lets it go after 60 s with no tool calls. |
 | Demo | `examples/demo-app` | `taria-demo`, a task-manager TUI an agent drives end to end. |
 
@@ -36,8 +36,9 @@ and an input the app deliberately dropped looks like a slow one.
 
 ## Wire protocol
 
-- Transport: Unix domain socket, newline-delimited JSON (ndjson). One JSON
-  object per line.
+- Transport: a Unix domain socket, or on Windows a named pipe in byte mode
+  (see Transports below), carrying newline-delimited JSON (ndjson), the same
+  bytes on either. One JSON object per line.
 - Up (app to bridge): one `hello` per connection, carrying `app_label` and
   `protocol_version`, then `snapshot` and `ack` messages.
 - Down (bridge to app): `input` messages carrying an `id` and an
@@ -536,6 +537,10 @@ and a silence.
 
 ## Socket lifecycle
 
+This is the lifecycle on Linux and macOS, where the endpoint is a Unix socket
+file. On Windows it is a named pipe, which has no file to resolve, vet or
+unlink; Transports, below, says what takes their place.
+
 App side (`TariaLayer::bind`, or `bind_or_disabled`):
 
 1. Resolve the path with `taria::socket::resolve_path`: `$TARIA_SOCK`
@@ -735,6 +740,11 @@ hits: in every row but the last, the bridge reached something listening at
 that path. The input tools ask for a tree before they send anything, so they
 carry whichever of these applies rather than a second vocabulary for it.
 
+On Windows the table has two more rows and one row means something else: a
+pipe another account owns, an open refused as busy, and a silent connection
+that is the app rather than another bridge. What the bridge says to each is
+under Transports, What the bridge says on Windows.
+
 An ack whose `status` this build cannot name fails its whole line, id
 included, so the app answering an input is indistinguishable at the bridge
 from the app saying nothing; a rejected line inside the window is the only
@@ -874,6 +884,236 @@ is restored, because the layer never prints. Two more, `truncated_snapshots`
 and `oversized_snapshots`, lose no input: they count trees the agent was
 handed cut (see Tree depth and Snapshot size). `LayerStats` is
 `#[non_exhaustive]`, so a new count is not a breaking change.
+
+## Transports
+
+Since 0.4.0 the adapter and the bridge each keep everything that is the same
+on every platform in one place, and put what is not behind a small seam, in
+`transport/` in each crate. Linux and macOS share the Unix socket transport,
+and Windows has a named pipe one (a pipe is a kernel object with a name under
+`\\.\pipe\`, which two processes open like a file). The layer's threads, its
+input and ack queues, generations and stamps, the dedupe and the bounding of
+trees have one implementation, and so do the bridge's manager and every
+answer it builds, which is why the bytes on the connection are the same on
+every platform. `docs/protocol.md` section 14.8 is the normative statement of
+the Windows rules; this section is how the reference peers keep them.
+
+### The seam
+
+The adapter needs four types and one function from a transport:
+
+- `Listener`, bound with `Listener::bind` at the path or pipe name the app
+  asked for. It accepts one bridge at a time, gives up once the layer's
+  shutdown flag is set, says whether the bridge it hands over waited behind
+  the previous session (which decides the discard of input written before
+  the `hello`), and cleans up after itself when dropped.
+- `Connection`, one per bridge, with a write timeout, split into a `Reader`
+  for the reader thread and a `Writer` for the writer loop.
+- `Reader`, a `Read`, which can also read just what is already waiting
+  (`with_nonblocking_reads`), for that discard.
+- `Writer`, whose `write_all_before(deadline)` writes a whole buffer by a
+  deadline or fails, which is what bounds every line at `WRITE_TIMEOUT` and
+  the acks flushed at shutdown at `SHUTDOWN_FLUSH`, and whose `shutdown`
+  wakes a `Reader` blocked on the same connection.
+- `user_identity`, which namespaces the default endpoint between users: the
+  uid on a unix, the SID (security identifier, the string that names an
+  account, `S-1-5-21-...`) on Windows.
+
+Every transport keeps three promises for `Writer::shutdown`. What was written
+stays written: a byte a write finished putting on the connection is still
+readable by the bridge after the shutdown, and after the listener closes,
+until the bridge has read it, and nothing in the shutdown waits for that
+read, which could wait forever. It wakes the reader: a `Reader` blocked on the
+connection returns end of stream at once. It stays shut: every read started
+after it returns end of stream at once, so a reader that was between two
+reads cannot start one that never ends. A Unix socket has all three from the
+kernel, since `shutdown(Both)` is sticky and leaves sent data readable.
+Windows has them from a closed event per session and from never disconnecting
+a pipe at shutdown, only closing it.
+
+The bridge serves whatever its transport's `connect` returns as a plain
+`AsyncRead + AsyncWrite` stream, split with `tokio::io::split`, and needs
+only this much more:
+
+| Item | Unix | Windows |
+|---|---|---|
+| `connect` | `UnixStream::connect` | tokio's named-pipe client, then the owner check |
+| `peer_pid` | `SO_PEERCRED` (`LOCAL_PEERPID` on macOS) | `GetNamedPipeServerProcessId` |
+| `nothing_listens` | `ConnectionRefused` or `NotFound` | `NotFound` |
+| `refusal` | never | `Busy` (`ERROR_PIPE_BUSY`) or `Foreign` (another account's pipe) |
+| `BACKLOG` | true: a connect opens before the app accepts it | false: an open succeeds only into a free instance |
+| `check_endpoint` | any path | a local pipe name, by `check_pipe_name` |
+
+`BACKLOG` is what decides what a connection that stays silent means: a
+bridge waiting behind another where it is true, the app itself where it is
+false. `ensure_supported` is the last item, which the server builders call
+first so that a platform with no transport says so; every platform taria
+builds for has one now.
+
+When a connection ends the bridge drops the whole stream, which closes both
+directions. `tokio::io::split` keeps one stream under both halves, so dropping
+only the write half closes nothing. A future change that drops only the
+bridge's write half, to tell the app it is done writing while it goes on
+reading, needs an explicit `shutdown().await` on that half. On Windows even
+that is only a flush, since tokio's named pipe has no half-close; the app
+sees end of stream once both halves are gone.
+
+### Windows: one named pipe
+
+The adapter creates `\\.\pipe\taria-<SID>-<label>`, or the pipe
+`$TARIA_SOCK` names when that is a local pipe name and nothing else. It is
+the first instance of its name (`FILE_FLAG_FIRST_PIPE_INSTANCE`), the only
+one allowed, refuses clients on other machines
+(`PIPE_REJECT_REMOTE_CLIENTS`), is a byte stream both ways, and is owned by
+the user with a DACL (discretionary access control list, the part of a
+security descriptor that says who may open the object) that grants that user
+read and write and nobody anything, protected from inherited entries. The SID
+in the name only keeps one user's pipes apart from another's in the
+machine-wide pipe namespace; the safety comes from those flags, that DACL
+and the bridge's owner check, together.
+
+So the socket file's rules have Windows counterparts rather than copies.
+There is no directory to vet: the descriptor decides who can open the pipe.
+There is no stale socket to unlink and no liveness probe: a second app on a
+live name fails to create the first instance, which the adapter reports as
+`AddrInUse`, as on Unix, decided by the system and not by a probe. And there
+is no file to remove at exit. A pipe, and its name, lives while any handle
+to it is open, so an app restarted while a bridge still holds its old end is
+refused until that bridge reads end of stream and closes, which taria-mcp
+does at once.
+
+The one instance is reused from session to session. The next accept retires
+the last session: it sets the session's closed event, waits until nothing of
+the session is left (the layer has joined its reader and writer by then), and
+only then disconnects the client (`DisconnectNamedPipe`) and listens again
+(`ConnectNamedPipe`). A disconnect throws away what the client has not read,
+and between sessions is the only place one happens. At shutdown the handle is
+closed instead, which leaves what the writer wrote, the acks flushed at
+shutdown included, readable by the bridge until it has read it.
+
+Names reach Windows only through the wide-character (`W`) calls, as UTF-16.
+An ANSI call would pass the name through the code page first, whose best-fit
+mapping can turn a character `check_pipe_name` passed into a `\`. Windows
+trims trailing dots and spaces as it opens a name, so `\\.\pipe\taria.` and
+`\\.\pipe\taria` are one pipe; both peers hand the name to Windows, which
+normalises it the same way for each.
+
+The bridge opens the pipe with tokio's named-pipe client, at tokio's default
+`SECURITY_IDENTIFICATION` level, so what serves the pipe can learn who the
+bridge is and cannot act as it. Before it reads or writes anything it reads
+the pipe's owner (`GetSecurityInfo`) and compares it with its own token's
+user SID. Pipe names are machine-wide and any process can create one under
+the app's name first, so a pipe another account owns is closed unread and
+unwritten, refused as `Foreign`, and logged as a warning, when the refusal is
+new, that names the owner. With `--app` the binary derives the name from the
+same token SID, which `taria_mcp::current_user_sid()` exposes on Windows.
+
+### Overlapped I/O
+
+The reader thread and the writer loop use the one pipe handle at the same
+time. A handle opened for synchronous I/O lets one call through at a time,
+so a read waiting for the bridge would hold every write up behind it. The
+pipe is opened for overlapped I/O instead, Windows' asynchronous I/O: a call
+starts an operation and returns, and the kernel finishes it later, writing
+the result into an `OVERLAPPED` structure the caller provided and signalling
+an event. That memory belongs to the kernel until the operation finishes,
+which is the whole of the design's risk, and these invariants contain it:
+
+- **Every operation runs through an `Op`**: the `OVERLAPPED`, its event and
+  its buffer, boxed, so the addresses the kernel holds stay put however the
+  `Op` moves.
+- **An operation never outlives the call that started it.** Each is started
+  and finished inside one call on the `Op`'s owner, so none is in flight once
+  that call returns.
+- **Finished means the kernel said so.** A wait that gives up, on a deadline
+  or a shutdown, cancels the operation (`CancelIoEx`) and then waits for it
+  to finish, and only then is its memory reused or freed. An `Op` dropped
+  with an operation still in flight, which only a panic can cause, does the
+  same, and leaks its memory rather than free it if even that fails.
+- **The handle is closed once, and never under an operation.** The listener
+  and the session share it through an `Arc`, and every operation runs inside
+  a call on an owner that holds that `Arc`.
+- **A shutdown stays shut.** Each session has a closed event, set once by
+  `Writer::shutdown` and never reset. Every read and write checks it before
+  it starts and waits on it beside its own event. Cancelling the read in
+  flight alone would not do: a cancel reaches only the operation in flight
+  when it is made, and a reader between reads would start its next one after
+  it and wait forever.
+- **A write is bounded whole.** A line is one `WriteFile`, waited on for what
+  is left of its deadline and on the closed event beside it. At the deadline
+  it is cancelled and waited for, so its buffer is never freed under the
+  kernel, and it fails `TimedOut` unless it finished in full first.
+  `FlushFileBuffers`, which waits for the bridge to read and can wait
+  forever, is never called.
+
+The listener's `ConnectNamedPipe` is overlapped too, waited on in 50 ms
+slices with the shutdown flag read between them, the counterpart of the Unix
+listener's poll, so a layer dropped with no bridge connected waits at most
+one slice.
+
+### Why `windows-sys` and not `interprocess`
+
+Both crates take `windows-sys` on Windows only: raw bindings to the Win32
+API, with no code of their own to run, which costs nothing on Linux or macOS.
+The bridge's stream is tokio's named-pipe client, from a dependency it
+already had. The adapter's pipe is about 1,300 lines written against those
+bindings, tests aside, where a crate could have done it in a few. The
+obvious crate, `interprocess`, was turned down for three things it does that
+break a promise taria makes:
+
+- **Its pipe streams have no write timeout.** Every line the adapter writes
+  has 5 s, and the acks flushed at shutdown 250 ms, so that a bridge that
+  stops reading is dropped and an app's exit stays bounded. A write that can
+  wait forever on a bridge that never reads breaks both.
+- **Its listener keeps a hidden backlog.** Each accept creates the next
+  instance ahead of time, so a second bridge connects into that spare and
+  sits there silent: the Unix backlog back again, with the ambiguity a
+  one-instance pipe removes. With one instance, a held app refuses the second
+  bridge as busy, which is better evidence than silence, and a silent
+  connection can only be the app.
+- **It hands dropped streams to background "limbo" threads**, which flush
+  the pipe, that is wait for the peer to read, before they close it. Those
+  are threads the layer neither started nor can join, waiting on a bridge
+  that may never read, and holding a handle that keeps the pipe's name taken,
+  so a restarted app cannot create it.
+
+The hand-rolled transport is tested where it can go wrong: a second bind
+refused as in use, the owner and the DACL read back, a second client told
+the pipe is busy, the write deadline against a bridge that never reads, a
+shutdown waking a blocked reader and every later read, the instance reused
+session after session, and what was written before shutdown surviving the
+pipe's close. `crates/taria-mcp/tests/adapter_e2e.rs` then drives a real
+`TariaLayer` in a child process from the real `taria-mcp` binary on every
+platform, Windows included.
+
+### What the bridge says on Windows
+
+Three answers exist only on Windows, because only the Windows transport
+refuses a connect, and only there does a silent connection mean the app.
+Linux and macOS answers are unchanged, byte for byte.
+
+- **Busy.** The open was refused with `ERROR_PIPE_BUSY`: another bridge has
+  the one instance. The answer is the held answer, with the pipe's refusal
+  as its evidence in place of a silent connection's age, and the same retry
+  advice by this bridge's `--idle-release`. A bridge that let go of the app
+  itself gets the held-after-release answer, as on Unix. A busy refusal
+  forgets the last connection's rejected lines, oversized tree aside, as a
+  connect does.
+- **Silent pipe.** A connection opened and has said nothing past the 500 ms
+  grace. On Windows that is the app, suspended (a debugger, a process tool)
+  or stuck before its `hello`, or something that is not a taria adapter, and
+  the answer says so and that it is not another bridge. It replaces the held
+  answer that the same silence gets on Unix.
+- **Foreign.** The pipe at the name belongs to another account. The answer
+  says it is not the app, that the bridge closed it untouched, and that the
+  user should find what serves it; the log names the owner. It outranks
+  every other answer, an oversized tree included, since it is not the app
+  whose tree or lines those would be about, and it clears the bridge's
+  record of having let go, as finding nothing listening does.
+
+Stopped-app detection reads `/proc`, so it stays Linux only: on Windows a
+suspended app gets the silent-pipe answer, and the no-ack answer never names
+a stopped app. `docs/cli.md` quotes the three texts.
 
 ## Focus contract
 

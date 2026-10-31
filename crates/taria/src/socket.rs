@@ -279,12 +279,24 @@ pub const MAX_PIPE_NAME_CHARS: usize = 256;
 /// Build the default pipe name for `app_label`, run by the user whose SID
 /// string is `user`: `\\.\pipe\taria-<user>-<label>`.
 ///
-/// Part of what the Windows transport will use, in place of
-/// [`resolve_path`]'s socket paths. Pipes share one namespace per machine
-/// rather than living in a per-user directory, so the user's SID is in the
-/// name to keep one user's pipes apart from another's. The name only keeps
-/// them apart; the pipe's own security descriptor is what keeps another user
-/// out.
+/// What the Windows transport names its pipe by, in place of
+/// [`resolve_path`]'s socket paths, through [`resolve_pipe_name`]. Pipes
+/// share one namespace per machine rather than living in a per-user
+/// directory, so the user's SID is in the name to keep one user's pipes apart
+/// from another's.
+///
+/// The name only keeps them apart, and the safety does not come from it: any
+/// process can create a pipe under any name first. It comes from four things
+/// the transports do with the name. The adapter creates the pipe with
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it never joins a pipe something else
+/// created first, and with `PIPE_REJECT_REMOTE_CLIENTS`, so no other machine
+/// can connect, and gives it a DACL that lets only its own user in; the
+/// bridge checks that the pipe it opened is owned by its own user before it
+/// reads or writes anything.
+///
+/// Windows trims trailing dots and spaces from a name as it opens it, so a
+/// label `app.` names the same pipe as `app`. Both peers pass the name to
+/// Windows, which normalises it alike for each, so they still meet.
 ///
 /// `user` is a SID string, as `ConvertSidToStringSidW` writes one
 /// (`S-1-5-21-...`), and is supplied by the caller, which keeps this function

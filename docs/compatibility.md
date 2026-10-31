@@ -102,14 +102,29 @@ has a lint that catches it.
   snapshot shape moved leaves the bridge with no tree at all and `read_tree`
   reports that none has arrived. Every input tool refuses either way,
   because the app cannot parse the input messages this bridge writes.
-- Unix only for now: the adapter is built on unix-only APIs, and the
-  transport is a Unix domain socket bound through them. Linux is the
-  tested platform.
+- Three platforms, since 0.4.0, each with its own transport and its own
+  gaps:
+
+  | Platform | Transport | CI | What it lacks |
+  | --- | --- | --- | --- |
+  | Linux | Unix domain socket | Rust suites, `scripts/e2e.py`, `scripts/adversarial.py` | nothing |
+  | macOS | Unix domain socket | Rust suites, both scripts (the one probe that reads `/proc` is skipped) | stopped-app detection: a stopped app reads as held |
+  | Windows | named pipe, `\\.\pipe\taria-<SID>-<label>` | Rust suites, among them a real adapter driven by the real `taria-mcp` | stopped-app detection: a suspended app reads as suspended or stuck, with no pid; the two Python scripts, which need a pseudo-terminal, `/proc` and `AF_UNIX` |
+
+  The release page carries a `taria-mcp` build for each: tarballs for
+  x86_64 and aarch64 Linux and both macOS architectures, and a `.zip` for
+  x86_64 Windows. The BSDs' `sun_path` limit is handled, but nothing builds
+  or tests taria on them.
 - Socket paths are capped by AF_UNIX at the platform's `sun_path` minus the
   terminating NUL: 107 bytes on Linux, 103 on macOS and the BSDs. Set
   `$TARIA_SOCK` to a shorter path when the default is too long, inside a
   directory only you can reach: the adapter binds only under a directory you
   own that grants no group or other access, so `/tmp` is refused.
+- On Windows the cap is 256 UTF-16 code units for the whole pipe name, and
+  `$TARIA_SOCK` must be a pipe on this machine, `\\.\pipe\<name>`, with one
+  name after the prefix: anything else is refused, a pipe on another
+  machine included, because opening one goes over SMB (Windows file
+  sharing). A label may not contain `\`.
 - Trees are capped at `MAX_NODE_DEPTH`, 32 levels, because a snapshot past
   that exceeds what a JSON parser will recurse into and would arrive as
   nothing. The adapter cuts deeper branches at publish and tells the app.

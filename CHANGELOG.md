@@ -26,9 +26,10 @@ to grow without a break: `LayerStats` is `#[non_exhaustive]`, and a
 This breaks Rust callers of all three crates; the table under Upgrading maps
 every removed name to what replaces it. The cut moves nothing on the wire:
 `InputId`, a newtype in Rust now, is still a bare integer in the JSON. The
-binary's command line is unchanged, and so is every text an agent reads
-through `taria-mcp`, from the instructions to each answer, byte for byte,
-but for the exceptions under "For whoever drives an app". The typed state
+binary's command line on Linux and macOS is unchanged (Windows is new), and
+so is every text an agent reads through `taria-mcp`, from the instructions
+to each answer, byte for byte, but for the exceptions under "For whoever
+drives an app". The typed state
 changes the outline's `read_tree` description and adds the answer to `act`
 on a disabled node. Against an app that stamps, the stamps reword the no-ack
 answer and its rejected-line variant, which now name 3000ms, and add
@@ -74,6 +75,20 @@ additive: `PROTOCOL_VERSION` stays 1. A 0.3.3 `taria-mcp` reads a 0.4.0 app as
 it read a 0.3.3 one, its 500 ms included, and shows the stamp as
 `"after_input":N`; a 0.4.0 `taria-mcp` answers an app that does not stamp
 exactly as 0.3.3 did.
+
+**taria runs on Windows.** Until now the adapter was built on unix-only APIs
+and neither crate built for Windows. On Windows the adapter now creates a
+named pipe (a kernel object named under `\\.\pipe\`, which two processes
+open like a file), `\\.\pipe\taria-<SID>-<label>`, where the SID (security
+identifier) is the string Windows names the user's account by, and the
+bridge connects to it. The pipe carries the same ndjson as the socket, byte
+for byte, so this is a transport for a platform version 1 did not reach, not
+a change to version 1: `PROTOCOL_VERSION` stays 1. The pipe is created as the
+first and only instance of its name, refuses clients on other machines, and
+is owned by the user with a DACL (the list of who may open it) that lets
+only that user in; the bridge checks the owner before it reads or writes
+anything. On Linux and macOS nothing moves: the command line, every text and
+every behaviour are as they were.
 
 ### Upgrading
 
@@ -229,6 +244,39 @@ be answered well by a 0.4.0 `taria-mcp`:
   capabilities in `_meta`. `server/discover`, like `initialize`, opens no
   connection to the app. In that mode `resources/list` and `prompts/list` carry
   `"ttlMs":0,"cacheScope":"private"`.
+- **`taria-mcp` runs on Windows.** Take `taria-mcp.exe` from the new
+  `taria-mcp-x86_64-pc-windows-msvc.zip` on the releases page, with its
+  sha256 beside it, or `cargo install taria-mcp`. `--app <label>` derives
+  `\\.\pipe\taria-<SID>-<label>` from the process token's SID, as the
+  adapter does, and `--socket` takes a pipe name. Both, and `$TARIA_SOCK`
+  under `--app`, take only a pipe on this machine, `\\.\pipe\` in any letter
+  case and then one name; anything else is a usage error, a pipe on another
+  machine included, because opening one goes over SMB (Windows file sharing)
+  and hands that machine the user's credentials. `--help` describes the pipe
+  on Windows.
+- **Three answers exist only on Windows**, each with the usual opening
+  (`no snapshot from the app yet: `, or after a disconnect
+  `app '<label>' disconnected (last snapshot seq N)`):
+  - A pipe has no listen backlog, so a held app refuses a second bridge as
+    busy, and that bridge gets the held answer with the pipe's refusal as
+    its evidence: `the app is held by another bridge. The pipe name is
+    right: the app's pipe refused this bridge as busy, which is what a
+    second bridge gets, because a taria adapter serves one bridge at a
+    time.`, then the same retry advice as on Unix.
+  - A connection that opens and stays silent past the 500 ms grace is
+    therefore the app itself, not another bridge: `the app accepted this
+    bridge's connection N.Ns ago but has sent nothing, not even the taria
+    handshake; it may be suspended or stuck.`, then that this is not another
+    bridge holding the app and to check that the app is responsive.
+  - A pipe at the app's name that another account owns is refused unread
+    and unwritten, ahead of every other answer: `the pipe at this name is
+    owned by another account than this bridge's user, so it is not the
+    app's, and this bridge closed it without reading or writing anything.`,
+    then why that can happen and what the user should do. The log names the
+    owner. `docs/cli.md` quotes all three whole.
+- **Stopped-app detection stays Linux only.** It reads `/proc`. On Windows a
+  suspended app gets the silent-pipe answer above, with no pid, and on macOS
+  a stopped app still reads as held.
 
 ### For an app author adopting taria
 
@@ -269,6 +317,16 @@ be answered well by a 0.4.0 `taria-mcp`:
 - **`TariaLayer::bind_or_disabled_at(label, path)` is public.** It binds at a
   path the app chose and returns a disabled layer when that fails, as
   `bind_or_disabled` does at the resolved path.
+- **`taria-ratatui` builds and serves on Windows, with no change to your
+  code.** One dependency works on Linux, macOS and Windows, so an app that
+  kept taria behind `#[cfg(unix)]` and `[target.'cfg(unix)'.dependencies]`
+  can drop both. On Windows it pulls in `windows-sys` (raw Win32 bindings)
+  and nothing else. `socket_path()` is the pipe name there. A second app on
+  a live name is refused with `AddrInUse`, as on Unix, and `bind_error()`
+  says why in words of its own: the name in use, a `$TARIA_SOCK` or a
+  `bind_at` name that is not a local pipe, a label holding `\`, a SID the
+  token would not give, or the system refusing the pipe. The integration
+  guide's "Socket paths" section gains "On Windows" with each of them.
 
 ### For a second implementer
 
@@ -320,6 +378,29 @@ be answered well by a 0.4.0 `taria-mcp`:
   id and queueing it now happen under one lock, so overlapping tool calls
   cannot put a higher id on the wire first, which crediting by stamp relies
   on.
+- **`docs/protocol.md` gains the Windows transport.** Section 2.1 adds the
+  named pipe in byte mode beside the socket, section 13.3 its 256-unit
+  limit on the whole name, sections 14.5 and 14.7 what a busy refusal and a
+  silent connection mean with no backlog, and new section 14.8 the rules:
+  the name and the SID in it, `$TARIA_SOCK` honoured only for a local
+  `\\.\pipe\` name in any case, the first-instance and reject-remote flags,
+  a DACL that grants only the user, the bridge's owner check before any read
+  or write, one instance reused across sessions, and a pipe that lives while
+  any handle to it is open. The conformance lists in sections 1.3 and 1.4
+  name the pipe and the owner check. `docs/architecture.md` gains
+  Transports: the seam, the overlapped I/O design and its invariants, and
+  why the pipe is written on `windows-sys` rather than `interprocess`.
+- **`taria::socket` gains the pipe naming, pure and on every platform:**
+  `pipe_name(label, sid)`, `check_pipe_name(name)`,
+  `resolve_pipe_name(taria_sock, sid, label)`, `LOCAL_PIPE_PREFIX`
+  (`\\.\pipe\`), `MAX_PIPE_NAME_CHARS` (256) and the `#[non_exhaustive]` error
+  `InvalidPipeName`, whose `Label`, `User`, `NotLocal`, `Name` and `TooLong`
+  each carry the value refused. On Windows `MAX_SOCKET_PATH_BYTES` is the
+  pipe-name limit, 256 UTF-16 code units rather than bytes, and
+  `check_path_len` and `SocketPathTooLong::path_len` count in those units.
+- **`taria_mcp::current_user_sid()` is public on Windows**: the user's SID
+  string from the process token, which is what names the pipe `--app`
+  finds.
 
 ### The gates
 
@@ -359,6 +440,30 @@ be answered well by a 0.4.0 `taria-mcp`:
   check that `server/discover` and a `tools/list` sent the 2026-07-28 way open
   no connection to the app, and check that the builder refuses outside a
   tokio runtime.
+- CI runs on three platforms. New `windows-latest` and `macos-latest` jobs
+  run the Rust suites, clippy on Windows and both Python scripts on macOS
+  (the one probe that needs `/proc` says it was skipped); the Linux job adds
+  clippy for the Windows target and a docs build with warnings denied, and
+  the MSRV job checks the Windows target too. The scripts cannot run on
+  Windows, which has no pseudo-terminal for the demo, no `/proc` and no
+  `AF_UNIX`.
+- New `crates/taria-mcp/tests/adapter_e2e.rs` runs a real `TariaLayer` in a
+  child process against the real `taria-mcp` binary over stdio, on every
+  platform: tools and acks, a held app, idle release, an app restarted under
+  a new pid, and a second app refused. It is the end-to-end gate on Windows.
+  New tests of the pipe itself cover a second bind refused as in use, the
+  owner and DACL read back, a busy second client, the write deadline against
+  a bridge that never reads, a shutdown waking a blocked reader, the
+  instance reused session after session, the last ack surviving the app's
+  exit, a pipe another account owns refused, and each Windows answer pinned
+  byte for byte.
+- `scripts/wine-test.sh` runs the Windows build of the tests under Wine from
+  Linux; it needs `mingw-w64-gcc`, `wine` and the `x86_64-pc-windows-gnu`
+  target (`CONTRIBUTING.md`). Wine is a stand-in, and the Windows CI job is
+  the gate.
+- Releases gain `taria-mcp-x86_64-pc-windows-msvc.zip`, holding
+  `taria-mcp.exe`, the README and both licences, beside a `.sha256` that
+  `sha256sum -c` reads.
 
 ## [0.3.3] - 2026-10-25
 

@@ -2,9 +2,9 @@
 //!
 //! Embed a [`TariaLayer`] in your ratatui app and each rendered frame can also
 //! publish a semantic [`taria::Snapshot`] over the taria transport (one JSON
-//! message per line over a Unix domain socket). Agent inputs come back as
-//! [`taria::AgentInput`] values your event loop handles like any other input
-//! source.
+//! message per line over a Unix domain socket on Linux and macOS, or a named
+//! pipe on Windows). Agent inputs come back as [`taria::AgentInput`] values
+//! your event loop handles like any other input source.
 //!
 //! [`taria::AgentInput::Text`] is the one that needs aiming rather than
 //! handling: typed text belongs wherever your app puts typing, not in your key
@@ -20,8 +20,9 @@
 //! use taria_ratatui::{InputStatus, TariaLayer, sem};
 //!
 //! fn main() -> std::io::Result<()> {
-//!     // Never fails: if the socket cannot be bound the layer is inert and
-//!     // the app runs exactly as it would without taria.
+//!     // Never fails: if the socket (a named pipe on Windows) cannot be
+//!     // bound, the layer is inert and the app runs exactly as it would
+//!     // without taria.
 //!     let mut layer = TariaLayer::bind_or_disabled("my-app");
 //!     let mut terminal = ratatui::init();
 //!

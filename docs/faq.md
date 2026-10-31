@@ -35,8 +35,9 @@ reading a taria tree for one app and capturing a tmux pane for another.
 **Do I have to use MCP, or can I speak the taria protocol directly?**
 
 MCP is a convenience. `taria-mcp` is one client of a plain protocol: ndjson
-over a Unix domain socket, one JSON object per line. Anything that can open a
-socket can read snapshots and send input without MCP in the picture.
+over a Unix domain socket, or a named pipe on Windows, one JSON object per
+line. Anything that can open one can read snapshots and send input without
+MCP in the picture.
 `docs/protocol.md` specifies every message, so an MCP TUI bridge of your own,
 in another language, is a matter of writing one.
 
@@ -55,18 +56,40 @@ into nodes, publish it after each draw, drain agent input around the blocking
 call in your event loop, and acknowledge the inputs you deliberately ignore.
 It touches neither your rendering nor your state, and it is one direct
 dependency: `taria-ratatui` pulls in the core crate and its one dependency
-`serde`, plus `serde_json` and the ratatui you already had. If the socket cannot be bound the layer is inert and
-the app runs exactly as it did before, so taria cannot keep your app from
-starting. `docs/integration-guide.md` is the walkthrough, with the mistakes
-two real retrofits made.
+`serde`, plus `serde_json`, the ratatui you already had, and on Windows only
+`windows-sys`, the raw Win32 bindings. The same dependency builds on Linux,
+macOS and Windows, so nothing needs a `cfg` around it. If taria cannot bind
+its socket, or its pipe on Windows, the layer is inert and the app runs
+exactly as it did before, so taria cannot keep your app from starting.
+`docs/integration-guide.md` is the walkthrough, with the mistakes two real
+retrofits made.
 
 **Does taria work on Windows?**
 
-No. The adapter is built on unix-only APIs, and the transport is a Unix
-domain socket bound through them. Linux is the tested platform and
-the only one CI runs the suites on; the release workflow builds `taria-mcp`
-for macOS, and the AF_UNIX path limit is handled per platform, but nothing
-exercises macOS end to end. Windows is not supported.
+Yes, from 0.4.0. On Windows the app and the bridge talk over a named pipe (a
+kernel object named under `\\.\pipe\`, which two processes open like a file)
+instead of a Unix domain socket, and carry the same JSON lines over it, byte
+for byte. The adapter creates `\\.\pipe\taria-<your SID>-<label>`, where the
+SID is the string Windows names your account by, and makes it yours alone:
+owned by you, open to nobody else, refusing clients on other machines.
+`taria-mcp --app <label>` derives the same name, and checks that the pipe is
+owned by you before it reads or writes anything. Install the bridge with
+`cargo install taria-mcp`, or take the Windows `.zip` from the releases page.
+
+CI runs the Rust suites on Linux, macOS and Windows, including a test that
+drives a real adapter from the real `taria-mcp` binary on each. The two
+Python scripts, `scripts/e2e.py` and `scripts/adversarial.py`, drive the demo
+through a pseudo-terminal and run on Linux and macOS only. Locally the
+Windows build was run under Wine (`scripts/wine-test.sh`, see
+`CONTRIBUTING.md`), which is a stand-in: the Windows CI job is the word that
+counts.
+
+What Windows lacks is the stopped-app diagnosis. On Linux the bridge reads
+`/proc` to tell an app stopped by Ctrl-Z, a signal or a debugger from one
+held by another bridge, and names it with its pid. Windows has no `/proc`:
+there a suspended app shows as a connection that stays silent, which the
+bridge reports as the app suspended or stuck, without a pid. macOS has no
+`/proc` either, and reports a stopped app as held.
 
 **Can two agents connect to the same app at once?**
 
@@ -80,8 +103,10 @@ since it leaves the same silence. A TUI suspended as a job in its terminal is
 resumed only by `fg` there, so the agent is told to ask you to run it.)
 Anything it wrote while it waited is thrown away when its turn comes, because
 it was written before it had seen a tree. taria-mcp sends nothing until it has
-a tree, so a second agent loses nothing. Multiple simultaneous clients are on
-the deferred list in `docs/architecture.md`.
+a tree, so a second agent loses nothing. On Windows a pipe has no such queue:
+the second bridge's open is refused as busy, it has nothing to write into,
+and `read_tree` says the app is held, with the same retry advice. Multiple
+simultaneous clients are on the deferred list in `docs/architecture.md`.
 
 They can take turns, though. Since 0.3.2, taria-mcp opens no connection until
 its first tool call, and lets the app go after 60 s with no tool calls. A
