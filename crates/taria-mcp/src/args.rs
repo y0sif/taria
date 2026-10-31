@@ -5,8 +5,6 @@
 //! the app-side adapter (`taria-ratatui`) binds to.
 
 use std::env;
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -184,11 +182,25 @@ pub fn resolve_socket_path(app_label: &str) -> Result<PathBuf, taria::socket::In
 
 /// Uid where available (via `/proc/self` on Linux), else `$USER`/`$LOGNAME`,
 /// else a fixed fallback. Only used to namespace the temp-dir fallback path.
+#[cfg(unix)]
 fn user_identity() -> String {
-    if let Ok(meta) = fs::metadata("/proc/self") {
+    use std::os::unix::fs::MetadataExt;
+
+    if let Ok(meta) = std::fs::metadata("/proc/self") {
         return meta.uid().to_string();
     }
     env::var("USER")
+        .or_else(|_| env::var("LOGNAME"))
+        .unwrap_or_else(|_| "default".to_string())
+}
+
+/// `$USERNAME`, else `$USER`/`$LOGNAME`, else a fixed fallback: Windows has no
+/// uid, and this build has no Windows transport, whose pipe will be named by
+/// the user's SID instead (see `taria::socket::pipe_name`).
+#[cfg(not(unix))]
+fn user_identity() -> String {
+    env::var("USERNAME")
+        .or_else(|_| env::var("USER"))
         .or_else(|_| env::var("LOGNAME"))
         .unwrap_or_else(|_| "default".to_string())
 }

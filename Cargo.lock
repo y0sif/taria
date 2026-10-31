@@ -1161,10 +1161,12 @@ dependencies = [
  "serde",
  "serde_json",
  "taria",
+ "taria-ratatui",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1175,6 +1177,7 @@ dependencies = [
  "serde_json",
  "taria",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

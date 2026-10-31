@@ -33,6 +33,7 @@
 
 mod bridge;
 mod server;
+mod transport;
 mod tree_format;
 
 pub use server::{DEFAULT_IDLE_RELEASE, TariaMcpServer, TariaMcpServerBuilder};

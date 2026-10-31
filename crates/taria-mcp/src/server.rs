@@ -37,6 +37,7 @@ use crate::bridge::{
     self, AppSnapshot, BridgeHandle, BridgeState, Call, Demand, LinkState, OVERSIZED_LINE,
     SendError, UNACKED_HOLD,
 };
+use crate::transport;
 use crate::tree_format::TreeFormat;
 
 /// How long the bridge keeps the app with no tool calls before it lets go,
@@ -416,8 +417,12 @@ impl TariaMcpServerBuilder {
     /// returns an error and spawns nothing. The runtime needs its IO and time
     /// drivers, as [`enable_all`](tokio::runtime::Builder::enable_all) turns
     /// on.
+    ///
+    /// On Windows, which has no taria transport yet, it returns an
+    /// [`Unsupported`](io::ErrorKind::Unsupported) error and spawns nothing.
     pub fn on_demand(self) -> io::Result<TariaMcpServer> {
         require_runtime("on_demand")?;
+        transport::ensure_supported()?;
         let (handle, demand) = bridge::spawn_on_demand(self.socket, self.idle_release);
         let tools = Tools {
             demand: Some(demand),
@@ -442,9 +447,11 @@ impl TariaMcpServerBuilder {
     /// # Errors
     ///
     /// As [`on_demand`](Self::on_demand): outside a tokio runtime this
-    /// returns an error and spawns nothing.
+    /// returns an error and spawns nothing, and so it does on Windows, which
+    /// has no taria transport yet.
     pub fn connected(self) -> io::Result<TariaMcpServer> {
         require_runtime("connected")?;
+        transport::ensure_supported()?;
         let tools = Tools::with_tree_format(bridge::spawn(self.socket), self.tree_format);
         Ok(TariaMcpServer { tools })
     }

@@ -5,6 +5,9 @@
 //!
 //! Plain threads and blocking sockets: the binary is a separate process, and
 //! nothing here needs a runtime.
+//!
+//! Unix only: the fake app listens on a Unix socket.
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

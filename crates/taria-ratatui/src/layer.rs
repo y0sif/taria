@@ -3,15 +3,8 @@
 
 use std::collections::VecDeque;
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read};
 use std::mem;
-use std::net::Shutdown;
-use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -24,13 +17,15 @@ use taria::{AgentInput, MAX_NODE_DEPTH, Node, PROTOCOL_VERSION, Role, Snapshot, 
 
 use crate::FrameRecorder;
 use crate::bound::{self, ROOT_BUDGET, SnapshotTooLarge};
+use crate::transport::{self, Accepted, Connection, Listener, Reader, Writer};
 
 /// How long the writer may spend on any one line before the connection is
 /// dropped. Protects the app from a peer that stops reading, or reads too
 /// slowly to take a whole line in that time.
 ///
 /// The bound is on the line, not on each wait for room in the socket, which
-/// is all a socket's own write timeout bounds (see [`write_all_before`]).
+/// is all a socket's own write timeout bounds (see
+/// [`Writer::write_all_before`]).
 /// Bounded that way, a line far larger than the socket buffers could stall
 /// for one timeout per wait: a bridge that had stopped reading held a 900 KB
 /// snapshot for two timeouts, and one taking 64 KB every 3 s, which freed
@@ -40,29 +35,6 @@ use crate::bound::{self, ROOT_BUDGET, SnapshotTooLarge};
 /// within this time is dropped, and reconnects to be sent the latest snapshot
 /// afresh.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The most one `write` call is handed, so that the kernel waits for room in
-/// the socket at most once inside it, and the write timeout, which bounds
-/// each such wait rather than the call, bounds the call too. See
-/// [`write_all_before`].
-///
-/// One buffer on Linux, and within the send low-water mark that macOS and the
-/// BSDs wait for before they copy anything. A typical line is one or a few
-/// calls, and a snapshot at [`MAX_LINE_BYTES`] about five hundred, measured at
-/// under a millisecond more than one call for the lot.
-const WRITE_CHUNK: usize = 2 * 1024;
-
-/// The longest one wait for room in the socket runs before the writer looks
-/// at the clock again. See [`write_all_before`].
-///
-/// The kernel keeps a socket's write timeout on a timer wheel that files a
-/// long timeout coarsely and fires it late: on Linux at 1000 Hz, a 5 s
-/// timeout fired up to 430 ms past its time when measured, more than the
-/// whole [`SHUTDOWN_FLUSH`]. A timeout this short is filed to the
-/// millisecond, so waiting in slices of it holds a deadline to within a few
-/// milliseconds, and a writer stalled on a stuck bridge wakes 20 times a
-/// second to find it still stuck.
-const WRITE_WAIT: Duration = Duration::from_millis(50);
 
 /// How long the writer may spend, in total, on the acks still queued when the
 /// layer shuts down.
@@ -117,28 +89,6 @@ const ACK_QUEUE: usize = 1024;
 /// ack, which the peer already has to survive; remembering them without bound
 /// would be a leak in an app that runs for days.
 const ACKABLE_INPUTS: usize = INPUT_QUEUE;
-
-/// How long the listener naps between accept attempts.
-///
-/// The listener socket is non-blocking, so the thread is never parked in
-/// `accept()` and shutdown is noticed without anything connecting: [`Drop`]
-/// sets the flag and the thread returns within one nap. Waking a blocking
-/// `accept()` by connecting to the socket path cannot do that, because the
-/// path may by then hold a socket another process bound, whose listener would
-/// take the wake-up while this one stayed parked forever.
-const ACCEPT_POLL: Duration = Duration::from_millis(50);
-
-/// How long to wait for the "is anything listening there?" probe that runs
-/// before an existing socket file is replaced.
-///
-/// `connect` is the only liveness probe the standard library offers, and it
-/// blocks with no timeout: a socket whose owner stopped accepting with a full
-/// backlog would park the app inside `bind`, during startup, which is the one
-/// thing taria promises never to do. So the probe runs on a thread of its own
-/// and its answer is waited for only this long; no answer in time means
-/// "cannot tell", which refuses the bind rather than unlinking a socket that
-/// may still be serving.
-const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The embeddable taria endpoint for a ratatui app.
 ///
@@ -325,10 +275,6 @@ struct Inner {
     shared: Arc<Shared>,
     input_rx: Receiver<QueuedInput>,
     listener: Option<JoinHandle<()>>,
-    /// Device and inode of the socket file as bound, so [`Drop`] can tell it
-    /// from a file that replaced it. `None` when it could not be read, which
-    /// makes every comparison fail and leaves the path alone.
-    socket_ident: Option<(u64, u64)>,
     seq: u64,
     /// The root of the newest snapshot published.
     last_root: Option<Node>,
@@ -452,37 +398,12 @@ impl TariaLayer {
     ///   The path can come verbatim from `$TARIA_SOCK`, and a typo there is
     ///   not a reason to delete a file the user meant to keep.
     pub fn bind_at(app_label: &str, socket_path: impl Into<PathBuf>) -> io::Result<Self> {
-        // Absolutize before looking at the parent: a bare filename like
-        // "app.sock" has an empty parent, which must not bypass the privacy
-        // check by silently binding in an unvetted current directory.
-        let socket_path = absolutize(socket_path.into())?;
-
-        // Check the length here, before anything is created: over the limit,
-        // `bind` below would fail with `InvalidInput: path must be shorter
-        // than SUN_LEN`, which names neither the path, its length, the limit,
-        // nor a way out. `SocketPathTooLong` names all four.
-        taria::socket::check_path_len(&socket_path)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
-
-        if let Some(parent) = socket_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_private_dir(parent)?;
-        }
-        // Free the path if a dead socket is holding it, and refuse the bind
-        // if anything else is.
-        clear_socket_path(&socket_path)?;
-
-        let listener = UnixListener::bind(&socket_path)?;
-        // Polled rather than parked in `accept()`, so shutdown needs no
-        // connection to be noticed; see `ACCEPT_POLL`.
-        if let Err(err) = listener.set_nonblocking(true) {
-            drop(listener);
-            let _ = fs::remove_file(&socket_path);
-            return Err(err);
-        }
-        // Identify the socket just bound, before anyone else can replace it.
-        let socket_ident = socket_ident(&socket_path);
+        // The transport vets the path, frees it of a dead socket and binds
+        // there, or says why it will not. It cleans up after itself when
+        // dropped, which is why a failure below needs no unlink here: the
+        // listener goes down with whatever failed to take it.
+        let listener = Listener::bind(socket_path.into())?;
+        let socket_path = listener.path().to_path_buf();
         let shared = Arc::new(Shared {
             app_label: app_label.to_string(),
             state: Mutex::new(State::default()),
@@ -497,14 +418,7 @@ impl TariaLayer {
         let thread_shared = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name("taria-listener".into())
-            .spawn(move || accept_loop(listener, thread_shared, input_tx));
-        let handle = match handle {
-            Ok(handle) => handle,
-            Err(err) => {
-                let _ = fs::remove_file(&socket_path);
-                return Err(err);
-            }
-        };
+            .spawn(move || accept_loop(listener, thread_shared, input_tx))?;
 
         Ok(Self {
             app_label: app_label.to_string(),
@@ -513,7 +427,6 @@ impl TariaLayer {
                 shared,
                 input_rx,
                 listener: Some(handle),
-                socket_ident,
                 seq: 0,
                 last_root: None,
                 last_raw: None,
@@ -1118,33 +1031,14 @@ impl Drop for TariaLayer {
             state.shutdown = true;
             inner.shared.cv.notify_all();
         }
+        // The listener thread owns the transport's listener, which unlinks
+        // the socket file as it is dropped on the way out, and only while the
+        // file is still the one it bound. So once the join returns, the
+        // socket is gone, or belongs to somebody else and is left alone.
         if let Some(handle) = inner.listener.take() {
             let _ = handle.join();
         }
-        remove_own_socket(&self.socket_path, inner.socket_ident);
     }
-}
-
-/// Unlink the socket file, but only while it is still the one this layer
-/// bound.
-///
-/// A second instance that started later has a socket of its own at the same
-/// path, and unlinking that on the way out would leave it running with no way
-/// for a bridge to reach it (the mirror of the takeover `clear_socket_path`
-/// refuses). Device and inode are what separate the file this layer created
-/// from a file that merely has the same name.
-fn remove_own_socket(path: &Path, bound: Option<(u64, u64)>) {
-    if bound.is_some() && socket_ident(path) == bound {
-        let _ = fs::remove_file(path);
-    }
-}
-
-/// Identify the file at `path` by device and inode, so a later look can tell
-/// the same file from a different one that took its place. `None` when it
-/// cannot be read, which fails every comparison and so leaves the path alone.
-fn socket_ident(path: &Path) -> Option<(u64, u64)> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    Some((meta.dev(), meta.ino()))
 }
 
 /// State shared between the app thread and the connection threads.
@@ -1555,59 +1449,15 @@ fn copy_within_depth(root: &mut Node) -> Node {
 
 /// Accept loop: serves one bridge client at a time until shutdown.
 ///
-/// The listener is non-blocking, so this thread is never parked in `accept()`
-/// and the shutdown flag is checked on its own schedule; see [`ACCEPT_POLL`]
-/// for why exit cannot be left to depend on a connection arriving.
-///
-/// It also tracks whether the next connection it accepts waited behind the
-/// last one, which is what decides if [`start_connection`] discards what that
-/// client wrote before its hello. A connection accepted after a session
-/// ended, before any accept has found the backlog empty, was waiting in the
-/// backlog while that session ran; a client that connects in the instant
-/// between the session's end and the next accept is taken for one too. One
-/// accepted after an accept found nothing connected after the session had
-/// ended, so it waited behind nobody, and neither did the first connection of
-/// the process.
-fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender<QueuedInput>) {
-    let mut waited = false;
-    loop {
-        if shared.is_shutdown() {
-            return;
-        }
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                if shared.is_shutdown() {
-                    return;
-                }
-                // Both halves of a session are read and written as blocking
-                // streams, and an accepted socket inherits the listener's
-                // non-blocking flag on some platforms. Say it outright rather
-                // than rely on which one this is.
-                if stream.set_nonblocking(false).is_err() {
-                    continue;
-                }
-                // Errors just drop this client; the loop keeps accepting.
-                let _ = serve_client(stream, &shared, &input_tx, waited);
-                // Whoever is in the backlog now connected while that client
-                // was served, so it waited behind it, however that ended.
-                waited = true;
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                // Nobody is waiting, so whoever connects next waited behind
-                // nobody.
-                waited = false;
-                // Nap instead of spinning, then back to the shutdown check at
-                // the top.
-                thread::sleep(ACCEPT_POLL);
-            }
-            Err(_) => {
-                if shared.is_shutdown() {
-                    return;
-                }
-                // Avoid a hot loop on a persistently failing listener.
-                thread::sleep(ACCEPT_POLL);
-            }
-        }
+/// The transport's [`Listener::accept`] returns once the shutdown flag is
+/// set, without waiting for a connection to wake it, and says whether each
+/// bridge it hands over waited behind the last one, which is what decides if
+/// [`start_connection`] discards what that client wrote before its hello. The
+/// listener is dropped as this returns, which unlinks the socket file.
+fn accept_loop(mut listener: Listener, shared: Arc<Shared>, input_tx: SyncSender<QueuedInput>) {
+    while let Some(Accepted { connection, waited }) = listener.accept(|| shared.is_shutdown()) {
+        // Errors just drop this client; the loop keeps accepting.
+        let _ = serve_client(connection, &shared, &input_tx, waited);
     }
 }
 
@@ -1615,19 +1465,16 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>, input_tx: SyncSender
 /// until the client disconnects or the layer shuts down.
 ///
 /// `waited` says the client was in the listen backlog when the previous
-/// session ended; see [`accept_loop`] and [`start_connection`].
+/// session ended; see [`Listener::accept`] and [`start_connection`].
 fn serve_client(
-    stream: UnixStream,
+    connection: Connection,
     shared: &Arc<Shared>,
     input_tx: &SyncSender<QueuedInput>,
     waited: bool,
 ) -> io::Result<()> {
-    // SO_SNDTIMEO is shared across the duplicated fds; only writes block long
-    // enough to need it. Every line sets it again before each of its writes,
-    // from its own deadline (see `write_all_before`), so after the first line
-    // it stays at `WRITE_WAIT` or less, and this value governs no write: it
-    // only means the socket never starts out with no timeout at all.
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    // Every line is bounded by its own deadline (see `write_line`); this only
+    // means the connection never starts out with no write timeout at all.
+    connection.set_write_timeout(WRITE_TIMEOUT)?;
 
     // Capture the snapshot and epoch atomically so the writer loop neither
     // misses nor duplicates a publish that races the handshake. Acks left
@@ -1651,8 +1498,8 @@ fn serve_client(
         (initial, state.epoch, state.generation)
     };
     let alive = Arc::new(AtomicBool::new(true));
-    let (mut write_stream, reader) = match start_connection(
-        stream,
+    let (mut writer, reader) = match start_connection(
+        connection,
         shared,
         input_tx,
         initial_snapshot,
@@ -1672,11 +1519,11 @@ fn serve_client(
         }
     };
 
-    writer_loop(&mut write_stream, shared, &alive, initial_epoch);
+    writer_loop(&mut writer, shared, &alive, initial_epoch);
 
     // Unblock the reader (it is parked in a blocking read) and reap it before
     // going back to accept the next client.
-    let _ = write_stream.shutdown(Shutdown::Both);
+    let _ = writer.shutdown();
     let _ = reader.join();
     // Whatever is still queued can no longer be delivered, and means nothing
     // to the next client. Queued inputs need no sweep here: the reader
@@ -1689,8 +1536,7 @@ fn serve_client(
 /// send the handshake (and the snapshot a new client is owed) and start the
 /// connection's reader thread, so every way of failing to get a connection
 /// off the ground funnels through one `Err` for the caller to clean up after.
-/// On success the writer's handle on the socket comes back beside the reader
-/// thread.
+/// On success the connection's writer comes back beside the reader thread.
 ///
 /// # Input written before the hello
 ///
@@ -1707,9 +1553,10 @@ fn serve_client(
 ///
 /// Only a client that `waited` is drained: one the accept loop took from the
 /// backlog after a session ended, before it last found the backlog empty
-/// (see [`accept_loop`]). A client that connects to an idle app is accepted
-/// within one [`ACCEPT_POLL`], and one that writes at once without reading
-/// the hello, a script piping a line into the socket, waited behind nobody.
+/// (see [`Listener::accept`]). A client that connects to an idle app is
+/// accepted within one poll of the listener, and one that writes at once
+/// without reading the hello, a script piping a line into the socket, waited
+/// behind nobody.
 /// What it wrote is input for the session it is about to get, as it was in
 /// 0.3.0, and discarding it would lose it unacked, with nothing to tell the
 /// client. The protocol leaves the choice to the app; this keeps the discard
@@ -1735,56 +1582,57 @@ fn serve_client(
 /// The latest snapshot is skipped, not written, once the layer is shutting
 /// down, for the reason the writer skips one (see [`writer_loop`]).
 fn start_connection(
-    stream: UnixStream,
+    connection: Connection,
     shared: &Arc<Shared>,
     input_tx: &SyncSender<QueuedInput>,
     initial_snapshot: Option<Snapshot>,
     alive: &Arc<AtomicBool>,
     generation: u64,
     waited: bool,
-) -> io::Result<(UnixStream, JoinHandle<()>)> {
-    let mut write_stream = stream.try_clone()?;
+) -> io::Result<(Writer, JoinHandle<()>)> {
+    let (mut reader, mut writer) = connection.split()?;
     let starts_mid_line = if waited {
-        discard_unsolicited(&stream, shared)?
+        discard_unsolicited(&mut reader, shared)?
     } else {
         false
     };
 
     write_line(
-        &mut write_stream,
+        &mut writer,
         &AppToBridge::hello(shared.app_label.clone(), PROTOCOL_VERSION).stamps(true),
     )?;
     if let Some(snapshot) = initial_snapshot
         && !shared.is_shutdown()
     {
-        write_line(&mut write_stream, &AppToBridge::Snapshot(snapshot))?;
+        write_line(&mut writer, &AppToBridge::Snapshot(snapshot))?;
     }
     let reader = thread::Builder::new().name("taria-reader".into()).spawn({
         let alive = Arc::clone(alive);
         let shared = Arc::clone(shared);
         let input_tx = input_tx.clone();
-        move || reader_loop(stream, input_tx, alive, shared, generation, starts_mid_line)
+        move || reader_loop(reader, input_tx, alive, shared, generation, starts_mid_line)
     })?;
-    Ok((write_stream, reader))
+    Ok((writer, reader))
 }
 
 /// Read off and count what a client that waited its turn wrote before its
 /// hello, for [`start_connection`]. Returns whether it stopped partway through
 /// a line, whose remainder the reader is then told to skip.
-fn discard_unsolicited(stream: &UnixStream, shared: &Shared) -> io::Result<bool> {
-    // The flag belongs to the open socket, not to this handle, so the
-    // `try_clone`d writer goes non-blocking with it. It is put back before
-    // anything is written: the hello and every later write rely on blocking
-    // until their deadline.
-    stream.set_nonblocking(true)?;
+fn discard_unsolicited(reader: &mut Reader, shared: &Shared) -> io::Result<bool> {
+    // Only what is already there is read: the reads stop rather than wait,
+    // and wait again before anything is written, since the hello and every
+    // later write rely on blocking until their deadline.
     let mut unsolicited = Vec::new();
-    let read = read_unsolicited(stream, &mut unsolicited);
-    // Counted whatever the read ended in: an input read off here was
-    // discarded either way, including when the next byte overflows the cap.
-    shared
-        .stale_inputs
-        .fetch_add(count_input_lines(&unsolicited), Ordering::Relaxed);
-    stream.set_nonblocking(false)?;
+    let read = reader.with_nonblocking_reads(|ready| {
+        let read = read_unsolicited(ready, &mut unsolicited);
+        // Counted whatever the read ended in: an input read off here was
+        // discarded either way, including when the next byte overflows the
+        // cap.
+        shared
+            .stale_inputs
+            .fetch_add(count_input_lines(&unsolicited), Ordering::Relaxed);
+        read
+    })?;
     read?;
     Ok(unsolicited.last().is_some_and(|&byte| byte != b'\n'))
 }
@@ -1875,7 +1723,7 @@ fn count_input_lines(bytes: &[u8]) -> u64 {
 /// It is still a line, so a remainder over [`MAX_LINE_BYTES`] breaks the
 /// connection like any other.
 fn reader_loop(
-    stream: UnixStream,
+    stream: Reader,
     input_tx: SyncSender<QueuedInput>,
     alive: Arc<AtomicBool>,
     shared: Arc<Shared>,
@@ -1986,7 +1834,7 @@ fn reader_loop(
 /// under the lock, as it exits, so an `alive` read under the lock vouches
 /// for every ack taken in the same hold. Every shutdown check takes the acks
 /// in the same hold that read `alive`.
-fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut last_epoch: u64) {
+fn writer_loop(stream: &mut Writer, shared: &Shared, alive: &AtomicBool, mut last_epoch: u64) {
     loop {
         let (acks, snapshot) = {
             let mut state = shared.lock_state();
@@ -2057,7 +1905,7 @@ fn writer_loop(stream: &mut UnixStream, shared: &Shared, alive: &AtomicBool, mut
 /// queued acks are taken in the same hold of the lock that read `alive`,
 /// which is what vouches for them; see [`writer_loop`].
 fn stop_writing(
-    stream: &mut UnixStream,
+    stream: &mut Writer,
     shared: &Shared,
     alive: &AtomicBool,
     unwritten: impl IntoIterator<Item = (InputId, InputStatus)>,
@@ -2082,13 +1930,13 @@ fn stop_writing(
 /// [`WRITE_TIMEOUT`] for why. A line that misses it may be written in part,
 /// and every caller then drops the connection, which is the only thing that
 /// can follow a partial line.
-fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
+fn write_line(stream: &mut Writer, msg: &AppToBridge) -> io::Result<()> {
     let mut line = serde_json::to_vec(msg).map_err(io::Error::other)?;
     line.push(b'\n');
     let deadline = Instant::now()
         .checked_add(WRITE_TIMEOUT)
         .ok_or_else(|| io::Error::other("the write deadline is past what the clock can hold"))?;
-    write_all_before(stream, &line, deadline)
+    stream.write_all_before(&line, deadline)
 }
 
 /// Write the acks a shutdown found queued, oldest first, giving up once
@@ -2098,7 +1946,7 @@ fn write_line(stream: &mut UnixStream, msg: &AppToBridge) -> io::Result<()> {
 /// misses the deadline costs its waiter the timeout it would have waited out
 /// with no flush at all. The connection is closed straight after, so the
 /// write timeout this leaves on the socket is never used again.
-fn flush_acks(stream: &mut UnixStream, acks: impl IntoIterator<Item = (InputId, InputStatus)>) {
+fn flush_acks(stream: &mut Writer, acks: impl IntoIterator<Item = (InputId, InputStatus)>) {
     let Some(deadline) = Instant::now().checked_add(SHUTDOWN_FLUSH) else {
         return;
     };
@@ -2112,284 +1960,7 @@ fn flush_acks(stream: &mut UnixStream, acks: impl IntoIterator<Item = (InputId, 
         lines.extend_from_slice(&line);
         lines.push(b'\n');
     }
-    let _ = write_all_before(stream, &lines, deadline);
-}
-
-/// `write_all`, finished by `deadline` or failed with
-/// [`TimedOut`](io::ErrorKind::TimedOut).
-///
-/// A socket's write timeout does not bound a `write` call, only each wait for
-/// room inside one, and a call waits again for every piece the kernel splits
-/// it into (Linux allocates a buffer of at most a few tens of KB at a time,
-/// and waits for room before each). So a large line, against a bridge that
-/// frees a little room before every wait can time out, never times out at
-/// all: a 900 KB snapshot to a bridge taking 64 KB every 3 s held the writer
-/// for forty seconds with a 5 s timeout. Setting the timeout to what is left
-/// of a deadline before each call does not help on its own, because a single
-/// call runs past the deadline.
-///
-/// So no call is handed more than [`WRITE_CHUNK`] bytes, few enough that the
-/// kernel waits for room at most once inside it, and that wait is given what
-/// is left of the deadline, or [`WRITE_WAIT`] if that is less, set before
-/// every call. A wait that times out short of the deadline is simply waited
-/// again. A timeout of zero means none at all to the socket and is refused,
-/// which is why nothing left ends the loop rather than reaching it.
-fn write_all_before(
-    stream: &mut UnixStream,
-    mut bytes: &[u8],
-    deadline: Instant,
-) -> io::Result<()> {
-    while !bytes.is_empty() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        stream.set_write_timeout(Some(left.min(WRITE_WAIT)))?;
-        let chunk = bytes.get(..WRITE_CHUNK).unwrap_or(bytes);
-        match stream.write(chunk) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-            // The socket is blocking, so this is the wait's timeout firing,
-            // and the clock at the top of the loop says whether that was the
-            // deadline.
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
-}
-
-/// Make `path` absolute, resolving a relative path (including a bare
-/// filename) against the current directory. Ensures the socket path always
-/// has a real parent directory for [`ensure_private_dir`] to vet.
-fn absolutize(path: PathBuf) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Ok(env::current_dir()?.join(path))
-    }
-}
-
-/// Make `path` free for `bind`, or say why it cannot be.
-///
-/// Binding needs the path to be absent, so a socket left behind by a run that
-/// was killed before it could clean up has to be unlinked first. That unlink
-/// has to be earned. The path can come verbatim from `$TARIA_SOCK`, and a
-/// private directory passes the vetting whatever else is in it (`~/.ssh` is
-/// 0700 and user-owned), so removing whatever happens to be there would let a
-/// typo delete a file the user meant to keep. A socket another instance is
-/// still serving must survive too: unlinking it and binding a fresh one in its
-/// place leaves that instance running, believing it is reachable, while every
-/// bridge connects to the newcomer instead.
-///
-/// So: only a socket is ever removed, and only once a connection to it has
-/// been refused.
-fn clear_socket_path(path: &Path) -> io::Result<()> {
-    // symlink_metadata so a symlink is seen as itself: following one would
-    // decide about a socket somewhere else and unlink the link.
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(io::Error::new(
-                err.kind(),
-                format!("cannot inspect {}: {err}", path.display()),
-            ));
-        }
-    };
-    if !meta.file_type().is_socket() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} already exists and is not a socket (it is {}); refusing to delete it to \
-                 bind there. Point $TARIA_SOCK at a path taria may create.",
-                path.display(),
-                describe_file_type(&meta)
-            ),
-        ));
-    }
-    match probe_socket(path) {
-        // Nothing is listening: the socket outlived whatever bound it.
-        SocketProbe::Stale => match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            // Someone else cleaned it up in the meantime, which is the state
-            // this call wanted anyway.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(io::Error::new(
-                err.kind(),
-                format!("cannot remove the stale socket {}: {err}", path.display()),
-            )),
-        },
-        SocketProbe::Live => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!(
-                "another instance is already serving the taria socket {}; refusing to take it \
-                 over, because that would leave it running with no way for a bridge to reach \
-                 it. To run a second instance alongside it, give it a socket of its own: set \
-                 TARIA_SOCK to a different path.",
-                path.display()
-            ),
-        )),
-        SocketProbe::Unknown(why) => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!(
-                "cannot tell whether another instance is serving the taria socket {} ({why}); \
-                 refusing to remove a socket that may still be in use. Set TARIA_SOCK to a \
-                 different path to bind elsewhere.",
-                path.display()
-            ),
-        )),
-    }
-}
-
-/// What is at a socket path that is not a socket, for the error that refuses
-/// to delete it.
-fn describe_file_type(meta: &fs::Metadata) -> &'static str {
-    let kind = meta.file_type();
-    if kind.is_symlink() {
-        "a symlink"
-    } else if kind.is_dir() {
-        "a directory"
-    } else if kind.is_file() {
-        "a regular file"
-    } else {
-        "another kind of file"
-    }
-}
-
-/// The answer to "is anything serving the socket at this path?".
-enum SocketProbe {
-    /// The connection was accepted: something is listening.
-    Live,
-    /// The connection was refused, or the file went away: nothing is.
-    Stale,
-    /// The probe could not answer, carrying the reason for the error that
-    /// reports it.
-    Unknown(String),
-}
-
-/// Try to connect to the socket at `path`, briefly, to find out whether
-/// anything is listening on it.
-///
-/// The connect runs on a thread of its own because it blocks with no timeout;
-/// see [`SOCKET_PROBE_TIMEOUT`]. An answer that does not arrive in time is
-/// [`Unknown`](SocketProbe::Unknown), never a guess: the whole point is to
-/// avoid unlinking a socket that is still being served.
-fn probe_socket(path: &Path) -> SocketProbe {
-    let (tx, rx) = mpsc::channel();
-    let probe_path = path.to_path_buf();
-    let spawned = thread::Builder::new()
-        .name("taria-socket-probe".into())
-        .spawn(move || {
-            let outcome = UnixStream::connect(&probe_path).map(|stream| {
-                // Nothing is ever sent on it. A peer serving this path sees a
-                // connection that opens and closes, which is what it does
-                // with any client that goes away.
-                let _ = stream.shutdown(Shutdown::Both);
-            });
-            // The receiver is gone once the wait above times out; that is the
-            // `Unknown` case, and there is nothing to report to.
-            let _ = tx.send(outcome);
-        });
-    if let Err(err) = spawned {
-        return SocketProbe::Unknown(format!("the probe thread could not start: {err}"));
-    }
-    match rx.recv_timeout(SOCKET_PROBE_TIMEOUT) {
-        Ok(Ok(())) => SocketProbe::Live,
-        // Refused is what a socket with no listener answers; a socket that
-        // vanished between the look and the connect leaves the path free too.
-        Ok(Err(err))
-            if matches!(
-                err.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-            ) =>
-        {
-            SocketProbe::Stale
-        }
-        Ok(Err(err)) => SocketProbe::Unknown(format!("connecting to it failed: {err}")),
-        Err(_) => SocketProbe::Unknown(format!(
-            "connecting to it did not finish within {SOCKET_PROBE_TIMEOUT:?}"
-        )),
-    }
-}
-
-/// Create (if needed) and vet the directory that will hold the socket.
-///
-/// The socket's parent directory decides who can replace or redirect the
-/// socket: if it is a symlink, owned by another user, or accessible to
-/// group/others, a local attacker can swap the socket for their own and
-/// impersonate the app (or intercept the bridge). The directory is created
-/// with mode `0700`, then verified via `symlink_metadata`: it must be a
-/// real directory (not a symlink), owned by the current user, with no
-/// group/other permission bits. Any violation is an error.
-fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    builder.mode(0o700);
-    // An existing directory is fine here; whether it is *acceptable* is
-    // decided by the checks below, which also surface real create failures.
-    let _ = builder.create(dir);
-
-    // symlink_metadata so a planted symlink is seen as itself, not followed.
-    let meta = fs::symlink_metadata(dir).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("socket directory {} is unusable: {err}", dir.display()),
-        )
-    })?;
-    if !meta.file_type().is_dir() {
-        return Err(io::Error::other(format!(
-            "socket directory {} is not a real directory (it may be a symlink planted by \
-             another user to hijack the socket); refusing to use it",
-            dir.display()
-        )));
-    }
-    let uid = current_uid()?;
-    if meta.uid() != uid {
-        return Err(io::Error::other(format!(
-            "socket directory {} is owned by uid {} instead of the current user (uid {}); \
-             its owner could replace the socket to hijack the connection; refusing to use it",
-            dir.display(),
-            meta.uid(),
-            uid
-        )));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(io::Error::other(format!(
-            "socket directory {} is group/world-accessible (mode {:03o}); other users could \
-             replace the socket to hijack the connection; re-create it with mode 0700",
-            dir.display(),
-            meta.mode() & 0o777
-        )));
-    }
-    Ok(())
-}
-
-/// The current effective uid, without `unsafe` or extra dependencies.
-///
-/// On Linux, `/proc/self` is owned by this process's effective uid. On other
-/// Unixes, fall back to creating a probe file in the system temp dir: a file
-/// this process creates is owned by its effective uid.
-fn current_uid() -> io::Result<u32> {
-    if let Ok(meta) = fs::metadata("/proc/self") {
-        return Ok(meta.uid());
-    }
-    let probe = env::temp_dir().join(format!("taria-uid-probe-{}", std::process::id()));
-    let _ = fs::remove_file(&probe);
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&probe)?;
-    let uid = file.metadata()?.uid();
-    drop(file);
-    let _ = fs::remove_file(&probe);
-    Ok(uid)
+    let _ = stream.write_all_before(&lines, deadline);
 }
 
 /// Resolve the default socket path for `app_label` from the environment.
@@ -2403,7 +1974,7 @@ fn resolve_socket_path(app_label: &str) -> Result<PathBuf, taria::socket::Invali
         env::var_os("TARIA_SOCK"),
         env::var_os("XDG_RUNTIME_DIR"),
         &env::temp_dir(),
-        &user_identity(),
+        &transport::user_identity(),
         app_label,
     )
 }
@@ -2417,25 +1988,23 @@ fn invalid_label(err: taria::socket::InvalidAppLabel) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, err.to_string())
 }
 
-/// Uid where available (via `/proc/self` on Linux), else `$USER`/`$LOGNAME`,
-/// else a fixed fallback. Only used to namespace the temp-dir fallback path.
-fn user_identity() -> String {
-    if let Ok(meta) = fs::metadata("/proc/self") {
-        return meta.uid().to_string();
-    }
-    env::var("USER")
-        .or_else(|_| env::var("LOGNAME"))
-        .unwrap_or_else(|_| "default".to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    #[cfg(unix)]
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     use super::*;
     use crate::test_util::bind_test_layer;
+    #[cfg(unix)]
+    use crate::transport::{absolutize, ensure_private_dir};
 
     /// Unique, absent scratch path under the system temp dir.
+    #[cfg(unix)]
     fn scratch_path(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("taria-dirtest-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
@@ -2446,11 +2015,11 @@ mod tests {
     /// A private (0700) temp dir that removes itself when the test ends, so
     /// nothing is left in the system temp dir even on panic.
     fn private_temp_dir(prefix: &str) -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix(prefix)
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("create test dir")
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(prefix);
+        #[cfg(unix)]
+        builder.permissions(fs::Permissions::from_mode(0o700));
+        builder.tempdir().expect("create test dir")
     }
 
     /// The shared state a connection's threads work on, without a socket, for
@@ -2467,6 +2036,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_private_dir_accepts_fresh_0700_dir() {
         let dir = scratch_path("fresh");
@@ -2479,6 +2049,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_private_dir_rejects_symlinked_dir() {
         let target = scratch_path("symlink-target");
@@ -2494,6 +2065,7 @@ mod tests {
         let _ = fs::remove_dir_all(&target);
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_private_dir_rejects_world_accessible_dir() {
         let dir = scratch_path("world-writable");
@@ -2506,6 +2078,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn absolutize_joins_relative_paths_onto_cwd() {
         let cwd = env::current_dir().unwrap();
@@ -2528,6 +2101,7 @@ mod tests {
     /// itself passes [`ensure_private_dir`]. Tested without touching
     /// `set_current_dir` (racy across parallel tests) by comparing against
     /// vetting the cwd directly.
+    #[cfg(unix)]
     #[test]
     fn bind_at_bare_filename_vets_cwd() {
         let cwd = env::current_dir().unwrap();
@@ -2556,6 +2130,7 @@ mod tests {
     /// Over the kernel's limit, `bind` alone would say only
     /// `InvalidInput: path must be shorter than SUN_LEN`. The named error has
     /// to survive the trip through `io::Error`.
+    #[cfg(unix)]
     #[test]
     fn bind_at_refuses_an_over_long_socket_path() {
         let dir = private_temp_dir("taria-longpath-");
@@ -3249,6 +2824,7 @@ mod tests {
     /// overlap certain; through a live connection the writer wakes on the
     /// first of the two and usually drains it before the second exists, so
     /// the socket tests only ever see the two in separate passes.
+    #[cfg(unix)]
     #[test]
     fn writer_sends_pending_acks_before_a_pending_snapshot() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3272,7 +2848,7 @@ mod tests {
             let shared = Arc::clone(&shared);
             let alive = Arc::clone(&alive);
             move || {
-                let mut server = server;
+                let mut server = Writer::from(server);
                 writer_loop(&mut server, &shared, &alive, 0);
             }
         });
@@ -3303,6 +2879,7 @@ mod tests {
     /// Write junk into `stream` until the peer's side is full, so the next
     /// write blocks: a bridge that has stopped reading. Returns how many
     /// bytes it took, for a test that wants to read past them later.
+    #[cfg(unix)]
     fn fill_until_blocked(stream: &UnixStream) -> usize {
         stream.set_nonblocking(true).expect("non-blocking");
         let chunk = [b'x'; 4096];
@@ -3322,12 +2899,13 @@ mod tests {
     /// a writer that never does fails the test instead of hanging the suite.
     /// The stream is dropped as the loop returns, which is the EOF a test
     /// reads to know nothing else was written.
+    #[cfg(unix)]
     fn spawn_writer(server: UnixStream, shared: &Arc<Shared>) -> Receiver<()> {
         let (tx, rx) = mpsc::channel();
         thread::spawn({
             let shared = Arc::clone(shared);
             move || {
-                let mut server = server;
+                let mut server = Writer::from(server);
                 let alive = AtomicBool::new(true);
                 writer_loop(&mut server, &shared, &alive, 0);
                 drop(server);
@@ -3340,6 +2918,7 @@ mod tests {
     /// The exit the flush exists for: the app dequeued an input, refined its
     /// ack and dropped the layer, all before the writer ran again. Both acks
     /// are still queued, and so is the snapshot the app published last.
+    #[cfg(unix)]
     #[test]
     fn a_shutdown_writes_the_queued_acks_and_not_the_snapshot() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3386,6 +2965,7 @@ mod tests {
     /// batch, blocked on a slow bridge. What it has not written of that batch
     /// goes out under the flush's bound, followed by anything queued since,
     /// and the snapshot that was due after the batch is skipped.
+    #[cfg(unix)]
     #[test]
     fn a_shutdown_mid_batch_writes_the_rest_of_it_and_what_queued_since() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3450,6 +3030,7 @@ mod tests {
     /// there is no ack after it whose check could notice, so the writer used
     /// to go straight on to the snapshot, the one line a shutdown skips and
     /// the one that can hold `Drop` for a whole `WRITE_TIMEOUT`.
+    #[cfg(unix)]
     #[test]
     fn a_shutdown_while_the_last_ack_is_written_never_writes_the_snapshot() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3507,6 +3088,7 @@ mod tests {
     /// stopped reading, a queue of acks each given the time left would still
     /// be one bound long, and a queue each given `WRITE_TIMEOUT` would hold
     /// the app's exit for minutes.
+    #[cfg(unix)]
     #[test]
     fn the_shutdown_flush_gives_up_on_a_bridge_that_stopped_reading() {
         let (server, client) = UnixStream::pair().expect("socket pair");
@@ -3631,6 +3213,7 @@ mod tests {
     /// Exit must not depend on the wake-up connection succeeding: with the
     /// socket file gone, nothing can return the listener from `accept()`, and
     /// a join would hang the app forever.
+    #[cfg(unix)]
     #[test]
     fn drop_returns_even_when_the_listener_cannot_be_woken() {
         let layer = bind_test_layer("taria-drophang-", "unwakeable");
@@ -3658,6 +3241,7 @@ mod tests {
     ///
     /// Dropping must also leave that socket alone: it is the other instance's
     /// way of being reached.
+    #[cfg(unix)]
     #[test]
     fn drop_neither_hangs_nor_unlinks_when_the_socket_was_replaced() {
         let dir = private_temp_dir("taria-replaced-");
@@ -3695,6 +3279,7 @@ mod tests {
     /// vetting whatever else is inside it, so a typo in it (`~/.ssh/config`
     /// is 0700 and user-owned) used to mean startup silently deleted a file
     /// the user meant to keep.
+    #[cfg(unix)]
     #[test]
     fn binding_never_deletes_something_that_is_not_a_socket() {
         let dir = private_temp_dir("taria-notasocket-");
@@ -3729,6 +3314,7 @@ mod tests {
     /// that was killed before `Drop` could run. Nothing is listening on it,
     /// and refusing it would leave the app unable to start until somebody
     /// deleted the file by hand.
+    #[cfg(unix)]
     #[test]
     fn a_socket_nothing_is_listening_on_is_replaced() {
         let dir = private_temp_dir("taria-stalesock-");
@@ -3750,6 +3336,7 @@ mod tests {
     /// testing a TUI. The second used to unlink the first's socket and bind
     /// its own there, leaving the first running, reporting itself enabled,
     /// and reachable by nobody.
+    #[cfg(unix)]
     #[test]
     fn binding_over_a_live_socket_is_refused_and_leaves_it_serving() {
         let dir = private_temp_dir("taria-twice-");

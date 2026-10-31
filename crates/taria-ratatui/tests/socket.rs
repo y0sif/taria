@@ -1,6 +1,9 @@
 //! Integration tests for the taria transport side of `TariaLayer`: handshake,
 //! snapshot streaming, agent input, per-input acks, and reconnects, all over a
 //! real Unix domain socket.
+//!
+//! Unix only: they drive the Unix transport with `std`'s Unix sockets.
+#![cfg(unix)]
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;

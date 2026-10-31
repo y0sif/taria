@@ -60,6 +60,7 @@ mod recorder;
 mod semantic;
 #[cfg(test)]
 mod test_util;
+mod transport;
 
 pub use bound::SnapshotTooLarge;
 pub use key::{text_to_keys, to_crossterm, to_crossterm_key};

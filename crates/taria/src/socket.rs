@@ -9,6 +9,11 @@
 //! Path building only: nothing here touches the filesystem, so the core crate
 //! stays free of I/O. Creating, vetting, and removing the socket belong to the
 //! adapter.
+//!
+//! On Windows the endpoint will be a named pipe rather than a Unix socket, and
+//! [`pipe_name`], [`check_pipe_name`] and [`resolve_pipe_name`] are what the
+//! Windows transport will use to name it. They are as pure as the rest, so
+//! they build and are tested on every platform.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -23,7 +28,19 @@ use std::path::{Path, PathBuf};
 /// and is refused on macOS, by `std` itself before the kernel sees it, which
 /// is not a hypothetical band: macOS `$TMPDIR` is around 49 bytes, so the
 /// temp-dir fallback plus a long app label lands in it.
+///
+/// On Windows, where taria's endpoint is a named pipe, it is
+/// [`MAX_PIPE_NAME_CHARS`] instead, counted in UTF-16 code units.
+#[cfg(not(windows))]
 pub const MAX_SOCKET_PATH_BYTES: usize = SUN_PATH_BYTES - 1;
+
+/// Longest endpoint name the system will accept: on Windows, where taria's
+/// endpoint is a named pipe, the pipe-name limit [`MAX_PIPE_NAME_CHARS`],
+/// counted in UTF-16 code units rather than bytes.
+///
+/// Elsewhere it is the AF_UNIX `sun_path` buffer minus its NUL, in bytes.
+#[cfg(windows)]
+pub const MAX_SOCKET_PATH_BYTES: usize = MAX_PIPE_NAME_CHARS;
 
 /// `sun_path` on the BSD-derived unixes, Apple's included: `char
 /// sun_path[104]`, unchanged since 4.4BSD.
@@ -37,12 +54,15 @@ pub const MAX_SOCKET_PATH_BYTES: usize = SUN_PATH_BYTES - 1;
 const SUN_PATH_BYTES: usize = 104;
 
 /// `sun_path` on Linux and the other unixes taria builds for: 108 bytes.
+/// Windows has no entry here: its endpoint is a named pipe, whose limit is
+/// [`MAX_PIPE_NAME_CHARS`].
 #[cfg(not(any(
     target_vendor = "apple",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "dragonfly"
+    target_os = "dragonfly",
+    windows
 )))]
 const SUN_PATH_BYTES: usize = 108;
 
@@ -166,13 +186,28 @@ impl SocketPathTooLong {
         &self.path
     }
 
-    /// Length of the rejected path, in bytes.
+    /// Length of the rejected path, in bytes (in UTF-16 code units on
+    /// Windows, where the path is a pipe name).
     pub fn path_len(&self) -> usize {
         self.len
     }
 }
 
 impl fmt::Display for SocketPathTooLong {
+    #[cfg(windows)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "pipe name {} is {} characters, over the {MAX_SOCKET_PATH_BYTES} character limit for \
+             named pipes on {}; set $TARIA_SOCK to a shorter name of the form \
+             {LOCAL_PIPE_PREFIX}<name>",
+            self.path.display(),
+            self.len,
+            std::env::consts::OS,
+        )
+    }
+
+    #[cfg(not(windows))]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The limit is named with the platform it belongs to: it differs
         // across unixes, so a bare number sends someone comparing it against
@@ -198,10 +233,10 @@ impl Error for SocketPathTooLong {}
 /// Check `path` against [`MAX_SOCKET_PATH_BYTES`] before binding or connecting.
 ///
 /// Length is measured with `OsStr::len`, which on unix is the byte length of
-/// the path, the same count the kernel applies. Unix domain sockets exist only
-/// on unix, so no other measure is needed.
+/// the path, the same count the kernel applies. On Windows the path is a pipe
+/// name, and it is measured the way Windows counts one, in UTF-16 code units.
 pub fn check_path_len(path: &Path) -> Result<(), SocketPathTooLong> {
-    let len = path.as_os_str().len();
+    let len = endpoint_len(path);
     if len > MAX_SOCKET_PATH_BYTES {
         return Err(SocketPathTooLong {
             path: path.to_path_buf(),
@@ -210,6 +245,229 @@ pub fn check_path_len(path: &Path) -> Result<(), SocketPathTooLong> {
     }
     Ok(())
 }
+
+/// The length [`check_path_len`] holds against the limit: bytes on unix.
+#[cfg(not(windows))]
+fn endpoint_len(path: &Path) -> usize {
+    path.as_os_str().len()
+}
+
+/// The length [`check_path_len`] holds against the limit: UTF-16 code units
+/// on Windows, which is what the pipe-name limit counts.
+#[cfg(windows)]
+fn endpoint_len(path: &Path) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().count()
+}
+
+/// The prefix of every named pipe on this machine: `\\.\pipe\`.
+///
+/// Part of what the Windows transport will use. A pipe name is a path into
+/// the pipe namespace of some machine, and this one is the local machine's.
+/// `\\host\pipe\name` is the same pipe on another machine, reached over SMB,
+/// so it is not merely another spelling: see [`check_pipe_name`].
+pub const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\";
+
+/// Longest name a Windows named pipe may have, [`LOCAL_PIPE_PREFIX`]
+/// included, in UTF-16 code units (Windows characters).
+///
+/// Part of what the Windows transport will use. Windows documents the whole
+/// pipe name string as at most 256 characters, so the bound is on the name
+/// as a whole, not on the part after the prefix.
+pub const MAX_PIPE_NAME_CHARS: usize = 256;
+
+/// Build the default pipe name for `app_label`, run by the user whose SID
+/// string is `user`: `\\.\pipe\taria-<user>-<label>`.
+///
+/// Part of what the Windows transport will use, in place of
+/// [`resolve_path`]'s socket paths. Pipes share one namespace per machine
+/// rather than living in a per-user directory, so the user's SID is in the
+/// name to keep one user's pipes apart from another's. The name only keeps
+/// them apart; the pipe's own security descriptor is what keeps another user
+/// out.
+///
+/// `user` is a SID string, as `ConvertSidToStringSidW` writes one
+/// (`S-1-5-21-...`), and is supplied by the caller, which keeps this function
+/// pure. Anything else is refused with [`InvalidPipeName::User`]: it is
+/// interpolated into the name, so a value that is not a SID could carry a
+/// separator into it.
+///
+/// The label is held to the rule [`resolve_path`] holds it to, and also may
+/// not contain `\`, which on Windows is a path separator: anything else is
+/// [`InvalidPipeName::Label`]. A name over [`MAX_PIPE_NAME_CHARS`] is
+/// [`InvalidPipeName::TooLong`].
+pub fn pipe_name(app_label: &str, user: &str) -> Result<String, InvalidPipeName> {
+    if !is_pipe_label(app_label) {
+        return Err(InvalidPipeName::Label(app_label.to_string()));
+    }
+    if !is_sid_string(user) {
+        return Err(InvalidPipeName::User(user.to_string()));
+    }
+    let name = format!("{LOCAL_PIPE_PREFIX}taria-{user}-{app_label}");
+    check_pipe_name_len(&name)?;
+    Ok(name)
+}
+
+/// Check a pipe name given whole, such as `$TARIA_SOCK`, before binding or
+/// connecting to it.
+///
+/// Part of what the Windows transport will use, for the override and for an
+/// explicit name passed to the adapter or the bridge. The name is honoured
+/// only if it starts with [`LOCAL_PIPE_PREFIX`], exactly: anything else is
+/// [`InvalidPipeName::NotLocal`], `\\host\pipe\name` included, because
+/// opening a pipe on another machine goes over SMB, which hands that machine
+/// the user's credentials and puts the agent's input on the network.
+///
+/// The pipe's own name, after the prefix, must be one name. A `\` or `/` in
+/// it, a NUL, or nothing but dots and spaces is [`InvalidPipeName::Name`]:
+/// Windows normalizes a `\\.\` path before opening it, folding `/` into `\`,
+/// resolving `.` and `..` and trimming trailing dots and spaces, so
+/// `\\.\pipe\..\UNC\host\share` would leave the pipe namespace for SMB after
+/// passing a prefix check, and a NUL would end the name early. A name over
+/// [`MAX_PIPE_NAME_CHARS`] is [`InvalidPipeName::TooLong`].
+pub fn check_pipe_name(name: &str) -> Result<(), InvalidPipeName> {
+    let Some(own) = name.strip_prefix(LOCAL_PIPE_PREFIX) else {
+        return Err(InvalidPipeName::NotLocal(name.to_string()));
+    };
+    let separated = own.contains(['\\', '/', '\0']);
+    if separated || own.trim_end_matches(['.', ' ']).is_empty() {
+        return Err(InvalidPipeName::Name(name.to_string()));
+    }
+    check_pipe_name_len(name)
+}
+
+/// Resolve the pipe name for `app_label`, the Windows counterpart of
+/// [`resolve_path`] and part of what the Windows transport will use.
+///
+/// Precedence, highest first:
+///
+/// 1. `taria_sock` (`$TARIA_SOCK`), when set and non-empty, if it passes
+///    [`check_pipe_name`]. An override the check refuses is an error, not a
+///    reason to fall back: the user named an endpoint, and serving or
+///    connecting somewhere else would leave the two peers apart with nothing
+///    said. One that is not valid Unicode cannot name a pipe either, and is
+///    [`InvalidPipeName::NotLocal`].
+/// 2. [`pipe_name`] for `app_label` and `user`.
+///
+/// The label is checked before the precedence above, as [`resolve_path`]
+/// checks it, so a label is acceptable or not on its own terms whatever the
+/// environment says.
+pub fn resolve_pipe_name(
+    taria_sock: Option<OsString>,
+    user: &str,
+    app_label: &str,
+) -> Result<String, InvalidPipeName> {
+    if !is_pipe_label(app_label) {
+        return Err(InvalidPipeName::Label(app_label.to_string()));
+    }
+    if let Some(name) = taria_sock
+        && !name.is_empty()
+    {
+        let Some(name) = name.to_str() else {
+            return Err(InvalidPipeName::NotLocal(
+                name.to_string_lossy().into_owned(),
+            ));
+        };
+        check_pipe_name(name)?;
+        return Ok(name.to_string());
+    }
+    pipe_name(app_label, user)
+}
+
+/// Is `label` fit to end a pipe name? A plain file name, as for a socket,
+/// and no `\` either, which Windows reads as a separator.
+fn is_pipe_label(label: &str) -> bool {
+    is_plain_file_name(label) && !label.contains('\\')
+}
+
+/// Is `user` a SID string: `S-` and then fields of ASCII letters and digits,
+/// separated by single dashes?
+///
+/// Loose on the digits, since an identifier authority of 2^32 or more is
+/// written in hex, and strict on everything that could act as a separator.
+fn is_sid_string(user: &str) -> bool {
+    user.strip_prefix("S-").is_some_and(|fields| {
+        fields.split('-').all(|field| {
+            !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+    })
+}
+
+/// Refuse a pipe name over [`MAX_PIPE_NAME_CHARS`] UTF-16 code units.
+fn check_pipe_name_len(name: &str) -> Result<(), InvalidPipeName> {
+    let len = name.encode_utf16().count();
+    if len > MAX_PIPE_NAME_CHARS {
+        return Err(InvalidPipeName::TooLong {
+            name: name.to_string(),
+            len,
+        });
+    }
+    Ok(())
+}
+
+/// A pipe name that cannot be built or used, from [`pipe_name`],
+/// [`check_pipe_name`] or [`resolve_pipe_name`].
+///
+/// Part of what the Windows transport will use. Each variant carries the
+/// value refused, so the message can name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidPipeName {
+    /// The app label is not a single plain name: it has a `/` or `\`, is
+    /// `.`, `..` or empty, or holds a NUL.
+    Label(String),
+    /// The user is not a SID string.
+    User(String),
+    /// The name does not start with [`LOCAL_PIPE_PREFIX`], so it is not a
+    /// pipe on this machine.
+    NotLocal(String),
+    /// The part after [`LOCAL_PIPE_PREFIX`] is not one name.
+    Name(String),
+    /// The name is over [`MAX_PIPE_NAME_CHARS`].
+    TooLong {
+        /// The name refused.
+        name: String,
+        /// Its length in UTF-16 code units.
+        len: usize,
+    },
+}
+
+impl fmt::Display for InvalidPipeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Label(label) => write!(
+                f,
+                "app label {label:?} cannot end a pipe name; it must be a single name, so no `/` \
+                 or `\\`, and not `.`, `..` or empty. Set $TARIA_SOCK to a pipe name of your own, \
+                 {LOCAL_PIPE_PREFIX}<name>, to use one."
+            ),
+            Self::User(user) => write!(
+                f,
+                "{user:?} is not a SID string (S-1-...), so it cannot keep this user's pipes apart \
+                 from another's"
+            ),
+            Self::NotLocal(name) => write!(
+                f,
+                "`{name}` does not start with {LOCAL_PIPE_PREFIX}, so it is not taken for a pipe \
+                 on this machine; $TARIA_SOCK must name one that way. A pipe on another machine \
+                 (\\\\host\\pipe\\...) is refused, because opening it goes over SMB"
+            ),
+            Self::Name(name) => write!(
+                f,
+                "`{name}` names no single pipe: after {LOCAL_PIPE_PREFIX} it needs one name, with \
+                 no `\\` or `/`, and not empty or only dots and spaces"
+            ),
+            Self::TooLong { name, len } => write!(
+                f,
+                "pipe name `{name}` is {len} characters, over the {MAX_PIPE_NAME_CHARS} character \
+                 limit for named pipes; use a shorter app label, or set $TARIA_SOCK to a shorter \
+                 name of the form {LOCAL_PIPE_PREFIX}<name>"
+            ),
+        }
+    }
+}
+
+impl Error for InvalidPipeName {}
 
 #[cfg(test)]
 mod tests {
@@ -374,11 +632,17 @@ mod tests {
             target_os = "freebsd",
             target_os = "netbsd",
             target_os = "openbsd",
-            target_os = "dragonfly"
+            target_os = "dragonfly",
+            windows
         )))]
         assert_eq!(
             MAX_SOCKET_PATH_BYTES, 107,
             "this platform declares sun_path[108]"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            MAX_SOCKET_PATH_BYTES, MAX_PIPE_NAME_CHARS,
+            "the endpoint here is a named pipe, not a Unix socket"
         );
     }
 
@@ -398,6 +662,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn too_long_error_names_path_length_limit_and_platform() {
         let path = PathBuf::from(format!("/tmp/{}.sock", "x".repeat(120)));
@@ -412,6 +677,300 @@ mod tests {
         assert!(
             message.contains(std::env::consts::OS),
             "the limit is per platform, so the message must name this one: {message}"
+        );
+        assert!(message.contains("TARIA_SOCK"), "message: {message}");
+    }
+
+    /// On Windows the limit is the pipe name's, counted the way Windows
+    /// counts it, and the message says it is about a pipe.
+    #[cfg(windows)]
+    #[test]
+    fn too_long_error_on_windows_names_the_pipe_limit() {
+        let name = PathBuf::from(format!("{LOCAL_PIPE_PREFIX}{}", "x".repeat(300)));
+        let err = check_path_len(&name).unwrap_err();
+        assert_eq!(err.path_len(), 309);
+        let message = err.to_string();
+        assert!(message.contains("309 characters"), "message: {message}");
+        assert!(message.contains("256 character"), "message: {message}");
+        assert!(message.contains(LOCAL_PIPE_PREFIX), "message: {message}");
+    }
+
+    /// A SID string as Windows writes one for a local account.
+    const SID: &str = "S-1-5-21-3623811015-3361044348-30300820-1013";
+
+    #[test]
+    fn a_pipe_is_named_for_the_user_and_the_label() {
+        let name = pipe_name("demo", SID).expect("a plain label and a SID name a pipe");
+        assert_eq!(
+            name,
+            r"\\.\pipe\taria-S-1-5-21-3623811015-3361044348-30300820-1013-demo"
+        );
+        assert_eq!(
+            check_pipe_name(&name),
+            Ok(()),
+            "the default name is one the override check accepts"
+        );
+    }
+
+    /// The label rule for a socket file, plus `\`, which Windows reads as a
+    /// separator, so `a\b` would name a pipe inside a pipe namespace path.
+    #[test]
+    fn a_pipe_label_must_be_one_name_with_no_backslash() {
+        for label in [
+            r"a\b",
+            r"\",
+            r"..\..\x",
+            r"\\host\pipe\x",
+            "/etc/cron.d/evil",
+            "sub/dir",
+            ".",
+            "..",
+            "",
+            "nul\0byte",
+        ] {
+            assert_eq!(
+                pipe_name(label, SID),
+                Err(InvalidPipeName::Label(label.to_string())),
+                "label: {label:?}"
+            );
+            // Refused before the override is looked at, as `resolve_path`
+            // refuses one.
+            assert_eq!(
+                resolve_pipe_name(Some(r"\\.\pipe\custom".into()), SID, label),
+                Err(InvalidPipeName::Label(label.to_string())),
+                "label: {label:?}"
+            );
+        }
+        // The socket-path rule itself is untouched: `\` is an ordinary
+        // character in a Unix file name.
+        #[cfg(unix)]
+        assert!(resolve_path(None, None, Path::new("/tmp"), "1000", r"a\b").is_ok());
+    }
+
+    #[test]
+    fn plain_labels_with_awkward_characters_still_name_a_pipe() {
+        for label in ["my app", "app.v2", "..app", "app..", "-", "app:1"] {
+            assert_eq!(
+                pipe_name(label, SID),
+                Ok(format!(r"\\.\pipe\taria-{SID}-{label}")),
+                "label: {label:?}"
+            );
+        }
+    }
+
+    /// The user is interpolated into the name, so only a SID string is
+    /// taken, and nothing in one can act as a separator.
+    #[test]
+    fn the_user_must_be_a_sid_string() {
+        for user in [
+            "S-1-5-18",
+            SID,
+            // An identifier authority past 32 bits is written in hex.
+            "S-1-0x123456789ABC-1",
+        ] {
+            assert!(pipe_name("demo", user).is_ok(), "user: {user:?}");
+        }
+        for user in [
+            "",
+            "S-",
+            "S--",
+            "S-1-",
+            "S-1--5",
+            "s-1-5-18",
+            "1000",
+            "alice",
+            r"S-1-5\x",
+            "S-1-5/x",
+            "S-1-5-18 ",
+            "S-1-5-..",
+        ] {
+            assert_eq!(
+                pipe_name("demo", user),
+                Err(InvalidPipeName::User(user.to_string())),
+                "user: {user:?}"
+            );
+        }
+    }
+
+    /// Only a pipe on this machine is honoured. Every other spelling is
+    /// refused rather than normalized into one, `\\host\pipe\` first among
+    /// them, because opening a remote pipe goes over SMB.
+    #[test]
+    fn an_override_must_name_a_pipe_on_this_machine() {
+        for name in [
+            r"\\host\pipe\taria",
+            r"\\192.168.0.7\pipe\taria",
+            r"\\?\pipe\taria",
+            r"\\.\PIPE\taria",
+            "//./pipe/taria",
+            r"\\.\pipetaria",
+            r"\\.\pipe",
+            r"C:\Users\me\taria.sock",
+            "/run/user/1000/taria/demo.sock",
+            "",
+        ] {
+            assert_eq!(
+                check_pipe_name(name),
+                Err(InvalidPipeName::NotLocal(name.to_string())),
+                "name: {name:?}"
+            );
+        }
+    }
+
+    /// The part after the prefix has to be a single name: Windows normalizes
+    /// a `\\.\` path before opening it, so a separator or a dot segment
+    /// there could walk out of the pipe namespace after the prefix check.
+    #[test]
+    fn an_override_must_name_one_pipe() {
+        for name in [
+            r"\\.\pipe\",
+            r"\\.\pipe\..\UNC\host\share",
+            r"\\.\pipe\..\..\C:\Windows\win.ini",
+            r"\\.\pipe\a\b",
+            r"\\.\pipe\a/b",
+            r"\\.\pipe\.",
+            r"\\.\pipe\..",
+            r"\\.\pipe\ . ",
+            "\\\\.\\pipe\\a\0b",
+        ] {
+            assert_eq!(
+                check_pipe_name(name),
+                Err(InvalidPipeName::Name(name.to_string())),
+                "name: {name:?}"
+            );
+        }
+        for name in [
+            r"\\.\pipe\taria",
+            r"\\.\pipe\my pipe",
+            r"\\.\pipe\..taria",
+            r"\\.\pipe\taria.",
+            r"\\.\pipe\taria:1",
+        ] {
+            assert_eq!(check_pipe_name(name), Ok(()), "name: {name:?}");
+        }
+    }
+
+    /// 256 characters for the whole name, prefix included, counted in UTF-16
+    /// code units: a character outside the BMP is two of them.
+    #[test]
+    fn the_pipe_name_limit_is_the_whole_name_in_utf16_units() {
+        let prefix = LOCAL_PIPE_PREFIX.encode_utf16().count();
+        let at_limit = format!(
+            "{LOCAL_PIPE_PREFIX}{}",
+            "x".repeat(MAX_PIPE_NAME_CHARS - prefix)
+        );
+        assert_eq!(check_pipe_name(&at_limit), Ok(()));
+        let over = format!("{at_limit}x");
+        assert_eq!(
+            check_pipe_name(&over),
+            Err(InvalidPipeName::TooLong {
+                name: over.clone(),
+                len: MAX_PIPE_NAME_CHARS + 1
+            })
+        );
+
+        // One unit short of the limit, then a character that takes two.
+        let short = format!(
+            "{LOCAL_PIPE_PREFIX}{}",
+            "x".repeat(MAX_PIPE_NAME_CHARS - prefix - 1)
+        );
+        assert_eq!(check_pipe_name(&format!("{short}\u{e9}")), Ok(()));
+        assert!(matches!(
+            check_pipe_name(&format!("{short}\u{1F600}")),
+            Err(InvalidPipeName::TooLong { len, .. }) if len == MAX_PIPE_NAME_CHARS + 1
+        ));
+
+        // The default name is held to the same limit, so a long label is
+        // refused rather than handed to Windows to truncate or reject.
+        let fixed = format!("{LOCAL_PIPE_PREFIX}taria-{SID}-")
+            .encode_utf16()
+            .count();
+        let longest = "l".repeat(MAX_PIPE_NAME_CHARS - fixed);
+        assert!(pipe_name(&longest, SID).is_ok());
+        assert!(matches!(
+            pipe_name(&format!("{longest}l"), SID),
+            Err(InvalidPipeName::TooLong { len, .. }) if len == MAX_PIPE_NAME_CHARS + 1
+        ));
+    }
+
+    #[test]
+    fn a_valid_override_wins_and_an_empty_one_is_ignored() {
+        assert_eq!(
+            resolve_pipe_name(Some(r"\\.\pipe\custom".into()), SID, "demo"),
+            Ok(r"\\.\pipe\custom".to_string())
+        );
+        for unset in [None, Some(OsString::new())] {
+            assert_eq!(
+                resolve_pipe_name(unset.clone(), SID, "demo"),
+                pipe_name("demo", SID),
+                "override: {unset:?}"
+            );
+        }
+        // The user only names the default; an override needs no SID.
+        assert!(resolve_pipe_name(Some(r"\\.\pipe\custom".into()), "", "demo").is_ok());
+        assert_eq!(
+            resolve_pipe_name(None, "", "demo"),
+            Err(InvalidPipeName::User(String::new()))
+        );
+    }
+
+    /// An override the check refuses is an error, never a reason to serve or
+    /// connect at the default name instead, where the other peer is not.
+    #[test]
+    fn a_refused_override_is_an_error_not_a_fallback() {
+        assert_eq!(
+            resolve_pipe_name(Some(r"\\host\pipe\custom".into()), SID, "demo"),
+            Err(InvalidPipeName::NotLocal(r"\\host\pipe\custom".to_string()))
+        );
+        assert_eq!(
+            resolve_pipe_name(Some(r"\\.\pipe\a\b".into()), SID, "demo"),
+            Err(InvalidPipeName::Name(r"\\.\pipe\a\b".to_string()))
+        );
+    }
+
+    /// An override that is not valid Unicode cannot be a pipe name.
+    #[cfg(unix)]
+    #[test]
+    fn an_override_that_is_not_unicode_is_refused() {
+        use std::os::unix::ffi::OsStringExt;
+        let name = OsString::from_vec(b"\\\\.\\pipe\\\xff".to_vec());
+        assert!(matches!(
+            resolve_pipe_name(Some(name), SID, "demo"),
+            Err(InvalidPipeName::NotLocal(_))
+        ));
+    }
+
+    #[test]
+    fn pipe_errors_name_the_value_and_the_rule() {
+        let message = check_pipe_name(r"\\host\pipe\taria")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains(r"`\\host\pipe\taria`"),
+            "message: {message}"
+        );
+        assert!(message.contains(LOCAL_PIPE_PREFIX), "message: {message}");
+        assert!(message.contains("SMB"), "message: {message}");
+
+        let message = check_pipe_name(r"\\.\pipe\a\b").unwrap_err().to_string();
+        assert!(message.contains(r"`\\.\pipe\a\b`"), "message: {message}");
+        assert!(message.contains("one name"), "message: {message}");
+
+        let message = pipe_name(r"a\b", SID).unwrap_err().to_string();
+        assert!(message.contains(r#""a\\b""#), "message: {message}");
+        assert!(message.contains(r"`\`"), "message: {message}");
+        assert!(message.contains("TARIA_SOCK"), "message: {message}");
+
+        let message = pipe_name("demo", "alice").unwrap_err().to_string();
+        assert!(message.contains("alice"), "message: {message}");
+        assert!(message.contains("SID"), "message: {message}");
+
+        let long = format!("{LOCAL_PIPE_PREFIX}{}", "x".repeat(300));
+        let message = check_pipe_name(&long).unwrap_err().to_string();
+        assert!(message.contains("309 characters"), "message: {message}");
+        assert!(
+            message.contains(&format!("{MAX_PIPE_NAME_CHARS} character")),
+            "message: {message}"
         );
         assert!(message.contains("TARIA_SOCK"), "message: {message}");
     }
