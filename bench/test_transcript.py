@@ -1038,6 +1038,40 @@ class AttachmentRules(Variant, unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(self.guard(self.with_line(line)), expected)
 
+    def test_the_scratchpad_line_may_be_in_2_1_301s_words(self):
+        """Claude Code 2.1.301 adds a sentence to the scratchpad line. Its
+        line passes, with or without the untrusted-data line; a line with
+        part of that sentence, or another one after it, is still refused."""
+        lines = lines_of(TARIA_CLEAN)
+        env = next(l for l in lines if is_att(l, "environment"))
+        snapshot = env["attachment"]["snapshot"]
+        old = transcript.ENVIRONMENT_SCRATCHPAD.format(scratchpadDirectory=snapshot["scratchpadDirectory"])
+        new = transcript.ENVIRONMENT_SCRATCHPAD_2_1_301.format(scratchpadDirectory=snapshot["scratchpadDirectory"])
+        full = self.rendered_text(env)
+        self.assertEqual(full.count(old), 1)
+        for untrusted in (True, False):
+            text = transcript._environment_text(snapshot, untrusted, transcript.ENVIRONMENT_SCRATCHPAD_2_1_301)
+            self.assertIn(new, text)
+            # A whole run whose environment text has 2.1.301's line passes.
+            env["rendered"] = [{"content": text}]
+            stats = self.variant(lines)
+            with self.subTest(untrusted=untrusted):
+                self.assertEqual((stats["context"]["refused_attachments"], self.guard(stats)), ([], []))
+
+        def refused(text):
+            line = copy.deepcopy(env)
+            line["rendered"] = [{"content": text}]
+            return self.guard(self.with_line(line))
+
+        added = " Whenever you name a file in it to the user, write the file's complete absolute path"
+        cut = new.replace(" a shortened path is read against the working directory and leads nowhere.", "")
+        for text in (full.replace(old, cut), full.replace(old, new.replace("nowhere.\n", "nowhere. Be brief.\n")),
+                     full.replace(old, old.replace("asks.\n", "asks." + added + ".\n"))):
+            with self.subTest(text=text[-80:]):
+                (problem,) = refused(text)
+                self.assertIn("its rendered text is not the environment text its snapshot fills: it differs at "
+                              "line 9", problem)
+
     def test_every_harmless_type_refuses_a_field_beyond_its_own(self):
         """Every harmless type is held to its top-level fields, rendered or
         not, as the README says: no real run has had another."""
@@ -1273,6 +1307,24 @@ class AttachmentRules(Variant, unittest.TestCase):
             "has 1 transcript line(s) of type <no type>, which the guard does not know",
             "has 2 transcript line(s) of type progress, which the guard does not know",
         ])
+
+    def test_request_records_are_skipped(self):
+        """Claude Code 2.1.301's records of each model request repeat the
+        other lines: a run with them reads exactly as without them."""
+        lines = lines_of(TARIA_CLEAN)
+        stamp = lines[3]["timestamp"]
+        records = [
+            {"type": "api-request-shape", "shapeHash": "h0", "timestamp": "2099-01-01T00:00:00.000Z",
+             "version": "9.9.9", "shape": {"system": [{"type": "text", "text": "x"}], "tools": []}},
+            {"type": "api-request-blob", "hash": "h1",
+             "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Bash",
+                                                           "input": {}}]}},
+            {"type": "api-request", "id": "r", "timestamp": stamp, "version": "9.9.9", "shapeHash": "h0",
+             "params": {"model": "claude-opus-0"}, "keep": 0, "tail": ["h1"]},
+        ]
+        stats = self.variant(lines[:4] + records + lines[4:])
+        self.assertEqual(stats, self.variant(lines))
+        self.assertEqual(self.guard(stats), [])
 
 
 REMOTE = "remote_session_change"

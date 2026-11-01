@@ -96,9 +96,18 @@ the environment's and the session context's rendered text must be the
 template Claude Code 2.1.294 renders them in (ENVIRONMENT_TEXT,
 SESSION_CONTEXT_TEXT) filled with the attachment's own values (the
 environment's untrusted-data line, ENVIRONMENT_UNTRUSTED, may be missing,
-and is exact when there), the date's and the model's their one sentence. An
-attachment whose `rendered` is there
+and is exact when there; its scratchpad line may be in 2.1.301's words,
+ENVIRONMENT_SCRATCHPAD_2_1_301, one sentence longer), the date's and the
+model's their one sentence. An attachment whose `rendered` is there
 but does not read as text is refused too, never taken for no text.
+
+Claude Code 2.1.301 also records each model request in the transcript, in
+three line types (REQUEST_RECORDS): `api-request-shape` (the request's
+system prompt and tools), `api-request-blob` (one message of it, by hash)
+and `api-request` (the request's parameters and the blobs it sent). They
+repeat what the user, assistant and attachment lines hold, add nothing to
+the agent's context, and are skipped before anything is read, so a run's
+stats are what 2.1.294 would have recorded.
 
 Context can also arrive inside a tool result rather than as an attachment:
 Claude Code appends its reminders to a tool's output as `<system-reminder>`
@@ -115,7 +124,8 @@ each: an attachment of a type with no rule, or in a shape its rule does not
 know, or whose rendered text does not read; an attachment line with no
 type, or whose attachment is not an object; a `<system-reminder>` block in
 or beside a tool result; a line whose type is not `user`, `assistant` or
-`attachment`; and a second prompt, beside a tool result or on its own.
+`attachment` (or a request record); and a second prompt, beside a tool
+result or on its own.
 
 An orchestrating session in auto mode gives every subagent Claude Code's
 SubagentHandback tool and a second prompt telling it to report through it,
@@ -185,6 +195,9 @@ ATTACHMENTS_FLAGGED = {
 ATTACHMENTS_TOLERABLE = frozenset({"remote_session_change"})
 KNOWN_ATTACHMENTS = ATTACHMENTS_VERIFIED | ATTACHMENTS_HARMLESS | frozenset(ATTACHMENTS_FLAGGED)
 LINE_TYPES = frozenset({"user", "assistant", "attachment"})
+# Claude Code 2.1.301's records of each model request: skipped, they repeat
+# the other lines and add no context (see the module docstring).
+REQUEST_RECORDS = frozenset({"api-request", "api-request-blob", "api-request-shape"})
 # The top-level fields each harmless type is known with, `type` included: any
 # other is refused. thinking_drop's are those of every record Claude Code
 # 2.1.280 and 2.1.294 wrote outside the bench (no bench run has had one).
@@ -246,6 +259,14 @@ ENVIRONMENT_SCRATCHPAD = (
     "directories; it is session-specific, isolated from the project, and can generally be used without "
     "permission prompts. Only use `/tmp` if the user explicitly asks.\n"
 )
+# Claude Code 2.1.301's scratchpad line: the same, then a sentence on naming a
+# file in it. Either version's line passes, and nothing between them.
+ENVIRONMENT_SCRATCHPAD_2_1_301 = ENVIRONMENT_SCRATCHPAD[:-1] + (
+    " Whenever you name a file in it to the user, write the file's complete absolute path in one piece, not a "
+    "bare filename, a path that starts at the scratchpad folder, or the directory followed by filenames: a "
+    "shortened path is read against the working directory and leads nowhere.\n"
+)
+ENVIRONMENT_SCRATCHPADS = (ENVIRONMENT_SCRATCHPAD, ENVIRONMENT_SCRATCHPAD_2_1_301)
 # The snapshot fields the environment text shows, always.
 ENVIRONMENT_SHOWN = ("workingDirectory", "isGitRepo", "platform", "shell", "osVersion")
 # session_context renders one `# key` section per context value, in the
@@ -641,16 +662,18 @@ def _rendered_problem(texts, expected, what):
     return None
 
 
-def _environment_text(snapshot, untrusted=True):
+def _environment_text(snapshot, untrusted=True, scratchpad_line=ENVIRONMENT_SCRATCHPAD):
     """The text Claude Code renders from an environment `snapshot`
     (ENVIRONMENT_TEXT), with the untrusted-data line or, for `untrusted`
-    false, without it; None when the snapshot lacks a field the text shows."""
+    false, without it, and its scratchpad line in `scratchpad_line`'s words
+    (2.1.294's by default); None when the snapshot lacks a field the text
+    shows."""
     if any(key not in snapshot for key in ENVIRONMENT_SHOWN):
         return None
     values = {key: json.dumps(snapshot[key]) if isinstance(snapshot[key], bool) else snapshot[key]
               for key in ENVIRONMENT_SHOWN}
     scratchpad = snapshot.get("scratchpadDirectory")
-    values["scratchpad"] = "" if scratchpad is None else ENVIRONMENT_SCRATCHPAD.format(scratchpadDirectory=scratchpad)
+    values["scratchpad"] = "" if scratchpad is None else scratchpad_line.format(scratchpadDirectory=scratchpad)
     values["untrusted"] = ENVIRONMENT_UNTRUSTED if untrusted else ""
     return ENVIRONMENT_TEXT.format(**values)
 
@@ -696,8 +719,9 @@ def _harmless_shape(kind, att, texts):
         if expected is None:
             missing = [key for key in ENVIRONMENT_SHOWN if key not in snapshot]
             return f"its rendered text cannot be checked: its snapshot has no {', '.join(missing)}" if texts else None
-        return _rendered_problem(texts, (expected, _environment_text(snapshot, untrusted=False)),
-                                 "the environment text its snapshot fills")
+        accepted = tuple(_environment_text(snapshot, untrusted, line)
+                         for line in ENVIRONMENT_SCRATCHPADS for untrusted in (True, False))
+        return _rendered_problem(texts, accepted, "the environment text its snapshot fills")
     if kind == "session_context":
         context = att.get("context")
         if not isinstance(context, dict):
@@ -968,6 +992,8 @@ def read_transcript(path, tolerated=()):
     final = None  # the last assistant line's message: {"id", "synthetic", "text", "error"}
     max_turns_reached = None
     for number, line in enumerate(lines):
+        if line.get("type") in REQUEST_RECORDS:
+            continue
         agent_id = agent_id or (line.get("agentId") if isinstance(line.get("agentId"), str) else None)
         session_id = session_id or (line.get("sessionId") if isinstance(line.get("sessionId"), str) else None)
         stamp = _timestamp(line.get("timestamp"))
