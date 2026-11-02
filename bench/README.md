@@ -34,6 +34,11 @@ agent a set of tools). All are registered as `tui`, so the agent sees
   30 ms apart, so `"Escape d"` is not alt+d, and the settle wait is capped at
   the 500 ms taria-mcp waits for an app to react.
 
+- **molerat**: orhun's [molerat](https://github.com/orhun/molerat), its
+  `molerat-mcp` bridge (found on PATH) with `get_ui` (the AccessKit tree as
+  JSON) and `perform_action`. It needs a demo that publishes a molerat tree,
+  so it runs only with `--demo-bin` (see The molerat arm).
+
 The cycle-2 token and character figures in `RESULTS.md` predate the 0.4.0
 demo, so they are not a baseline for a batch run against 0.4.0. Its task
 rows carry `"selected"` and `"checked"` instead of `"value":"todo"`, which
@@ -624,6 +629,48 @@ does for cycle2a and cycle2b. The first outline batch, outline1, ran
 against full1 at another commit, with another identity line and with
 remote control's note, so its ratios against full1 read as a cross-batch
 comparison (RESULTS.md, History).
+
+## The molerat arm
+
+A same-app comparison with molerat: both arms drive one binary,
+`bench/dual-demo`, which is taria-demo's state machine, rendering and state
+dump (its source files, included by path) publishing a molerat tree beside
+the taria one each frame. It is its own crate and workspace, so molerat
+stays out of taria's lockfile, and it takes molerat from GitHub at the
+commit the pilot ran. Every molerat action yields the taria act it stands
+for and goes through the same `apply_agent_input`, so the task checks grade
+both arms on the same dump. The node and action mapping is in
+`bench/dual-demo/MAPPING.md`, and the pilot's results in `MOLERAT.md`.
+
+`plan --demo-bin PATH` (and `dry-run --demo-bin PATH`) runs every arm of the
+batch on that binary instead of `target/debug/taria-demo`; the plan records
+`demo_bin`, and with the molerat arm `molerat_mcp`. Each run's demo gets its
+own molerat endpoint file in its temp dir (`s/endpoint.key`, passed to the
+demo and to molerat-mcp as `MOLERAT_MCP_ENDPOINT_FILE`), so parallel slots
+never share molerat's default discovery file. The molerat arm without
+`--demo-bin` is refused. `next` holds the demo binary and molerat-mcp to
+their dep-info sources, as it does this repo's binaries; an installed
+molerat-mcp has none, so it only has to exist. It is looked up on PATH by
+`run.py` and again by `mcp_launch.py` when an agent starts, so Claude
+Code's PATH needs it too. molerat's tools share no name with taria's, so
+one batch may hold both.
+
+```bash
+cargo install --git https://github.com/orhun/molerat --rev 0c62c33 --features mcp molerat
+cargo build --manifest-path bench/dual-demo/Cargo.toml
+DUAL=$PWD/bench/dual-demo/target/debug/dual-demo
+python3 bench/run.py dry-run --arms taria,molerat --demo-bin $DUAL     # 12/12 pass
+python3 bench/run.py agents --slots 4                                  # adds tui-molerat-1..4
+python3 bench/run.py plan --batch B --arms taria,molerat --models sonnet,haiku --runs 2 \
+    --demo-bin $DUAL --seed 42 --effort medium --max-turns 30
+```
+
+What differs between the arms beyond the tree: molerat-mcp has no raw
+`key` or `type_text`, and `perform_action` answers once the action is
+queued ("Action dispatched to the application"), before the app applies it
+and without a tree, so its agent reads the effect with another `get_ui`.
+Its `tools/list` is about 12.8k characters to taria-mcp's 1.9k, carried in
+every call.
 
 ## Tests
 

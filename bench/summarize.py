@@ -91,12 +91,13 @@ AGENT_MODES = ("subagent", "spend")  # "spend": rows from before subagent runs
 # Which arms are compared, and which way round: each pair is (subject,
 # baseline), its difference is subject minus baseline and its ratios are
 # baseline/subject (above 1x: the baseline used more). Every arm is held
-# against tmux, the screen scraper, and outline against taria, the same
-# bridge showing JSON. bench/harness.py's ARMS names them; this module
-# reads only rows, so it keeps its own copy of the order.
-ARM_ORDER = ("taria", "tmux", "outline")
+# against tmux, the screen scraper, outline against taria, the same
+# bridge showing JSON, and molerat against taria, the other semantic layer
+# on the same app. bench/harness.py's ARMS names them; this module reads
+# only rows, so it keeps its own copy of the order.
+ARM_ORDER = ("taria", "tmux", "outline", "molerat")
 BASELINE = "tmux"
-EXTRA_PAIRS = (("outline", "taria"),)
+EXTRA_PAIRS = (("outline", "taria"), ("molerat", "taria"))
 NO_BATCH = "(none)"
 # Attachment types a batch's plan tolerated (run.py plan
 # --tolerate-attachment), which each of its rows records in
@@ -607,7 +608,8 @@ def _arm_key(arm):
 
 def arm_pairs(arms):
     """The (subject, baseline) pairs to compare among `arms`: outline vs
-    taria, then every other arm vs tmux, each only when both are present."""
+    taria and molerat vs taria, then every other arm vs tmux, each only when
+    both are present."""
     present = sorted({a for a in arms if a is not None}, key=_arm_key)
     pairs = [(a, b) for a, b in EXTRA_PAIRS if a in present and b in present]
     if BASELINE in present:

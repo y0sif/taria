@@ -27,11 +27,23 @@ REPO = os.path.dirname(BENCH)
 DEMO_BIN = os.path.join(REPO, "target", "debug", "taria-demo")
 MCP_BIN = os.path.join(REPO, "target", "debug", "taria-mcp")
 TMUX_MCP = os.path.join(BENCH, "tmux_mcp.py")
+# molerat's stdio bridge, built outside this repo: molerat-mcp on PATH, as
+# `cargo install --git https://github.com/orhun/molerat --features mcp molerat`
+# puts it (bench/MOLERAT.md pins the rev). Only its path is known here: the
+# molerat arm execs it, against a demo that publishes a molerat tree beside the
+# taria one (`plan --demo-bin`). Not on PATH, it stays the bare name, which
+# require_fresh_external refuses.
+MOLERAT_MCP = shutil.which("molerat-mcp") or "molerat-mcp"
 
 SERVER_KEY = "tui"  # one name for every arm, so tool names do not name the arm
 # taria: the bridge's JSON tree. tmux: the screen. outline: the same bridge
 # as taria, showing the same tree as an indented outline (--tree-format).
-ARMS = ("taria", "tmux", "outline")
+# molerat: molerat-mcp, AccessKit's tree, against a demo that publishes one
+# (--demo-bin), so it is never run against taria-demo itself.
+ARMS = ("taria", "tmux", "outline", "molerat")
+# The arms whose server needs a demo that publishes a molerat tree as well as
+# the taria one (`plan --demo-bin`, `dry-run --demo-bin`).
+DUAL_ARMS = ("molerat",)
 # Exactly the tools each arm's server lists. The dry run checks the live
 # servers against this, and grading holds the agent's tool calls to it
 # (transcript.guard), so the two cannot drift apart unnoticed.
@@ -39,6 +51,7 @@ ARM_TOOLS = {
     "taria": ("read_tree", "act", "key", "type_text"),
     "tmux": ("screen", "send_keys"),
     "outline": ("read_tree", "act", "key", "type_text"),
+    "molerat": ("get_ui", "perform_action"),
 }
 # How the bridge arms show the tree. taria and outline list the same tools,
 # so what tells them apart in a transcript is the read_tree description
@@ -46,7 +59,7 @@ ARM_TOOLS = {
 # text the solver has to parse. taria runs the bridge's default (json), as
 # every batch before the outline arm did.
 ARM_TREE_FORMAT = {"taria": "json", "outline": "outline"}
-SERVER_NAMES = {"taria": "taria-mcp", "tmux": "tmux-mcp", "outline": "taria-mcp"}
+SERVER_NAMES = {"taria": "taria-mcp", "tmux": "tmux-mcp", "outline": "taria-mcp", "molerat": "molerat-mcp"}
 
 COLS, ROWS = 120, 40
 READY_TIMEOUT = 5.0
@@ -181,6 +194,38 @@ def require_fresh_build(repo=REPO, binaries=BINARIES):
         )
 
 
+def require_fresh_external(binaries):
+    """Refuse a binary built outside this repo (a --demo-bin, molerat-mcp)
+    that is missing, or older than a source its dep-info lists. Without a
+    readable dep-info there is nothing to hold it to, and it only has to
+    exist. Its own repo's manifests are not dated: build it there."""
+    for binary in binaries:
+        if not os.path.exists(binary):
+            if binary == MOLERAT_MCP:
+                raise HarnessError("molerat-mcp is not on PATH; install it as bench/MOLERAT.md says, then rerun")
+            raise HarnessError(f"{binary} not built; build it in its own repo, then rerun")
+        sources = dep_info_sources(binary)
+        if sources is None:
+            continue
+        source, source_at = _newest(sources)
+        built_at = os.path.getmtime(binary)
+        if source is not None and built_at < source_at:
+            raise HarnessError(
+                f"{binary} is {source_at - built_at:.0f}s older than {source}, so it is not that "
+                "source tree; rebuild it, then rerun"
+            )
+
+
+def binaries_under_test(arms, demo_bin=None):
+    """(this repo's binaries, binaries built elsewhere) that runs of `arms`
+    against `demo_bin` (None: taria-demo) need, for the freshness checks."""
+    ours = [MCP_BIN] if demo_bin is not None else [DEMO_BIN, MCP_BIN]
+    external = [demo_bin] if demo_bin is not None else []
+    if any(arm == "molerat" for arm in arms):
+        external.append(MOLERAT_MCP)
+    return tuple(ours), tuple(external)
+
+
 # --- The demo under test --------------------------------------------------------
 
 
@@ -258,6 +303,12 @@ class DemoRun:
         <tmp>/state.json   the demo's state dump, graded after the run
 
         <tmp>/tmux.conf    the private server's only config: status off
+        <tmp>/s/endpoint.key  with a --demo-bin only: the demo's molerat
+                           endpoint file (MOLERAT_MCP_ENDPOINT_FILE), which
+                           molerat-mcp reads to find it
+
+    `demo_bin` is the binary run (taria-demo by default); another one is
+    named in to_slot() so a later process reaches and tears down the same.
 
     `<tmp>` has a neutral `tui-` prefix, and a temp dir whose path names an
     arm or the benchmark is refused (the tmux arm reads the socket path off
@@ -271,7 +322,7 @@ class DemoRun:
     so it outlives the process that started it.
     """
 
-    def __init__(self):
+    def __init__(self, demo_bin=None):
         base = tempfile.gettempdir()
         told = [word for word in TELLTALE if word in base.lower()]
         if told:
@@ -286,6 +337,10 @@ class DemoRun:
         self.sock = os.path.join(sockdir, "app.sock")
         self.tmux_sock = os.path.join(sockdir, "tmux.sock")
         self.state_path = os.path.join(self.tmpdir, "state.json")
+        self.demo_bin = demo_bin or DEMO_BIN
+        # A per-run molerat endpoint file for a --demo-bin, so parallel slots
+        # never share molerat's default discovery file.
+        self.molerat_key = os.path.join(sockdir, "endpoint.key") if demo_bin else None
         if len(os.fsencode(self.sock)) > SOCKET_PATH_MAX:
             shutil.rmtree(self.tmpdir, ignore_errors=True)
             raise HarnessError(
@@ -313,8 +368,13 @@ class DemoRun:
             raise
 
     def to_slot(self):
-        """What a later process needs to talk to this demo and tear it down."""
-        return {field: getattr(self, field) for field in SLOT_FIELDS}
+        """What a later process needs to talk to this demo and tear it down.
+        A --demo-bin run adds `demo_bin` and `molerat_key`; a taria-demo run's
+        fields are what they always were."""
+        fields = {field: getattr(self, field) for field in SLOT_FIELDS}
+        if self.demo_bin != DEMO_BIN or self.molerat_key is not None:
+            fields.update(demo_bin=self.demo_bin, molerat_key=self.molerat_key)
+        return fields
 
     @classmethod
     def from_slot(cls, fields):
@@ -338,9 +398,17 @@ class DemoRun:
         for field in ("server_pid", "demo_pid"):
             if fields[field] is not None and not isinstance(fields[field], int):
                 raise HarnessError(f"slot file's {field} {fields[field]!r} is not a pid")
+        demo_bin = fields.get("demo_bin") or DEMO_BIN
+        if not (isinstance(demo_bin, str) and os.path.isabs(demo_bin)):
+            raise HarnessError(f"slot file's demo_bin {demo_bin!r} is not an absolute path")
+        key = fields.get("molerat_key")
+        if key is not None and not (isinstance(key, str) and os.path.isabs(key) and key != tmpdir
+                                    and os.path.commonpath([tmpdir, key]) == tmpdir):
+            raise HarnessError(f"slot file's molerat_key {key!r} is outside {tmpdir}")
         run = cls.__new__(cls)
         for field in SLOT_FIELDS:
             setattr(run, field, fields[field])
+        run.demo_bin, run.molerat_key = demo_bin, key
         run.tmux = ["tmux", "-S", run.tmux_sock, "-f", run.tmux_conf]
         return run
 
@@ -356,11 +424,21 @@ class DemoRun:
             raise HarnessError(f"tmux {args[0]} failed: {result.stderr.strip()}")
         return result
 
+    def _demo_env(self):
+        env = [f"TARIA_SOCK={self.sock}", f"TARIA_DEMO_STATE={self.state_path}"]
+        if self.molerat_key is not None:
+            env.append(f"MOLERAT_MCP_ENDPOINT_FILE={self.molerat_key}")
+        return env
+
+    def _up(self):
+        """Whether the demo's endpoints and dump all exist yet."""
+        paths = [self.sock, self.state_path] + ([self.molerat_key] if self.molerat_key else [])
+        return all(os.path.exists(p) for p in paths)
+
     def start(self):
         self._tmux(
             "new-session", "-d", "-s", self.name, "-x", str(COLS), "-y", str(ROWS),
-            "env", f"TARIA_SOCK={self.sock}", f"TARIA_DEMO_STATE={self.state_path}",
-            DEMO_BIN,
+            "env", *self._demo_env(), self.demo_bin,
         )
         # Only a fallback for close(): kill-server through the socket path is
         # the real teardown, so a failure here costs nothing.
@@ -371,13 +449,15 @@ class DemoRun:
             pass
         deadline = time.monotonic() + READY_TIMEOUT
         while time.monotonic() < deadline:
-            if os.path.exists(self.sock) and os.path.exists(self.state_path):
+            if self._up():
                 break
             time.sleep(0.02)
         else:
+            molerat = (f", molerat endpoint file {os.path.exists(self.molerat_key)}"
+                       if self.molerat_key else "")
             raise HarnessError(
                 f"the demo never came up (socket {os.path.exists(self.sock)}, "
-                f"state dump {os.path.exists(self.state_path)}); pane:\n{self.capture()}"
+                f"state dump {os.path.exists(self.state_path)}{molerat}); pane:\n{self.capture()}"
             )
         # The first frame is drawn right after the first dump; wait for it to
         # hold still so neither arm's first look races the first draw.
@@ -400,7 +480,7 @@ class DemoRun:
         the socket takes a connection, the state dump exists, and the pane
         holds a drawn, settled screen. No MCP client is started here."""
         deadline = time.monotonic() + timeout
-        while not (os.path.exists(self.state_path) and self.socket_accepts()):
+        while not (self._up() and self.socket_accepts()):
             if time.monotonic() > deadline:
                 raise HarnessError(
                     f"the demo is not ready for an agent (socket accepts {self.socket_accepts()}, "
@@ -433,7 +513,7 @@ class DemoRun:
         when the demo does.
         """
         if self.demo_pid and os.path.isdir("/proc"):
-            return _is_ours(self.demo_pid, DEMO_BIN, f"TARIA_SOCK={self.sock}")
+            return _is_ours(self.demo_pid, self.demo_bin, f"TARIA_SOCK={self.sock}")
         return self.alive()
 
     def pane_size(self):
@@ -512,7 +592,7 @@ class DemoRun:
             except (OSError, subprocess.SubprocessError):
                 pass
         if self.demo_pid:
-            _kill_if_ours(self.demo_pid, DEMO_BIN, f"TARIA_SOCK={self.sock}")
+            _kill_if_ours(self.demo_pid, self.demo_bin, f"TARIA_SOCK={self.sock}")
         if self.server_pid:
             _kill_if_ours(self.server_pid, self.tmux_sock)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -543,6 +623,17 @@ def server_entry(arm, run):
             "type": "stdio",
             "command": sys.executable,
             "args": [TMUX_MCP, "--session", run.name, "--socket-path", run.tmux_sock],
+        }
+    if arm == "molerat":
+        if getattr(run, "molerat_key", None) is None:
+            raise HarnessError(
+                "the molerat arm needs a demo that publishes a molerat tree: run it with --demo-bin"
+            )
+        return {
+            "type": "stdio",
+            "command": MOLERAT_MCP,
+            "args": [],
+            "env": {"MOLERAT_MCP_ENDPOINT_FILE": run.molerat_key},
         }
     raise HarnessError(f"unknown arm {arm!r}; choose from {', '.join(ARMS)}")
 
@@ -715,6 +806,8 @@ def wait_ready(arm, client, timeout=READY_TIMEOUT):
     agent never meets a bridge that has not connected yet. These calls are
     the harness's, not the solver's, and are not counted.
     """
+    if arm == "molerat":
+        return _wait_molerat(client, timeout)
     if arm not in ARM_TREE_FORMAT:
         return
     deadline = time.monotonic() + timeout
@@ -726,3 +819,21 @@ def wait_ready(arm, client, timeout=READY_TIMEOUT):
             if time.monotonic() > deadline:
                 raise HarnessError(f"taria-mcp ({arm} arm) never reached the demo: {err.message}")
             time.sleep(0.1)
+
+
+def _wait_molerat(client, timeout):
+    """molerat-mcp connects on its first call, and a demo's endpoint takes
+    one bridge for its life, so this is that call: get_ui until it shows a
+    published tree."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            text = client.call("get_ui")
+            if '"root"' in text:
+                return
+            err = "no tree published yet"
+        except ToolError as caught:
+            err = caught.message
+        if time.monotonic() > deadline:
+            raise HarnessError(f"molerat-mcp never reached the demo: {err}")
+        time.sleep(0.1)

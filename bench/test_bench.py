@@ -1817,8 +1817,8 @@ class AgentFiles(unittest.TestCase):
                                    "--results-dir", os.path.join(self.dir, "results"))
         self.assertEqual(code, 0, err)
         ours = sorted(f for f in os.listdir(self.dir) if f.endswith(".md"))
-        self.assertEqual(ours, ["tui-outline-1.md", "tui-outline-2.md", "tui-taria-1.md", "tui-taria-2.md",
-                                "tui-tmux-1.md", "tui-tmux-2.md"])
+        self.assertEqual(ours, ["tui-molerat-1.md", "tui-molerat-2.md", "tui-outline-1.md", "tui-outline-2.md",
+                                "tui-taria-1.md", "tui-taria-2.md", "tui-tmux-1.md", "tui-tmux-2.md"])
         others = {
             "reviewer.md": "---\nname: reviewer\n---\n",
             "tui-other-1.md": "---\nname: x\n---\n",
@@ -2220,7 +2220,9 @@ class OutlineArm(unittest.TestCase):
         self.assertEqual(harness.ARM_TREE_FORMAT, {"taria": "json", "outline": "outline"})
         self.assertEqual(set(harness.ARMS), set(harness.ARM_TOOLS))
         self.assertEqual(set(harness.ARMS), set(solvers.SOLVERS))
-        self.assertEqual(runner.parse_args(["dry-run"]).arms, list(harness.ARMS))
+        # The molerat arm needs a --demo-bin, so the dry run takes it only with one.
+        self.assertEqual(runner.parse_args(["dry-run"]).arms, [a for a in harness.ARMS if a not in harness.DUAL_ARMS])
+        self.assertEqual(runner.parse_args(["dry-run", "--demo-bin", "/x"]).arms, list(harness.ARMS))
         self.assertEqual(runner.parse_args(["plan", "--batch", "b", "--arms", "outline"]).arms, ["outline"])
 
     def test_the_ready_wait_runs_for_both_bridge_arms(self):
@@ -2292,7 +2294,7 @@ class OutlineArm(unittest.TestCase):
         found = agents.problems(path, "taria", 1, slots, "medium", 30, sha)
         self.assertEqual(len(found), 2, found)
         self.assertIn("name is 'tui-outline-1', the plan needs 'tui-taria-1'", found[0])
-        self.assertEqual(len(agents.remove(tmp)), 3 * 2)
+        self.assertEqual(len(agents.remove(tmp)), len(harness.ARMS) * 2)
 
     def test_arm_names_cannot_be_read_as_each_other(self):
         self.assertEqual(agents.FILE_RE.match("tui-outline-1.md").groups(), ("outline", "1"))
@@ -2572,6 +2574,173 @@ class Summary(unittest.TestCase):
         self.assertAlmostEqual(summarize.fisher_exact(0, 0, 0, 0), 1.0)
         # Symmetric in the arms.
         self.assertAlmostEqual(summarize.fisher_exact(7, 3, 2, 8), summarize.fisher_exact(2, 8, 7, 3))
+
+
+# --- The molerat arm ------------------------------------------------------------------------
+
+# The dual demo (taria-demo with a molerat tree beside the taria one), built
+# from bench/dual-demo; the live tests below run only where it and molerat-mcp are.
+DUAL_DEMO = os.environ.get("TARIA_BENCH_DUAL_DEMO") or os.path.join(
+    REPO, "bench", "dual-demo", "target", "debug", "dual-demo")
+HAVE_DUAL = os.path.isfile(DUAL_DEMO) and os.path.isfile(harness.MOLERAT_MCP)
+
+
+class MoleratArm(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def fields(self, **extra):
+        return {**SlotFields().fields(), "demo_bin": "/opt/dual-demo",
+                "molerat_key": "/tmp/tui-abc123/s/endpoint.key", **extra}
+
+    def test_its_tools_server_and_slot(self):
+        self.assertEqual(harness.ARM_TOOLS["molerat"], ("get_ui", "perform_action"))
+        self.assertEqual(harness.SERVER_NAMES["molerat"], "molerat-mcp")
+        self.assertNotIn("molerat", harness.ARM_TREE_FORMAT, "no read_tree, so no tree format to hold it to")
+        self.assertEqual(runner.colliding_arms(["taria", "molerat", "tmux"]), [], "one batch may hold taria and molerat")
+        run = DemoRun.from_slot(json.loads(json.dumps(self.fields())))
+        self.assertEqual(run.to_slot(), self.fields())
+        self.assertEqual(harness.server_entry("molerat", run), {
+            "type": "stdio", "command": harness.MOLERAT_MCP, "args": [],
+            "env": {"MOLERAT_MCP_ENDPOINT_FILE": "/tmp/tui-abc123/s/endpoint.key"}})
+        # taria-demo has no molerat endpoint: the arm is refused, not pointed at molerat's default file.
+        with self.assertRaises(harness.HarnessError):
+            harness.server_entry("molerat", DemoRun.from_slot(SlotFields().fields()))
+        for bad in ({"molerat_key": "/tmp/elsewhere/endpoint.key"}, {"demo_bin": "dual-demo"}):
+            with self.subTest(bad=bad), self.assertRaises(harness.HarnessError):
+                DemoRun.from_slot(self.fields(**bad))
+
+    def test_plan_needs_a_demo_bin_and_records_it(self):
+        results = os.path.join(self.tmp, "results")
+        code, _, err = quiet_cli("plan", "--batch", "m", "--arms", "taria,molerat", "--results-dir", results)
+        self.assertEqual(code, runner.EXIT_HARNESS)
+        self.assertIn("--demo-bin", err)
+        demo = os.path.join(self.tmp, "dual-demo")
+        with open(demo, "w") as f:
+            f.write("")
+        code, out, err = quiet_cli("plan", "--batch", "m", "--arms", "taria,molerat", "--tasks", "T1",
+                                   "--demo-bin", demo, "--seed", "3", "--results-dir", results)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"demo {demo}", out)
+        paths = runner.Paths(results, "m")
+        plan = runner.load_plan(paths)
+        self.assertEqual((plan["demo_bin"], plan["molerat_mcp"]), (demo, harness.MOLERAT_MCP))
+        job, slot = runner.claim(paths, plan, 1)
+        self.assertEqual(slot["demo_bin"], demo, "every arm's slot runs the plan's demo")
+        # Without --demo-bin a plan records none and its slots carry none.
+        code, _, err = quiet_cli("plan", "--batch", "t", "--arms", "taria", "--tasks", "T1", "--results-dir", results)
+        self.assertEqual(code, 0, err)
+        plan = runner.load_plan(runner.Paths(results, "t"))
+        self.assertIsNone(plan["demo_bin"])
+        self.assertNotIn("molerat_mcp", plan)
+        self.assertNotIn("demo_bin", runner.claim(runner.Paths(results, "t"), plan, 2)[1])
+
+    def test_the_ready_wait_reads_get_ui_until_a_tree(self):
+        answers = [harness.ToolError("Molerat is not available"), harness.ToolError("not yet"),
+                   '{"application":"taria-demo"}', '{"application":"taria-demo","root":{"id":0}}']
+
+        class Client:
+            calls = []
+
+            def call(self, tool):
+                self.calls.append(tool)
+                answer = answers[len(self.calls) - 1]
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+
+        client = Client()
+        harness.wait_ready("molerat", client)
+        self.assertEqual(client.calls, ["get_ui"] * 4)
+
+    @unittest.skipIf(transcript is None, "bench/transcript.py is missing")
+    def test_the_guard_holds_a_molerat_run_to_its_tools(self):
+        prompt = tasks.TASKS["T2"].prompt
+        path = write_transcript(self.tmp, "m1", prompt, "molerat", {"get_ui": 2, "perform_action": 1},
+                                "tui-molerat-1")
+        stats = transcript.read_transcript(path)
+
+        def guard(arm, stats=stats):
+            return transcript.guard(stats, arm, "sonnet", harness.ARM_TOOLS[arm], effort="medium",
+                                    tree_format=harness.ARM_TREE_FORMAT.get(arm))
+
+        self.assertEqual(guard("molerat"), [])
+        self.assertTrue(any("was not offered mcp__tui__act" in p for p in guard("taria")), guard("taria"))
+        # A molerat run that called a taria tool is refused.
+        path = write_transcript(self.tmp, "m2", prompt, "molerat", {"get_ui": 1, "read_tree": 1}, "tui-molerat-1")
+        problems = guard("molerat", transcript.read_transcript(path))
+        self.assertIn("called mcp__tui__read_tree (1x), which is not a molerat arm tool", problems)
+
+    def test_the_launcher_takes_the_molerat_arm(self):
+        out = subprocess.run([sys.executable, MCP_LAUNCH, "--arm", "molerat", "--slot", "1",
+                              "--slots-dir", self.tmp], capture_output=True, text=True, timeout=30,
+                             stdin=subprocess.DEVNULL)
+        self.assertEqual(out.returncode, 1, out.stderr)  # refused for the empty slot, not for the arm
+        self.assertIn("slot 1 holds no job", out.stderr)
+
+    def test_its_agent_files(self):
+        slots = os.path.join(self.tmp, "slots")
+        written = agents.write(1, self.tmp, slots)
+        path = os.path.join(self.tmp, "tui-molerat-1.md")
+        self.assertIn(path, written)
+        self.assertEqual(agents.problems(path, "molerat", 1, slots, "medium", 30, agents.body_sha256()), [])
+        self.assertEqual(agents.read(path)["server"]["args"][1:5], ["--arm", "molerat", "--slot", "1"])
+        self.assertEqual(agents.FILE_RE.match("tui-molerat-1.md").groups(), ("molerat", "1"))
+
+
+@unittest.skipUnless(HAVE_TMUX and HAVE_DUAL, "tmux, the dual demo or molerat-mcp is missing")
+@unittest.skipIf(transcript is None, "bench/transcript.py is missing")
+class MoleratLive(unittest.TestCase):
+    """The molerat arm on the dual demo: the scripted solver, and one job
+    through a slot as the orchestrator runs it."""
+
+    PROV = {"git_sha": None, "git_dirty": None, "claude_version": None}
+
+    def test_the_scripted_solver_passes_and_its_sabotage_fails(self):
+        for sabotage, want in ((False, "passed"), (True, "failed")):
+            row = runner.dry_run_one(tasks.TASKS["T6"], "molerat", 0, "j001", "b", 1, sabotage, self.PROV, DUAL_DEMO)
+            self.assertEqual(row["status"], want, row["error"] or row["reason"])
+            self.assertEqual(row["demo_exit"], "clean")
+
+    def test_a_job_through_a_slot(self):
+        tmp = tempfile.mkdtemp(prefix="rehearsal-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        results, agents_dir = os.path.join(tmp, "results"), os.path.join(tmp, "agents")
+        common = ("--results-dir", results)
+        self.assertEqual(run_py("agents", "--slots", "1", "--dir", agents_dir, *common).returncode, 0)
+        out = run_py("plan", "--batch", "mol", "--tasks", "T3", "--arms", "molerat", "--demo-bin", DUAL_DEMO,
+                     "--seed", "1", *common)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+        def next_(*argv):
+            out = run_py("next", "--batch", "mol", "--slot", "1", "--agents-dir", agents_dir, *common, *argv)
+            return out.returncode, json.loads(out.stdout.splitlines()[0]), out.stderr
+
+        code, job, err = next_()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(job["agent"], "tui-molerat-1")
+        slot = runner.read_slot(runner.Paths(results), 1)
+        self.addCleanup(runner.teardown, slot)
+        self.assertEqual(slot["demo"]["demo_bin"], DUAL_DEMO)
+        entry = agents.read(os.path.join(agents_dir, "tui-molerat-1.md"))["server"]
+        client = McpStdio({"command": entry["command"], "args": entry["args"]}, cwd=tmp, name="tui-molerat-1")
+        try:
+            client.initialize()
+            self.assertEqual(sorted(client.tools_list()), ["get_ui", "perform_action"])
+            harness.wait_ready("molerat", client)
+            session = solvers.CountingSession(client)
+            solvers.solve("T3", "molerat", session)
+        finally:
+            client.close()
+        path = write_transcript(tmp, "molj001", job["prompt"], "molerat", dict(session.calls), job["agent"],
+                                served=client.tools)
+        code, done, err = next_("--agent-id", "molj001", "--transcript-file", path)
+        self.assertEqual((code, done), (0, {"done": True}), err)
+        row = read_rows(results, "mol")[0]
+        self.assertEqual((row["status"], row["guard_problems"], row["demo_exit"]), ("passed", [], "clean"),
+                         row["error"] or row["reason"])
+        self.assertFalse(os.path.exists(slot["demo"]["tmpdir"]))
 
 
 if __name__ == "__main__":

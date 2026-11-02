@@ -1,0 +1,24 @@
+[package]
+name = "dual-demo"
+description = "taria-demo with a molerat tree published beside the taria one: one app, one state, two agent stacks."
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, outside taria's, so molerat stays out of taria's
+# Cargo.lock and the workspace gate.
+[workspace]
+
+[[bin]]
+name = "dual-demo"
+path = "src/main.rs"
+
+[dependencies]
+# As taria-demo trims it (examples/demo-app/Cargo.toml).
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+taria = { path = "../../crates/taria" }
+taria-ratatui = { path = "../../crates/taria-ratatui" }
+# The molerat the pilot in bench/MOLERAT.md ran against.
+molerat = { git = "https://github.com/orhun/molerat", rev = "0c62c331678ea55ae70a8a91bd6680792923e3d0", features = ["mcp"] }

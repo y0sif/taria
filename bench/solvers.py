@@ -4,7 +4,9 @@ Each solver drives the demo through the same MCP server an agent would get,
 using only what that arm's tools show: the taria solver reads node ids and
 advertised actions from the JSON tree, the outline solver reads the same
 from the outline text (parse_outline), the tmux solver reads the screen
-text and presses keys. A task's plan is a list of steps every solver
+text and presses keys, and the molerat solver reads molerat-mcp's AccessKit
+tree (numeric ids, roles, labels, actions and custom actions) and performs
+what it advertises. A task's plan is a list of steps every solver
 implements; the sabotage plan is a plausible wrong one, which the task's
 check must fail.
 
@@ -16,6 +18,7 @@ Python 3 stdlib only.
 
 import json
 import re
+import time
 from collections import Counter
 
 from tasks import T1_TITLE, T2_TITLE, T3_TITLE, T4_SUFFIX, T5_DELETE, T5_PREFIX, T6_TITLE
@@ -514,6 +517,166 @@ class TmuxSolver:
             self.keys("Space")
 
 
+# --- molerat: molerat-mcp's AccessKit tree ---------------------------------------------
+#
+# get_ui returns {"application": ..., "root": {"id": <number>, "role": "Window",
+# "children": [...]}}; a node has `role` (AccessKit's, as "ListBoxOption"),
+# `label`, `value`, `description`, `selected`, `focused`, `actions` (standard
+# AccessKit actions, as "click") and `customActions` ([{"id", "description"}]).
+# perform_action takes {"nodeId", "action"} plus `customActionId` for
+# "customAction" and `data` ({"value": ...}) for "setValue". Which node is
+# which comes from the dual demo's tree (MAPPING.md in its crate): the tabs
+# are Tab nodes, the tasks ListBoxOption nodes of the one ListBox, the draft a
+# TextInput, the dialog a Dialog with Delete and Cancel buttons.
+
+
+class MoleratSolver:
+    """The taria solver's steps on molerat's tree. perform_action answers
+    once the action is queued, before the app applies it, so each step reads
+    the tree again until it shows the effect, as an agent reading it after
+    its own think time would find it. Those reads are counted like any."""
+
+    TABS = {"active": "Active", "done": "Done"}
+    SETTLE = 2.0  # seconds a step waits for its effect to show
+    TICK = 0.1  # the demo applies queued actions within a 50 ms tick
+
+    def __init__(self, session):
+        self.s = session
+
+    def tree(self):
+        text = self.s.call("get_ui")
+        try:
+            tree = json.loads(text)
+        except ValueError:
+            raise SolverError(f"get_ui returned no JSON tree: {text[:300]!r}")
+        if not isinstance(tree, dict) or not isinstance(tree.get("root"), dict):
+            raise SolverError(f"get_ui shows no published tree: {text[:300]!r}")
+        return tree
+
+    @staticmethod
+    def nodes(tree, role, label=None):
+        return [n for n in flatten(tree["root"])
+                if n.get("role") == role and (label is None or n.get("label") == label)]
+
+    def one(self, tree, role, label=None):
+        found = self.nodes(tree, role, label)
+        if not found:
+            raise SolverError(f"no {role} node{' labelled ' + repr(label) if label else ''} in the tree")
+        return found[0]
+
+    @classmethod
+    def items(cls, tree):
+        boxes = cls.nodes(tree, "ListBox")
+        return [] if not boxes else [n for n in boxes[0].get("children", []) if n.get("role") == "ListBoxOption"]
+
+    @classmethod
+    def tab_of(cls, tree):
+        return next((n.get("label") for n in cls.nodes(tree, "Tab") if n.get("selected")), None)
+
+    def perform(self, node, action=None, custom=None, value=None):
+        """perform_action on `node`: a standard action it advertises, or the
+        custom action whose description is `custom`; `value` as setValue's data."""
+        args = {"nodeId": node["id"]}
+        if custom is not None:
+            ids = [a.get("id") for a in node.get("customActions") or [] if a.get("description") == custom]
+            if not ids:
+                raise SolverError(f"node {node['id']} advertises no custom action {custom!r}")
+            args.update(action="customAction", customActionId=ids[0])
+        else:
+            if action not in (node.get("actions") or []):
+                raise SolverError(f"node {node['id']} does not advertise {action!r}: {node.get('actions')}")
+            args["action"] = action
+        if value is not None:
+            args["data"] = {"value": value}
+        self.s.call("perform_action", args)
+
+    def until(self, predicate, what):
+        deadline = time.monotonic() + self.SETTLE
+        while True:
+            time.sleep(self.TICK)
+            tree = self.tree()
+            if predicate(tree):
+                return tree
+            if time.monotonic() > deadline:
+                raise SolverError(f"the tree never showed {what}")
+
+    def on_tab(self, tab, tree=None):
+        tree = tree or self.tree()
+        label = self.TABS[tab]
+        if self.tab_of(tree) != label:
+            self.perform(self.one(tree, "Tab", label), "click")
+            tree = self.until(lambda t: self.tab_of(t) == label, f"the {label} tab selected")
+        return tree
+
+    def locate(self, title):
+        """The option labelled `title`, switching tabs if it is on the other one."""
+        tree = self.tree()
+        for _ in range(2):
+            item = next((n for n in self.items(tree) if n.get("label") == title), None)
+            if item is not None:
+                return item
+            tree = self.on_tab("done" if self.tab_of(tree) == "Active" else "active", tree)
+        raise SolverError(f"no option labelled {title!r} on either tab")
+
+    def add(self, title):
+        self.perform(self.one(self.tree(), "TextInput", "New task"), "setValue", value=title)
+        tree = self.until(lambda t: self.one(t, "TextInput", "New task").get("value") == title,
+                          f"the draft {title!r}")
+        self.perform(self.one(tree, "TextInput", "New task"), custom="Add task")
+        self.until(lambda t: any(n.get("label") == title for n in self.items(t)), f"{title!r} listed")
+
+    def _gone(self, node_id, what):
+        self.until(lambda t: all(n["id"] != node_id for n in self.items(t)), what)
+
+    def toggle(self, title):
+        item = self.locate(title)
+        self.perform(item, custom="Toggle done")
+        self._gone(item["id"], f"{title!r} moved to the other tab")
+
+    def delete(self, title):
+        item = self.locate(title)
+        self.perform(item, custom="Delete")
+        self.until(lambda t: bool(self.nodes(t, "Dialog")), f"a dialog for {title!r}")
+        self.confirm_dialog()
+
+    def _dialog(self, tree):
+        dialogs = self.nodes(tree, "Dialog")
+        if not dialogs:
+            raise SolverError("no dialog in the tree")
+        return dialogs[0]
+
+    def confirm_dialog(self):
+        dialog = self._dialog(self.tree())
+        button = next((n for n in dialog.get("children", []) if n.get("label") == "Delete"), None)
+        if button is None:
+            raise SolverError("the dialog has no Delete button")
+        self.perform(button, "click")
+        self.until(lambda t: not self.nodes(t, "Dialog"), "the dialog closed")
+
+    def dismiss_dialog(self):
+        self.perform(self._dialog(self.tree()), custom="Close the dialog without deleting")
+        self.until(lambda t: not self.nodes(t, "Dialog"), "the dialog closed")
+
+    def add_from(self, tab, position, suffix):
+        items = self.items(self.on_tab(tab))
+        if len(items) <= position:
+            raise SolverError(f"the {tab} tab has {len(items)} options, no position {position}")
+        self.add(items[position]["label"] + suffix)
+
+    def toggle_matching(self, tab, prefix):
+        # By node id: an id names its task however the list shifts.
+        for item in [n for n in self.items(self.on_tab(tab)) if n.get("label", "").startswith(prefix)]:
+            self.perform(item, custom="Toggle done")
+            self._gone(item["id"], f"{item.get('label')!r} moved to the other tab")
+
+    def toggle_at(self, tab, positions):
+        # By position, re-read each time: the mistake identity exists to stop.
+        for position in positions:
+            item = self.items(self.on_tab(tab))[position]
+            self.perform(item, custom="Toggle done")
+            self._gone(item["id"], f"{item.get('label')!r} moved to the other tab")
+
+
 # --- Plans ----------------------------------------------------------------------------
 
 THIRD = 2  # zero-based position of "the third task"
@@ -539,7 +702,7 @@ PLANS = {
     ),
 }
 
-SOLVERS = {"taria": TariaSolver, "tmux": TmuxSolver, "outline": OutlineSolver}
+SOLVERS = {"taria": TariaSolver, "tmux": TmuxSolver, "outline": OutlineSolver, "molerat": MoleratSolver}
 
 
 def solve(task_id, arm, session, sabotage=False):

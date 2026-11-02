@@ -9,6 +9,9 @@ harness.server_entry configures it for that demo:
   taria    target/debug/taria-mcp --app taria-demo, with TARIA_SOCK=<demo socket>
   outline  the same, plus --tree-format outline
   tmux     python3 bench/tmux_mcp.py --session <name> --socket-path <tmux socket>
+  molerat  molerat-mcp from PATH, with
+           MOLERAT_MCP_ENDPOINT_FILE=<the demo's endpoint file>, a per-run file
+           in the slot's temp dir (only a --demo-bin demo has one)
 
 exec, not a proxy: the server inherits this process's stdio, so the MCP
 stream passes straight through and nothing here can alter or delay it.
@@ -25,7 +28,7 @@ marker when it frees the slot (graded, aborted, or a dead prepare). A refused
 agent is offered no tools, which the transcript guard reports as a harness
 error.
 
-Usage:  python3 bench/mcp_launch.py --arm taria|tmux|outline --slot K [--slots-dir D]
+Usage:  python3 bench/mcp_launch.py --arm taria|tmux|outline|molerat --slot K [--slots-dir D]
 
 Python 3 stdlib only.
 """

@@ -9,6 +9,13 @@ as `tui`, so the agent sees `mcp__tui__<tool>` whichever it is:
   outline  the same bridge with --tree-format outline (the same tree, one line per node)
   tmux     bench/tmux_mcp.py, screen-scraping the same pane
 
+  molerat  molerat-mcp (on PATH, from github.com/orhun/molerat), get_ui and
+           perform_action on an AccessKit tree, against a demo that publishes one
+           beside the taria tree (bench/dual-demo): `plan --demo-bin PATH` (and
+           `dry-run --demo-bin PATH`) runs every arm of the batch on that binary
+           instead of taria-demo, and the plan records it. Without --demo-bin
+           nothing changes, and molerat is refused.
+
 A run is graded on the demo's state dump by the task's check (bench/tasks.py),
 never on the screen or the tree, and on the demo process still running.
 
@@ -107,11 +114,11 @@ an `archive` that found a row's transcript neither archived nor live).
 Python 3 stdlib only. Never builds, never calls a model.
 
 Usage:  python3 bench/run.py dry-run [--tasks T1,T3] [--arms taria,tmux,outline] [--runs N] [--seed S]
-                                     [--sabotage] [--batch B]
+                                     [--sabotage] [--batch B] [--demo-bin PATH]
         python3 bench/run.py agents  --slots K [--dir D] [--effort E] [--max-turns N] [--remove]
         python3 bench/run.py plan    --batch B [--tasks ..] [--arms ..] [--models sonnet,haiku]
                                      [--runs N] [--seed S] [--effort E] [--max-turns N]
-                                     [--tolerate-attachment remote_session_change]
+                                     [--tolerate-attachment remote_session_change] [--demo-bin PATH]
         python3 bench/run.py next    --batch B --slot K [--agent-id ID] [--agents-dir D]
         python3 bench/run.py status  --batch B
         python3 bench/run.py abort   --batch B --slot K [--reason TEXT]
@@ -145,6 +152,8 @@ from harness import (  # noqa: E402
     ARM_TOOLS,
     ARM_TREE_FORMAT,
     ARMS,
+    DUAL_ARMS,
+    MOLERAT_MCP,
     REPO,
     SERVER_KEY,
     SERVER_NAMES,
@@ -152,7 +161,9 @@ from harness import (  # noqa: E402
     HarnessError,
     McpStdio,
     ToolError,
+    binaries_under_test,
     require_fresh_build,
+    require_fresh_external,
     server_entry,
     wait_ready,
 )
@@ -434,13 +445,14 @@ def teardown(slot):
 # --- One run, either mode ---------------------------------------------------------------
 
 
-def prepare_demo(task, on_created=None):
+def prepare_demo(task, on_created=None, demo_bin=None):
     """A started demo, through the task's setup, ready for any arm's server.
 
     `on_created(run)` is called once the temp dir exists and before anything
     is started, so a caller can record what to tear down if this process dies.
+    `demo_bin` runs that binary instead of taria-demo (`--demo-bin`).
     """
-    run = DemoRun()
+    run = DemoRun(demo_bin)
     try:
         if on_created is not None:
             on_created(run)
@@ -544,14 +556,14 @@ def check_tree_format(arm, name, tools):
         )
 
 
-def dry_run_one(task, arm, run_index, job_id, batch, seed, sabotage, prov):
+def dry_run_one(task, arm, run_index, job_id, batch, seed, sabotage, prov, demo_bin=None):
     row = new_row(
         ts=now(), batch=batch, job=job_id, task=task.id, arm=arm, run=run_index, seed=seed,
         mode="dry-run", solver="scripted-sabotage" if sabotage else "scripted", **prov,
     )
     run = None
     try:
-        run = prepare_demo(task)
+        run = prepare_demo(task, demo_bin=demo_bin)
         calls, wall_ms, solver_error = drive_scripted(task, arm, run, sabotage)
         row.update(tool_calls=calls, tool_calls_total=sum(calls.values()), wall_ms=wall_ms)
         graded = grade(task, run)
@@ -572,20 +584,40 @@ def dry_run_one(task, arm, run_index, job_id, batch, seed, sabotage, prov):
     return row
 
 
-def preflight():
+def preflight(arms=(), demo_bin=None):
+    """tmux, and a fresh build of every binary runs of `arms` on `demo_bin`
+    need: this repo's (require_fresh_build), and --demo-bin and molerat-mcp,
+    built elsewhere (require_fresh_external)."""
     if shutil.which("tmux") is None:
         raise CommandError("tmux not on PATH")
+    ours, external = binaries_under_test(arms, demo_bin)
     try:
-        require_fresh_build()
+        require_fresh_build(binaries=ours)
+        require_fresh_external(external)
     except HarnessError as err:
         raise CommandError(str(err))
+
+
+def check_demo_bin(arms, demo_bin):
+    """Refuse a --demo-bin that is not an absolute path to a file, and an arm
+    that needs one (DUAL_ARMS) without it."""
+    if demo_bin is not None and not (os.path.isabs(demo_bin) and os.path.isfile(demo_bin)):
+        raise CommandError(f"--demo-bin {demo_bin!r} is not an absolute path to a built binary")
+    needing = [arm for arm in arms if arm in DUAL_ARMS]
+    if needing and demo_bin is None:
+        raise CommandError(
+            f"the {', '.join(needing)} arm needs a demo that publishes a molerat tree beside the taria one: "
+            "pass --demo-bin PATH (e.g. the absolute path of bench/dual-demo/target/debug/dual-demo), "
+            "which every arm of the run then uses"
+        )
 
 
 def cmd_dry_run(args):
     paths = Paths(args.results_dir, args.batch)
     if os.path.exists(paths.plan):
         raise CommandError(f"batch {args.batch} is a subagent batch ({paths.plan}); name another")
-    preflight()
+    check_demo_bin(args.arms, args.demo_bin)
+    preflight(args.arms, args.demo_bin)
     jobs = [(t, a, r) for t in args.tasks for a in args.arms for r in range(args.runs)]
     random.Random(args.seed).shuffle(jobs)
     prov = {**git_provenance(), "claude_version": None}
@@ -593,7 +625,7 @@ def cmd_dry_run(args):
     for number, (task_id, arm, run_index) in enumerate(jobs, 1):
         row = dry_run_one(
             TASKS[task_id], arm, run_index, f"j{number:03d}", args.batch, args.seed,
-            args.sabotage, prov,
+            args.sabotage, prov, args.demo_bin,
         )
         append_row(paths, row)
         print(json.dumps(row), flush=True)
@@ -645,6 +677,7 @@ def cmd_plan(args):
         )
     if os.path.exists(paths.plan):
         raise CommandError(f"{paths.plan} exists; a plan is never replaced, name a new batch")
+    check_demo_bin(args.arms, args.demo_bin)
     if has_rows(paths):
         # A dry run's job ids are a plan's (jNNN), and claim takes a job with
         # a row as done: the plan would skip those jobs without a word.
@@ -673,6 +706,10 @@ def cmd_plan(args):
         # Attachment types the guard flags that this batch lets through,
         # recorded per run instead (see plan_tolerated): not a clean batch.
         "tolerated_attachments": sorted(set(args.tolerate_attachments)),
+        # The binary every arm's demo runs (`--demo-bin`), or null for
+        # taria-demo; and, with the molerat arm, the molerat-mcp it execs.
+        "demo_bin": args.demo_bin,
+        **({"molerat_mcp": MOLERAT_MCP} if any(a in DUAL_ARMS for a in args.arms) else {}),
         "agent_body_sha256": agents.body_sha256(),
         **git_provenance(),
         "jobs": jobs,
@@ -687,7 +724,8 @@ def cmd_plan(args):
     print(
         f"run.py: batch {args.batch}: {len(jobs)} jobs ({len(args.tasks)} tasks x "
         f"{len(args.arms)} arms x {len(args.models)} models x {args.runs} runs), seed "
-        f"{args.seed}, effort {args.effort}, max {args.max_turns} turns{tolerance_note(plan)}; {paths.plan}"
+        f"{args.seed}, effort {args.effort}, max {args.max_turns} turns{tolerance_note(plan)}"
+        f"{'; demo ' + args.demo_bin if args.demo_bin else ''}; {paths.plan}"
     )
     return EXIT_OK
 
@@ -894,19 +932,22 @@ def claim(paths, plan, k):
                 "arm": job["arm"], "model": job["model"], "run": job["run"], "state": "claimed",
                 "pid": os.getpid(), "claimed": now(),
             }
+            if plan.get("demo_bin"):
+                slot["demo_bin"] = plan["demo_bin"]  # every arm of the batch runs it (plan --demo-bin)
             create_slot(paths, k, slot)
             return job, slot
     return None, None
 
 
 def prepare_slot(paths, k, slot):
-    """Start the slot's demo and mark the slot ready for its agent."""
+    """Start the slot's demo (its `demo_bin`, the plan's, or taria-demo) and
+    mark the slot ready for its agent."""
 
     def created(run):
         slot.update(state="starting", demo=run.to_slot())
         write_slot(paths, k, slot)
 
-    run = prepare_demo(TASKS[slot["task"]], on_created=created)
+    run = prepare_demo(TASKS[slot["task"]], on_created=created, demo_bin=slot.get("demo_bin"))
     mcp_launch.clear_markers(paths.slots, k)  # none can be this job's: the slot was never ready
     # To the millisecond: a transcript that starts before it did not drive this demo.
     slot.update(state="ready", demo=run.to_slot(), prepared=now("milliseconds"))
@@ -1262,7 +1303,7 @@ def _next_locked(args, paths, plan):
         print(f"run.py: agent {args.agent_id} was already graded", file=sys.stderr)
 
     try:
-        preflight()
+        preflight(plan.get("arms") or (), plan.get("demo_bin"))
         check_agent_files(plan, k, args.agents_dir, paths.slots)
         job, slot = claim_in_session(paths, plan, k, session)
     except CommandError as err:
@@ -1591,6 +1632,12 @@ def cmd_archive(args):
 # --- Command line ---------------------------------------------------------------------------
 
 
+def dry_run_arms(demo_bin):
+    """The dry run's arms when --arms is not given: every arm the demo can
+    serve, so the molerat arm only with a --demo-bin."""
+    return list(ARMS) if demo_bin is not None else [a for a in ARMS if a not in DUAL_ARMS]
+
+
 def _list(value, choices, what):
     items = [v.strip() for v in value.split(",") if v.strip()]
     bad = [v for v in items if v not in choices]
@@ -1618,6 +1665,11 @@ def _tolerable(value):
     return value
 
 
+def _abspath(value):
+    """A path as given, made absolute and with ~ expanded."""
+    return os.path.abspath(os.path.expanduser(value))
+
+
 def _positive(value):
     number = int(value)
     if number < 1:
@@ -1642,10 +1694,16 @@ def parse_args(argv=None):
     selection.add_argument(
         "--arms", "--arm", dest="arms", action="extend",
         type=lambda v: _list(v, list(ARMS), "arm"),
-        help=f"comma-separated arms (default: dry-run {','.join(ARMS)}, plan {','.join(PLAN_DEFAULT_ARMS)}; "
-             "a plan refuses arms that share tool names, taria and outline)",
+        help=f"comma-separated arms (default: dry-run {','.join(dry_run_arms(None))} (and molerat with "
+             f"--demo-bin), plan {','.join(PLAN_DEFAULT_ARMS)}; a plan refuses arms that share tool names, "
+             "taria and outline)",
     )
     selection.add_argument("--runs", type=_positive, default=1, help="runs per combination (default 1)")
+    selection.add_argument(
+        "--demo-bin", type=_abspath, metavar="PATH",
+        help="run every arm's demo from this binary instead of target/debug/taria-demo (recorded in the "
+             "plan): one that publishes a molerat tree beside the taria one, which the molerat arm needs",
+    )
     selection.add_argument("--seed", type=int, help="shuffle seed (default: random, recorded)")
     limits = argparse.ArgumentParser(add_help=False)
     limits.add_argument("--effort", default=agents.DEFAULT_EFFORT, choices=agents.EFFORTS,
@@ -1701,7 +1759,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.command in ("dry-run", "plan"):
         args.tasks = list(dict.fromkeys(args.tasks or task_ids))
-        args.arms = list(dict.fromkeys(args.arms or (ARMS if args.command == "dry-run" else PLAN_DEFAULT_ARMS)))
+        args.arms = list(dict.fromkeys(args.arms or (dry_run_arms(args.demo_bin) if args.command == "dry-run"
+                                                     else PLAN_DEFAULT_ARMS)))
         if args.seed is None:
             args.seed = random.SystemRandom().randrange(2**31)
     if args.command == "plan":

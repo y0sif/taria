@@ -1,0 +1,321 @@
+//! dual-demo: taria-demo (examples/demo-app, its state machine, rendering
+//! and state dump unchanged) with a molerat tree published beside the taria
+//! one, so one app can be driven by taria-mcp or by molerat-mcp and graded on
+//! the same state. See `molerat_tree` and MAPPING.md for how the two trees
+//! correspond.
+//!
+//! taria-demo: a small task-manager TUI that an agent drives end to end
+//! through taria's semantic tree (lists, tabs, a text input, a confirm-delete
+//! dialog, and the way out of the app), all reachable via semantic acts, with
+//! raw keys as a fallback rather than as the way in. Typed text is not a
+//! fallback: it goes to the field that accepts typing, and nowhere else (see
+//! [`mod@update`]).
+//!
+//! molerat's endpoint goes to `MOLERAT_MCP_ENDPOINT_FILE` when that is set
+//! (molerat reads it), else to molerat's own discovery file.
+//!
+//! With `TARIA_DEMO_STATE=<path>` set, the demo also keeps its state as JSON
+//! at that path (see [`mod@state`]), for harnesses that grade what an agent
+//! did. Unset, nothing is written.
+//!
+//! With `TARIA_DEMO_SLOW_MS=<n>` set, the demo holds each agent input for `n`
+//! milliseconds after dequeueing it and before applying it, the way an app
+//! whose handler does real work does. That is the app issue #17 was about:
+//! its input is acknowledged at once and its tree comes later. Unset, empty,
+//! `0` or not a number, inputs are applied at once.
+
+// taria-demo's own files, so both demos run one state machine.
+#[path = "../../../examples/demo-app/src/app.rs"]
+mod app;
+#[path = "../../../examples/demo-app/src/events.rs"]
+mod events;
+mod molerat_tree;
+#[path = "../../../examples/demo-app/src/state.rs"]
+mod state;
+#[path = "../../../examples/demo-app/src/tree.rs"]
+mod tree;
+#[path = "../../../examples/demo-app/src/ui.rs"]
+mod ui;
+#[path = "../../../examples/demo-app/src/update.rs"]
+mod update;
+
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+use molerat::Molerat;
+use ratatui::DefaultTerminal;
+use taria_ratatui::TariaLayer;
+
+use app::App;
+use events::setup_event_channel;
+use molerat_tree::Message;
+use ui::view;
+use update::{apply_agent_input, update};
+
+fn main() -> io::Result<()> {
+    // Binding never fails the app: taria being unavailable is a reason to run
+    // without it, not a reason not to run.
+    let mut layer = TariaLayer::bind_or_disabled("taria-demo");
+    // Both lines print here, before `ratatui::init()` takes the alternate
+    // screen: a print after that lands on a screen the TUI owns, garbling the
+    // frame, and disappears with the alternate screen on exit. Printed to the
+    // primary buffer it is still there when the demo quits, which is where an
+    // agent operator goes looking for the socket path.
+    // A pipe on Windows. Named apart there only, so the Linux and macOS line
+    // keeps its bytes.
+    #[cfg(windows)]
+    const ENDPOINT: &str = "pipe";
+    #[cfg(not(windows))]
+    const ENDPOINT: &str = "socket";
+    match layer.bind_error() {
+        Some(err) => eprintln!("taria-demo: taria disabled: {err}"),
+        None => eprintln!(
+            "taria-demo: taria {ENDPOINT} at {}",
+            layer.socket_path().display()
+        ),
+    }
+    // The same for molerat: an endpoint that cannot start leaves the app
+    // running without it, said here, before the alternate screen.
+    let (mut molerat, molerat_error) = molerat_tree::open("taria-demo");
+    match molerat_error {
+        Some(err) => eprintln!("taria-demo: molerat disabled: {err}"),
+        None => match std::env::var_os("MOLERAT_MCP_ENDPOINT_FILE") {
+            Some(path) => eprintln!(
+                "taria-demo: molerat endpoint file at {}",
+                PathBuf::from(path).display()
+            ),
+            None => eprintln!("taria-demo: molerat endpoint at its default discovery file"),
+        },
+    }
+
+    let mut terminal = ratatui::init();
+    let result = run(&mut terminal, &mut layer, &mut molerat);
+    ratatui::restore();
+
+    // Safe to print again only now the alternate screen is gone. A nonzero
+    // count means agent inputs arrived faster than this loop drained them.
+    let stats = layer.stats();
+    let dropped = stats.dropped_inputs;
+    if dropped > 0 {
+        eprintln!("taria-demo: dropped {dropped} agent input(s): the app could not keep up");
+    }
+    // The other silent discard: inputs the layer threw away because the
+    // bridge connection they were aimed at ended before this loop dequeued
+    // them, or because a bridge waiting for the socket wrote them before its
+    // hello. Nothing on the agent side hears about those, so the person
+    // running the demo is the only one who can.
+    let stale = stats.stale_inputs;
+    if stale > 0 {
+        eprintln!(
+            "taria-demo: discarded {stale} agent input(s): their bridge connection ended first, \
+             or a waiting bridge wrote them before its hello"
+        );
+    }
+    // The third: inputs the layer answered `Ignored` on this app's behalf
+    // because their kind is one this build of taria cannot read. The agent
+    // was told, so nothing is lost on that side, but the reason is a taria
+    // version gap that only whoever runs the app can close.
+    let unknown = stats.unknown_inputs;
+    if unknown > 0 {
+        eprintln!(
+            "taria-demo: could not read {unknown} agent input(s): the bridge speaks a newer \
+             taria than this app; raise the app's taria dependency"
+        );
+    }
+    // The fourth, and the one that points the other way: these inputs were
+    // applied, but the answers to them were dropped because the bridge was
+    // reading them slower than the app produced them. Every one of those is
+    // an agent call that was answered nowhere and waited out a timeout, so it
+    // belongs on this list even though the app itself lost nothing.
+    //
+    // Worded to start differently from the three above, because the e2e gate
+    // recognizes each of those lines by its opening words.
+    let acks = stats.dropped_acks;
+    if acks > 0 {
+        eprintln!(
+            "taria-demo: lost the answer to {acks} agent input(s): the bridge read them slower \
+             than the app answered them, so those agent calls waited out a timeout instead"
+        );
+    }
+    // The last two lose no input at all. They say the agent was shown less
+    // than this app drew: a tree cut for depth, or one cut to fit the single
+    // line a bridge reads. The agent cannot tell either from a tree that was
+    // simply smaller, so whoever runs the app is the one who has to hear it,
+    // with the node to look at, because the fix is to publish less there.
+    //
+    // This demo's tree is a few levels deep, so the first should never
+    // print. The second does once the new-task draft passes a megabyte,
+    // because the draft is published whole on purpose: it is the case the
+    // bound exists for. Both open with words of their own, like the four
+    // above, so a gate can tell each line from the rest.
+    let truncated = stats.truncated_snapshots;
+    if truncated > 0 {
+        let last = stats
+            .last_truncation
+            .map(|err| format!("; the last: {err}"))
+            .unwrap_or_default();
+        eprintln!("taria-demo: cut {truncated} snapshot(s) to the depth limit{last}");
+    }
+    let oversized = stats.oversized_snapshots;
+    if oversized > 0 {
+        let last = stats
+            .last_oversize
+            .map(|err| format!("; the last: {err}"))
+            .unwrap_or_default();
+        eprintln!("taria-demo: trimmed {oversized} snapshot(s) to fit one line{last}");
+    }
+    result
+}
+
+fn run(
+    terminal: &mut DefaultTerminal,
+    layer: &mut TariaLayer,
+    molerat: &mut Molerat<Message>,
+) -> io::Result<()> {
+    let mut app = App::new();
+    app.socket_hint = if layer.is_enabled() {
+        layer.socket_path().display().to_string()
+    } else {
+        "taria disabled".to_string()
+    };
+    let mut state_file = StateFile::from_env();
+    let slow = slow_from_env();
+    let result = event_loop(terminal, layer, molerat, &mut app, &mut state_file, slow);
+    // On exit, however the loop ended, so the file holds the final state.
+    sync_state(&mut state_file, &app);
+    result
+}
+
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    layer: &mut TariaLayer,
+    molerat: &mut Molerat<Message>,
+    app: &mut App,
+    state_file: &mut Option<StateFile>,
+    slow: Option<Duration>,
+) -> io::Result<()> {
+    let rx = setup_event_channel();
+
+    while app.running {
+        // Agent inputs are drained around the blocking recv below; the 50ms
+        // tick bounds the latency between an agent act and its effect.
+        drain_agent_input(app, layer, slow);
+        drain_molerat_input(app, molerat, slow);
+        // Before the draw and the publish, so a harness that sees the effect
+        // on screen or in the tree finds it in the file too.
+        sync_state(state_file, app);
+
+        terminal.draw(|frame| view(app, frame))?;
+
+        // Publish the semantic tree for the exact state just drawn; the
+        // layer dedups identical trees, so publishing every frame is free.
+        // After the drain above and never before it, so the first tree the
+        // layer stamps with an input's id carries that input's effect.
+        layer.publish(tree::build_nodes(app));
+        // And the molerat tree for the same state, built the same way.
+        molerat_tree::publish(molerat, app);
+
+        match rx.recv() {
+            Ok(event) => update(app, event),
+            Err(_) => break,
+        }
+        drain_agent_input(app, layer, slow);
+        drain_molerat_input(app, molerat, slow);
+        sync_state(state_file, app);
+    }
+    Ok(())
+}
+
+/// Where the state dump goes, when a harness asked for one with
+/// `TARIA_DEMO_STATE`, and the last contents written there.
+///
+/// Unset or empty means no file at all and no behaviour change: the dump is
+/// for benchmarks and tests, never for the person running the demo.
+struct StateFile {
+    path: PathBuf,
+    written: Option<String>,
+}
+
+impl StateFile {
+    fn from_env() -> Option<Self> {
+        std::env::var_os("TARIA_DEMO_STATE")
+            .filter(|path| !path.is_empty())
+            .map(|path| Self {
+                path: PathBuf::from(path),
+                written: None,
+            })
+    }
+}
+
+/// Write the state dump if the state changed since the last write.
+///
+/// Written whole to `<path>.tmp` and renamed over `<path>`, so a reader never
+/// sees half a file. A failed write is ignored and retried on the next change
+/// check: the dump serves a harness, and the app must not fail, print over its
+/// own screen, or stop for one.
+fn sync_state(state_file: &mut Option<StateFile>, app: &App) {
+    let Some(file) = state_file else { return };
+    let Ok(json) = state::to_json(app) else {
+        return;
+    };
+    if file.written.as_deref() == Some(json.as_str()) {
+        return;
+    }
+    let mut tmp = OsString::from(file.path.as_os_str());
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if fs::write(&tmp, &json).is_ok() && fs::rename(&tmp, &file.path).is_ok() {
+        file.written = Some(json);
+    }
+}
+
+/// Apply every queued agent input, refining the ack of each one the app
+/// deliberately ignored.
+///
+/// The layer acks `Delivered` as it hands an input over, which only says the
+/// event loop dequeued it. `Ignored` is the follow-up that tells an agent
+/// waiting on an effect that no effect is coming, and last ack wins.
+/// `apply_agent_input` returns the status and `drain` sends the ones that
+/// refine it, so no input id passes through this app at all.
+///
+/// With `slow` set, each input is held that long between its dequeue and
+/// its effect (see `TARIA_DEMO_SLOW_MS`).
+fn drain_agent_input(app: &mut App, layer: &TariaLayer, slow: Option<Duration>) {
+    layer.drain(|input| {
+        if let Some(slow) = slow {
+            thread::sleep(slow);
+        }
+        apply_agent_input(app, input)
+    });
+}
+
+/// Apply every action molerat queued, through the same `apply_agent_input`
+/// a taria input reaches: each molerat handler yields the taria act it
+/// stands for (see `molerat_tree`). molerat has no ack channel, so the
+/// status is dropped. `slow` holds each one as it holds a taria input.
+fn drain_molerat_input(app: &mut App, molerat: &mut Molerat<Message>, slow: Option<Duration>) {
+    let messages: Vec<Message> = molerat.messages().collect();
+    for message in messages {
+        if let Some(slow) = slow {
+            thread::sleep(slow);
+        }
+        apply_agent_input(app, message.into_input());
+    }
+}
+
+/// How long `TARIA_DEMO_SLOW_MS` asks the demo to hold each agent input, or
+/// `None` when it is unset, empty, zero or not a whole number of
+/// milliseconds.
+fn slow_from_env() -> Option<Duration> {
+    std::env::var("TARIA_DEMO_SLOW_MS")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+}
