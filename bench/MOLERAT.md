@@ -142,14 +142,18 @@ close most of the gap.
 ## Run it yourself
 
 Two ways: drive the dual demo by hand from one Claude Code session, or run
-the benchmark.
+the benchmark. Both need molerat-mcp on PATH and the dual demo built:
+
+```bash
+cargo install --git https://github.com/orhun/molerat --rev 0c62c33 --features mcp molerat
+cargo build --manifest-path bench/dual-demo/Cargo.toml
+```
 
 By hand:
 
 ```bash
 cargo install taria-mcp
-cargo install --git https://github.com/orhun/molerat --rev 0c62c33 --features mcp molerat
-cargo run --manifest-path bench/dual-demo/Cargo.toml        # in its own terminal
+bench/dual-demo/target/debug/dual-demo        # in its own terminal
 claude mcp add taria -- taria-mcp --app taria-demo
 claude mcp add molerat -- molerat-mcp
 ```
@@ -161,8 +165,7 @@ The benchmark (Python 3, tmux, Claude Code):
 
 ```bash
 cargo build --workspace
-cargo build --manifest-path bench/dual-demo/Cargo.toml
-DUAL=bench/dual-demo/target/debug/dual-demo
+DUAL=$PWD/bench/dual-demo/target/debug/dual-demo
 python3 bench/run.py dry-run --arms taria,molerat --demo-bin $DUAL     # scripted, no model: 12/12 pass
 python3 bench/run.py agents --slots 4
 python3 bench/run.py plan --batch B --arms taria,molerat --models sonnet,haiku --runs 2 \
