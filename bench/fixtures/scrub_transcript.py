@@ -28,7 +28,13 @@ Replaced:
   - environment: workingDirectory (in its rendered text too, which shows
     it) and scratchpadDirectory (in every string too);
   - every line: cwd (/home/user/project), gitBranch, slug, sessionId, agentId;
-  - in every string anywhere: the session ids, the agent id, the
+  - every requestId and promptId at any depth, and the request id of a
+    serverClassifierContext (auto mode's permission check): each distinct id
+    by its own zeroed placeholder (req_000000000000000000000001,
+    00000000-0000-4000-9000-000000000001, 00000000-0000-4000-a000-...),
+    numbered in order of first appearance, so lines that shared one still do;
+  - in every string anywhere: the session ids, the agent id, the request
+    and prompt ids, the working directory (/home/user/project), the
     organization uuid, a /home/<user> prefix (/home/user), the user name,
     e-mail addresses (but Claude Code's own noreply@anthropic.com, which
     remote control's note carries and bench/transcript.py pins), and each
@@ -74,6 +80,36 @@ KEPT_EMAILS = ("noreply@anthropic.com",)
 SESSION_URL = re.compile(r"(https://claude\.ai/code/session_)([0-9A-Za-z]+)")
 FAKE_SESSION_URL = "https://claude.ai/code/session_FIXTURE"
 META_KEYS = ("agentType", "description", "model")
+# Request and prompt ids, by key (or parent.key): the placeholder each
+# distinct value becomes, numbered from 1.
+ID_PLACEHOLDERS = {
+    "requestId": "req_{:024d}",
+    "promptId": "00000000-0000-4000-9000-{:012d}",
+    "serverClassifierContext.request": "00000000-0000-4000-a000-{:012d}",
+}
+PLACEHOLDER_ID = re.compile(r"req_\d{24}|00000000-0000-4000-[9a]000-\d{12}")
+
+
+def id_placeholders(lines):
+    """{id: placeholder} for every id ID_PLACEHOLDERS names in `lines`, at
+    any depth, numbered per key in order of first appearance."""
+    found = {key: {} for key in ID_PLACEHOLDERS}
+
+    def visit(value, parent=None):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                name = key if key in ID_PLACEHOLDERS else f"{parent}.{key}"
+                if name in ID_PLACEHOLDERS and isinstance(item, str) and item:
+                    seen = found[name]
+                    seen.setdefault(item, ID_PLACEHOLDERS[name].format(len(seen) + 1))
+                visit(item, key)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item, parent)
+
+    for line in lines:
+        visit(line)
+    return {old: new for seen in found.values() for old, new in seen.items()}
 
 
 def placeholder(server):
@@ -110,15 +146,32 @@ class Scrubber:
             if isinstance(l.get("attachment"), dict) and l["attachment"].get("type") == "environment"
             and isinstance(l["attachment"].get("snapshot"), dict)
         }
+        # The working directory, wherever it shows (a permission classifier's
+        # context carries it): the user name goes anyway, the layout with it.
+        cwds = {l.get("cwd") for l in lines} | {
+            l["attachment"]["snapshot"].get("workingDirectory") for l in lines
+            if isinstance(l.get("attachment"), dict) and l["attachment"].get("type") == "environment"
+            and isinstance(l["attachment"].get("snapshot"), dict)
+        }
+        cwds = {c for c in cwds if isinstance(c, str) and c.startswith("/") and len(c) > 1 and c != FAKE_CWD}
         # Longest first: the scratchpad path holds the session id and the user name.
         self.exact = [(s, FAKE_SCRATCH) for s in scratch if isinstance(s, str) and s]
+        self.exact += [(c, FAKE_CWD) for c in sorted(cwds, key=len, reverse=True)]
         self.exact += [(s, session_id) for s in sessions if s] + [(a, agent_id) for a in agents if a]
         self.exact += [(o, FAKE_ORG) for o in orgs if isinstance(o, str) and o]
         self.users = sorted(users)
         self.words = sorted({w for w in redact if w})
+        # One pass, so a placeholder written is never replaced again. An id
+        # already in placeholder form (a fixture scrubbed before) is no secret.
+        self.ids = id_placeholders(lines)
+        self.id_pattern = re.compile("|".join(
+            re.escape(i) for i in sorted(self.ids, key=len, reverse=True))) if self.ids else None
         self.secrets = [s for s, _ in self.exact] + self.users + self.words
+        self.secrets += [i for i in self.ids if not PLACEHOLDER_ID.fullmatch(i)]
 
     def text(self, value):
+        if self.id_pattern is not None:
+            value = self.id_pattern.sub(lambda m: self.ids[m.group(0)], value)
         for old, new in self.exact:
             value = value.replace(old, new)
         value = HOME.sub("/home/user", value)
