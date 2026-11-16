@@ -1,11 +1,40 @@
 //! The Unix transport: a Unix domain socket in a private directory.
 //!
-//! Binding vets the socket's directory, clears a socket a killed run left
-//! behind and refuses a live one, and the listener unlinks its socket when it
-//! is dropped, but only while the file is still the one it bound. The listener
-//! is non-blocking and polls the layer's shutdown flag, so exit never waits on
-//! a connection. Each accepted connection is one blocking socket, duplicated
-//! into a reader and a writer.
+//! # Binding
+//!
+//! [`Listener::bind`] never parks the app during startup, and never takes a
+//! path away from something that still uses it. In order:
+//!
+//! 1. A relative path is made absolute, so the directory that holds the
+//!    socket is always the one vetted.
+//! 2. The path is checked against the platform's `sun_path` limit
+//!    ([`check_path_len`](taria::socket::check_path_len)), whose error names
+//!    the path, its length, the limit and the platform.
+//! 3. The directory is created `0700` and must be private
+//!    ([`ensure_private_dir`]): a real directory, not a symlink, owned by
+//!    this user, with no group or other bits. Otherwise another local user
+//!    could swap the socket.
+//! 4. A file already at the path is cleared only when it is a socket nothing
+//!    is listening on ([`clear_socket_path`]). A live socket is refused with
+//!    `AddrInUse`, so a second instance cannot strand the first. Anything
+//!    that is not a socket is refused with `AlreadyExists` and left alone,
+//!    since the path can come verbatim from `$TARIA_SOCK`. The liveness probe
+//!    is a `connect` on a thread of its own, waited on for
+//!    [`SOCKET_PROBE_TIMEOUT`]; no answer refuses the bind.
+//!
+//! Dropping the [`Listener`] unlinks the socket file only while it is still
+//! the one this listener bound, compared by device and inode.
+//!
+//! # Serving
+//!
+//! The listener is non-blocking and checks the shutdown flag every
+//! [`ACCEPT_POLL`], so exit never waits on a connection. Each accepted
+//! connection is one blocking socket, duplicated into a reader and a writer.
+//! A write is handed at most [`WRITE_CHUNK`] at a time and waits for room in
+//! slices of [`WRITE_WAIT`], so a deadline holds to within a slice whatever
+//! the kernel's timer does. `shutdown(Both)` keeps the three promises of
+//! [`Writer::shutdown`] by itself: it is sticky, wakes the reader, and leaves
+//! sent data readable.
 
 use std::env;
 use std::fs;
@@ -33,17 +62,15 @@ use super::Accepted;
 /// One buffer on Linux, and within the send low-water mark that macOS and the
 /// BSDs wait for before they copy anything. A typical line is one or a few
 /// calls, and a snapshot at [`MAX_LINE_BYTES`](taria::wire::MAX_LINE_BYTES)
-/// about five hundred, measured at under a millisecond more than one call for
-/// the lot.
+/// about five hundred, which costs little more than one call for the lot.
 const WRITE_CHUNK: usize = 2 * 1024;
 
 /// The longest one wait for room in the socket runs before the writer looks
 /// at the clock again. See [`Writer::write_all_before`].
 ///
 /// The kernel keeps a socket's write timeout on a timer wheel that files a
-/// long timeout coarsely and fires it late: on Linux at 1000 Hz, a 5 s
-/// timeout fired up to 430 ms past its time when measured, more than the
-/// layer's whole `SHUTDOWN_FLUSH`. A timeout this short is filed to the
+/// long timeout coarsely and fires it late, by more than the layer's whole
+/// `SHUTDOWN_FLUSH`. A timeout this short is filed to the
 /// millisecond, so waiting in slices of it holds a deadline to within a few
 /// milliseconds, and a writer stalled on a stuck bridge wakes 20 times a
 /// second to find it still stuck.
@@ -306,8 +333,7 @@ impl Writer {
     /// splits it into (Linux allocates a buffer of at most a few tens of KB at
     /// a time, and waits for room before each). So a large line, against a
     /// bridge that frees a little room before every wait can time out, never
-    /// times out at all: a 900 KB snapshot to a bridge taking 64 KB every 3 s
-    /// held the writer for forty seconds with a 5 s timeout. Setting the
+    /// times out at all. Setting the
     /// timeout to what is left of a deadline before each call does not help
     /// on its own, because a single call runs past the deadline.
     ///
@@ -658,10 +684,10 @@ mod tests {
 
     use super::*;
 
-    /// Threads of one process share its pid, and the probe was once named by
-    /// the pid alone: binds made at once raced on one file, and one of them
-    /// failed with a bare `File exists`. That made a few of the socket tests
-    /// fail at random on macOS, where every bind probes. Each round releases
+    /// Threads of one process share its pid, so a probe named by the pid
+    /// alone would make binds made at once race on one file, and one of them
+    /// fail with a bare `File exists`: a few of the socket tests would fail
+    /// at random on macOS, where every bind probes. Each round releases
     /// eight probes together into one directory.
     #[test]
     fn probes_made_at_once_all_learn_the_uid() {

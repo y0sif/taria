@@ -1,10 +1,23 @@
 //! Semantic tree construction: the taria nodes published every frame.
 //!
-//! Pure (state in, nodes out) so the invariants are unit-testable. Ids are
-//! stable across frames and across mutations: tabs and the input keep fixed
-//! ids, a list item is `task-<task id>` so it keeps its id while it moves
-//! between tabs and while other tasks are deleted, and the dialog nodes exist
-//! only while the dialog is open.
+//! Pure (state in, nodes out) so the invariants are unit-testable:
+//!
+//! - Ids are identities, not positions. Tabs and the input keep fixed ids,
+//!   and a list item is `task-<task id>` ([`TASK_IDS`]), so it keeps its id
+//!   while it moves between tabs, while other tasks are deleted, and across
+//!   restarts. The dialog nodes exist only while the dialog is open.
+//! - Exactly one node is focused. `selected` marks the cursor row and the
+//!   active tab apart from focus, and a task's done state is its `checked`.
+//!   The list and the tab bar also name them in their values, for readers
+//!   that do not read typed state, the bench among them.
+//! - Every state has an advertised way out. The input advertises `focus`
+//!   while the keyboard is elsewhere, `dismiss` while it holds it, and
+//!   `activate` only while the draft would submit. The `quit` node is the way
+//!   out of the app.
+//! - An action is advertised only where it does something. While the delete
+//!   dialog is open only its nodes advertise actions, and the rest stays
+//!   visible but inert. An act on a node that is gone, the dialog's or a
+//!   deleted task's, is answered `Ignored` (see [`mod@crate::update`]).
 
 use taria::id::IdSpace;
 use taria::{Action, Node, Role};
@@ -98,9 +111,9 @@ fn list_node(app: &App) -> Node {
     // node publishes the active tab. Without them, a `select` sent while the
     // input has focus would move the cursor without changing anything an
     // agent can read, and the bridge would truthfully report no change for an
-    // input the app handled. The value predates `selected` and stays, so a
-    // reader built before 0.4.0, and the benchmark, still find it. An empty
-    // list has no row to name and so has no value.
+    // input the app handled. The value stays beside `selected`, so a reader
+    // that does not read typed state, and the benchmark, still find it. An
+    // empty list has no row to name and so has no value.
     if let Some(selected) = app.selected_id() {
         node = node.value(TASK_IDS.id(selected));
     }
@@ -151,10 +164,10 @@ fn input_node(app: &App) -> Node {
 /// The way out of the app, as a node rather than as a key an agent has to
 /// know about.
 ///
-/// The footer has always told a person `[q] quit`, while the tree advertised
-/// no exit at all, so an agent's only way to close the demo was the raw-key
-/// fallback the project's conventions keep off the primary path (and which
-/// types the letter `q` whenever the input holds the keyboard). The modal
+/// The footer tells a person `[q] quit`. Without this node an agent's only
+/// way to close the demo would be the raw-key fallback the project's
+/// conventions keep off the primary path (and which types the letter `q`
+/// whenever the input holds the keyboard). The modal
 /// strips its action like every other node's, because a dialog asking about a
 /// delete is not a moment to quit.
 fn quit_node(app: &App) -> Node {
@@ -496,9 +509,9 @@ mod tests {
 
     /// `focus` is the way in, so it is advertised exactly where it is a move:
     /// while the keyboard is somewhere else. Advertised while the input
-    /// already holds it, it would be the same advertised-but-ignored pair
-    /// `activate` used to be, and an agent would learn that an advertised
-    /// action may do nothing.
+    /// already holds it, it would be an advertised-but-ignored pair, like
+    /// `activate` on an empty draft, and an agent would learn that an
+    /// advertised action may do nothing.
     #[test]
     fn the_input_advertises_focus_only_while_the_keyboard_is_elsewhere() {
         let mut app = App::new();

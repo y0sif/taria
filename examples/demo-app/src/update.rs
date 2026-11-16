@@ -8,14 +8,14 @@
 //! # Typed text goes where the app puts typing
 //!
 //! [`AgentInput::Text`] is typing, so it is routed to this app's text-entry
-//! state, the new-task input, and never through [`handle_key`]. Lowered
-//! through the key handler instead, text sent while the list has focus meets
-//! the list's single-key bindings: one `type_text` of "deploy" opened the
-//! delete dialog on `d`, was answered `y` by its own last character, and cost
-//! a task, while the bridge reported plain success because a task vanishing is
-//! a changed tree. Text nothing is accepting is reported
-//! [`Ignored`](InputStatus::Ignored) instead, so an agent that types at the wrong
-//! moment hears about it rather than tripping bindings.
+//! state, the new-task input, and never through [`handle_key`]. Lowered through
+//! the key handler instead, text sent while the list has focus meets the list's
+//! single-key bindings: one `type_text` of "deploy" would open the delete
+//! dialog on `d` and answer it `y` with its own last character, costing a task,
+//! while the bridge reports plain success because a task vanishing is a changed
+//! tree. Text nothing is accepting is reported
+//! [`Ignored`](InputStatus::Ignored) instead, so an agent that types at the
+//! wrong moment hears about it rather than tripping bindings.
 //!
 //! The rule other apps should copy is not "text means the text field". It is
 //! that the app decides where typed characters go: an app whose typing surface
@@ -407,11 +407,11 @@ fn focus_input(app: &mut App) -> InputStatus {
 /// the new task selected. An empty draft adds nothing and is reported
 /// ignored, so an agent that activates too early hears about it.
 ///
-/// A new task is active, so it lives on the Active tab, and submitting from
-/// the Done tab used to leave it in no published node at all: the draft
+/// A new task is active, so it lives on the Active tab. Submitted from the Done
+/// tab without switching, it would be in no published node at all: the draft
 /// cleared, the tree changed, the cursor stayed put, and an agent that then
-/// read the tree found nothing it had asked for and could reasonably submit
-/// again. Showing the tab the task landed on is what makes the addition
+/// read the tree would find nothing it had asked for and could reasonably
+/// submit again. Showing the tab the task landed on is what makes the addition
 /// observable, and it is what a person adding a task wants to see too.
 fn submit_input(app: &mut App) -> InputStatus {
     let title = app.input.trim().to_string();
@@ -567,11 +567,11 @@ mod tests {
         assert_eq!(app.tasks.len(), before);
     }
 
-    /// Submitting while the Done tab was on screen used to create a task that
-    /// appeared in no published node: the draft cleared and the tree changed,
-    /// so the bridge reported success, while an agent reading the tree back
-    /// found nothing it had asked for and could reasonably submit again. A
-    /// new task is active, so the app shows the tab it landed on.
+    /// Submitting while the Done tab is on screen must not create a task that
+    /// appears in no published node: the draft clears and the tree changes,
+    /// so the bridge reports success, while an agent reading the tree back
+    /// finds nothing it asked for. A new task is active, so the app shows the
+    /// tab it landed on.
     #[test]
     fn submitting_from_the_done_tab_shows_the_task_it_created() {
         let mut app = App::new();
@@ -831,11 +831,11 @@ mod tests {
         assert_eq!(app.focus, Focus::List);
     }
 
-    /// The bug this routing exists to end: `type_text("deploy")` with the
-    /// list focused used to lower to plain key events, where `d` opened the
-    /// delete dialog and the `y` in the same word confirmed it. One call
-    /// deleted a task and the bridge reported success, because a task
-    /// vanishing is a changed tree.
+    /// What this routing prevents: `type_text("deploy")` with the list
+    /// focused, lowered to plain key events, would open the delete dialog on
+    /// `d` and confirm it with the `y` in the same word. One call would delete
+    /// a task while the bridge reports success, because a task vanishing is a
+    /// changed tree.
     #[test]
     fn text_at_the_list_types_nothing_and_says_so() {
         let mut app = App::new();
@@ -1187,9 +1187,9 @@ mod tests {
         assert_eq!(app.dialog, None, "plain esc still cancels");
     }
 
-    /// The guard used to sit on the `Char` arms alone, so every named key was
-    /// the plain binding whatever it carried: `ctrl+enter` submitted the draft
-    /// and `ctrl+esc` threw it away.
+    /// The guard covers named keys too, not only the `Char` arms: otherwise
+    /// every named key is the plain binding whatever it carries, and
+    /// `ctrl+enter` submits the draft and `ctrl+esc` throws it away.
     #[test]
     fn modified_named_keys_are_not_the_plain_bindings() {
         let mut app = App::new();

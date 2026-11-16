@@ -501,10 +501,10 @@ mod tests {
             err.contains("--idle-release") && err.contains("whole seconds from 0 to 86400"),
             "a missing value names the flag and the range: {err}"
         );
-        // `+5` and `+0` are what `u64::from_str` takes and this used to; the
-        // last two are past the range, the second of them past a `u64` too,
-        // and 2^64 - 1 below it used to be taken as a window too far off to
-        // reach, which meant "never".
+        // `+5` and `+0` are what `u64::from_str` takes; the last two are past
+        // the range, the second of them past a `u64` too, and 2^64 - 1 below
+        // it would otherwise read as a window too far off to reach, which
+        // means "never".
         for value in [
             "",
             "-1",

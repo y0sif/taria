@@ -555,8 +555,8 @@ mod tests {
         }
     }
 
-    /// The two shapes that make a label more than a file name. Both used to
-    /// resolve to a path the adapter would bind and, on the way, unlink:
+    /// The two shapes that make a label more than a file name. Unrefused,
+    /// both resolve to a path the adapter would bind and, on the way, unlink:
     /// `Path::join` keeps an absolute label and discards everything resolved
     /// before it, and a relative one walks up out of the runtime directory.
     #[test]

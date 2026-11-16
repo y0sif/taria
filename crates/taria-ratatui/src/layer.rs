@@ -1,5 +1,88 @@
 //! The [`TariaLayer`]: socket lifecycle, background threads, snapshot
 //! publishing, and input acknowledgement for a ratatui app.
+//!
+//! Binding starts a listener thread that serves one bridge at a time, and each
+//! bridge gets a reader thread and a writer loop. The app thread only
+//! publishes and dequeues, each under a brief lock, so the render path never
+//! waits on a bridge. The platform half (the socket or the pipe) is
+//! [`transport`].
+//!
+//! # Publishing
+//!
+//! [`publish`](TariaLayer::publish) wraps the nodes in an `app` root, focused
+//! only when no node below it is, and strips every action from a node marked
+//! `disabled`. Then, in order:
+//!
+//! 1. A tree equal to the one the previous frame built stops here, before
+//!    anything is cut or measured.
+//! 2. A tree over [`MAX_NODE_DEPTH`] is cut branch-wise: each node at the
+//!    limit goes out without its children. Cut, never withheld, because a
+//!    withheld tree leaves the agent on a stale one.
+//! 3. A tree over one line is trimmed to fit by [`bound`]. This
+//!    comes after the depth cut, because measuring serializes, which
+//!    recurses. Focus is decided again after each cut.
+//! 4. A tree that, once cut, is the snapshot already sent stops too.
+//! 5. Otherwise `seq` goes up and the writer gets the snapshot.
+//!
+//! The cuts are counted per snapshot sent, not per frame drawn, in
+//! [`LayerStats`]: `truncated_snapshots` and `last_truncation` for depth,
+//! `oversized_snapshots` and `last_oversize` for size. Every tree as built
+//! that the layer lets go of is freed without recursing, since it can be
+//! deeper than the call stack.
+//!
+//! # Stamps
+//!
+//! Every snapshot carries in `after_input` the newest input the app dequeued
+//! on the live connection. Only an input handed over by `drain`, `try_recv`
+//! or `recv_timeout` stamps: a dropped, unknown, stale or pre-hello input
+//! never does. A new connection's first snapshot is unstamped, and the hello
+//! says `stamps: true`. A frame that stops at step 1 or 4 after a dequeue
+//! still sends: the snapshot already sent goes out again, not cut again,
+//! under the same `seq`, with only its stamp moved. So the first tree
+//! published after a dequeue is the one a stamping bridge credits to that
+//! input.
+//!
+//! # Acks
+//!
+//! Each input is acked [`Delivered`](InputStatus::Delivered) as it is
+//! dequeued, and [`Dropped`](InputStatus::Dropped) when the input queue is
+//! full. An input whose kind this build cannot read is acked
+//! [`Ignored`](InputStatus::Ignored) by the layer and never queued. The app
+//! refines a delivered input to `Ignored` by returning it from
+//! [`drain`](TariaLayer::drain) or calling [`ack`](TariaLayer::ack), before
+//! its next publish: that tree answers the input, so a later `Ignored` is too
+//! late. The writer sends queued acks before the snapshot published after
+//! them, so an ack always reaches the bridge first.
+//!
+//! # A connection owns its inputs
+//!
+//! Each connection has a generation, and every queued input carries the one
+//! it arrived on. The reader retires its generation as it exits, before the
+//! disconnect is observable anywhere. An input from a retired generation is
+//! discarded at dequeue, unacked, since the peer that would read the ack is
+//! gone. [`ack`](TariaLayer::ack) refuses an id whose connection has ended,
+//! because ids restart with each bridge process, and one with
+//! [`ACKABLE_INPUTS`] or more newer inputs delivered after it.
+//!
+//! A client that waited in the backlog behind the previous session has what
+//! it wrote before its hello read off and discarded, unacked. A client that
+//! waited behind nobody keeps what it wrote. Both discards count in
+//! `stale_inputs`.
+//!
+//! # Bounds
+//!
+//! - [`INPUT_QUEUE`]: full, it drops the newest input, acked `Dropped`, rather
+//!   than block the reader.
+//! - [`ACK_QUEUE`]: full, it drops the oldest ack, because the answers an
+//!   agent still waits on are the newest.
+//! - [`WRITE_TIMEOUT`]: each line gets this long in all; a bridge that cannot
+//!   take it is dropped, and reconnects to the latest snapshot.
+//! - [`SHUTDOWN_FLUSH`]: at shutdown the queued acks get this long in all, and
+//!   a waiting snapshot is not sent, since it describes a UI about to go.
+//!
+//! So [`Drop`] is bounded by one listener poll, one line and the flush. The
+//! four counters of lost agent traffic are `dropped_inputs`, `stale_inputs`,
+//! `unknown_inputs` and `dropped_acks`.
 
 use std::collections::VecDeque;
 use std::env;
@@ -28,13 +111,11 @@ use crate::transport::{self, Accepted, Connection, Listener, Reader, Writer};
 /// is all a socket's own write timeout bounds (see
 /// [`Writer::write_all_before`]).
 /// Bounded that way, a line far larger than the socket buffers could stall
-/// for one timeout per wait: a bridge that had stopped reading held a 900 KB
-/// snapshot for two timeouts, and one taking 64 KB every 3 s, which freed
-/// room before any wait timed out, held it for forty seconds. [`Drop`] waits
-/// for the writer, so either held the app's exit too. Now a bridge that
-/// cannot take a whole line, a snapshot of up to [`MAX_LINE_BYTES`] included,
-/// within this time is dropped, and reconnects to be sent the latest snapshot
-/// afresh.
+/// for one timeout per wait, and a bridge that frees a little room before
+/// each wait times out could hold it indefinitely. [`Drop`] waits for the
+/// writer, so that would hold the app's exit too. A bridge that cannot take a
+/// whole line, a snapshot of up to [`MAX_LINE_BYTES`] included, within this
+/// time is dropped, and reconnects to be sent the latest snapshot afresh.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the writer may spend, in total, on the acks still queued when the
@@ -46,9 +127,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// a turn between those calls, so every one of those answers can still be
 /// queued, the [`Delivered`](InputStatus::Delivered) of the dequeue included,
 /// and closing the connection without them leaves the agent waiting out a
-/// timeout on an input the app did take. Measured before this flush existed,
-/// such an app got no ack out at all in 16 runs of 20. So they are written
-/// before the connection closes.
+/// timeout on an input the app did take. So they are written before the
+/// connection closes.
 ///
 /// Bounded, because [`Drop`] waits for the writer and an exit must not hang on
 /// a bridge that stopped reading; [`WRITE_TIMEOUT`] is far too long for that.
@@ -198,7 +278,7 @@ pub struct LayerStats {
     /// its hello: the first connection of a process, and one that connects
     /// after the listener last found nobody waiting. A script that connects
     /// to an idle app and writes at once is such a client, and its input is
-    /// its session's, as it was in 0.3.0. A client that waits for the hello
+    /// its session's. A client that waits for the hello
     /// before writing is never affected either way, and taria-mcp is one,
     /// whose input tools refuse to send until the app's first snapshot has
     /// arrived.
@@ -1605,24 +1685,22 @@ fn serve_client(
 /// The accept loop serves one client to completion before it accepts the
 /// next, so a client that connects meanwhile sits in the listen backlog with
 /// a socket that works, and whatever it writes there waits in the kernel's
-/// buffer: a probe measured 180 KB accepted before a write would block, all
-/// of it readable once the connection is finally served. Read as the new
-/// session's first lines, that is input the app applies on behalf of a client
-/// that wrote it blind, to a tree it never saw, and the hello is the boundary
-/// that tells the two apart: nothing written before it can have been written
-/// in reply to it. See [`LayerStats::stale_inputs`], which counts what is
-/// thrown away here.
+/// buffer, all of it readable once the connection is finally served. Read as
+/// the new session's first lines, that is input the app applies on behalf of
+/// a client that wrote it blind, to a tree it never saw, and the hello is the
+/// boundary that tells the two apart: nothing written before it can have been
+/// written in reply to it. See [`LayerStats::stale_inputs`], which counts
+/// what is thrown away here.
 ///
 /// Only a client that `waited` is drained: one the accept loop took from the
 /// backlog after a session ended, before it last found the backlog empty
 /// (see [`Listener::accept`]). A client that connects to an idle app is
 /// accepted within one poll of the listener, and one that writes at once
 /// without reading the hello, a script piping a line into the socket, waited
-/// behind nobody.
-/// What it wrote is input for the session it is about to get, as it was in
-/// 0.3.0, and discarding it would lose it unacked, with nothing to tell the
-/// client. The protocol leaves the choice to the app; this keeps the discard
-/// to the client it exists for.
+/// behind nobody. What it wrote is input for the session it is about to get,
+/// and discarding it would lose it unacked, with nothing to tell the client.
+/// The protocol leaves the choice to the app; this keeps the discard to the
+/// client it exists for.
 ///
 /// For a client that waited, the stream is read without blocking, right
 /// before the hello is written and not a step earlier, and everything already
@@ -3359,8 +3437,8 @@ mod tests {
         let path = dir.path().join("replaced.sock");
         let layer = TariaLayer::bind_at("replaced", &path).expect("bind the first layer");
 
-        // What a second instance used to do, done by hand because binding
-        // over a live socket is now refused.
+        // What a second instance would do, done by hand because binding over
+        // a live socket is refused.
         fs::remove_file(&path).expect("remove this layer's socket");
         let usurper = UnixListener::bind(&path).expect("bind another listener at the path");
 
@@ -3388,8 +3466,8 @@ mod tests {
 
     /// `$TARIA_SOCK` is used verbatim, and a private directory passes the
     /// vetting whatever else is inside it, so a typo in it (`~/.ssh/config`
-    /// is 0700 and user-owned) used to mean startup silently deleted a file
-    /// the user meant to keep.
+    /// is 0700 and user-owned) must never make startup delete a file the
+    /// user meant to keep.
     #[cfg(unix)]
     #[test]
     fn binding_never_deletes_something_that_is_not_a_socket() {
@@ -3444,9 +3522,9 @@ mod tests {
     }
 
     /// Two instances of the same app, which is an ordinary thing to do while
-    /// testing a TUI. The second used to unlink the first's socket and bind
-    /// its own there, leaving the first running, reporting itself enabled,
-    /// and reachable by nobody.
+    /// testing a TUI. The second must not unlink the first's socket and bind
+    /// its own there, which would leave the first running, reporting itself
+    /// enabled, and reachable by nobody.
     #[cfg(unix)]
     #[test]
     fn binding_over_a_live_socket_is_refused_and_leaves_it_serving() {

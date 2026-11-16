@@ -49,6 +49,13 @@
 //! agent sends back: a node it can read but not address is worse than one it
 //! cannot read at all.
 //!
+//! A cut string carries [`MARKER`] where it was cut, and no string of
+//! [`STRING_FLOOR`] escaped bytes or less is cut. A [`Role::Log`] or
+//! [`Role::Terminal`] value keeps its tail, where those grow; every other
+//! string keeps its head. The budget, [`ROOT_BUDGET`], assumes the largest
+//! `seq` and stamp, so the same tree is always cut the same way and the
+//! layer's dedupe still works on a trimmed tree.
+//!
 //! Everything here is pure: no I/O, nothing the layer's threads share.
 
 use std::collections::VecDeque;

@@ -1,5 +1,5 @@
 //! A bridge that let go of an app, after the app was replaced by a new
-//! process at the same path, no longer calls its own release the reason it is
+//! process at the same path, does not call its own release the reason it is
 //! locked out.
 //!
 //! The apps here are separate processes, because the bridge tells one app

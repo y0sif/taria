@@ -1,9 +1,9 @@
 //! The value types behind a [`Node`](crate::Node)'s typed state, and the
 //! lenient reading every state field gets.
 //!
-//! The state fields were added in 0.4.0, inside the frozen version 1, so a
-//! peer built before them must keep parsing every node, and a peer built
-//! after them must not let one of them cost a whole snapshot. A field that
+//! The state fields are additions inside the frozen version 1, so a peer
+//! that does not know them must keep parsing every node, and a peer that
+//! does must not let one of them cost a whole snapshot. A field that
 //! fails its parse fails the node, the node fails the snapshot, and the
 //! reader skips the line, which leaves an agent on a stale tree with nothing
 //! saying why. So a state field in the wrong type or shape, `"selected":"yes"`,

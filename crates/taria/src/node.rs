@@ -88,7 +88,7 @@ pub enum Role {
     /// prefix of what is there now rather than the whole of it. A stream the
     /// app does not write itself, a command's or a model's, is relayed text:
     /// mark it with [`Node::relayed`], as "Mark relayed text" in
-    /// `docs/integration-guide.md` describes.
+    /// `docs/tree-guide.md` describes.
     Log,
     /// An embedded terminal emulator, a pty another program is drawing into.
     /// Its contents are a screen rather than a semantic tree, so an agent
@@ -293,10 +293,9 @@ impl Error for TreeTooDeep {}
 /// One widget in the semantic tree.
 ///
 /// `#[non_exhaustive]` because a node is where new optional fields land, as
-/// `relayed` did in 0.3.3 and the typed state, `description` and `selected`
-/// through `column_count`, did in 0.4.0, and an optional field is the
-/// cheapest additive change the format has. Nothing outside this crate loses
-/// anything to it: [`new`](Self::new) plus the chainable setters below
+/// `relayed`, `description` and the typed state did, and an optional field is
+/// the cheapest additive change the format has. Nothing outside this crate
+/// loses anything to it: [`new`](Self::new) plus the chainable setters below
 /// already reach every field, so a struct literal was never the way to build
 /// one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,11 +359,11 @@ pub struct Node {
     /// picked in a list that allows more than one. Selection, not focus: a
     /// cursor sits on a row whether or not the list holds the keyboard.
     ///
-    /// This field and every one after it, up to `actions`, came in 0.4.0. Each
-    /// is omitted when unset, absence means not stated, never `false` (but for
-    /// [`disabled`](Self::disabled), where the two say the same), and a value
-    /// of the wrong type or shape reads as not stated rather than failing the
-    /// node.
+    /// This field and every one after it, up to `actions`, follow one rule.
+    /// Each is omitted when unset, absence means not stated, never `false` (but
+    /// for [`disabled`](Self::disabled), where the two say the same), and a
+    /// value of the wrong type or shape reads as not stated rather than failing
+    /// the node.
     #[serde(
         default,
         deserialize_with = "state::lenient_bool",
@@ -905,11 +904,11 @@ mod tests {
         assert!(!serde_json::from_str::<Node>(json).unwrap().relayed);
     }
 
-    /// A node that sets none of the 0.4.0 fields is the line 0.3.3 wrote,
-    /// byte for byte: every one of them is omitted when unset, and the
-    /// fields before them keep their order. Pinned literally, since a field
-    /// that went out as `null` or `false` would change every snapshot an
-    /// older peer reads.
+    /// A node that sets none of the typed-state fields is the line an older
+    /// peer wrote, byte for byte: every one of them is omitted when unset, and
+    /// the fields before them keep their order. Pinned literally, since a field
+    /// that went out as `null` or `false` would change every snapshot an older
+    /// peer reads.
     #[test]
     fn a_node_without_state_serializes_exactly_as_before() {
         let node = Node::new("tasks", Role::List)
@@ -1045,7 +1044,7 @@ mod tests {
         }
     }
 
-    /// The leniency the 0.4.0 fields get: a value of the wrong type or shape
+    /// The leniency the state fields get: a value of the wrong type or shape
     /// reads as not stated, and the node, with everything else it says, is
     /// kept. `null` reads as absent too.
     #[test]

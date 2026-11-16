@@ -1,4 +1,11 @@
 //! Per-frame recording of the semantic tree.
+//!
+//! A [`FrameRecorder`] collects one frame's top-level nodes in order, from
+//! [`push`](FrameRecorder::push) and from [`sem`](crate::sem)-wrapped widgets,
+//! and [`publish`](FrameRecorder::publish) hands them to the layer, which
+//! decides what goes out (see [`layer`](crate::layer)). The recorder has no
+//! `Drop` of its own, so it borrows the layer only until its last use, and a
+//! frame left unpublished is freed without recursing.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -207,7 +214,7 @@ mod tests {
     }
 
     /// Compiled rather than run for what it checks: a recorder holds the
-    /// layer only until its last use, as it did in 0.3.0. A `Drop` on
+    /// layer only until its last use. A `Drop` on
     /// [`FrameRecorder`](crate::FrameRecorder) itself would hold it to the
     /// end of the scope, and reading the layer before giving up on a frame
     /// would be rejected as a second borrow (E0502).

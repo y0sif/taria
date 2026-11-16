@@ -136,8 +136,8 @@ mod tests {
         assert_eq!(back, stamped);
     }
 
-    /// An unstamped snapshot is the line 0.3.3 wrote, byte for byte, and a
-    /// stamp goes between `seq` and `root`.
+    /// An unstamped snapshot is the line an older peer wrote, byte for byte,
+    /// and a stamp goes between `seq` and `root`.
     #[test]
     fn the_stamp_is_omitted_when_unset_and_written_before_the_root() {
         let root = Node::new("app", Role::App);

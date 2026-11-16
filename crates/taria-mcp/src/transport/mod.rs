@@ -28,6 +28,14 @@
 //!
 //! Unix connects to a Unix domain socket; Windows to a named pipe, named by
 //! [`taria::socket::resolve_pipe_name`].
+//!
+//! When a connection ends the bridge drops the whole stream, which closes
+//! both directions. `tokio::io::split` keeps one stream under both halves, so
+//! dropping only the write half closes nothing. A change that wants to tell
+//! the app it is done writing while it goes on reading needs an explicit
+//! `shutdown().await` on that half, and on Windows even that is only a flush:
+//! a named pipe has no half-close, so the app sees end of stream once both
+//! halves are gone.
 
 #[cfg(unix)]
 mod unix;

@@ -199,8 +199,8 @@ mod tests {
     }
 
     /// End to end through the parser. The grammar itself is tested in
-    /// `taria::key`; these only prove the string path still reaches the same
-    /// events it used to.
+    /// `taria::key`; these only prove a parsed string lowers to the event its
+    /// key names.
     #[test]
     fn strings_parse_and_lower() {
         let cases = [

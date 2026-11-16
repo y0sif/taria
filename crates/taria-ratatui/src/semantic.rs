@@ -1,4 +1,10 @@
 //! The [`sem`] wrapper: attach a semantic node to any ratatui widget.
+//!
+//! The node is recorded when the widget renders, so the tree follows render
+//! order, interleaved with [`FrameRecorder::push`] calls. The recording
+//! borrow is released before the inner widget renders, so nested `sem`s in
+//! one frame cannot conflict; a borrow that fails skips the node rather than
+//! panic.
 
 use std::any;
 use std::cell::RefCell;
