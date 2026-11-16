@@ -20,5 +20,6 @@ categories = ["accessibility", "command-line-interface"]
 
 [workspace.dependencies]
 taria = { path = "crates/taria", version = "0.4.0" }
+taria-ratatui = { path = "crates/taria-ratatui", version = "0.4.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

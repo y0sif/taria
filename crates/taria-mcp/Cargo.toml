@@ -27,7 +27,7 @@ name = "taria-mcp"
 path = "src/main.rs"
 
 [dev-dependencies]
-taria-ratatui = { path = "../taria-ratatui" }
+taria-ratatui.workspace = true
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 
