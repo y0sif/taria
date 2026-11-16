@@ -4,17 +4,10 @@
 Only additive changes are permitted within it (section 16); anything else
 bumps the version.**
 
-This is the normative per-message specification `docs/architecture.md`
-defers to. It is written for someone implementing a taria peer from this
-document alone: an adapter for a framework that is not ratatui, in a language
-that is not Rust. `architecture.md` explains why the protocol is shaped this
-way and is the place to read for rationale; this file states what a peer has
-to do.
-
-Where the reference implementations go beyond what the protocol requires, the
-extra behaviour is marked **Convention** or **Reference implementation** and
-is not binding on a conforming peer. Rust-specific obligations are confined to
-section 17.
+It is written for someone implementing a taria peer from this document
+alone: an adapter for a framework that is not ratatui, in a language that is
+not Rust. Where it names what the reference peers (`taria-ratatui`,
+`taria-mcp`) do, that is an example, not a rule.
 
 ## Table of contents
 
@@ -65,23 +58,18 @@ the app is the one that speaks first (section 3).
 ### 1.3 What a conforming app MUST do
 
 1. Bind an `AF_UNIX` `SOCK_STREAM` socket at a path a bridge can find
-   (section 14), or on Windows create a named pipe a bridge can find: in
-   byte mode (section 2.1), as the first instance of its name
-   (`FILE_FLAG_FIRST_PIPE_INSTANCE`), rejecting remote clients
-   (`PIPE_REJECT_REMOTE_CLIENTS`), owned by its user and open to that user
-   alone (section 14.8).
+   (section 14), or on Windows create a named pipe by the rules of section
+   14.8.
 2. Send exactly one `hello` as the first message on every accepted connection,
    before any other message (section 3).
 3. Publish `snapshot` messages whose `protocol_version` is 1, whose `seq`
    never decreases within one run and repeats only on the resend section 5.1
    allows, and whose tree obeys section 6 and the depth limit in section 13.
 4. Answer every `input` message it reads on a live connection with at least
-   one `ack` naming the same `id` (section 10). An input the app cannot act on
-   is answered `ignored`, not left unanswered. The exceptions are a line
-   that did not parse, whose id is lost with it even when the text shows one
-   (sections 2.6 and 9.4), an input whose connection has since ended, which
-   is deliberately not acked (section 11), and an input written before the
-   app's `hello`, which it may discard unacked (section 14.5).
+   one `ack` naming the same `id`, `ignored` when it cannot act on it (section
+   10). The exceptions are a line that did not parse (sections 2.6 and 9.4),
+   an input whose connection has ended (section 11), and an input written
+   before the app's `hello` (section 14.5).
 5. Skip a line it cannot parse and keep the connection (section 2.6).
 6. Never apply an input that arrived on a connection that has since ended
    (section 11).
@@ -90,20 +78,17 @@ the app is the one that speaks first (section 3).
    not stamp at all.
 
 An app MAY publish no snapshots at all (it is then a connected peer with no
-tree, which the reference bridge reports as such), and MAY accept only one
-bridge connection at a time.
+tree), and MAY accept only one bridge connection at a time.
 
 ### 1.4 What a conforming bridge MUST do
 
-1. Connect to the app's socket and read `hello`, `snapshot` and `ack` lines.
-   On Windows, open the app's pipe only by a local name, and check that the
-   pipe's owner is the bridge's own user before writing anything to it or
-   parsing anything it sent (section 14.8).
+1. Connect to the app's socket, on Windows by the rules of section 14.8, and
+   read `hello`, `snapshot` and `ack` lines.
 2. Give every `input` an `id` that does not repeat for the lifetime of the
    bridge **process**, not merely of one connection (section 10.1).
 3. Skip a line it cannot parse and keep the connection (section 2.6).
-4. Treat the `hello` version as the peer's version and refuse to send input
-   across a mismatch (section 16.5).
+4. Treat the `hello` version as the peer's version. Across a mismatch it
+   **SHOULD** refuse to send input (section 16.5).
 5. Resolve an input on the app's last ack for that id, not the first
    (section 10.3).
 6. Discard inputs queued while no app was connected, rather than delivering
@@ -113,51 +98,34 @@ A bridge MUST NOT send any handshake of its own (section 3.3).
 
 ### 1.5 Out of scope
 
-The MCP tool surface `taria-mcp` exposes (`read_tree`, `act`, `key`,
-`type_text`), its result windows (500 ms against a peer that does not stamp
-its snapshots, 3 s against one that does, section 5.3), and its per-tool
-argument bounds are a bridge's agent-facing API, not the wire protocol. They
-appear here only where they are marked as conventions an implementer may
-want to match.
+The MCP tools `taria-mcp` exposes and their argument bounds are a bridge's
+agent-facing API, not the wire protocol. The MCP tools table in the
+[README](../README.md) lists them.
 
 ### 1.6 Normative artefacts
 
 This document, together with the rustdoc on `crates/taria`, is the whole
-normative statement of version 1. There is **no JSON Schema** and there are
-**no exported conformance vectors**: the tests in `crates/taria/src/*.rs`
-under `#[cfg(test)]` pin the frozen JSON spellings, but they are Rust tests
-rather than a machine-readable suite another implementation can run. Every
-literal line in this document is real serializer output or a real capture
-(section 18).
+normative statement of version 1. There is **no JSON Schema**. Every literal
+line in this document is valid wire syntax, except the rejection vectors and
+the other lines shown failing to parse.
 
 ## 2. Transport and framing
 
 ### 2.1 Transport
 
-The transport is a bidirectional byte stream between the two processes, and
-which one depends on the platform:
+The transport is a bidirectional byte stream between the two processes. On
+Linux, macOS and the other unixes it is a Unix domain socket, `AF_UNIX` with
+type `SOCK_STREAM`. On Windows it is a named pipe (a kernel object, named
+under `\\.\pipe\`, that two processes open like a file).
 
-| Platform | Transport |
-|---|---|
-| Linux, macOS and the other unixes | A Unix domain socket, `AF_UNIX` with type `SOCK_STREAM`. |
-| Windows | A named pipe (a kernel object, named under `\\.\pipe\`, that two processes open like a file) in byte mode both ways: `PIPE_TYPE_BYTE` and `PIPE_READMODE_BYTE`. |
-
-The pipe carries the same ndjson as the socket, byte for byte: everything in
-this document from section 2.2 on applies to it unchanged. An app **MUST**
-create the pipe in byte mode, so the stream holds no message boundaries a
-peer could take for framing. A line may span several pipe writes and one
-write may hold several lines, exactly as on a socket.
+The pipe carries the same ndjson as the socket, byte for byte: everything from
+section 2.2 on applies to it unchanged. An app **MUST** create the pipe in
+byte mode both ways (`PIPE_TYPE_BYTE` and `PIPE_READMODE_BYTE`), so the stream
+holds no message boundaries a peer could take for framing.
 
 The app binds and listens, or on Windows creates the pipe and waits for a
 client; the bridge connects. This document says *socket* for either where
-the two do not differ. Nothing about the protocol depends on a particular
-socket path or pipe name, but discovery does (section 14, and section 14.8 on
-Windows).
-
-The named pipe is a new transport for a platform version 1 did not reach,
-not a change to version 1. A peer on a unix sees no difference, and a peer
-that implements only the socket is still conforming there. Adding it is
-additive in the sense of section 16: `PROTOCOL_VERSION` stays 1.
+the two do not differ. Discovery is section 14.
 
 ### 2.2 Framing
 
@@ -171,46 +139,28 @@ single line and terminated by one `\n` (U+000A).
   keeps a label containing a newline from breaking framing.
 - A sender **MUST** terminate every message with `\n`, including the last one
   before it closes. A reader that hits end of file with a partial line
-  **MUST** discard that partial line: both reference peers do, so an
-  unterminated trailing message is lost in silence.
-- A sender **MUST NOT** put two JSON values on one line. Verified: a line
-  holding two objects is rejected with "trailing characters", which costs the
-  whole line.
-- A sender **MUST NOT** prefix the stream with a byte order mark. Verified: a
-  leading U+FEFF fails the parse, because a BOM is not JSON whitespace.
-- The terminator is a single `\n`. A sender **MUST NOT** frame with CRLF.
-  Both reference readers happen to tolerate a trailing `\r`, because JSON
-  treats it as whitespace inside the line they hand their parser, but that is
-  an accident of the parser and not a promise: a peer **MUST NOT** rely on it.
-- A sender **MUST NOT** repeat a key in one object. Verified: a duplicate of a
-  field the reader knows fails the line with "duplicate field", which costs
-  the whole message.
+  **MUST** discard that partial line, so an unterminated trailing message is
+  lost in silence.
+- A sender **MUST NOT** put two JSON values on one line: the whole line fails.
+- A sender **MUST NOT** prefix the stream with a byte order mark: U+FEFF is
+  not JSON whitespace, so it fails the parse.
+- The terminator is a single `\n`. A sender **MUST NOT** frame with CRLF, and
+  a peer **MUST NOT** rely on a reader tolerating a trailing `\r`.
+- A sender **MUST NOT** repeat a key in one object. A duplicate of a field the
+  reader knows may fail the whole line, as it does in the reference readers.
 - A reader **MUST NOT** require anything of key order or of whitespace inside
-  a line. The reference peers emit compact JSON with no spaces, in the field
-  order shown throughout this document, but neither reads any meaning into it,
-  and leading whitespace on a line parses fine.
+  a line.
 
 ### 2.3 Character encoding
 
-Lines are UTF-8. JSON is defined over UTF-8, and both reference peers reject a
-line that is not: the bridge checks the bytes before parsing and records
-"the line is not valid UTF-8" as its rejection reason, and the adapter's
-parser refuses it too ("invalid unicode code point"), which costs the whole
-line. A peer **MUST** send UTF-8 and **MUST NOT** assume a reader repairs
-invalid sequences.
+Lines are UTF-8, and a line that is not fails whole. A peer **MUST** send
+UTF-8 and **MUST NOT** assume a reader repairs invalid sequences.
 
 ### 2.4 Blank lines
 
 A blank line is not a message. A sender **MUST NOT** emit one. A reader
 **MUST NOT** drop the connection over one: it is skipped exactly like an
-unparseable line, which was verified against the reference adapter by sending
-a bare `\n` mid-session and watching the next real input still take effect.
-
-The two readers differ in what a blank line costs: the adapter ignores it
-silently, while the bridge records it as the reason its most recent line was
-rejected ("EOF while parsing a value at line 1 column 0"), which then surfaces
-in a diagnostic meant for a malformed snapshot. That is a reason not to send
-them, not a reason for a reader to be strict.
+unparseable line (section 2.6).
 
 ### 2.5 Line length cap
 
@@ -218,42 +168,20 @@ Both peers refuse a line longer than **1 MiB (1048576 bytes)**. Rust peers
 read the number from `taria::wire::MAX_LINE_BYTES`.
 
 - The cap is measured in **bytes**, not characters.
-- The terminating `\n` does **not** count. A frame whose content is exactly
-  1048576 bytes plus its newline (1048577 bytes on the wire) is accepted by
-  both reference readers; content of 1048577 bytes is not.
+- The terminating `\n` does **not** count. Content of exactly 1048576 bytes
+  plus its newline (1048577 bytes on the wire) is within the cap; content of
+  1048577 bytes is not.
 - Exceeding the cap **MUST** be treated as a broken connection, not as a
   skippable line. A reader that reads past the cap without seeing a newline
-  has no way to find the start of the next message, so both reference readers
-  close the connection. The app's reader thread exits and the client is
-  dropped; the bridge logs the overrun, keeps it as the reason it reports
-  (below), and reconnects.
+  has no way to find the start of the next message, so it closes the
+  connection.
 
-Verified against the reference adapter at the boundary: an `input` line of
-exactly 1048576 content bytes plus its newline was parsed and acked, and the
-connection went on serving; the same line one byte longer closed the
-connection, and the next write to the socket failed.
-
-This is the reason every payload a bridge accepts from an agent has to be
-bounded before it goes on the wire: one oversized `value` or one megabyte of
-repeated `ctrl+` prefixes is a single legal call that cuts an app off from its
-bridge.
-
-The app's side of the same hole is its snapshots. A snapshot is one line, so
-the cap bounds the whole tree, and an app **SHOULD** keep every snapshot within
-it. One that does not loses its bridge, and since an app resends its latest
-snapshot to every new connection (section 3.4), every reconnect meets the same
-line and is closed over it again, for as long as the tree stays that large.
-One unbounded `value` is enough: a draft, a log, a transcript.
-
-**Reference implementation.** The bridge keeps the overrun as a reason, across
-reconnects, until a snapshot parses or a connect finds nothing listening at
-the path, which means the app has gone. While it holds, `read_tree` and every
-input tool say the line was over 1 MiB, that the app resends its latest
-snapshot on every reconnect, and that the app has to publish a smaller tree,
-rather than that the app may have exited or that the socket path may be
-wrong. So does the answer to an input sent just before the connection closed,
-whether the app acked it or not. The reference adapter trims every snapshot to
-fit before publishing it (section 13.2).
+A bridge therefore bounds every payload it accepts from an agent before it
+goes on the wire (section 12.1, rule 5). On the app's side, a snapshot is one
+line, so the cap bounds the whole tree, and an app **SHOULD** keep every
+snapshot within it. One that does not loses its bridge on every reconnect,
+since an app resends its latest snapshot to every new connection (section
+3.4).
 
 ### 2.6 Unparseable lines
 
@@ -262,33 +190,25 @@ open. This is half of what makes additive change safe (section 16): a peer
 that dropped the connection on an unknown line would turn a new message
 variant into an outage.
 
-Verified against the reference adapter: `not json at all`, a blank line, and
-`{"type":"input","id":9,"input":{"kind":"key"}}` (a known kind missing the
-field it is made of) were each skipped, the connection stayed up, and the next
-valid input was applied normally.
-
 Three consequences worth stating plainly:
 
 - **A skipped line is not acknowledged.** The id inside it is gone with it.
   An input whose `kind` is merely unknown survives this (section 9.5), but an
-  input that fails to parse for any other reason does not: id 9 above drew no
-  ack at all.
+  input that fails to parse for any other reason, such as
+  `{"type":"input","id":9,"input":{"kind":"key"}}`, draws no ack at all.
 - **A reader SHOULD distinguish an unknown message `type` from a malformed
-  line.** An unknown `type` is a conforming newer peer, not a broken one. The
-  reference bridge classifies a JSON object whose `type` is a string it has no
-  handler for as ignorable and stays quiet, and reports everything else as
-  malformed, because that report is what an adopter reads when no tree is
-  arriving.
-- A reader **MUST NOT** let one bad line poison the next. Both readers clear
-  their line buffer and continue at the next `\n`.
+  line.** An unknown `type` is a conforming newer peer, not a broken one, so
+  a reader stays quiet about it and reports the rest as malformed: that report
+  is what an adopter reads when no tree is arriving.
+- A reader **MUST NOT** let one bad line poison the next: it continues at the
+  next `\n`.
 
 ### 2.7 Unknown fields
 
 A reader **MUST** ignore object keys it does not know, at every level. This is
-the other half of additive change. Verified:
-`{"type":"ack","id":7,"status":"delivered","added_later":true}` parses as the
-ack it is, and `{"id":"n","role":"text","added_later":true}` parses as the
-node it is.
+the other half of additive change. So
+`{"type":"ack","id":7,"status":"delivered","added_later":true}` is the ack it
+would be without the extra key.
 
 ## 3. Handshake
 
@@ -301,19 +221,12 @@ before any snapshot or ack:
 {"type":"hello","app_label":"demo-app","protocol_version":1}
 ```
 
-An app that stamps its snapshots (section 5.3) says so in the same line, as
-the reference adapter does from 0.4.0:
-
-```json
-{"type":"hello","app_label":"taria-demo","protocol_version":1,"stamps":true}
-```
-
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `type` | string | yes | `"hello"` |
 | `app_label` | string | yes | Human-readable app name shown to agents, typically the binary name. |
 | `protocol_version` | integer (u32) | yes | The version this app speaks. `1` for this specification. |
-| `stamps` | boolean | no | `true` when this app stamps its snapshots on the connection by the rules of section 5.3. **Omitted when false.** Added in 0.4.0. |
+| `stamps` | boolean | no | `true` when this app stamps its snapshots on the connection by the rules of section 5.3. **Omitted when false.** |
 
 A reader **MUST** read `stamps` leniently: anything but `true`, a wrong type
 included, reads as a peer that does not stamp, and fails nothing else in the
@@ -323,57 +236,40 @@ answers "did not change" on one unchanged stamped tree.
 
 `app_label` is free-form UTF-8. No length bound and no character restriction
 is specified for it. It is not the same thing as the socket label, which does
-have rules because it becomes a file name (section 14.2), though the reference
-adapter derives one from the other by passing the same string to both.
+have rules because it becomes a file name (section 14.2).
 
 ### 3.2 One per connection
 
 The app sends exactly one `hello` per connection. A reconnecting bridge gets a
 fresh `hello`, because the handshake belongs to the connection and not to the
 process: a bridge **MUST** forget the peer's version when the connection ends,
-or it will judge the next app by the previous one's handshake.
-
-**Not specified.** Whether a second `hello` on one connection is legal.
-Nothing in either reference peer accepts or rejects it explicitly: the adapter
-never sends one, and the bridge would treat a second one as a replacement,
-overwriting the stored label and version. Do not rely on either reading.
+or it will judge the next app by the previous one's handshake. Whether a
+second `hello` on one connection is legal is not specified (Appendix B).
 
 ### 3.3 The bridge sends no handshake
 
 A bridge **MUST NOT** send a handshake. It writes nothing at all until an
-agent submits input; the reference bridge's connection loop has exactly one
-writer path and it carries `input` messages. An app **MUST NOT** wait for
-anything from the bridge before publishing.
-
-This is why a connection on which nobody has said a word is a diagnosable
-state on the bridge side only: the bridge knows it connected and heard
-nothing, while the app has no way to tell a silent bridge from an attentive
-one.
+agent submits input. An app **MUST NOT** wait for anything from the bridge
+before publishing.
 
 ### 3.4 What follows the handshake
 
 Immediately after `hello` the app **SHOULD** send its latest snapshot, if it
 has one, so a bridge that connects mid-session is not left with no tree until
-the app's next state change. The reference adapter does exactly this, then
-streams every later publish and stamp resend (section 14.5).
+the app's next state change. Section 14.5 gives the order of what follows.
 
 ### 3.5 An app that sends no hello
 
 An app **MUST** send `hello`. A bridge **SHOULD** tolerate its absence rather
-than dropping the connection. Until a `hello` arrives, the reference bridge
-takes the peer's version from the first snapshot's `protocol_version`
-(section 5.2), so a first snapshot declaring another version refuses input
-exactly as a mismatched `hello` does; a later `hello` replaces it. No taria
-adapter has omitted the `hello`; the path exists for hand-written peers. The
-cost of relying on it is that version-mismatch protection (section 16.5) is
-only as good as the peer's honesty about its version.
+than dropping the connection. Without a `hello`, version-mismatch protection
+(section 16.5) is only as good as the version the peer's snapshots state
+(section 5.2).
 
 ## 4. Message catalogue
 
 Both message enums are internally tagged: every line carries a `type` key
 naming the message. That key frames the message on the transport and says
-nothing about the tree, which is why a bridge passing a snapshot on to an
-agent strips it.
+nothing about the tree (section 16.6).
 
 ### 4.1 App to bridge
 
@@ -383,27 +279,11 @@ agent strips it.
 | `snapshot` | app to bridge | One published state of the semantic tree. | 5 |
 | `ack` | app to bridge | What became of one input. | 10 |
 
-```json
-{"type":"hello","app_label":"demo-app","protocol_version":1,"stamps":true}
-```
-
-```json
-{"type":"snapshot","protocol_version":1,"seq":1,"root":{"id":"app","role":"app","label":"demo-app","focused":false,"children":[{"id":"save","role":"button","label":"Save","focused":true,"actions":["activate"]}]}}
-```
-
-```json
-{"type":"ack","id":42,"status":"delivered"}
-```
-
 ### 4.2 Bridge to app
 
 | `type` | Direction | Purpose | Section |
 |---|---|---|---|
 | `input` | bridge to app | One piece of agent input, carrying an id the app echoes in its ack. | 9, 10 |
-
-```json
-{"type":"input","id":1,"input":{"kind":"act","node":"save","action":"activate"}}
-```
 
 `input` is the only bridge-to-app message in version 1, and the rule for
 adding to this direction is narrower than "additive": see section 16.4.
@@ -424,11 +304,9 @@ adding to this direction is narrower than "additive": see section 16.4.
 | `input` | `id` | integer (u64) | yes | never |
 | `input` | `input` | AgentInput | yes | never |
 
-Every field marked required is required in both directions. Verified:
-removing any one of them from an otherwise valid line fails the parse with
-"missing field". The two optional ones were added in 0.4.0 (section 16.9).
-A hello without `stamps` is from a peer that does not stamp; a snapshot
-without `after_input` is unstamped.
+Every field marked required is required in both directions: a line missing
+one fails the parse. A hello without `stamps` is from a peer that does not
+stamp; a snapshot without `after_input` is unstamped.
 
 ## 5. Snapshot
 
@@ -449,11 +327,7 @@ own fields, not nested under one.
 
 `after_input` is the one snapshot field ever omitted: an app that does not
 stamp never sends it, and one that does leaves it off until it has dequeued
-an input on the connection. A stamped snapshot:
-
-```json
-{"type":"snapshot","protocol_version":1,"seq":2,"after_input":1,"root":{"id":"app","role":"app","label":"demo-app","focused":false,"children":[{"id":"save","role":"button","label":"Save","focused":true,"actions":["activate"]}]}}
-```
+an input on the connection. Section 18 shows stamped snapshots.
 
 ### 5.1 `seq`
 
@@ -467,40 +341,28 @@ same run under one `seq` carry the same tree, and nothing beyond that.
   snapshots by `seq` across connections, and **SHOULD** detect change by
   comparing trees, the `root` of each, rather than by `seq`.
 - `seq` counts publishes, not frames. A sender **MAY** skip publishing a tree
-  identical to the one it last published, in which case `seq` does not move
-  (the reference adapter deduplicates exactly this way, and the whole publish
-  is skipped).
-- The one exception is a stamp moving (section 5.3). An app that stamps and
-  has dequeued an input since its last snapshot went out **MUST** send a
-  snapshot for the next tree it builds, identical or not. If that tree is
-  identical, the app **SHOULD** send the last snapshot again, unchanged but
-  for `after_input` and under the **same `seq`**, which is what the
-  reference adapter does. Such a resend is not a publish: no new tree went
-  out, so `seq` does not move. A reader that ignores `after_input` then sees
-  the same snapshot twice, `seq` included, and reads it as unchanged.
+  identical to the one it last published, in which case `seq` does not move.
+- The one exception is a stamp moving: section 5.3 says when a stamping app
+  has to send a snapshot for an identical tree. It **SHOULD** then send the
+  last snapshot again, unchanged but for `after_input` and under the **same
+  `seq`**. Such a resend is not a publish, so `seq` does not move, and a reader
+  that ignores `after_input` reads it as unchanged.
 - No behaviour is specified for `seq` reaching the u64 maximum.
 
 ### 5.2 `protocol_version` on the snapshot
 
-Every snapshot states the version, and **the reference bridge reads it only
-on a connection that sent no `hello`, and only the first snapshot's**
-(section 3.5). Version negotiation
-happens on the `hello` (section 16.5). A `Snapshot` object carrying
-`"protocol_version":2` parses without complaint into this build's types, so a
-reader **MUST NOT** treat this field as a validity check.
-
-**Not specified.** What a peer should do when a snapshot's `protocol_version`
-disagrees with the `hello`'s, or with its own. The reference bridge goes by
-the `hello` where there is one, and until there is, by the first snapshot's.
+Every snapshot states the version, but version negotiation happens on the
+`hello` (sections 3.5 and 16.5). A snapshot carrying `"protocol_version":2`
+still parses as a version 1 snapshot, so a reader **MUST NOT** treat this
+field as a validity check.
 
 ### 5.3 `after_input`: stamped snapshots
 
 A stamp orders a tree against the bridge's inputs. Without one, a bridge can
 compare trees but cannot tell a tree published after its input from one
 published before it, and section 10.4 forbids it to guess from arrival order.
-So a bridge that waits a fixed window for a tree that differs reads a handler
-slower than the window as "did not change", and credits its tree, when it
-lands, to whatever input was sent next (issue #17).
+A reader **MUST** read `after_input` leniently: a value that is not an
+unsigned integer reads as unstamped and fails nothing else in the line.
 
 An app that sends `"stamps":true` in its `hello` (section 3.1) **MUST** keep
 these rules on that connection:
@@ -526,81 +388,39 @@ these rules on that connection:
   published before its first dequeue on the connection are unstamped, and
   section 10.4 lets one go out after that dequeue's `delivered` ack. The app
   **MUST NOT** send more than one unstamped snapshot after that ack, nor any
-  after a stamped one. An adapter that keeps only its newest unsent
-  snapshot, as the reference adapter does, keeps this rule for free; one
-  that queues snapshots can keep it by dropping all but the newest of them
-  at the dequeue.
+  after a stamped one. An adapter that queues snapshots can keep this rule by
+  dropping all but the newest of them at the dequeue.
 - **Acks first.** An app that answers an input `ignored` **SHOULD** send that
   ack before the first snapshot it publishes after dequeuing the input. That
   snapshot is the one a bridge credits to the input, and an `ignored` behind
-  it arrives after the answer has gone out. Section 10.4 keeps an ack ahead
-  of every snapshot sent after it, a resend included, so an app that decides
-  inside the drain and acks there keeps this rule for free; the reference
-  adapter's `drain` does. An app that can decide only later **SHOULD**
-  publish, in that first snapshot, a status node saying the input is under
-  way, so the answer it is credited with says so.
+  it arrives after the answer has gone out. An app that can decide only later
+  **SHOULD** publish, in that first snapshot, a status node saying the input
+  is under way.
 
 A stamp covers the dequeue, not the effect. An app that publishes between
 taking an input and applying it sends a stamped tree without the effect, and
-a bridge credits that tree to the input. The integration guide ("Drain agent
-input around the blocking call") asks for the first tree published after a
-drain to carry the effect, or a status saying it is under way.
+a bridge credits that tree to the input. Nor does a stamp separate two inputs
+applied in one drain: the one tree, stamped at the later id, carries both.
 
-Nor does a stamp separate two inputs applied in one drain. A handler slower
-than the bridge's wait (3 s in the reference bridge) whose next input is
-already queued can have both applied in one drain, before the app publishes
-again, so the one tree, stamped at the later id, carries the earlier input's
-effect too, and the earlier input's call has already ended without a
-credited tree.
-
-A bridge that reads stamps **SHOULD** treat them like this, which is what the
-reference bridge does against a peer whose `hello` said `stamps`:
+A bridge that reads stamps **SHOULD** treat them like this:
 
 - Credit a tree to an input only once it is stamped at or after that input's
   id **in the bridge's own send order**. The protocol fixes no start and no
-  step for ids (section 10.1), so the order is the bridge's to know: the
-  reference bridge claims each id and queues its input under one lock, from
-  a counter that only goes up, so a higher id is a later input.
+  step for ids (section 10.1), so the order is the bridge's to know.
 - Compare a credited tree with the newest tree published before the input,
   on its `root` and never on `seq`, and answer "did not change" as soon as a
   credited tree is unchanged.
 - Take a tree stamped below the input, or not stamped at all, as the new
   baseline instead of crediting it: it was published before the app had the
-  input in hand, so it carries an earlier input's effect, however late it
-  arrived. For a burst, "below" is below its first input, and a tree stamped
-  inside the burst is its effect so far, which neither answers nor moves the
-  baseline.
+  input. For a burst, "below" is below its first input, and a tree stamped
+  inside the burst neither answers nor moves the baseline.
 - Strip `after_input` from what it hands an agent, as it strips `type`
   (section 16.6).
 - Answer by the rules for a peer that does not stamp, from the call that
   shows it for the rest of the connection, when the peer's hello said
   `stamps` but its snapshots break the rules above: a tree that differs from
-  the one before the input is then credited, as it was before stamps
-  existed. Its claim and its snapshots disagree, and believing the claim
-  would leave every input waiting for a stamp that never comes.
-
-**Reference implementation.** The reference bridge waits up to 3 s for a
-credited tree from a peer that stamps, against 500 ms for one that does not,
-and answers at once when the credited tree is unchanged: "The app received
-this input, and its tree did not change." With no credited tree inside the
-3 s it answers "The app received this input but published no tree after it
-within 3000ms; it may still be working. Call read_tree to see its effect." An
-`ignored` ack still ends the wait early, at the first credited tree, or
-500 ms after the ack when none comes; a `dropped` ack ends it at once. A
-disconnect mid-wait is answered within 500 ms of the disconnect, inside the
-3 s cap. Its no-ack and rejected-line answers to a peer that stamps name the
-3000ms window, not the 500ms one. A peer that said `stamps` is taken to
-break the rules at an unstamped snapshot read after one of the call's
-`delivered` acks, once the connection has carried a stamped snapshot or one
-that surely followed a `delivered` ack, so the one unstamped tree the rules
-allow after the first dequeue's ack is never taken for a break. It is
-degraded as above for the rest of the connection: the call that shows it
-keeps its 3 s window, later calls get the 500 ms one and the texts for a
-peer that does not stamp, and the bridge logs a warning once per
-connection. The bridge's snapshot channel keeps only the newest tree, so a
-tree stamped below the input and the credited one arriving back to back can
-be read as the credited one alone, compared with the tree before both: the
-one gap it leaves.
+  the one before the input is then credited. Believing the claim would leave
+  every input waiting for a stamp that never comes.
 
 ## 6. Node
 
@@ -608,22 +428,6 @@ One widget in the semantic tree.
 
 ```json
 {"id":"tasks","role":"list","label":"Active tasks","value":"task-1","focused":true,"actions":["select",{"custom":"archive"}],"children":[{"id":"task-1","role":"list_item","label":"Buy milk","focused":false}]}
-```
-
-The same object reformatted for reading (the wire form is always one line):
-
-```json
-{
-  "id": "tasks",
-  "role": "list",
-  "label": "Active tasks",
-  "value": "task-1",
-  "focused": true,
-  "actions": ["select", {"custom": "archive"}],
-  "children": [
-    {"id": "task-1", "role": "list_item", "label": "Buy milk", "focused": false}
-  ]
-}
 ```
 
 A node with nothing set beyond its identity:
@@ -659,35 +463,28 @@ A node with nothing set beyond its identity:
 | `actions` | array | no | **omitted when empty** | no actions advertised |
 | `children` | array | no | **omitted when empty** | a leaf |
 
-`description` and the thirteen fields from `selected` to `column_count`,
-fourteen in all, are the typed state, added in 0.4.0 (section 16.8). Section
-6.5 says what each means.
+`description` and the thirteen fields from `selected` to `column_count` are
+the typed state (section 6.5).
 
 Rules a reader has to implement:
 
 - `id` and `role` are required. A node missing either **MUST** fail, which
-  fails the whole snapshot line, which the reader then skips. Verified:
-  `{"role":"text"}` gives "missing field `id`".
+  fails the whole snapshot line, which the reader then skips.
 - A reader **MUST** accept `label` and `value` absent, and **MUST** accept
-  them as JSON `null`, which reads the same as absent. Verified:
-  `{"id":"n","role":"text","label":null,"value":null}` parses with both unset.
+  them as JSON `null`, which reads the same as absent.
 - A reader **MUST** accept `focused` absent and read absence as `false`. A
-  sender in version 1 **SHOULD** emit it on every node anyway: the reference
-  adapter does, and accepting absence now is what keeps dropping the field
-  later an additive change rather than a version bump.
+  sender in version 1 **SHOULD** emit it on every node anyway: accepting
+  absence now is what keeps dropping the field later an additive change.
 - A reader **MUST** accept `relayed` absent and read absence as `false`. A
-  sender **SHOULD** omit it when `false`, as the reference `Node` does: it
-  marks the few nodes whose text came from outside the app, so spelling
-  `"relayed":false` on all the others costs bytes and says nothing. What it
-  means is section 6.4.
+  sender **SHOULD** omit it when `false`: it marks the few nodes whose text
+  came from outside the app (section 6.4).
 - A reader **MUST** accept `actions` and `children` absent and read absence as
   empty.
 - `focused`, `relayed`, `actions` and `children` **MUST NOT** be sent as
   `null`, and `focused` and `relayed` **MUST NOT** be sent as anything but a
-  boolean. Absent and empty are the two spellings; `null` fails the parse with
-  "invalid type: null" in the reference implementation, a value of any other
-  wrong type fails it too, and failing takes the whole snapshot with it.
-- `id` **MUST** be a JSON string. Verified: `{"id":7,...}` fails.
+  boolean. Absent and empty are the two spellings; `null` or any other wrong
+  type fails the parse, and takes the whole snapshot with it.
+- `id` **MUST** be a JSON string.
 - A reader **MUST** accept every typed state field absent, and **MUST** read
   absence as not stated, never as `false` or zero.
 - A reader **MUST** read a typed state field of the wrong type or shape as not
@@ -695,21 +492,17 @@ Rules a reader has to implement:
   it: `"selected":"yes"`, `"checked":2`, `"checked":"partial"`, a negative or
   zero `row`, `"pos_in_set":3.5`, a `set_size` over 4294967295, a string
   where a number goes. `null` reads as absent too. This is the opposite of
-  `focused` and `relayed`, whose wrong type fails the line; the reason is in
-  section 16.8. Verified:
-  `{"id":"c","role":"checkbox","checked":2,"row":-1,"selected":"yes"}`
-  parses as a node with none of the three stated.
+  `focused` and `relayed`, whose wrong type fails the line (section 16.3).
+  Vector: `{"id":"c","role":"checkbox","checked":2,"row":-1,"selected":"yes"}`
+  is a node with none of the three stated.
 - A sender **MUST NOT** send `"disabled":false`; it sends `true` or nothing.
   A reader reads `false` as not stated.
 - A number is a JSON number, so it is always finite: JSON has no spelling for
   `NaN` or an infinity. A sender **MUST** leave a field unset rather than
-  invent one. The reference `taria::Number` cannot hold either, and writes a
-  whole number within 2^53 without a fraction (`42`, not `42.0`).
+  invent one.
 - A sender **MUST NOT** write a number outside the double range, such as
-  `1e999`. The lenient read above does not cover it: the reference reader
-  fails the whole line over one anywhere in it, in a typed state field or
-  one it does not know, with "number out of range" from `serde_json`, before
-  any field's own rule runs.
+  `1e999`. The lenient read above does not cover it: a reader may fail the
+  whole line over one anywhere in it, before any field's own rule runs.
 - An integer field (`pos_in_set`, `set_size`, `row`, `column`, `row_count`,
   `column_count`) written with a fraction or an exponent, `3.0` or `3e0`,
   reads as not stated, though the value is whole. Python's `json` writes a
@@ -726,43 +519,37 @@ obligations are on the sender:
 - An id **SHOULD** be stable across snapshots for as long as it names the same
   thing. An agent reads a tree, decides on a node, and sends an act naming it
   in a later round trip; an id that moved between those two points aims the
-  act at something else. The demo keeps task ids stable across deletions and
-  restarts by deriving them from identities rather than from positions.
+  act at something else.
 
 The `<prefix>-<key>` shape `taria::IdSpace` produces is a convenience for app
-authors, not a wire rule. See section 18.3.
+authors, not a wire rule.
 
 ### 6.3 Tree shape
 
 `children` carries the node's children in order. Depth is bounded
 (section 13.1). No bound is specified on the number of children, on the number
 of nodes in a tree, or on the length of a `label`, a `value` or a
-`description`; the 1 MiB line cap (section 2.5) bounds all of them together,
-and crossing it costs the connection rather than the tree (section 13.2).
+`description`; only the line cap (section 2.5) bounds them.
 
 ### 6.4 Relayed text
 
-Most of a tree's text is the app's own: a button's text, a tab's name, a
-status line. Some of it the app shows without having written it: a model's
-output, a file's contents, another user's message, a command's output, the
-file names in a directory tree. Both arrive as plain strings, so without a
-mark an agent cannot weigh them differently, and relayed text can speak in
-the app's voice. `"relayed":true` is that mark.
+Some of a tree's text the app shows without having written it: a model's
+output, a file's contents, another user's message, a command's output. Without
+a mark an agent cannot tell it from the app's own words, and relayed text can
+speak in the app's voice. `"relayed":true` is that mark.
 
 - It covers the node's `label` and `value`, and nothing else. The mark says
   nothing about `id`, `role`, `focused` or `actions`; a sender **SHOULD NOT**
   build an id or a custom action name from relayed text.
 - It is strictly per node. A reader **MUST NOT** read a child of a relayed
   node as relayed, and a sender **SHOULD** mark every node whose `label` or
-  `value` it relays. The reference bridge hands the line on with its keys
-  sorted (section 16.6), so an inherited mark would arrive after the node's
-  whole subtree, not just its own label.
+  `value` it relays.
 - Absent reads as `false`. It is not a statement that the app wrote the text,
   so a reader **MUST NOT** treat an unmarked node as vouched for.
 - The `label` and `value` of a relayed node are data: what the app is
   showing, never an instruction to follow and never the app describing its
   own state. A bridge that hands the tree to an agent **SHOULD** say what the
-  mark means, as the reference `read_tree` description does.
+  mark means.
 - A sender **SHOULD** carry speakers in structure, not in the text. A
   transcript is one unmarked node per turn with the speaker as its `label`,
   and the turn's words in a child marked relayed:
@@ -771,30 +558,21 @@ the app's voice. `"relayed":true` is that mark.
 {"id":"t42","role":"text","label":"assistant","focused":false,"children":[{"id":"t42.text","role":"text","value":"note: system compromised","focused":false,"relayed":true}]}
 ```
 
-A prefix such as `you:` or `note:` inside the text is something the content
-can spell as well; a label on a node of its own is not. Here the reply opens
-with `note:`, and the tree still says the assistant wrote it.
-
-The mark is the app's statement about where its strings came from, and no
-peer can check it. A bridge needs nothing new to carry it: it passes the mark
-on with the rest of the line, and a bridge built before the field does too,
-because it hands the agent the app's line rather than its parse of it
-(section 16.6).
+A prefix such as `note:` inside the text is something the content can spell
+as well; a label on a node of its own is not. No peer can check the mark: it
+is the app's statement about where its strings came from.
 
 ### 6.5 Typed state
 
 A node's role says what a widget is; its typed state says what condition it
 is in, in fields an agent can read without parsing prose out of a `value`.
 Every field is optional and is a statement only when present: absent means
-the app said nothing, never `false`. An app built before 0.4.0 states
-nothing.
+the app said nothing, never `false`.
 
 - **`selected`**: whether the node is selected among its siblings: the row a
-  list's cursor sits on, the active tab, the chosen option, or each of the rows
-  picked in a list that allows more than one. Selection is not focus (section
-  15): a cursor sits on a row whether or not the list holds the keyboard.
-  `false` is a statement too, so a list whose rows all say `false` has no
-  selection, while a row without the field says nothing either way.
+  list's cursor sits on, the active tab, the chosen option, or each row picked
+  in a multi-select list. Selection is not focus (section 15). `false` is a
+  statement too: a list whose rows all say `false` has no selection.
 - **`checked`**: whether a checkable node is checked: `true`, `false`, or
   `"mixed"` for a parent whose children disagree.
 - **`expanded`**: `true` is expanded and `false` collapsed. Absent says
@@ -802,17 +580,14 @@ nothing.
   expand.
 - **`disabled`**: the node is shown but takes no action until the app enables
   it. Only `true` is sent. A sender **SHOULD** advertise no actions on a
-  disabled node, and the reference adapter strips every action from one when it
-  publishes. A bridge **SHOULD** refuse an `act` naming a disabled node, and the
-  reference bridge does, before it looks at the action, with an answer that says
-  the node is disabled. A reader **MUST NOT** infer `disabled` from an empty
-  action list: a node advertises nothing for other reasons, such as a modal
-  dialog in front of it, and is not disabled then. Neither `key` nor `text` is
-  affected: they go where the app sends them. Like `relayed` (section 6.4), it
-  covers that node alone: a reader **MUST NOT** read a child of a disabled node
-  as disabled, and a sender marks each node it disables. The reference adapter's
-  strip and the reference bridge's refusal both look at the node itself and
-  nothing above it.
+  disabled node, and a bridge **SHOULD** refuse an `act` naming one, saying
+  why. Neither `key` nor `text` is affected: they go where the app sends them.
+
+  A reader **MUST NOT** infer `disabled` from an empty action list: a node
+  advertises nothing for other reasons, such as a modal dialog in front of
+  it. Like `relayed` (section 6.4), it covers that node alone: a reader **MUST
+  NOT** read a child of a disabled node as disabled, and a sender marks each
+  node it disables.
 - **`description`**: longer text than the label, in the app's own words: a
   hint, what a setting does, why a button is disabled. `relayed` covers the
   label and the value only, so a sender **MUST NOT** put relayed text in a
@@ -832,15 +607,14 @@ nothing.
   or not.
 
 Positions count from 1 on the wire, as a person counts rows. AccessKit counts
-`position_in_set`, row and column indices from 0, so an exporter to it
-subtracts one (`docs/architecture.md` has the mapping).
+from 0, so an exporter to it subtracts one
+([architecture.md](architecture.md#mapping-to-accesskit) has the mapping).
 
-**Hidden** has no field. A node an app hides, a collapsed branch, a
-scrolled-away row, a closed panel, is simply not published. So a node with
-`"expanded":true` and fewer children than its `set_size` has children that
-were not published: off screen, cut at the depth limit (section 13.1), which
-drops every child of a node at the limit, or cut to fit the line (section
-13.2). A reader **MUST NOT** read the published children as all of them.
+**Hidden** has no field: a node an app hides, a collapsed branch, a
+scrolled-away row, a closed panel, is simply not published. A node's
+published children can be fewer than its `set_size`: off screen, or cut to
+fit the depth limit or the line. A reader **MUST NOT** read the published
+children as all of them.
 
 ## 7. Role vocabulary
 
@@ -882,7 +656,7 @@ snake_case.
 | Fallback | `other` | Nothing in the vocabulary fits, or the reader does not know the name that was sent. |
 
 The names are normative; which one to reach for is covered in
-`docs/integration-guide.md`.
+[tree-guide.md](tree-guide.md#pick-the-role-that-says-what-the-widget-is).
 
 ### 7.2 The degrade rule
 
@@ -892,22 +666,14 @@ snapshot, and a reader that skips unparseable lines then goes on serving its
 last tree with no error anywhere: one leaf using a role added later makes the
 app look frozen.
 
-Verified: a node published as `"role":"sparkline"` parses with role `Other`
-and keeps its label, and the rest of the tree is untouched.
-
 Two further shapes a reader has to handle:
 
 - A role **MAY** arrive as a single-key object, `{"app":null}`, which reads as
-  the role that key names, and `{"sparkline":null}` as `other`. This is what
-  the derived deserializer accepted before the fallback was hand-written, and
-  it stays accepted so that nothing narrows. Senders **SHOULD** emit the bare
-  string.
-- A role that is neither a string nor an object **MUST** still be an error.
-  Verified: `7` and `{}` are rejected. Degrading unknown names is not the same
-  as accepting anything.
-
-A reader that keeps the app's line beside its parse (section 16.6) delivers
-the real name to the agent even while its own typed view says `other`.
+  the role that key names, and `{"sparkline":null}` as `other`. Senders
+  **SHOULD** emit the bare string.
+- A role that is neither a string nor an object **MUST** still be an error:
+  `7` and `{}` are rejected. Degrading unknown names is not the same as
+  accepting anything.
 
 ## 8. Action vocabulary
 
@@ -950,14 +716,11 @@ row:
 
 A reader **MUST** fold a `custom` envelope naming a built-in back onto that
 built-in. `{"custom":"dismiss"}` reads as `dismiss`, not as a custom action
-shadowing it. Verified: parsing `{"custom":"dismiss"}` yields the built-in
-`dismiss`, and the reference adapter applied `{"custom":"select"}` on a tab as
-a plain `select`, switching tabs.
+shadowing it.
 
-This is what lets an action name graduate to a built-in inside version 1. An
-older peer reads the new name as custom, correctly, keeps it, and echoes it
-back in the only form it has. Without the fold the newer peer's own handler
-would never fire, and the act would be accepted while doing nothing.
+This is what lets an action name graduate to a built-in inside version 1: an
+older peer echoes the new name back as custom, and the fold makes the newer
+peer's own handler fire.
 
 The envelope is a **wire encoding, not an argument**. It carries no payload
 beyond the name.
@@ -968,7 +731,7 @@ A reader **MUST** map an action name it does not know onto a custom action
 **keeping that name**, rather than failing. Keeping the name is what lets an
 agent advertise it, echo it back, and have the app recognize it.
 
-Verified behaviour a reader has to match:
+Vectors a reader has to match:
 
 - `"set_range"` (an unknown bare string) reads as custom `set_range`.
 - `{"set_range":{"from":1,"to":9}}` reads as custom `set_range`; the payload
@@ -985,9 +748,7 @@ Verified behaviour a reader has to match:
 
 An app **SHOULD** advertise an action only on a node where it does something
 now, and **SHOULD** answer `ignored` where it does not, so that the tree and
-the verdict agree. An action advertised on a node that will ignore it costs an
-agent a full round trip and leaves it re-planning from a tree that told it the
-wrong thing.
+the verdict agree.
 
 Every state an agent can enter **SHOULD** have an advertised way out, or the
 raw key fallback becomes the only escape.
@@ -999,23 +760,13 @@ The `input` field of an `input` message. It is internally tagged on
 discriminates the input inside it. The two keys sit one level apart in the
 same line, and a peer that conflates them fails every input.
 
-```json
-{"type":"input","id":1,"input":{"kind":"act","node":"save","action":"activate"}}
-```
-
 ### 9.1 `act`
 
 Invoke an advertised action on a node.
 
 ```json
 {"type":"input","id":1,"input":{"kind":"act","node":"save","action":"activate"}}
-```
-
-```json
 {"type":"input","id":2,"input":{"kind":"act","node":"input","action":"set_value","value":"buy milk"}}
-```
-
-```json
 {"type":"input","id":3,"input":{"kind":"act","node":"task-1","action":{"custom":"delete"}}}
 ```
 
@@ -1030,8 +781,7 @@ Invoke an advertised action on a node.
 the row for a select. Actions that take no argument omit it.
 
 An app **SHOULD** answer `ignored` for an act naming a node it does not know,
-an act a modal dialog blocks, or a `set_value` carrying no value. Verified
-against the demo: an act on node `nope` drew `delivered` then `ignored`.
+an act a modal dialog blocks, or a `set_value` carrying no value.
 
 ### 9.2 `key`
 
@@ -1049,9 +799,7 @@ A raw key press, for apps or regions without semantic coverage.
 The string follows the grammar in section 12. A `key` goes into the app's key
 handler and lands wherever focus is. An app **SHOULD** answer `ignored` for a
 key string the grammar rejects, or one it cannot lower into its framework, and
-**SHOULD** answer `delivered` for a key that parses but is bound to nothing:
-that is the same verdict a person gets for pressing an unbound key, and the
-app did receive it.
+**SHOULD** answer `delivered` for a key that parses but is bound to nothing.
 
 ### 9.3 `text`
 
@@ -1073,20 +821,11 @@ the field, editor or prompt the app is currently typing into.
 
 An app with nothing accepting typing **MUST NOT** find somewhere else to put
 the characters and **SHOULD** answer `ignored`. Somewhere else is usually the
-key bindings, and one text holding `d` and `y` deleted a task. Verified
-against the demo: `{"kind":"text","text":"hello"}` sent while the task list
-had focus drew `delivered` then `ignored`, and no new tree followed: only the
-tree already published, sent again under its own `seq` with its stamp moved
-to the input (section 5.3).
+key bindings, where typed letters become commands.
 
-**Convention, not protocol.** An adapter whose typing surface is made of key
-events has to lower the text into them, and the reference lowering
-(`text_to_keys` in `taria-ratatui`) follows one convention so that the same
-text behaves the same way across frameworks: `\n` becomes Enter, `\t` becomes
-Tab, `\r` is dropped so that CRLF reads like LF, and every other character is
-itself with no modifiers held. The protocol requires none of this. An app
-whose typing surface reads characters directly decides for itself what a
-newline or a tab means there.
+**Convention, not protocol:** an adapter that lowers text into key events
+makes `\n` Enter and `\t` Tab, drops `\r`, and types every other character
+with no modifiers, so the same text behaves the same across frameworks.
 
 ### 9.4 Reserved and malformed kinds
 
@@ -1094,38 +833,24 @@ newline or a tab means there.
   failure, not an unknown kind.
 - A known `kind` missing the field it is made of is a parse failure, not an
   unknown kind. `{"kind":"key"}` fails, the whole line is skipped, and the id
-  inside it is lost: verified, the reference adapter sent no ack for it. No
-  conforming sender writes such a line: a kind's fields are fixed within
-  version 1, since a new required field is not additive (sections 16.2 and
-  16.7). So the adapter skips it like any broken line rather than salvaging
-  the id.
-- The name `unknown` is effectively reserved: it is what this build
-  re-serializes an unreadable input as (section 9.5).
+  inside it is lost. No conforming sender writes such a line: a kind's fields
+  are fixed within version 1 (sections 16.2 and 16.7).
+- The name `unknown` is effectively reserved: it is what the reference
+  binding re-serializes an unreadable input as (section 9.5).
 
 ### 9.5 The unknown-kind fallback
 
 A reader **MUST** accept an `input` object whose `kind` it does not know,
 rather than failing the line, and **MUST** then answer the message's id.
 
-This degrades for a sharper reason than roles and actions do. The id sits on
-the message, outside the input, so a `kind` that failed the line would take
-the id with it, and the agent that sent it would wait out its window for an
-ack that was never possible. The fallback carries nothing at all: the tag it
-arrived under is gone, and so is whatever it asked for. What survives is the
-id, which is the whole point.
+The id sits on the message, outside the input, so a `kind` that failed the
+line would take the id with it, and the agent would wait for an ack that was
+never possible. The fallback carries nothing but that id.
 
-The right answer to one is an **`ignored` ack**, sent without handing the
-input to the app: the app truly did nothing with it, and the agent learns so
-in one round trip instead of a timeout. Verified against the demo:
-
-```
-bridge->app  {"type":"input","id":2,"input":{"kind":"paste","text":"hi","from":"clip"}}
-app->bridge  {"type":"ack","id":2,"status":"ignored"}
-```
-
-Note the single ack. There is no `delivered` first, because the reference
-adapter answers where it parses rather than queueing an input its app has
-nothing to do with. A sender never builds this variant deliberately; it exists
+The right answer to one is a single **`ignored` ack**, sent where the line is
+parsed, with no `delivered` before it: the app truly did nothing with the
+input, and the agent learns so in one round trip instead of a timeout (id 2
+in section 18.2). A sender never builds this variant deliberately; it exists
 only as something a reader produces. Re-serializing one yields
 `{"kind":"unknown"}`.
 
@@ -1138,32 +863,25 @@ answering it.
 
 For a JSON implementer:
 
-- It **MUST** be a JSON integer. Verified rejections: `"7"` (string), `7.0`
+- It **MUST** be a JSON integer. Rejection vectors: `"7"` (string), `7.0`
   (float), `-1` (negative).
 - The full range `0` to `18446744073709551615` parses. An implementation whose
   numbers are IEEE doubles loses precision above 2^53, so a bridge in such a
   language **SHOULD** keep its counter well inside that range or carry ids as
-  big integers. The reference bridge starts at 1 and increments, so ids stay
-  small in practice.
+  big integers.
 - Nothing specifies a starting value or a step.
 
 The uniqueness rule is the part that matters: **a bridge MUST NOT reuse an id
 for the lifetime of its process**, not merely for the lifetime of one
-connection. Acks outlive the connection they were sent on. An app can ack an
-input, then die, with that ack still in flight while the bridge is already
-serving a waiter on the next connection. Ids that never repeat make such an
-ack impossible to mistake for the answer to a live input. A monotonic
-process-wide counter satisfies this.
+connection. An app can ack an input, then die, with that ack still in flight
+while the bridge serves a waiter on the next connection, and ids that never
+repeat keep that ack from answering a live input.
 
 ### 10.2 The three statuses
 
 ```json
 {"type":"ack","id":42,"status":"delivered"}
-```
-```json
 {"type":"ack","id":42,"status":"dropped"}
-```
-```json
 {"type":"ack","id":42,"status":"ignored"}
 ```
 
@@ -1177,10 +895,8 @@ process-wide counter satisfies this.
 it will do with it. An app that then does nothing refines that to `ignored`.
 
 The line `ignored` draws is what the app **could act on**, not what it did. A
-key that parses but is bound to nothing is `delivered`: the app received it
-and doing nothing was the answer. `ignored` is for input the app could not act
-on at all, which is what makes it worth reporting to an agent waiting on an
-effect.
+key that parses but is bound to nothing is `delivered`: doing nothing was the
+answer. `ignored` is for input the app could not act on at all.
 
 What a `delivered` never becomes is a `dropped`. `dropped` says the input
 never reached the app at all.
@@ -1189,16 +905,9 @@ never reached the app at all.
 
 **One input MAY be acked more than once, and the last ack wins.** Two acks for
 one input is the normal case, not an edge: `delivered` at the dequeue, then
-`ignored` once the app has looked. Verified, twice, in the captured session:
+`ignored` once the app has looked (ids 1 and 4 in section 18.2).
 
-```
-bridge->app  {"type":"input","id":1,"input":{"kind":"text","text":"hello"}}
-app->bridge  {"type":"ack","id":1,"status":"delivered"}
-app->bridge  {"type":"ack","id":1,"status":"ignored"}
-```
-
-A bridge **MUST NOT** resolve a waiter on the first ack that matches an id. A
-test bridge that did reported `delivered` for four inputs its app had refused.
+A bridge **MUST NOT** resolve a waiter on the first ack that matches an id.
 Acks for one input reach the bridge in the order the app sent them, so the
 newest received is the app's current answer.
 
@@ -1206,55 +915,33 @@ newest received is the app's current answer.
 
 An app **MUST NOT** let an ack be overtaken by a snapshot sent after it, a
 newly published tree or a resend (section 5.1) alike. An agent that saw the
-snapshot first could not tell whether it reflects its own input yet. The
-reference adapter enforces this by giving one thread the stream and
-flushing every pending ack before the pending snapshot in each pass.
+snapshot first could not tell whether it reflects its own input yet.
 
 The converse is not guaranteed. An ack **MAY** arrive before a snapshot that
-was published earlier, because the reference adapter batches: a pass that
-finds both waiting writes the acks first whatever order they were produced in.
-A bridge **MUST NOT** infer, from a snapshot arriving after an ack, that the
-snapshot post-dates the input.
-
-What it may read instead is the stamp. A snapshot from a peer that stamps
-(section 5.3) says in `after_input` which inputs it post-dates, whatever
-order it arrived in, and the rule above holds for stamped snapshots too: a
-resend of an identical tree with its stamp moved is not a publish (section
-5.1), but it is sent, so it goes out behind the acks queued before it.
+was published earlier, since an app may write its pending acks first. A
+bridge **MUST NOT** infer, from a snapshot arriving after an ack, that the
+snapshot post-dates the input. What it may read instead is the stamp
+(section 5.3).
 
 ### 10.5 No fallback for an unknown status
 
 `status` has **no** unknown-value fallback, unlike `role` and `action`. A
 status name a reader does not know fails its whole ack line, id included, and
-the reader skips that line. Verified:
-`{"type":"ack","id":7,"status":"coalesced"}` is a parse error, and
-`"Delivered"` is too, because the names are exactly the three lowercase
-spellings.
+the reader skips that line. Vectors: `{"type":"ack","id":7,"status":"coalesced"}`
+is a parse error, and `"Delivered"` is too, because the names are exactly the
+three lowercase spellings.
 
-This is deliberate and an implementer needs to understand the consequence. A
-status sits at the top of a message rather than nested inside one, so losing
-the ack loses only the ack. An input with no ack already means
-"unacknowledged", which is the safe reading of a status the receiver cannot
-interpret. The loss is one ack rather than a tree.
-
-What it costs is visibility: the app answering an input becomes
-indistinguishable, at the bridge, from the app saying nothing. A bridge
-**SHOULD** keep the reason a line was rejected and surface it when it reports
-"neither acknowledged nor changed", because that rejected line is the only
-trace left of the difference. Without it an agent reads silence as an app that
-does not ack.
-
-This is also the mechanism by which a status added in a later version 1
-release is safe: a bridge that cannot read it skips that ack and keeps the
-`delivered` before it, which is exactly today's answer.
+Losing the ack loses only the ack, and an unacknowledged input is the safe
+reading. So a status added within version 1 is safe: a bridge that cannot
+read it keeps the `delivered` before it. The cost is that the app's answer
+looks like silence, so a bridge **SHOULD** keep the reason a line was rejected
+and surface it when it reports an input "neither acknowledged nor changed".
 
 ### 10.6 An app that never acks
 
 An app that sends no acks at all still works. A bridge **SHOULD** fall back to
 comparing trees, and **SHOULD** report the distinction rather than claiming an
-effect it cannot prove. Both peers are then blind to the difference between an
-input the app ignored and one it has not got to yet, which is precisely what
-the ack exists to remove.
+effect it cannot prove.
 
 ## 11. Connection ownership
 
@@ -1267,29 +954,14 @@ the ack exists to remove.
 - The discard **MUST NOT** be acked. The peer that would read the ack is the
   one that left.
 - An app **MUST NOT** send an ack for an input of an ended connection to a
-  later connection. Ids are unique only within a bridge process, and a fresh
-  bridge counts from the start again, so an id an app held across a disconnect
-  can already name a live input of the next bridge's. That bridge's waiter
-  must not receive a verdict from a session it never saw.
+  later connection. Ids are unique only within a bridge process, so the id
+  can already name a live input of the next bridge's.
 - A bridge **MUST** discard inputs queued while no app was connected, for the
   mirror-image reason: replaying them into a freshly connected app instance
-  delivers keystrokes aimed at a UI that no longer exists. The reference
-  bridge drains its queue on every reconnect.
+  delivers keystrokes aimed at a UI that no longer exists.
 - A bridge **MUST** forget the peer's `protocol_version` when a connection
   ends, so the next connection is not judged by the previous app's handshake
   or snapshot version.
-
-**Reference implementation.** The adapter tags each connection with a
-generation, tags every queued input with the generation it arrived on, and
-retires that generation as the reader thread exits, before the disconnect is
-observable anywhere. An input from a retired generation is discarded at
-dequeue and counted in `stats().stale_inputs`. Input a waiting client wrote
-before the `hello` is counted there too, though it never reaches the queue
-(section 14.5). The same bookkeeping decides who may still be answered: `ack`
-refuses an id whose connection has ended, and an id also stops being
-answerable once its own connection has delivered a queue's worth (256) of
-newer inputs past it, which bounds what the layer remembers and costs at most
-a late ack the peer already has to survive.
 
 ## 12. Key string grammar
 
@@ -1321,11 +993,9 @@ and this is it verbatim, phrased there to follow "expected":
    `f+1`, `f01` and `f0000001` are all errors, deliberately: each of them
    would render back as `f1`, leaving an agent unable to derive the canonical
    form from what it sent.
-5. **Modifier peeling is unbounded.** The grammar strips modifier prefixes
-   with no limit, which is why a bridge accepting a key from an agent
-   **SHOULD** bound the string's length before parsing it: a megabyte of
-   `ctrl+` parses to the key it ends in and then serializes to a line neither
-   peer will read (section 2.5).
+5. **Modifier peeling is unbounded**, so a bridge accepting a key from an
+   agent **SHOULD** bound the string's length before parsing it: a megabyte of
+   `ctrl+` parses to the key it ends in, on a line over the cap (section 2.5).
 6. **Modifier order does not matter on the way in.** `shift+alt+ctrl+enter`
    parses; it renders as `ctrl+alt+shift+enter`.
 7. **A modifier name is case-insensitive, a single character is not.**
@@ -1333,18 +1003,16 @@ and this is it verbatim, phrased there to follow "expected":
 
 ### 12.2 The conformance contract
 
-A Rust peer parses this with `taria::key`, which is why the bridge's verdict
-on a key and the app's are identical by construction. An adapter in another
-language reimplements it, and **the parse/render round-trip is the contract to
-reimplement against: every press the parser can produce MUST render to a
-string that parses back to the same press.**
+A peer in another language reimplements the grammar, and **the parse/render
+round-trip is the contract to reimplement against: every press the parser can
+produce MUST render to a string that parses back to the same press.**
 
 The canonical rendering is modifiers in ctrl, alt, shift order, then the base
 key; `Char(' ')` renders as `space` and never as a literal space, so that a
 modified press such as `ctrl+space` stays parseable; backtab renders as
 `backtab` with no `shift+` prefix, and parses back with shift already set.
 
-Verified round trips:
+Round-trip vectors:
 
 | Input | Parses to | Renders as |
 |---|---|---|
@@ -1357,7 +1025,7 @@ Verified round trips:
 | `shift+alt+ctrl+enter` | enter, ctrl+alt+shift | `ctrl+alt+shift+enter` |
 | `F12` | f12 | `f12` |
 
-Verified rejections: `+a`, `ctrl+`, `f0`, `f13`, `f01`, `ab`, `meta+x`, the
+Rejection vectors: `+a`, `ctrl+`, `f0`, `f13`, `f01`, `ab`, `meta+x`, the
 empty string.
 
 ### 12.3 What a key does
@@ -1368,10 +1036,9 @@ framework **SHOULD** answer `ignored` rather than approximate it: lowering it
 to a near-miss event puts a keystroke into the app that the agent never asked
 for and reports it as applied.
 
-The key grammar is expected to grow inside version 1 (insert, the keypad,
-media keys). A key added to it is additive on the wire, because a key travels
-as a string, so an app built against an older grammar sees a string it cannot
-parse and answers `ignored`.
+The key grammar may grow inside version 1 (insert, the keypad, media keys).
+A key added to it is additive, because an app built against an older grammar
+sees a string it cannot parse and answers `ignored`.
 
 ## 13. Limits
 
@@ -1387,55 +1054,23 @@ A sender **MUST NOT** publish a snapshot whose tree is deeper than 32, and a
 reader **MUST** be able to parse one that is exactly 32.
 
 The limit exists because a snapshot is one JSON object and JSON parsers bound
-how far they recurse into one. `serde_json`, which both reference peers use,
-stops at 128 nested values, and every node costs two of them (its own object
-and its `children` array). Measured through a whole `{"type":"snapshot",...}`
-line rather than a bare node, 63 nested nodes parse and 64 fail. 32 is a
-little under half that, and the slack pays for the transport envelope, for a
-root an adapter adds above the nodes an app hands it, and for a peer whose
-parser is stricter than `serde_json`.
-
-Crossing it **reports nothing anywhere**. The reader skips the line it cannot
-parse exactly as it skips a truncated one, so a deep first snapshot leaves the
-bridge saying it has no tree while the app is connected and healthy, and a
-deep later snapshot leaves it serving the last shallow tree with nothing
-marking it stale. This is why the obligation sits on the sender.
-
-**What to do about a tree that is too deep is the sender's choice**, not a
-protocol rule. The reference adapter **cuts**: every node at the limit
-publishes without its children, per branch, and the app is told through
-`stats()`'s `truncated_snapshots` and `last_truncation` fields. Cutting,
-because the other two answers are the same failure: publishing the tree as
-built puts a line on the wire the bridge cannot parse, and skipping the
-publish is that same stale tree chosen deliberately. Only the cut still
-delivers the part of the tree that is fine. The fix is nearly always to
-publish what the widget draws rather than the data behind it: for a deep tree
-view, the expanded path and the rows on screen.
+how far they recurse into one. Crossing it **reports nothing anywhere**: the
+reader skips the line it cannot parse and goes on serving its last tree. This
+is why the obligation sits on the sender, and what to do about a tree that is
+too deep is the sender's choice.
 
 ### 13.2 Line length
 
-1 MiB, 1048576 bytes, excluding the terminating newline, as
-`taria::wire::MAX_LINE_BYTES`. See section 2.5.
-
-The line that grows is a snapshot, which section 2.5 asks an app to keep
-within the cap. Unlike a tree that is too deep, a tree that is too large is
-not skipped: it ends the connection, and does again on every reconnect
-(section 2.5).
-
-**What to do about a snapshot that is too large is the sender's choice**, as
-it is for depth, not a protocol rule. The reference adapter **trims**, and
-marks a cut string with `…` (U+2026). A `log` or `terminal` value keeps its
-end and starts with the marker, because the end is where those grow; every
-other string keeps its start. Ids and custom action names are never changed,
-so whatever an agent can read it can still act on. `docs/architecture.md`
-(Snapshot size) gives the order the adapter cuts in and how it tells the app.
+The line cap is section 2.5. Unlike a tree that is too deep, a snapshot too
+large for a line is not skipped: it ends the connection, on every reconnect.
+What to do about one is the sender's choice;
+[tree-guide.md](tree-guide.md#keep-the-snapshot-small-enough-to-arrive)
+covers it for app authors.
 
 ### 13.3 Socket path and pipe name length
 
-`sockaddr_un.sun_path` has to hold the path and its terminating NUL, so the
-limit is that buffer minus one, and the buffer is not the same size
-everywhere. Windows has no `sun_path`: its endpoint is a named pipe (section
-14.8), and the limit is on the pipe's whole name.
+`sockaddr_un.sun_path` holds the path and its terminating NUL, so the limit
+is that buffer minus one. On Windows the limit is on the pipe's whole name.
 
 | Platform | Buffer | Longest endpoint |
 |---|---|---|
@@ -1444,39 +1079,25 @@ everywhere. Windows has no `sun_path`: its endpoint is a named pipe (section
 | Windows | none | **256** UTF-16 code units, the whole pipe name, `\\.\pipe\` included |
 
 On a unix, length is the byte length of the path, the same count the kernel
-applies. A path in the band between the two binds on Linux and is refused on
-macOS, which is not hypothetical: the macOS temp dir is around 49 bytes, so
-the fallback path plus a long app label lands in it.
+applies. A path between the two limits binds on Linux and is refused on
+macOS.
 
-On Windows, length is counted the way Windows counts the name, in UTF-16 code
-units (a character outside the Basic Multilingual Plane, such as most emoji,
-counts two). The 256 covers the prefix, so the default name
-`\\.\pipe\taria-<SID>-<label>` spends 16 units on its fixed parts and the
-SID's own length on the user (a SID is the account's security id, section
-14.8): a typical account's SID is around 45 characters, which leaves a label
-about 190. A label that holds `\` is refused before the length is counted
-(section 14.8).
+On Windows, length is counted in UTF-16 code units (a character outside the
+Basic Multilingual Plane, such as most emoji, counts two). The 256 covers the
+prefix, so the default name `\\.\pipe\taria-<SID>-<label>` spends 16 units on
+its fixed parts and leaves the label 240 less the SID's length (section 14.8):
+196 units beside a 44-character SID such as
+`S-1-5-21-3623811015-3361044348-30300820-1013`, and 188 beside the longest
+`S-1-5-21-` account SID, 52 characters.
 
 Both peers **SHOULD** check this before binding or connecting rather than
-letting the kernel refuse. The kernel's own refusal names neither the path,
-its length, the limit, nor a way out. The bridge checking it while parsing its
-arguments is what keeps an over-long path from surfacing from inside a
-reconnect loop, where it reads as "the app is not running".
+letting the kernel refuse, since the kernel's refusal names neither the path,
+its length, the limit, nor a way out.
 
 ### 13.4 Bounds the reference bridge adds (convention)
 
-These are agent-facing tool bounds, not wire rules, but they exist to protect
-the wire and an implementer may want to match them. Each one closes a
-single-legal-call hole where an unbounded argument becomes a line over the
-1 MiB cap, which costs the app its bridge. The reference adapter closes the
-same hole on its side by trimming its snapshots (section 13.2).
-
-| Bound | Value | Why |
-|---|---|---|
-| `act` `value` length | 4096 characters | Same bound as `type_text`, because it answers the same question. |
-| `type_text` payload | 4096 characters | |
-| `key` string length | 64 characters, checked before the parse | Modifier peeling is unbounded (section 12.1). |
-| `key` repeat count | 1 to 64 | |
+The reference bridge's tool bounds are agent-facing, not wire rules (section
+1.5).
 
 ## 14. Socket discovery and lifecycle
 
@@ -1485,25 +1106,17 @@ same hole on its side by trimming its snapshots (section 13.2).
 Both peers derive the same default path from the same environment, or they
 never meet. Precedence, highest first:
 
-1. **`$TARIA_SOCK` verbatim**, when set and non-empty. An explicit path is an
-   override, so it is used exactly as given.
+1. **`$TARIA_SOCK` verbatim**, when set and non-empty.
 2. **`$XDG_RUNTIME_DIR/taria/<label>.sock`**, when `$XDG_RUNTIME_DIR` is set
-   and non-empty. This is the per-user runtime directory, already private and
-   already cleaned up at logout.
-3. **`<temp dir>/taria-<user>/<label>.sock`**. The temp dir is shared, so
-   `<user>` namespaces it to keep one user's sockets out of another's reach.
+   and non-empty.
+3. **`<temp dir>/taria-<user>/<label>.sock`**, where `<user>` keeps one
+   user's sockets apart from another's in the shared temp dir.
 
-An empty variable counts as unset in both branches.
-
-`<user>` is derived identically by both reference peers: the effective uid
-where it is available (through `/proc/self` on Linux), else `$USER`, else
-`$LOGNAME`, else the literal `default`. This derivation lives in each peer
-rather than in the shared crate, so a third-party adapter that wants to be
-discoverable through the fallback branch **MUST** match it.
-
-This resolution, sections 14.3 and 14.4, and the socket file of section 14.6
-are about a file on a unix. On Windows the endpoint is a named pipe, which is
-named, protected and freed differently; section 14.8 says how.
+`<user>` is the effective uid where it is available (through `/proc/self` on
+Linux), else `$USER`, else `$LOGNAME`, else the literal `default`. This
+derivation lives in each peer rather than in the shared crate, so a
+third-party adapter that wants to be discoverable through the fallback branch
+**MUST** match it. On Windows, section 14.8 replaces this resolution.
 
 ### 14.2 The label rule
 
@@ -1515,24 +1128,14 @@ This is checked **before** the precedence above, so a label is acceptable or
 not on its own terms and cannot pass on a machine that happens to set
 `$TARIA_SOCK` and fail on the next one.
 
-The reason is that the app binds **and unlinks** what the label resolves to.
-`/etc/cron.d/evil` as a label makes the path join discard the whole resolution
-and keep the absolute path, and `../../../tmp/pwn` walks out of the runtime
-directory. The label is argv-sourced, so this is not a privilege boundary; it
-is the difference between a bad argument reported as one and a bad argument
-deleting a file.
+The app binds **and unlinks** what the label resolves to, so a label such as
+`/etc/cron.d/evil` or `../../../tmp/pwn` would otherwise name a file outside
+the runtime directory.
 
 A label may hold anything else a file name may hold: `my app`, `app.v2`,
-`..app`, `app..`, `-` and `app:1` all resolve. The check is about components,
-not about characters someone finds surprising. An app that wants a path this
-rejects passes the path itself.
-
-The reference bridge refuses the same labels while parsing `--app`, where
-`--socket` remains the way to name a path.
-
-On Windows the label ends a pipe name rather than a file name, and a label
-that also contains `\` **MUST** be refused, since Windows reads `\` as a
-separator there too (section 14.8).
+`..app`, `app..`, `-` and `app:1` all resolve. An app that wants a path this
+rejects passes the path itself. On Windows a label holding `\` is refused too
+(section 14.8).
 
 ### 14.3 Directory vetting
 
@@ -1541,15 +1144,10 @@ mode `0700` and then vet it: it **MUST** be a real directory rather than a
 symlink, **MUST** be owned by the current user, and **MUST** have no group or
 other permission bits. Binding is refused otherwise.
 
-The parent directory decides who can replace or redirect the socket. A
+The parent directory decides who can replace or redirect the socket: a
 symlink, another user's ownership, or a group-writable mode each let a local
-attacker swap the socket for their own and impersonate the app, or intercept
-the bridge. The check uses the link's own metadata, not the target's, so a
-planted symlink is seen as itself.
-
-That is impersonation at the socket. Text inside the real app's tree that
-speaks as the app, a model's output or a file's contents, is the content-level
-case, and section 6.4 covers it.
+attacker swap the socket for their own. The check uses the link's own
+metadata, not the target's.
 
 ### 14.4 Freeing the path
 
@@ -1559,22 +1157,19 @@ killed has to be unlinked first. That unlink has to be earned:
 - **A socket nothing is listening on** is unlinked and the bind proceeds.
 - **A socket another instance is serving** is refused (`AddrInUse`), naming
   the path and saying to give the second instance one of its own. Taking it
-  over would leave the first instance running, believing it is reachable,
-  while every bridge connects to the newcomer.
+  over would leave the first instance unreachable.
 - **Anything that is not a socket** is refused (`AlreadyExists`) and left
   untouched. The path can come verbatim from `$TARIA_SOCK`, and a typo there
   is not a reason to delete a file.
 
-The liveness probe is a `connect` that is opened and immediately closed. A
-peer serving the path sees a connection that opens and closes, which is what
-it does with any client that goes away. An answer that does not arrive within
-a short timeout (250 ms in the reference adapter) refuses the bind rather than
-unlinking a socket that may still be serving.
+The liveness probe is a `connect` that is opened and immediately closed. An
+answer that does not arrive within a short timeout refuses the bind rather
+than unlinking a socket that may still be serving.
 
 ### 14.5 Serving
 
-The app listens and **MAY** serve one client at a time; the reference adapter
-does. On accept it sends, in this order:
+The app listens and **MAY** serve one client at a time. On accept it sends,
+in this order:
 
 1. the `hello`,
 2. the latest snapshot, if it has one, unstamped (section 5.3),
@@ -1582,90 +1177,20 @@ does. On accept it sends, in this order:
    the last one with only its stamp moved, which is not a publish (section
    5.1).
 
-Multiple simultaneous bridge clients per app are a deferred feature, not a
-protocol rule. With a one-at-a-time adapter, a second bridge's `connect`
-succeeds into the listen backlog (the kernel's queue of connections the app
-has not accepted yet) and is not accepted until the first bridge leaves, so
-until then that bridge sees an open connection on which nobody says a word. A
-bridge **SHOULD** report that state as itself rather than as a wrong socket
-path: in that state the bridge is connected to the right path, and sending an
-adopter back to check the path is the first wrong turn a retrofit takes.
+With a one-at-a-time app, a second bridge's `connect` succeeds into the
+listen backlog (the kernel's queue of connections the app has not accepted
+yet) and is not accepted until the first bridge leaves. Until then that bridge
+sees an open connection on which nobody says a word. A bridge **SHOULD**
+report that state as itself rather than as a wrong socket path, since the
+path is right.
 
-Anything a waiting bridge writes sits unread in the kernel's socket buffer
-until its turn comes, and would then be read as the new session's first lines.
-Nothing written before the `hello` can be a reply to it: that bridge has seen
-no tree, so its inputs name nodes and keys it guessed at. An app **MAY**
-discard input written before its `hello`, without acking it, since the session
-it would be answered in has not begun. A bridge that writes nothing before the
-`hello`, as the reference bridge does, loses nothing.
+Anything a waiting bridge writes sits in the kernel's socket buffer until its
+turn, and nothing written before the `hello` can be a reply to a tree. An app
+**MAY** discard input written before its `hello`, without acking it. A bridge
+that writes nothing before the `hello` loses nothing.
 
-**Reference implementation.** The adapter discards only for a client that was
-already waiting in the backlog when the previous session ended. Just before
-writing that client's `hello`, it reads off whatever is already waiting and
-discards it, counting each complete `input` line, of any kind, in
-`stats().stale_inputs`. If what it read stops partway through a line, the rest
-of that line is skipped when it arrives. More than 1 MiB waiting is treated like
-a line over the cap and closes the connection. The first connection of a
-process, and a client that connects to an idle app, waited behind nobody and
-keep what they wrote. The adapter tells the two apart by whether an accept
-has found the backlog empty since the last session ended, so a client that
-connects the instant a session ends counts as one that waited.
-
-**Not specified.** What a second bridge should do while its connection waits,
-or on Windows after its open is refused as busy, beyond reporting it.
-
-**Reference implementation.** The reference bridge takes turns, which is its
-own policy and not a rule. It opens no connection until its first tool call,
-so a bridge that is started and never used never takes the app. A bridge
-that waits says the app is held by another bridge, and when the holder lets
-go, so the agent retries: after 60 s with no tool calls on the default, or
-after the waiting bridge's own `--idle-release`, its best guess at a holder
-started the same way. Once the holder does (section 14.7), the waiting bridge
-is accepted. A waiting bridge that itself goes a whole window with no tool
-calls leaves the backlog.
-
-A stopped app keeps its socket listening and accepts nothing, which leaves a
-connection exactly as silent as a held app does. On Linux the reference bridge
-tells the two apart by the listener's state. It takes the listener's pid from
-`SO_PEERCRED`, the pid the kernel records for the other end of a Unix socket
-(for a connection still in the backlog, the process listening), and reads that
-process's state from `/proc/<pid>/stat`. A stopped app is named with its pid
-and how to resume it. A job suspended in its terminal, stopped outside the
-terminal's foreground process group, resumes only with `fg` there:
-`kill -CONT` resumes it only in the background, where its next use of the
-terminal stops it again. A tracing stop (state `t`) ends from the debugger,
-and any other stop with `kill -CONT`. Nothing on the wire carries any of it,
-and on macOS and the other unixes a stopped app reads as held.
-
-**On Windows there is no backlog**, and both of the silences above mean
-something else. A one-instance pipe (section 14.8) has no queue to wait in:
-while a bridge is served, a second bridge's open fails at once with
-`ERROR_PIPE_BUSY`, and no connection opens at all. That refusal is the only
-sign of an app held by another bridge, and a bridge **SHOULD** report it as
-the app held, not as a wrong pipe name or an app that has gone, and
-**SHOULD** retry it as it retries any connect (section 14.7). So:
-
-- A second bridge never has a connection to write into before its turn, and
-  the discard of input written before the `hello`, above, never applies.
-- An open connection that stays silent is not a bridge waiting its turn: the
-  app's pipe took it, and an app greets a bridge as soon as it takes one. A
-  bridge **SHOULD NOT** report that silence as the app held. It is the app
-  itself, suspended (by a debugger or a process tool), or stuck before its
-  `hello`, or a pipe that is not a taria app at all.
-
-**Reference implementation.** The reference bridge retries a busy open for
-250 ms (section 14.8), and answers a refusal that outlasts that with the held
-answer, in the same words and the same retry advice as on a unix, with the
-pipe's refusal as the evidence in place of the silent connection's age, and
-last that the app may instead be suspended or stuck: an app stopped after a
-session cannot listen again, so its pipe stays busy. The exception is a busy
-refusal while a pipe it refused still stands (section 14.8), which keeps that
-pipe's answer instead. It answers the silent pipe with the app suspended or
-stuck, the pipe name right, and a retry once the app responds. Stopped-app
-detection needs `/proc`, so on Windows a suspended app is named only as
-possibly suspended, never with its pid's state. Every answer that names the
-endpoint names the pipe and the pipe name where a unix answer names the
-socket and the socket path, and is otherwise the same text.
+On Windows there is no backlog, and section 14.8 says what a busy refusal and
+a silent pipe mean there.
 
 ### 14.6 Shutdown
 
@@ -1674,75 +1199,31 @@ still the one it bound, compared by device and inode. A second instance that
 took the path over is serving a socket of its own there, and unlinking it
 would leave that instance unreachable.
 
-Binding **MUST NOT** be able to park an app during startup. That is the one
-thing taria promises never to do, and it is why the reference adapter turns
-every bind failure into an inert layer rather than an error, polls a shutdown
-flag instead of parking in `accept()`, and runs its liveness probe with a
-timeout on a thread of its own.
+Binding **MUST NOT** be able to park an app during startup: a failure to
+bind leaves the app running without taria rather than waiting.
 
-**Reference implementation.** At shutdown the adapter writes the acks still
-queued for a connected bridge before it closes the connection, so an app that
-answers an input and exits in the same frame does not leave the agent told
-that input's fate is unknown. The flush gets 250 ms in all, and a snapshot
-still waiting is not sent: it describes a UI that is about to be gone. Exit
-stays bounded: at worst one 50 ms poll of the shutdown flag, the 5 s the line
-being written may take, and the 250 ms flush. Every line the adapter writes
-has 5 s in all, however large it is and however the bridge reads, and a
-bridge that cannot take a whole line in that time is dropped.
+An app that writes its pending acks before it closes the connection at
+shutdown keeps the answer to an input it applied in its last frame. A snapshot
+still waiting then is not worth sending: it describes a UI about to be gone.
 
 ### 14.7 Reconnection
 
-A bridge **SHOULD** reconnect with capped backoff rather than give up: the
-reference bridge starts at 250 ms, doubles, and caps at 2 s, retrying while
-tool calls want the app. A connection that dies young without delivering a
-snapshot **SHOULD** keep the backoff growing instead of resetting it, or a
-peer that accepts and immediately drops pulls the bridge into a full-CPU
-loop.
+A bridge **SHOULD** reconnect with capped backoff rather than give up. A
+connection that dies young without delivering a snapshot **SHOULD** keep the
+backoff growing instead of resetting it, or a peer that accepts and
+immediately drops pulls the bridge into a full-CPU loop.
 
 On disconnect a bridge **SHOULD** fail tool calls fast with an error naming
-the app that went away, rather than acting on a stale tree.
-
-**Reference implementation.** The reference bridge connects on demand. It
-opens no connection until its first tool call, which waits for the `hello` and
-the latest snapshot the app sends on accept (section 3.4), so that call still
-answers with the live tree. The wait normally takes milliseconds and never
-runs past 1.2 s. After 60 s with no tool calls it closes its connection, or
-leaves the listen backlog, and stops reconnecting until the next tool call, so
-a bridge waiting for the app gets it. Stopping while no call wants the app is
-not giving up: the next call reconnects. `--idle-release` sets the delay, and
-`0` never lets go. It does not let go while an input it sent is still waiting
-for its ack, for up to 30 s past the delay, because the app discards an input
-whose connection has ended (section 11). A bridge that reconnects into the
-backlog behind another, as the one that loses the race does when an app
-restarts, says the app is held by another bridge rather than that it may have
-exited. One that reconnects to an app that greets it but has not published yet
-says that, and that a retry is served the first snapshot. One that reconnects
-and cannot read what the app sends quotes the line it could not read: a
-connect forgets every reason it held but an oversized line's (section 13.2),
-so the reason quoted is the new connection's. On Linux, one whose connection
-is silent because the app is stopped names it as stopped, with its pid and how
-to resume it (section 14.5). One that let go of the app after its window says,
-in each of these answers, that the disconnect was its own release, not a fault,
-unless it has seen signs of a new instance since: nothing listening, or another
-pid listening than the one it let go of. None of this is a protocol rule. To
-the app, a bridge that let go is one that left.
-
-On Windows the same bridge reads a reconnect refused as busy as the app held
-by another bridge, the Windows form of landing in the backlog, and a
-reconnect that opens and stays silent as the app suspended or stuck (section
-14.5). It takes the peer's pid from `GetNamedPipeServerProcessId` rather
-than `SO_PEERCRED`, for telling one instance from the next. Since a pipe's
-name lives while any handle to the pipe is open (section 14.8), the bridge
-closes its end as soon as it reads end of stream, so that a restarted app can
-create the pipe again.
+the app that went away, rather than acting on a stale tree. A bridge that
+stops reconnecting while nothing wants the app, and connects again when
+something does, has not given up: to the app, it is a bridge that left.
 
 ### 14.8 Windows discovery
 
 On Windows the endpoint is a named pipe (section 2.1), and this section
 replaces sections 14.1, 14.3 and 14.4 there, and the socket file of section
 14.6. Sections 14.2, 14.5, 14.6 and 14.7 otherwise apply, with the
-differences they and this section state. Nothing here changes a byte on the
-connection: it is a transport a peer adds, and version 1 is unchanged.
+differences this section states.
 
 Two Windows terms recur. A **SID** (security identifier) is the string that
 names an account, `S-1-5-21-...`. A **DACL** (discretionary access control
@@ -1756,36 +1237,30 @@ it and how.
    user the process runs as, read from the process token (not a thread's
    impersonation token) and written as `ConvertSidToStringSidW` writes it.
 
-Pipe names share one namespace per machine rather than living in a per-user
-directory, so the SID is in the name to keep one user's pipes apart from
-another's. A peer that wants to be found by the default **MUST** derive it
-exactly this way. The name only keeps users apart; it does not keep anyone
-out. What does is four things below, together: the first-instance flag, the
-reject-remote flag, the DACL, and the bridge's owner check.
+Pipe names share one namespace per machine, so the SID keeps one user's pipes
+apart from another's. A peer that wants to be found by the default **MUST**
+derive it exactly this way. What keeps others out is not the name but four
+things below: the first-instance flag, the reject-remote flag, the DACL, and
+the bridge's owner check.
 
 **The override.** A peer **MUST** honour `$TARIA_SOCK` only when it names a
-pipe on the local machine: it starts with `\\.\pipe\`, in any letter case,
-since Windows matches the prefix without regard to case (`\\.\PIPE\x` is
-`\\.\pipe\x`), and what follows is one name, with no `\` or `/`, no NUL, and
-not empty or only dots and spaces. Anything else **MUST** be refused, not
-fallen back from: the user named an endpoint, and serving or connecting
-somewhere else would leave the two peers apart with nothing said. A remote
-name, `\\host\pipe\x`, is the reason for the rule. Opening a pipe on another
-machine goes over SMB (Windows file sharing), which sends that machine the
-user's credentials and puts the agent's input on the network. The other
-refusals close the ways around the prefix: Windows normalises a `\\.\` name
-before opening it, folding `/` into `\` and resolving `..`, so
-`\\.\pipe\..\UNC\host\share` passes a plain prefix check and leaves for SMB.
-The same rule holds for a name passed whole, such as the reference bridge's
-`--socket` and the adapter's `bind_at`.
+pipe on the local machine: it starts with `\\.\pipe\`, in any letter case
+(`\\.\PIPE\x` is `\\.\pipe\x`), and what follows is one name, with no `\` or
+`/`, no NUL, and not empty or only dots and spaces. Anything else **MUST** be
+refused, not fallen back from: the user named an endpoint, and serving or
+connecting somewhere else would leave the two peers apart with nothing said.
+The same rule holds for a name passed whole, such as a command-line argument.
 
-That normalisation also trims trailing dots and spaces, so `\\.\pipe\taria.`
-and `\\.\pipe\taria` name the same pipe, and a label `app.` the same pipe as
-`app`. Both peers pass the name to Windows, which normalises it alike for
-each, so they still meet. A peer **SHOULD** pass the name as UTF-16 to the
-wide-character (`W`) functions: the ANSI ones convert it through the code
-page first, and a best-fit conversion can turn a character the rule allowed
-into a `\`.
+A remote name, `\\host\pipe\x`, is the reason for the rule: opening it goes
+over SMB (Windows file sharing), which sends that machine the user's
+credentials and puts the agent's input on the network. The other refusals
+close the ways around the prefix, since Windows folds `/` into `\` and
+resolves `..` before opening, so `\\.\pipe\..\UNC\host\share` leaves for SMB.
+
+That normalisation also trims trailing dots and spaces, so a label `app.`
+names the same pipe as `app`, for both peers alike. A peer **SHOULD** pass the
+name as UTF-16 to the wide-character (`W`) functions: a best-fit conversion
+through the ANSI code page can turn a character the rule allowed into a `\`.
 
 **The label** is held to section 14.2's rule, and **MUST** also be refused if
 it contains `\`. The whole name is limited to 256 UTF-16 code units (section
@@ -1795,21 +1270,22 @@ it contains `\`. The whole name is limited to 256 UTF-16 code units (section
 
 - **MUST** create it as the first instance of its name
   (`FILE_FLAG_FIRST_PIPE_INSTANCE`), which fails while any instance of that
-  name exists. That is what refuses a second app on a live name, as section
-  14.4's `AddrInUse` does on a unix, and what keeps an app from joining, as a
-  second instance, a pipe something else created first under its name.
-  Taking a name over is impossible here, so there is nothing to free.
+  name exists. That refuses a second app on a live name, and keeps an app from
+  joining a pipe something else created first under its name.
 - **MUST** reject remote clients (`PIPE_REJECT_REMOTE_CLIENTS`).
 - **MUST** create it with a security descriptor whose owner is the user, and
-  whose DACL grants that user alone, protected from inherited entries. This
-  is section 14.3's private directory in another form: it decides who can
-  open the app's pipe.
+  whose DACL grants that user alone, protected from inherited entries.
 - **SHOULD** allow one instance (`nMaxInstances` 1). A second instance would
-  let a second bridge connect into it and wait unserved, which section 14.5
-  says a bridge reads as a stuck app, not a held one.
+  let a second bridge connect into it and wait unserved, which a bridge reads
+  as a stuck app, not a held one (below).
 - **MAY** reuse the one instance across sessions: disconnect the last client
-  (`DisconnectNamedPipe`) and listen again (`ConnectNamedPipe`). The
-  reference adapter does.
+  (`DisconnectNamedPipe`) and listen again (`ConnectNamedPipe`).
+
+**No backlog.** A one-instance pipe has no queue to wait in: while a bridge is
+served, a second bridge's open fails at once with `ERROR_PIPE_BUSY`, and no
+connection opens. That refusal is the only sign of an app held by another
+bridge, and a second bridge never has a connection to write into before its
+turn.
 
 **Opening the pipe.** The bridge:
 
@@ -1817,81 +1293,54 @@ it contains `\`. The whole name is limited to 256 UTF-16 code units (section
   or parses anything it sent, that the pipe's owner is its own user's SID,
   and otherwise close it with nothing written to it and nothing it sent
   parsed. Any process can create a pipe under the app's name before the app
-  does, or after it exits, and an agent that read it would take its tree for
-  the app's and send it input. An owner that is a group the user belongs to
-  is not the user. A runtime that starts a read into its own buffer as it
-  registers the pipe, as tokio's does, still conforms, provided what that
-  read took is dropped with the pipe and never parsed.
+  does, or after it exits. An owner that is a group the user belongs to is
+  not the user. A runtime that reads into its own buffer as it registers the
+  pipe still conforms, provided that read is dropped unparsed.
 - **SHOULD** read an open refused as access denied (`ERROR_ACCESS_DENIED`)
   as a pipe it cannot use, not as no app there, and **SHOULD NOT** report it
-  as surely not the app's, as it may a pipe another account owns. The app's
-  pipe grants its user access (above), but a bridge running as that user is
-  still denied it in a sandbox (a restricted token or an AppContainer) or at
-  low integrity, and a bridge running as another account, given the name
-  whole, is denied it too. So access denied means either a pipe the app did
-  not create, or a bridge with fewer rights than the app's user, and a
-  report of it names both, and what to check: that the bridge runs as the
-  app's user, outside any sandbox and at the app's integrity level.
+  as surely not the app's, as it may a pipe another account owns. Access
+  denied means either a pipe the app did not create, or a bridge with fewer
+  rights than the app's user: another account, a sandbox (a restricted token
+  or an AppContainer), or low integrity. A report of it names both.
 - **SHOULD** open it at the `SECURITY_IDENTIFICATION` impersonation level, so
   that what serves the pipe can learn who the bridge is but cannot act as it.
 - **SHOULD** retry an open refused as busy (`ERROR_PIPE_BUSY`) for a short
-  while before it reads the refusal as the app held by another bridge.
-  Between two sessions the one instance is busy for a moment: the last
-  bridge has closed its end, and the app has yet to disconnect it and
-  listen again. Refused at once, a bridge arriving in that moment would
-  report a free app as held.
+  while before it reads the refusal as the app held by another bridge, since
+  the one instance is busy for a moment between two sessions.
 - **SHOULD** read a refusal as busy that outlasts the retry as the app held
-  by another bridge, unless a refusal of the pipe stands (below), and a
-  missing name (`ERROR_FILE_NOT_FOUND`) as no app there (section 14.5).
+  by another bridge, not as a wrong pipe name or an app that has gone, unless
+  a refusal of the pipe stands (below). Either way it keeps retrying as it
+  retries any connect (section 14.7). It **SHOULD** read a missing name
+  (`ERROR_FILE_NOT_FOUND`) as no app there.
+- **SHOULD NOT** read an open connection that stays silent as the app held:
+  the app's pipe took it, and an app greets a bridge as soon as it takes one.
+  It is the app itself, suspended or stuck before its `hello`, or a pipe that
+  is not a taria app at all.
 - **SHOULD** keep reporting a pipe it refused, one another account owns or
   one that denied it access, on the busy refusals that follow, until a
   connect passes the owner check, finds nothing listening, or the bridge
-  stops trying, as the reference bridge does when it lets go of the app
-  after its idle window (section 14.7). A pipe that takes one open, fails
-  the owner check and is closed stays busy until its server disconnects that
-  open, which an impostor need never do, and read as the app held, its busy
-  refusals would send the agent to wait for an app that is not there. The
-  rule ends with the trying because what it stands over is what the bridge
-  has tried since: a bridge that stops trying cannot see the impostor exit
-  and the app come back, held by another bridge, and its next busy refusal
-  is read afresh.
+  stops trying: an impostor's pipe stays busy for as long as it likes.
 
 **The pipe's lifetime.** A pipe, and its name with it, lives while any handle
 to it is open, on either end. An app that exits while a bridge still holds
 its end leaves the name taken until that bridge closes, and a restarted app
 is refused as if the old one were still serving. A bridge **SHOULD** close
-its end as soon as it reads end of stream. An app **SHOULD** retry, for a
-short while, a create that fails because the name is in use
-(`ERROR_ACCESS_DENIED` from the first-instance flag, or `ERROR_PIPE_BUSY`)
-before it reports the name in use, so that an app restarted at once
-outlasts that bridge instead of running with taria off for the whole of its
-run. The retry has to stay short, since binding must not park the app's
-startup (section 14.6), and a second app on a name that is still served is
-refused all the same, that much later.
+its end as soon as it reads end of stream.
+
+An app **SHOULD** retry, for a short while, a create that fails because the
+name is in use (`ERROR_ACCESS_DENIED` from the first-instance flag, or
+`ERROR_PIPE_BUSY`) before it reports the name in use, so that an app
+restarted at once outlasts that bridge. The retry has to stay short, since
+binding must not park the app's startup (section 14.6).
 
 **Shutdown.** A pipe leaves no file behind, so section 14.6's rule on removing
-the socket file has nothing to act on. The acks flushed at shutdown (section
+the socket file has nothing to act on. Acks written at shutdown (section
 14.6) still have to reach the bridge: an app **SHOULD** close its end at
 shutdown rather than disconnect the client, since closing leaves what the
 app wrote readable by the bridge until it has read it, and
 `DisconnectNamedPipe` discards it. It **SHOULD NOT** wait for the bridge to
 read it either (`FlushFileBuffers`), which can wait forever and so park the
 app's exit.
-
-**Reference implementation.** `taria::socket` holds the pure parts both
-reference peers use: `pipe_name` builds the default name, `check_pipe_name`
-holds a name given whole to the override rule, and `resolve_pipe_name` is the
-precedence above. They build and are tested on every platform. The adapter
-creates the pipe with `PIPE_ACCESS_DUPLEX`, byte mode, one instance, the
-first-instance and reject-remote flags, and a DACL granting the user
-`GENERIC_READ | GENERIC_WRITE`, and retries a create that finds the name in
-use for 500 ms, 20 ms between tries, before it reports `AddrInUse`. The
-bridge opens it with tokio's named-pipe client, retries a busy open for
-250 ms, 10 ms between tries, checks the owner with `GetSecurityInfo`, and
-answers an open refused as access denied with both readings, the bridge's
-rights first. It keeps a refused pipe's answer over every failed connect
-after it but nothing listening, a busy refusal included, and drops it when
-it lets go of the app after its idle window, the one way it stops trying.
 
 ## 15. Focus contract
 
@@ -1900,32 +1349,19 @@ app's obligation rather than anything either peer enforces.**
 
 - An app **MUST** publish at most one node with `focused: true`.
 - An app **SHOULD** publish at least one. A tree with no focus tells an agent
-  nothing about where a raw key would land. The reference adapter guarantees
-  it by focusing the root it generates when no recorded node, or descendant of
-  one, is focused.
+  nothing about where a raw key would land.
 
-Neither reference peer validates this. The bridge does not read `focused` at
-all beyond describing it to an agent, so an app that publishes two focused
-nodes produces a tree that parses and misleads.
+Nothing checks this, so an app that publishes two focused nodes produces a
+tree that parses and misleads.
 
-**Not specified.** What a reader should do with a snapshot carrying zero or
-more than one focused node.
+Focus tells the agent where a raw `key` would land. It is also how an agent
+aims `text`, because an app accepting typing normally focuses the surface
+taking it, but what decides where typed characters go is the app.
 
-Focus tells the agent where a raw `key` would land, which is what makes the
-key fallback usable. It is also how an agent aims `text`, but only because an
-app that is accepting typing normally focuses the surface taking it. What
-decides where typed characters go is the app, not the protocol.
-
-**Focus is not selection.** Focus says where a key would go; a cursor sits on
-a row whether or not that list owns the keyboard. An app that publishes only
-focus makes a moved cursor invisible, and a bridge then truthfully reports
-"the tree did not change" for an input the app handled. Publish the selection
-as its own readable fact, in `selected` (section 6.5): the demo marks the
-cursor row `"selected":true` and every other row `"selected":false`, and also
-names the selected row's id in the list node's `value`, as it did before
-`selected` existed. Both are visible in the capture in section 18, where a
-`down` key moves `"selected":true` from `task-1` to `task-3` and the list's
-`"value":"task-1"` to `"value":"task-3"`.
+**Focus is not selection.** A cursor sits on a row whether or not that list
+owns the keyboard, so an app that publishes only focus makes a moved cursor
+invisible. Publish the selection in `selected` (section 6.5), as the capture
+in section 18.2 does when a `down` key moves it from `task-1` to `task-3`.
 
 ## 16. Versioning
 
@@ -1950,27 +1386,28 @@ something it quietly ignores.
 - A new ack **`status`** value.
 - A new **key name** in the grammar (section 12.3).
 
-### 16.3 The four degrade fallbacks
+### 16.3 The degrade fallbacks
 
-Neither property in 16.1 covers a value nested inside a message the peer does
-want, so the open vocabularies and the typed state carry their own
-fallbacks. A reader **MUST** implement all four:
+Neither property in 16.1 covers a value inside a message the peer does want,
+so the open vocabularies, the typed state and the stamps carry their own
+fallbacks. A reader **MUST** implement all six:
 
-| Value | Unknown reads as | Section |
+| Value | Unknown name reads as | Section |
 |---|---|---|
 | `role` | `other` | 7.2 |
 | `action` | a custom action **keeping the name** | 8.4 |
 | `input` `kind` | an unreadable input **keeping the message's id** | 9.5 |
-| a typed state field, such as a `checked` of `"partial"` | not stated, **keeping the node** | 6.1 |
+| a typed state field of the wrong shape, such as a `checked` of `"partial"` | not stated, **keeping the node** | 6.1 |
+| the hello's `stamps`, of any value but `true` | a peer that does not stamp, **keeping the hello** | 3.1 |
+| the snapshot's `after_input` of the wrong shape | unstamped, **keeping the tree** | 5.3 |
 
-An ack's `status` deliberately has **no** fallback (section 10.5), because it
-sits at the top of a message rather than nested inside one, so losing it loses
-only one ack.
+Read strictly, a field added later would fail its node or its message, and
+the reader would skip the line: an agent left on a stale tree over one field.
+`focused` and `relayed` are read strictly, since a mark that is not a boolean
+says nothing usable. An ack's `status` has **no** fallback (section 10.5):
+losing it loses only one ack.
 
 ### 16.4 The narrower rule for bridge-to-app messages
-
-Quietly ignoring the line is not the same as quietly ignoring the request, and
-in the bridge-to-app direction that difference is the whole point.
 
 An ack answers an id, and an id belongs to an `input` message. **A variant
 that is not an `input` cannot be acknowledged**: an old app skips it with
@@ -1985,13 +1422,10 @@ the unknown-kind fallback, and comes back as an ack the agent can act on. New
 bridge-to-app variants stay available for anything that is not input and wants
 no answer.
 
-Verified: the reference adapter, sent `{"type":"future","payload":1}`, skipped
-it without an ack and kept serving.
-
 ### 16.5 Version mismatch
 
 Peers on different versions disagree about the shape of every message, so an
-app on another version cannot parse a single input this bridge sends it.
+app on another version cannot parse a single input a bridge sends it.
 
 A bridge **SHOULD** split its tool surface by direction on a mismatch:
 
@@ -2001,15 +1435,9 @@ A bridge **SHOULD** split its tool surface by direction on a mismatch:
   having sent nothing. Forwarding input across a mismatch leaves the agent
   waiting on a session that can never react.
 
-Reading across a mismatch is the common case, not a guarantee. A bump is
-defined by the changes that break parsing, so a peer that moved a field of
-`Snapshot` delivers lines the bridge skips one by one, holds no tree at all,
-and answers "no snapshot from the app yet" rather than with a degraded one.
-What survives a bump is whatever the two versions still happen to spell the
-same way.
-
-An app has no comparable decision to make: it reads the bridge's version
-nowhere, because the bridge sends no handshake.
+Reading across a mismatch is the common case, not a guarantee: a bump is
+defined by the changes that break parsing, so a peer's snapshots may all fail
+to parse.
 
 ### 16.6 Passing the line on beats degrading
 
@@ -2017,11 +1445,7 @@ Degrading keeps the connection; passing the line on keeps the information. A
 bridge **SHOULD** store each snapshot as **the app's own line** beside the
 parse of it, and hand the line to the agent. A role, an action or a field the
 bridge has never heard of then reaches the agent by name instead of flattened
-into whatever its typed view could hold: an app publishing
-`"role":"sparkline"` had the agent read `"role":"other"`, with the real name
-on the wire the whole time.
-`taria-mcp --tree-format outline`, which hands the agent an outline instead of
-the line, renders it from the line for the same reason.
+into whatever its typed view could hold.
 
 The parse stays authoritative for what the bridge **decides**, because it is
 typed: validating node ids and advertised actions, and detecting change, read
@@ -2029,25 +1453,14 @@ the parse rather than the text. A line is passed on only after it parsed, so
 a malformed one is still skipped.
 
 The two things a bridge **SHOULD** remove from the line it passes on are the
-`"type":"snapshot"` framing key, which belongs to the transport rather than to
-the tree, and the `after_input` stamp (section 5.3), which orders the tree
-against the bridge's inputs and is for the bridge to reason about: an agent
-shown it reads an id it never sent as a fact about the app, and a tree sent
-again with only its stamp moved as one that changed. The reference bridge
-removes both, from every peer and in both tree formats, by parsing the line
-into a JSON value and writing that out again, which keeps every other key but
-not the app's spelling of the line: keys come out sorted and whitespace gone,
-string escapes are rewritten (`"\u00e9"` becomes `"é"`), and of a key
-repeated in one object only the last value is kept, though a repeated field
-the bridge knows never gets that far, because it fails the parse (section
-2.2). Numbers are rewritten too. An integer in the 64-bit range comes through
-as written, `-0` aside; any other number is read as the double nearest it and
-printed as serde_json writes that double: `1e3` becomes `1000.0`, `-0`
-becomes `-0.0`, `1e21` becomes `1e+21`, `1e-07` becomes `1e-7`, and an
-integer outside the 64-bit range becomes a float, keeping about 17
-significant digits. The read is exact since 0.4.0, so `1.4000000000000001`
-comes through digit for digit, where before 0.4.0 it read `1.4`. A sender
-**MUST NOT** rely on any of these spellings reaching the agent.
+`"type":"snapshot"` framing key, which belongs to the transport, and the
+`after_input` stamp (section 5.3): an agent shown it reads an id it never sent
+as a fact about the app, and a resend with only its stamp moved as a change.
+
+A bridge that removes them by parsing the line and writing it out again keeps
+every other key but not the app's spelling: key order, whitespace, string
+escapes and the spelling of numbers can all change. A sender **MUST NOT**
+rely on its spelling reaching the agent.
 
 ### 16.7 What forces a version bump
 
@@ -2063,155 +1476,23 @@ successfully and acts on the old meaning.
 
 ### 16.8 Typed state (0.4.0)
 
-The second addition since version 1 froze, after `relayed` in 0.3.3: fourteen
-optional node fields, `description` and the thirteen from `selected` to
-`column_count` (sections 6.1 and 6.5). Each is a new optional field, omitted
-when unset, so the addition is additive under section 16.2 and
-`PROTOCOL_VERSION` stays 1.
-
-- **An older reader** ignores the fields as unknown (section 2.7) and parses
-  every node as before. It reads no state, so to it a node is exactly what a
-  0.3.3 app would have sent, `value` and all.
-- **An older reference bridge** from 0.1.0 to 0.3.3, which hands the agent the
-  app's own line (section 16.6), passes the fields on in the JSON tree with the
-  rest of it. Its outline, in 0.3.0 to 0.3.3, shows them among the fields at the
-  end of the line, `checked=false selected=true`, rather than as marks, and its
-  `read_tree` description says nothing about them. It does not refuse `act` on a
-  disabled node, but against the reference adapter there is nothing to send: the
-  node advertises no actions, so its own validation refuses the act as
-  unadvertised.
-- **An older app** sends none of them, so every node reads as stating
-  nothing, which is what absent means.
-- **Leniently read.** A field added later fails the node when it is read
-  strictly, and a failed node fails the line, which the reader skips: the
-  agent is left on a stale tree with nothing saying why, over one field.
-  `relayed` is read strictly because a mark that is not a boolean is no
-  clearer about who wrote the text; state is not like that, so every field
-  added in 0.4.0 reads a wrong shape as not stated (section 6.1), and
-  `relayed` keeps its 0.3.3 rule.
-- **A repeated key now fails the line.** A 0.4.0 reader fails a line whose
-  node repeats one of the new keys, `"checked"` twice, with "duplicate
-  field", where a 0.3.3 reader skipped both copies as unknown. Section 2.2
-  already forbids a sender to repeat a key, so no conforming line changes
-  meaning; only a reader's tolerance of that mistake is gone.
-- **What changed for the demo.** The reference demo now states a task's done
-  state as `checked` instead of the value `"todo"` or `"done"`, and the
-  active tab and the cursor row as `selected` instead of a tab's value
-  `"selected"`. It keeps the list's and the tab bar's values. A reader that
-  matched the old values reads the demo, and only the demo, differently.
+What typed state means for older peers is in [compatibility.md](compatibility.md).
 
 ### 16.9 Stamps (0.4.0)
 
-The third addition since version 1 froze: `after_input` on the snapshot and
-`stamps` on the hello (sections 3.1 and 5.3), for issue #17. Each is a new
-optional field, omitted when unset, so the addition is additive under
-section 16.2 and `PROTOCOL_VERSION` stays 1. What changed beside the fields
-is one behaviour, which section 5.1 now allows: an app that stamps sends its
-latest snapshot again, under the same `seq`, when the app has dequeued an
-input since it went out.
-
-That resend moves what `seq` promises, from one number per snapshot sent to
-one per tree published, and section 16.7 makes a change of meaning the one
-that forces a bump. It does not force one here. Within one run `seq` still
-never decreases, so a higher one is still the newer tree. One inference
-does stop being true: until 0.4.0, item 3 of section 1.3 said `seq`
-"increases within one run", which let a reader assume no two snapshots
-share a `seq`. Such a reader, meeting the repeat, at worst drops it as a
-duplicate, which is harmless, because the tree is unchanged: the resend
-differs only in `after_input`, which an older reader never reads. Across
-runs `seq` promised nothing before and promises nothing now (section 5.1).
-
-- **An older reader** ignores both fields as unknown (section 2.7). It reads
-  the hello it always read, and every snapshot as the snapshot it was. The
-  resend of an identical tree is, to it, the same snapshot twice: `seq` and
-  every field it knows are unchanged, so a reader that compares whole
-  snapshots reads no change, and a reader that compares `seq` none either.
-- **An older reference bridge** from 0.1.0 to 0.3.3 hands the agent the app's
-  own line (section 16.6), so its JSON tree shows `"after_input":N` once the
-  app has dequeued an input, and its outline, in 0.3.0 to 0.3.3, shows
-  `after_input=N` among the header's fields. To an agent that can look like
-  a change, since two reads of one tree differ in it, and it names an input
-  id the agent never sent: ids are the bridge's, and no tool shows them.
-  Its answers do not move: it still waits its 500 ms and still reads a slow
-  handler as "did not change", the behaviour issue #17 is about, which only
-  a bridge that reads the stamp avoids.
-- **An older app** sends neither field. A bridge that reads stamps answers it
-  as it answered every peer before stamps existed, window and texts
-  included: the reference bridge does so byte for byte.
-- **An app that claims stamps and does not stamp** says `"stamps":true` and
-  sends unstamped snapshots section 5.3 does not allow: one after a stamped
-  snapshot, or more than one after its first dequeue's `delivered` ack,
-  which an adapter that queues snapshots can do without meaning to. A
-  bridge that reads stamps degrades the rest of the connection, from the
-  call that shows it, to the rules for a peer that does not stamp, so a
-  tree that differs is credited as it was before stamps existed, rather
-  than leaving every input waiting for a stamp that never comes. The
-  reference bridge also logs a warning, since the claim is the app's bug.
-  Both rules bind only an app that says `stamps`, which no app before 0.4.0
-  does.
-- **Leniently read.** A `stamps` that is not `true`, and an `after_input`
-  that is not an unsigned 64-bit integer, read as absent rather than failing
-  the line: the hello would otherwise take the version and label with it,
-  and the snapshot its whole tree.
+What stamps mean for older peers is in [compatibility.md](compatibility.md).
 
 ## 17. Rust language binding (non-normative)
 
-**This section is a language binding, not a wire rule.** A peer in another
-language can ignore all of it. It is here because the obligations it describes
-are easy to mistake for protocol requirements when reading `crates/taria`.
-
-Additive on the wire is not automatically additive in Rust. A peer skips a
-message variant it cannot parse, but a peer **rebuilt** against the version
-that added one meets it in an exhaustive `match` and stops compiling, and the
-peers this format is written for are exactly the ones that match on these
-types.
-
-So every type a version-1 addition can reach is `#[non_exhaustive]`. There are
-**twelve**: `AppToBridge`, `BridgeToApp`, `InputStatus`, `AgentInput`,
-`Action`, `Role`, `Node`, `Checked`, `Snapshot`, `key::Key`, `key::Modifiers`
-and `key::KeyPress`. The key types are on the list even though a key travels
-as a string, because the string is parsed into them and an adapter takes the
-result by value.
-
-The same reasoning reaches one level in, to the variants. A new optional field
-on an existing message is the format's cheapest additive change and also the
-one that breaks an outside peer hardest, because it breaks everything that
-builds or destructures that message. So **six** struct-like variants are
-marked too: `AppToBridge::Hello`, `AppToBridge::Ack`, `BridgeToApp::Input`,
-and `AgentInput::Act`, `Key` and `Text`. `AppToBridge::Snapshot` needs
-neither: it is a newtype around `Snapshot`, which is marked already.
-
-What that costs a Rust peer:
-
-- **Build marked variants through their constructors**, since a marked variant
-  has no struct literal from outside the crate: `AppToBridge::hello` (with
-  `.stamps(true)` for a peer that stamps), `ack`, `BridgeToApp::input`,
-  `AgentInput::act`, `key`, `text`, `Snapshot::new` (with `.after(id)` for
-  a stamp), `Node::new` plus its chainable setters, `Modifiers::NONE` /
-  `Modifiers::new`, `KeyPress::new`.
-- **End a destructuring pattern with `..`**, so a field added later does not
-  break the match.
-- **Carry a wildcard arm** on any `match` over these enums. The cost of the
-  wildcard is real: on `AgentInput` it is the arm that swallows `Text`, which
-  is how a demo can look complete while typing goes nowhere. The demo carries
-  `clippy::wildcard_enum_match_arm` to catch exactly that.
-
-Two more Rust-only facts:
-
-- `Role` and `Action` use hand-written deserializers that call
-  `deserialize_any`, so they decode from **self-describing formats only**.
-  ndjson is one; bincode and its relatives are not.
-- `key::Key`, `key::Modifiers` and `key::KeyPress` are deliberately **not**
-  serde-serializable. The wire form of a key is the string, and a second
-  encoding would let the two drift.
+The Rust API (`#[non_exhaustive]` types, constructors, wildcard arms) is
+documented in the [`taria` crate docs](https://docs.rs/taria).
 
 ## 18. Appendix A: a worked session
 
 ### 18.1 A complete connection
 
-Captured from the reference adapter by connecting a plain `AF_UNIX` client to
-a running `taria-demo` and recording every byte in both directions. Each line
-is verbatim; the tab-separated direction column is not on the wire, and each
+Every byte in both directions between a plain `AF_UNIX` client and a running
+`taria-demo`. The tab-separated direction column is not on the wire, and each
 message is followed by a single `\n`.
 
 ```
@@ -2224,33 +1505,14 @@ app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"after_input":1,"roo
 
 What to read out of it:
 
-- The `hello` comes first and the bridge answers nothing. It says
-  `"stamps":true`: every snapshot on this connection is stamped (section 5.3).
-- The first snapshot arrives unprompted, immediately after the handshake,
-  because the app already had one. It carries no `after_input`: nothing has
-  been dequeued on this connection yet.
-- `seq` is 1, then 2. Nothing was published in between, because nothing
-  changed.
-- The act names a node id and an action the tree advertised on that node
-  (`tab-done`, `select`). Neither was guessed.
+- The `hello` comes first and the bridge answers nothing. The first snapshot
+  follows unprompted and unstamped: nothing has been dequeued yet.
 - The ack precedes the snapshot published after it, and that snapshot is
-  stamped `"after_input":1`: published after the app dequeued input 1, so a
-  bridge can credit it to that input whenever it arrives.
-- The effect is legible in the next tree: the tabs node's value moved from
-  `Active` to `Done`, `"selected":true` moved from `tab-active` to
-  `tab-done`, and the list node re-labelled itself and published a different
-  set of children, whose `"checked":true` says they are done. A tree diff,
-  without the ack, could not have told that from an unrelated redraw.
-- Exactly one node is focused in each snapshot, and it is not the root: the
-  root carries `"focused":false` because a recorded node below it has focus.
-- The list publishes its selection twice: the cursor row says
-  `"selected":true` and every other row `"selected":false` (section 6.5), and
-  the list names the row in its own `value` (`task-1`, then `task-2`). That
-  is the focus-is-not-selection rule (section 15) in practice.
-- `selected`, `checked` and the rest of the typed state sit between
-  `focused` and `actions` in the app's line, while `description` comes before
-  `focused`. Every field is omitted where the app states nothing: no node
-  here says `expanded` or `disabled`.
+  stamped `"after_input":1`, so a bridge can credit it to input 1 whenever it
+  arrives.
+- Exactly one node is focused in each snapshot. The `app` root is the
+  reference adapter's wrapper around the nodes the app recorded; the protocol
+  requires a root node, not that one.
 
 ### 18.2 The four ack shapes
 
@@ -2275,40 +1537,15 @@ app->bridge	{"type":"snapshot","protocol_version":1,"seq":2,"after_input":4,"roo
 ```
 
 - **id 1**: text sent while nothing was accepting typing. Two acks, last wins.
-  Then the tree already published, sent again under its own `seq` 1 with
-  only `"after_input":1` added: the app dequeued the input and its tree did
-  not change (sections 5.1 and 5.3).
-- **id 2**: a `kind` this app has never heard of. One ack, `ignored`, sent
-  where the line was parsed, with no `delivered` before it because the input
-  was never queued. Never dequeued, so it stamps nothing, and no tree
-  follows.
+  Then the tree already published, resent under its own `seq` 1 with only
+  `"after_input":1` added (sections 5.1 and 5.3).
+- **id 2**: a `kind` this app has never heard of. One `ignored` ack, sent
+  where the line was parsed. Never dequeued, so it stamps nothing, and no
+  tree follows.
 - **id 3**: a key that moved the cursor. `delivered`, then the tree that shows
-  the move, in that order, stamped 3.
+  the move, stamped 3.
 - **id 4**: an act naming a node that does not exist. `delivered`, then
   `ignored`, then the tree of `seq` 2 again, stamped 4.
-
-The same session also confirms the skip rules: a blank line, `not json at
-all`, `{"type":"input","id":9,"input":{"kind":"key"}}` (a known kind missing
-its field) and `{"type":"future","payload":1}` were each sent mid-session,
-each drew no ack and no complaint, and the connection stayed up for the inputs
-that followed.
-
-### 18.3 What is not wire-normative
-
-- **Node ids are opaque strings.** The `<prefix>-<key>` shape
-  `taria::IdSpace` produces, and the rule that an id belongs to the space
-  named before its **first** separator, are an app-side convenience for
-  getting from a node id back to the thing it named. No reader parses ids, and
-  a conforming app may shape them however it likes.
-- **The auto-generated `app` root** in the captures above is the reference
-  adapter wrapping the nodes the app recorded. The protocol requires a root
-  node, not that particular one.
-- **`text_to_keys`** and its `\n` to Enter, `\t` to Tab, `\r` dropped
-  convention (section 9.3).
-- **Every 500 ms and 3 s window, queue size, backoff and retry figure** in
-  the reference peers, and the reference bridge's 60 s idle release (section
-  14.7). Nothing in the protocol specifies timing.
-- **The reference bridge's tool argument bounds** (section 13.4).
 
 ## 19. Appendix B: what is not specified
 
@@ -2322,8 +1559,7 @@ behaviour a peer may rely on.
    snapshot's (sections 3.5, 5.2).
 3. **`seq` at the u64 maximum** (section 5.1).
 4. **Duplicate keys naming a field the reader does not know.** A duplicate of
-   a known field fails the line in the reference implementation; a sender
-   **MUST NOT** emit either kind (section 2.2).
+   a known field may fail the line; section 2.2 forbids a sender either kind.
 5. **An ack's order relative to a snapshot published before it.** Only the
    other direction is guaranteed (section 10.4).
 6. **A snapshot carrying zero or more than one focused node** (section 15).
@@ -2332,13 +1568,13 @@ behaviour a peer may rely on.
    the wire forbids it. A bridge cannot rely on it: an app may discard such
    input (section 14.5).
 8. **What a second bridge should do while its connection waits to be
-   accepted** (section 14.5). Multiple simultaneous clients are deferred. The
-   reference bridge's turn-taking is its own policy (sections 14.5 and 14.7).
+   accepted, or on Windows after its open is refused as busy**, beyond
+   reporting it (sections 14.5 and 14.8). Multiple simultaneous clients are
+   deferred.
 9. **Any timing requirement.** No keepalive, no heartbeat, no deadline for an
    ack, no maximum publish rate.
 10. **Bounds on `app_label`, `label`, `value`, node count and children count.**
-    Only the 1 MiB line cap bounds them, and section 2.5 asks an app to keep
-    its snapshot within it (sections 3.1, 6.3, 13.2).
+    Only the line cap bounds them (section 2.5).
 11. **What a bridge does with relayed text beyond passing the mark on**, such
     as fencing or escaping it in what an agent reads. The reference bridge
     alters no text: it hands the mark on, and its outline prints it as
@@ -2349,7 +1585,4 @@ behaviour a peer may rely on.
     be checked. Neither reference peer checks any of it (section 6.5).
 13. **A stamp that breaks the rules of section 5.3**: one naming an id the
     bridge never sent on the connection, one that goes down, or an
-    `after_input` from a peer whose `hello` did not say `stamps`. The
-    reference bridge strips the field from what the agent reads either way,
-    reads a stamp only from a peer that said it stamps, and compares it as a
-    number against its own ids.
+    `after_input` from a peer whose `hello` did not say `stamps`.
