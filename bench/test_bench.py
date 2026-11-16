@@ -2342,7 +2342,7 @@ class OutlineArm(unittest.TestCase):
 
 
 class OutlineParser(unittest.TestCase):
-    """The outline solver's reading of taria-mcp's outline (docs/cli.md)."""
+    """The outline solver's reading of taria-mcp's outline (taria-mcp tree_format.rs)."""
 
     def test_the_documented_example(self):
         tree = solvers.parse_outline(OUTLINE_EXAMPLE)
@@ -2360,7 +2360,7 @@ class OutlineParser(unittest.TestCase):
         self.assertEqual([n["id"] for n in solvers.TariaSolver.items(tree)], ["task-1", "task-3", "task-4"])
 
     def test_the_typed_state_marks(self):
-        """docs/cli.md: the 0.4.0 marks read back into the JSON tree's fields,
+        """tree_format.rs: the 0.4.0 marks read back into the JSON tree's fields,
         and the solver's steps find the same rows they found before them."""
         tree = solvers.parse_outline(OUTLINE_EXAMPLE_TYPED)
         self.assertEqual(solvers.find(tree, "task-1"), {
@@ -2449,7 +2449,7 @@ class OutlineParser(unittest.TestCase):
         self.assertEqual(solvers.parse_outline(OUTLINE_EXAMPLE_BEFORE_ACT), solvers.parse_outline(OUTLINE_EXAMPLE))
 
     def test_a_quoted_key_right_after_the_role_is_a_field_not_a_label(self):
-        """docs/cli.md: a quoted token followed directly by `=` is a field
+        """tree_format.rs: a quoted token followed directly by `=` is a field
         key; only one followed by a space or the line's end is the label."""
         def root(line):
             return solvers.parse_outline("protocol_version=1\n" + line)["root"]
