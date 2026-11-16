@@ -1,6 +1,6 @@
 [package]
 name = "taria"
-description = "Agent accessibility layer for terminal user interfaces. Lets TUI apps expose their widget tree, focus state, and available actions to AI agents, like ARIA does for the web."
+description = "ARIA for terminals: an agent accessibility layer for TUIs. The protocol types a TUI app uses to publish its widget tree, focus and actions to AI agents."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

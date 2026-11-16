@@ -1,6 +1,6 @@
 [package]
 name = "taria-mcp"
-description = "MCP bridge for taria. Exposes any taria-enabled TUI app to AI agent harnesses (Claude Code, OpenCode, Cursor) as MCP tools."
+description = "ARIA for terminals: an agent accessibility layer for TUIs. The MCP (Model Context Protocol) bridge that lets AI agents in Claude Code, OpenCode or Cursor drive a taria-enabled TUI."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
