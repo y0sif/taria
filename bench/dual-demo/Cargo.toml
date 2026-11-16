@@ -20,5 +20,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 taria = { path = "../../crates/taria" }
 taria-ratatui = { path = "../../crates/taria-ratatui" }
-# The molerat the pilot in bench/MOLERAT.md ran against.
+# The molerat rev bench/README.md installs molerat-mcp from.
 molerat = { git = "https://github.com/orhun/molerat", rev = "0c62c331678ea55ae70a8a91bd6680792923e3d0", features = ["mcp"] }

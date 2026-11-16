@@ -1,19 +1,113 @@
 //! The MCP tool surface: `read_tree`, `act`, `key`, and `type_text`.
 //!
-//! [`TariaMcpServer::builder`] sets a server up, and its `on_demand()` or
-//! `connected()` picks the bridge. [`TariaMcpServerBuilder::on_demand`], which the `taria-mcp` binary
-//! uses, spawns a bridge that connects on the first tool call and lets go of
-//! the app after an idle window, and every tool call then counts as activity
-//! and gives a bridge it woke a bounded moment to reach the app.
+//! [`TariaMcpServer::builder`] sets a server up.
+//! [`TariaMcpServerBuilder::on_demand`], which the `taria-mcp` binary uses,
+//! spawns a bridge that connects on the first tool call and lets go of the
+//! app after an idle window; every tool call counts as activity and gives a
+//! bridge it woke a bounded moment to reach the app.
 //! [`TariaMcpServerBuilder::connected`], or inside the crate
 //! [`Tools::with_tree_format`] around a handle of its own, serves a bridge
 //! that [`bridge::spawn`] connects at once and keeps connected.
 //!
 //! The tools live on [`Tools`], a private type that the public
-//! [`TariaMcpServer`] wraps and delegates to. rmcp's `#[tool]` attribute gives
-//! the type it is used on a public `<name>_tool_attr()` function per tool, and
-//! takes no option to narrow it: on the public type those four functions were
-//! public API, which no caller needs and none could be kept from relying on.
+//! [`TariaMcpServer`] wraps. rmcp's `#[tool]` gives the type it is used on a
+//! public `<name>_tool_attr()` function per tool, which would otherwise be
+//! public API.
+//!
+//! # Checks before anything is sent
+//!
+//! An invalid call costs one error instead of a round trip and a silence.
+//!
+//! - `act`: the node id must be in the latest tree; a miss lists the valid
+//!   ids. A node marked `disabled` is refused before its action is resolved,
+//!   and only the mark decides that, never an empty action list. The action
+//!   must be one the node advertises; a miss lists them. `value` is bounded
+//!   at [`MAX_VALUE_CHARS`].
+//! - `key`: the string is bounded at [`MAX_KEY_CHARS`], then parsed with
+//!   [`taria::key`], the parser the adapter lowers with. `repeat` is 1 to
+//!   [`MAX_KEY_REPEAT`].
+//! - `type_text`: bounded at [`MAX_TEXT_CHARS`].
+//!
+//! The three length bounds keep one legal call from writing a line past
+//! [`MAX_LINE_BYTES`], which both peers treat as a broken connection, and
+//! `repeat`'s keeps one call from flooding the app's input queue. An input
+//! tool also needs a tree: with none it refuses with `read_tree`'s answer, so
+//! no input is queued for the next app instance. A peer on another protocol
+//! version keeps `read_tree` while its snapshots parse, and every input tool
+//! refuses ([`Tools::check_protocol`]).
+//!
+//! # Watching an input
+//!
+//! An input tool sends, then [`observe`]s acks and trees: an ack says the app
+//! saw the input, a tree that something happened. A `Dropped` for the last
+//! input ends the window at once. Otherwise an ack and an answering tree end
+//! it together, never one alone: a tree can precede a `Dropped`, and a
+//! `Delivered` can still be refined to `Ignored`. Against a peer whose hello
+//! does not say `stamps`, the window is [`UPDATE_WAIT`] and any tree that
+//! differs from the one the input was aimed at answers it. Against one that
+//! does, the window is [`SETTLE_WAIT`] and the stamp decides:
+//!
+//! - A tree stamped at or after the input is credited to it. Compared with
+//!   the baseline on `root`, never `seq`, it answers when it differs, and
+//!   "did not change" at once when it does not.
+//! - A tree stamped before the input, or not at all, becomes the baseline.
+//!   For a burst the stamp must reach the last press.
+//! - `Ignored` ends the wait at the first credited tree, or [`UPDATE_WAIT`]
+//!   after the ack; a disconnect [`UPDATE_WAIT`] after it.
+//! - A tree without a stamp after a `Delivered` ack, past the one the
+//!   protocol allows, breaks the claim: the connection is read as a peer that
+//!   does not stamp from then on, with one warning logged.
+//!
+//! Crediting by stamp holds because [`BridgeHandle::send`] claims each id and
+//! queues its input under one lock, so id order is send order. The one gap is
+//! the snapshot watch, which keeps only the newest tree.
+//!
+//! # The answer
+//!
+//! The first that applies wins ([`Tools::send_and_report`], [`report`]):
+//!
+//! 1. Nothing could be sent, or only part of a burst: an error saying so.
+//! 2. Acks were lost: an error, since any of them could have been a drop.
+//! 3. A drop anywhere in a burst: an error, the effect partial.
+//! 4. `Dropped`: an error, even when the app then went away.
+//! 5. The app went away: text if it had acked the input (a working `quit`
+//!    lands here), an error if not. An oversized line names the cause.
+//! 6. `Ignored`: text and the freshest tree.
+//! 7. A changed tree, with `Delivered` or no ack: the tree.
+//! 8. `Delivered`, no change: text, naming the window unless a credited tree
+//!    showed the change is final.
+//! 9. No ack, no change: text. A line rejected inside the window is quoted,
+//!    since it may have been the ack. Else a stopped app is named, on Linux,
+//!    with how long the unread input can still apply.
+//!
+//! The error flag means an invalid call, an input that did not land as sent,
+//! or one whose fate is unknown, nothing else, so three answers carry a note
+//! and no tree, and the tool descriptions promise the tree only if it changed.
+//!
+//! # Answering without a tree
+//!
+//! [`available_snapshot`] answers every call that finds no tree. For an app
+//! that never published, [`no_snapshot_reason`] picks the first that applies:
+//! a pipe that is not the app's or denied this bridge; a line over the cap;
+//! a line it could not read, quoted; a pipe refused as busy, the app held by
+//! another bridge; no connection, the one case where the path is in
+//! question; a handshake and no tree; a connection younger than
+//! [`SILENT_LINK_GRACE`], worth a retry; and silence past it, which is a
+//! stopped app where Linux shows one, the app itself on Windows, and
+//! otherwise the app held by another bridge. After a departure the answer
+//! opens with "disconnected (last snapshot seq N)", which callers match on,
+//! and [`reconnected_reason`] follows the same order on the new connection.
+//! Only a link that is down says the app may have exited. On Windows each
+//! answer says pipe where Unix says socket ([`ENDPOINT`],
+//! [`ENDPOINT_ADDRESS`]).
+//!
+//! # The texts
+//!
+//! The instructions and the tool descriptions are resent with every model
+//! call, so they stay short. `--tree-format outline` swaps only their format
+//! passages ([`FormatPassage`]). Tests pin both modes' texts byte for byte,
+//! and the answers callers match on, such as the "disconnected" opening and
+//! the texts a peer that does not stamp gets.
 
 use std::io;
 use std::path::PathBuf;
@@ -60,7 +154,7 @@ pub const DEFAULT_IDLE_RELEASE: Duration = Duration::from_secs(60);
 /// Such a peer gives no way to tell a tree published after the input from
 /// one published before it, so whatever differs inside the window is the
 /// answer, and a handler slower than the window reads as "did not change",
-/// its tree credited to whatever input comes next (issue #17). A peer that
+/// its tree credited to whatever input comes next. A peer that
 /// stamps waits on [`SETTLE_WAIT`] instead. This is also how long an
 /// `Ignored` ack from a peer that stamps waits for the tree published after
 /// it.
@@ -459,7 +553,7 @@ impl TariaMcpServerBuilder {
     /// The bridge connects to the socket as soon as it is spawned, holds the
     /// app for as long as this server or a clone of it lives, and reconnects
     /// whenever the connection ends, whether or not tool calls want the app.
-    /// That is how every bridge before 0.3.2 served. A taria adapter serves
+    /// A taria adapter serves
     /// one bridge at a time, so while this one holds the app no other session
     /// reaches it: [`on_demand`](Self::on_demand) is the one to use unless
     /// this server is the app's only client. The
@@ -1087,7 +1181,7 @@ fn swap_description(
 /// The name is read the way the bridge's parse of the app's line read every
 /// advertised action, through [`Action::from_wire`], so the name the tree
 /// spells an action by ([`Action::wire_name`]) reaches it. That covers the
-/// two cases a lookup by variant used to miss. A node advertising
+/// two cases a lookup by variant would miss. A node advertising
 /// `{"custom":"activate"}` advertises [`Action::Activate`], because the
 /// deserializer folds the envelope onto the built-in, so `activate` reaches
 /// it. And an action taria promoted to a built-in reads as that built-in on
@@ -1193,7 +1287,7 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
             } else {
                 // Only with no connection open: the one state in which this
                 // bridge cannot tell an app that is gone from one between
-                // two of its connects, and the 0.3.1 answer, byte for byte.
+                // two of its connects. Its text is pinned byte for byte.
                 // A rejected line is not quoted here, because with nothing
                 // open it may be the departed connection's, and the app that
                 // sent it may be the one that has exited.
@@ -1227,8 +1321,7 @@ fn available_snapshot(state: BridgeState, report: LinkReport) -> Result<AppSnaps
 /// The rejected line is quoted only here, with a connection open, because
 /// only then is it known to be the open connection's: the bridge forgets
 /// every other reason at each connect. A restarted app whose tree this bridge
-/// cannot read was otherwise told to retry, which no retry could fix (issue
-/// #16).
+/// cannot read would otherwise be told to retry, which no retry can fix.
 ///
 /// When the departure was this bridge letting go after its idle window, each
 /// answer that says this bridge reconnected says so between the opening and
@@ -1356,7 +1449,7 @@ fn is_oversized(rejected: Option<&str>) -> bool {
 ///
 /// [`BridgeState::Never`] is five states wearing one name, and they call for
 /// five different next steps. Only the last of them is worth checking a socket
-/// path over, and it used to be the answer given to all of them. Sending an
+/// path over. Sending an
 /// adopter to re-check a path the bridge is connected to is the first wrong
 /// turn a retrofit takes, and the bridge knew better every time:
 ///
@@ -1465,10 +1558,8 @@ fn no_snapshot_reason(report: LinkReport) -> String {
 /// that report it: why the silence means that, what frees the app, and when.
 ///
 /// The way out it names is a retry, not a hunt for the other process. A
-/// taria-mcp from 0.3.2 on lets go of the app once its session has gone quiet,
-/// and this bridge is accepted as soon as it does. Before 0.3.2 the holder was
-/// most often a bridge left running by an idle session, and the answer sent
-/// agents to find and stop it, which is the step letting go removes. When to
+/// taria-mcp lets go of the app once its session has gone quiet, and this
+/// bridge is accepted as soon as it does. When to
 /// retry is [`retry_guidance`]'s.
 fn held_by_another_bridge(open_for: Duration, idle_release: Option<Duration>) -> String {
     format!(
@@ -1608,7 +1699,7 @@ fn held_after_release(idle_release: Option<Duration>) -> String {
 /// The holder's window cannot be known from here, so the best guess is that
 /// it was started the way this one was, which is what a repo's shared
 /// `.mcp.json` does. A bridge on the default, or one handed in already
-/// spawned, names only the default, in the words 0.3.2 used.
+/// spawned, names only the default, in words pinned byte for byte.
 fn retry_guidance(idle_release: Option<Duration>) -> String {
     match idle_release {
         Some(window) if window.is_zero() => "This bridge never lets go of the app, and a \
@@ -1739,7 +1830,7 @@ impl Stopped {
     /// [`has_not_read`](Self::has_not_read) for a burst whose first `acked`
     /// inputs the app acknowledged before it stopped: only the others are
     /// unread, and the answer says how many were taken. Only a peer that
-    /// stamps gets it; a peer that does not is answered as in 0.3.3.
+    /// stamps gets it; a peer that does not keeps its pinned answer.
     fn has_not_read_the_rest(
         self,
         acked: usize,
@@ -2103,7 +2194,7 @@ pub(crate) struct Observed {
 /// connection (`settled`), a tree without a stamp read after one of this
 /// burst's `Delivered` acks is a broken claim, and the rest of the window is
 /// read as for a peer that does not stamp:
-/// every tree compared with `pre` as 0.3.3 compared it, so a tree that
+/// every tree compared with `pre`, stamp aside, so a tree that
 /// changed is this call's answer, on the window already running, never a
 /// longer one. [`Observed::degraded`] reports it, and the caller keeps it for
 /// the connection.
@@ -2590,8 +2681,8 @@ pub(crate) fn report(
         (None, Some(snapshot)) => tree_result(&snapshot, format),
         // A peer that stamps acks every input it dequeues, ahead of the tree
         // it publishes next, so its silence has texts of its own: neither
-        // 0.3.3's "it may not report acknowledgements" nor its "changed its
-        // tree" is true of it.
+        // "it may not report acknowledgements" nor "changed its tree", the
+        // texts for a peer that does not stamp, is true of it.
         (None, None) if seen.stamped => Ok(text_result(stamped_silence(
             &Silence {
                 rejected: seen.rejected,
@@ -3016,8 +3107,8 @@ mod tests {
     /// with "is the socket path correct?" sent the first agent to meet this
     /// project through nine shell calls of socket forensics.
     ///
-    /// The way out it names is a retry: since 0.3.2 a taria-mcp lets go of
-    /// the app once its session goes quiet, and the phrases pinned here are
+    /// The way out it names is a retry: a taria-mcp lets go of the app once
+    /// its session goes quiet, and the phrases pinned here are
     /// the ones the end-to-end scripts match on.
     #[test]
     fn a_connection_nobody_accepted_is_named_instead_of_blamed_on_the_path() {
@@ -3149,7 +3240,7 @@ mod tests {
     /// restarted and greeted it without drawing yet, or a connection too
     /// young for its silence to mean anything. Each keeps the departure
     /// opening and says what it is in the words the never-served answers use.
-    /// Only a link that is down keeps the 0.3.1 answer.
+    /// Only a link that is down says the app may have exited.
     #[test]
     fn a_reconnected_bridge_never_says_the_app_may_have_exited() {
         let gone = || BridgeState::Disconnected {
@@ -3208,7 +3299,7 @@ mod tests {
             .map(|(ms, _)| ms.parse::<u64>().expect("a whole number of ms"))
             .unwrap_or_else(|| panic!("{}", young.message));
         assert!((120..500).contains(&ms), "{}", young.message);
-        // "path" on Linux and macOS, as since 0.3.1, and the pipe name on
+        // "path" on Linux and macOS, pinned, and the pipe name on
         // Windows, as every other Windows answer says it.
         let right = if cfg!(windows) {
             "The pipe name is right"
@@ -3315,8 +3406,8 @@ mod tests {
     /// arrived whole. An app whose tree outgrew the limit greets every
     /// reconnect and then overflows again, so each moment the link describes
     /// (down between attempts, just opened, greeted) is one an agent polls
-    /// into, and each used to answer it with something else: the socket path,
-    /// "worth one retry", an app that never publishes nodes.
+    /// into, and none of them may answer it with something else: the socket
+    /// path, "worth one retry", an app that never publishes nodes.
     ///
     /// Down means between attempts only. The bridge drops the reason when a
     /// connect finds nothing listening, so a link that stays down because the
@@ -3424,11 +3515,11 @@ mod tests {
         }
     }
 
-    /// Issue #16. A bridge that had the app reconnects, and the new
+    /// A bridge that had the app reconnects, and the new
     /// connection sends a line this bridge cannot read: the app restarted
     /// after a change that broke its tree, while the agent's session stayed
-    /// up. The answer was the young, the held or the greeted one, each of
-    /// which says to retry, and no retry can help: the app did publish, and
+    /// up. The young, the held and the greeted answers each say to retry,
+    /// and no retry can help: the app did publish, and
     /// the bridge threw the line away. A reason seen with a connection open
     /// is that connection's (the bridge forgets the others at every
     /// connect), so it is quoted, ahead of the link and the handshake, as
@@ -3501,7 +3592,7 @@ mod tests {
     }
 
     /// The sentence a held answer from a bridge on the default window says
-    /// when the holder lets go, as 0.3.2 said it.
+    /// when the holder lets go, pinned byte for byte.
     const DEFAULT_RETRY: &str = "A taria-mcp lets go of the app after 60 s with no tool calls (its \
                                  default), and this bridge takes over as soon as it does, with no \
                                  restart; retry in a minute.";
@@ -3513,7 +3604,7 @@ mod tests {
     /// an agent on a 2 s window to wait thirty times longer than it needed
     /// to, and promised one on `--idle-release 0` a release that a holder
     /// started like it never makes. The default, and a bridge handed in
-    /// already spawned, keep the 0.3.2 text byte for byte.
+    /// already spawned, keep the default text byte for byte.
     #[test]
     fn the_held_answer_names_the_window_this_bridge_was_started_with() {
         let held = |idle_release| {
@@ -3667,7 +3758,7 @@ mod tests {
         // opening's sentence instead, the same way (the unreadable line's and
         // the stopped app's are pinned with theirs), and nothing else in it
         // changes. A link that is down and an oversized tree answer as they
-        // did: the first is the 0.3.1 answer byte for byte, and the second's
+        // did: the first is pinned byte for byte, and the second's
         // departure is the bridge closing the connection over the size.
         for (name, link, peer_protocol, rejected, said) in [
             ("young", open_for(10), None, None, true),
@@ -4412,7 +4503,7 @@ mod tests {
     /// From a peer that stamps, a stop is still the answer to silence, and a
     /// burst that stopped partway says how many presses the app took before
     /// it stopped, naming only the rest as unread. A single input, and any
-    /// peer that does not stamp, get the answer every peer got in 0.3.3.
+    /// peer that does not stamp, get the answer that names every input.
     #[test]
     fn a_stopped_stamping_app_names_only_the_inputs_it_has_not_read() {
         let stopped = Stopped {

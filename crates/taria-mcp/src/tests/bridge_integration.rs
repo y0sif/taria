@@ -548,9 +548,9 @@ async fn read_tree_forgets_the_size_once_the_app_left_a_stale_socket() {
 
 /// A message whose `type` this bridge has no variant for is additive under the
 /// freeze, so it must be ignored like an unknown enum variant, not reported as
-/// a malformed line. Regression for the v0.1 review: an internally tagged enum
-/// fails to parse such a line, so it used to land in the rejected-line path and
-/// misdiagnose a conforming newer app to the agent.
+/// a malformed line. An internally tagged enum fails to parse such a line, so
+/// without care it lands in the rejected-line path and misdiagnoses a
+/// conforming newer app to the agent.
 #[tokio::test]
 async fn read_tree_ignores_an_unknown_future_message_type() {
     let (_dir, path) = test_socket_path("future-msg");
@@ -574,8 +574,8 @@ async fn read_tree_ignores_an_unknown_future_message_type() {
     // The lines are processed in order on the one stream, so once the manager
     // has had a moment the unknown line has been seen. The app sent no
     // snapshot, so read_tree still errors, but with the plain "no snapshot yet"
-    // answer, never the "reached this socket ... malformed" one an unknown
-    // message used to trigger.
+    // answer, never the "reached this socket ... malformed" one meant for a
+    // line that failed to parse.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let err = server
         .read_tree()
@@ -621,8 +621,8 @@ async fn read_tree_ignores_an_unknown_future_message_type() {
 /// and the real cause was another session's `taria-mcp` still holding the app.
 /// The bridge knows its own connect succeeded, which is the whole difference.
 ///
-/// Since 0.3.2 the answer says the app is held by another bridge and that a
-/// taria-mcp lets go of it after a quiet minute, so the way out is a retry,
+/// The answer says the app is held by another bridge and that a taria-mcp
+/// lets go of it after a quiet minute, so the way out is a retry,
 /// not a hunt for the other process.
 #[tokio::test]
 async fn read_tree_names_a_connection_the_app_never_accepted() {
@@ -1814,8 +1814,8 @@ async fn newline_free_flood_disconnects_the_app_connection() {
 }
 
 /// An app that served a tree and then outgrew the cap. Every tool keeps the
-/// opening a disconnect has, and names the size where "it may have exited"
-/// used to be, including after the reconnect that greets the bridge and sends
+/// opening a disconnect has, and names the size instead of "it may have
+/// exited", including after the reconnect that greets the bridge and sends
 /// the same tree again: the handshake is not a tree, and must not clear it.
 #[tokio::test]
 async fn a_tree_that_outgrows_the_cap_is_named_by_every_tool() {
@@ -2345,10 +2345,10 @@ async fn a_line_that_does_not_parse_is_never_relayed() {
     );
 }
 
-// On-demand bridges: what the `taria-mcp` binary runs since 0.3.2. They
-// connect on the first tool call and let go of the app once no call has run
-// for their idle window, so an idle session no longer locks every other one
-// out of an app that serves one bridge at a time (issue #13).
+// On-demand bridges: what the `taria-mcp` binary runs. They connect on the
+// first tool call and let go of the app once no call has run for their idle
+// window, so an idle session does not lock every other one out of an app
+// that serves one bridge at a time.
 
 /// An idle window the on-demand tests can wait out: long enough that a test's
 /// own calls run inside it.
@@ -2592,7 +2592,7 @@ async fn a_connected_server_connects_at_once_serves_the_tree_and_never_lets_go()
         .expect("the session ends cleanly");
 }
 
-/// Issue #13 end to end. Two sessions share one app, which serves one bridge
+/// Two sessions share one app, which serves one bridge
 /// at a time. The first holds it; the second's first call lands in the listen
 /// backlog and says the app is held, and how it gets free. The first then
 /// goes quiet, lets go after its window with no call from anyone, and the
@@ -2895,8 +2895,8 @@ async fn the_bridge_that_loses_a_restart_race_says_the_app_is_held() {
                 return err;
             }
             // Until the silence outlasts the grace, the connection is young,
-            // and the answer says that much. It said the app may have exited
-            // before 0.3.2, about an app that was up and serving the winner.
+            // and the answer says that much, never that the app may have
+            // exited: it is up and serving the winner.
             assert!(
                 err.message.starts_with(
                     "app 'fake-app' disconnected (last snapshot seq 3), and this bridge \
@@ -3274,7 +3274,7 @@ async fn a_protocol_mismatch_still_refuses_input_on_the_first_call_after_a_relea
 }
 
 /// `--idle-release 0`: once connected, the bridge keeps the app for the rest
-/// of the session, the way every bridge before 0.3.2 did. The connection
+/// of the session. The connection
 /// stays open for five idle windows of the other tests.
 #[tokio::test]
 async fn a_zero_idle_window_never_lets_go() {
@@ -3393,11 +3393,11 @@ async fn a_call_cuts_the_reconnect_backoff_short() {
     );
 }
 
-/// Issue #16. A bridge that had the app reconnects to a restarted instance
+/// A bridge that had the app reconnects to a restarted instance
 /// that greets it and then publishes a snapshot this bridge cannot parse (a
 /// tree past what the JSON parser recurses into, or a taria whose snapshot
-/// shape differs, after a change the adopter just made). The answer was the
-/// greeted one, "retry, and the first snapshot it publishes is served", on
+/// shape differs, after a change the adopter just made). The greeted answer,
+/// "retry, and the first snapshot it publishes is served", would be wrong on
 /// every call, about an app that had published and been thrown away. The
 /// reason is quoted instead, as it is for a bridge that never had a tree.
 #[tokio::test]
@@ -3494,7 +3494,7 @@ async fn a_restarted_app_whose_tree_cannot_be_read_is_named_not_retried() {
     assert!(result_text(&tree).contains("fixed"), "{tree:?}");
 }
 
-/// The other half of the fix for issue #16. A line the bridge could not read
+/// The other half of quoting a rejected line. A line the bridge could not read
 /// is quoted with a connection open because it came from that connection:
 /// the bridge forgets every reason at a connect. Here the app's first
 /// instance sends a bad line partway through its session and then restarts,
@@ -3565,10 +3565,9 @@ async fn a_line_an_earlier_connection_sent_is_not_held_against_the_next() {
 }
 
 /// The same forgetting, for a bridge that never had a tree: an app whose
-/// line it could not read went away, and the next connection is greeted. Up
-/// to 0.3.2 the old reason outranked that greeting for good, since nothing
-/// but a parsed snapshot retired it; now the greeting is the answer, and the
-/// reason was the answer only while it was the last thing that happened.
+/// line it could not read went away, and the next connection is greeted. The
+/// greeting is the answer: the reason was the answer only while it was the
+/// last thing that happened, and must not outrank the greeting for good.
 #[tokio::test]
 async fn a_bridge_that_never_had_a_tree_forgets_the_last_connections_line() {
     let (_dir, listener, _handle, server) = setup("never-stale-rejected").await;
@@ -3664,11 +3663,11 @@ async fn a_bridge_that_let_go_says_its_disconnect_was_on_purpose() {
 }
 
 /// A bridge that let go of the app, and then found nothing listening at the
-/// path, no longer calls the disconnect its own: the app it let go of has
-/// gone since. Before, a new instance held by another session got the
+/// path, stops calling the disconnect its own: the app it let go of has gone
+/// since. Otherwise a new instance held by another session would get the
 /// released answer, "it is not a fault", about a departure that by then
 /// included the app's exit. Both "it may have exited" answers in between are
-/// as they always were.
+/// the plain ones.
 #[tokio::test]
 async fn a_bridge_that_let_go_drops_the_claim_once_the_app_is_gone() {
     let (_dir, path) = test_socket_path("released-gone");
@@ -3756,9 +3755,9 @@ fn activate_btn() -> Parameters<ActParams> {
     })
 }
 
-/// A peer that never sends `hello` used to pass the version check, since
-/// only the handshake set the version and none read as "no mismatch known",
-/// so a peer on another version was sent input it cannot parse. Every
+/// A peer that never sends `hello` must not pass the version check: if only
+/// the handshake set the version, none would read as "no mismatch known", and
+/// a peer on another version would be sent input it cannot parse. Every
 /// snapshot states its version, and until a `hello` arrives the first
 /// snapshot's is the version the bridge goes by.
 #[tokio::test]

@@ -3,15 +3,15 @@
 //!
 //! The wire format is not involved. An app sends the same version 1 JSON
 //! either way; this only decides the text an agent reads. The JSON is the
-//! default and is passed on with every field kept, minus its `type` key and
-//! with its keys sorted. The outline carries every node, id,
-//! role, relayed mark, label, value, focus state and other field, and the
-//! name of every action as `act` takes it, in fewer characters: most of a
-//! snapshot line is repeated field names, `"focused":false` on nearly every
-//! node, and punctuation, and the outline drops all three. The typed state a
-//! node states, selection, checks, numbers, positions, prints as marks. Extra
-//! keys inside an action object are not shown, because `act` takes only the
-//! name.
+//! default and is passed on minus its `type` key and its `after_input` stamp,
+//! every other field kept and the keys sorted. The outline carries every
+//! node, id, role, relayed mark, label, value, focus state and other field,
+//! and the name of every action as `act` takes it, in fewer characters: most
+//! of a snapshot line is repeated field names, `"focused":false` on nearly
+//! every node, and punctuation, and the outline drops all three. The typed
+//! state a node states, selection, checks, numbers, positions, prints as
+//! marks. Extra keys inside an action object are not shown, because `act`
+//! takes only the name.
 //!
 //! # Grammar
 //!
@@ -67,7 +67,9 @@
 //!   validates against. `{"custom":"delete"}` renders as `delete`, a string
 //!   as itself, and an object in a shape a newer app might send, such as
 //!   `{"scroll_to":{"row":3}}`, as the name the parse keeps, `scroll_to`. No
-//!   actions, or an empty list, omits the marker.
+//!   actions, or an empty list, omits the marker. A value no parse reads as
+//!   an action, such as `{"custom":7}`, would print as compact JSON, but the
+//!   bridge rejects a line carrying one, so no outline shows it.
 //! - `children`, an array, is the next level down; absent or empty is a leaf.
 //!
 //! Every string the line prints is either bare by the rule above or
@@ -125,13 +127,14 @@ use crate::bridge::AppSnapshot;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TreeFormat {
-    /// The app's own snapshot line, minus its message framing. The default,
-    /// and what every bridge before this option served.
+    /// The app's own snapshot line, minus its `type` framing key and its
+    /// `after_input` stamp. The default.
     #[default]
     Json,
     /// One line per node, indented by depth, carrying every node, field and
-    /// action name in fewer characters than the JSON. The grammar is in
-    /// [the CLI reference](https://github.com/y0sif/taria/blob/main/docs/cli.md#the-outline).
+    /// action name in fewer characters than the JSON. The user-facing summary
+    /// is [the CLI reference's "The outline"](https://github.com/y0sif/taria/blob/main/docs/cli.md#the-outline);
+    /// the full grammar is the module doc of `tree_format.rs`.
     Outline,
 }
 
@@ -575,9 +578,9 @@ fn split_outside_strings(s: &str, sep: char) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// The demo app's first tree, as a benchmark run received it from 0.3.3:
-    /// no typed state, which is every tree an app built before 0.4.0 sends,
-    /// and which renders exactly as it did then.
+    /// The demo app's first tree with no typed state, as a benchmark run
+    /// received it: what every app that sets none of the typed-state fields
+    /// sends, and its outline is pinned byte for byte.
     const DEMO_JSON: &str = r#"{"protocol_version":1,"root":{"children":[{"children":[{"actions":["select"],"focused":false,"id":"tab-active","label":"Active","role":"tab","value":"selected"},{"actions":["select"],"focused":false,"id":"tab-done","label":"Done","role":"tab"}],"focused":false,"id":"tabs","label":"Tabs","role":"tabs","value":"Active"},{"children":[{"actions":["select","toggle",{"custom":"delete"}],"focused":true,"id":"task-1","label":"Write the taria README","role":"list_item","value":"todo"},{"actions":["select","toggle",{"custom":"delete"}],"focused":false,"id":"task-3","label":"Wire up the MCP bridge","role":"list_item","value":"todo"},{"actions":["select","toggle",{"custom":"delete"}],"focused":false,"id":"task-4","label":"Record the killer demo","role":"list_item","value":"todo"}],"focused":false,"id":"tasks","label":"Active tasks","role":"list","value":"task-1"},{"actions":["set_value","focus"],"focused":false,"id":"input","label":"New task","role":"text_input","value":""},{"actions":["activate"],"focused":false,"id":"quit","label":"Quit","role":"button"}],"focused":false,"id":"app","label":"taria-demo","role":"app"},"seq":1}"#;
 
     const DEMO_OUTLINE: &str = r#"protocol_version=1 seq=1
@@ -592,7 +595,7 @@ app app "taria-demo"
   input text_input "New task" = "" act: set_value|focus
   quit button "Quit" act: activate"#;
 
-    /// The same first tree as the 0.4.0 demo publishes it, with the cursor
+    /// The same first tree as the demo publishes it now, with the cursor
     /// row and the active tab `selected` and each task's done state in
     /// `checked`, as the bridge passes it on.
     const DEMO_TYPED_JSON: &str = r#"{"protocol_version":1,"root":{"children":[{"children":[{"actions":["select"],"focused":false,"id":"tab-active","label":"Active","role":"tab","selected":true},{"actions":["select"],"focused":false,"id":"tab-done","label":"Done","role":"tab","selected":false}],"focused":false,"id":"tabs","label":"Tabs","role":"tabs","value":"Active"},{"children":[{"actions":["select","toggle",{"custom":"delete"}],"checked":false,"focused":true,"id":"task-1","label":"Write the taria README","role":"list_item","selected":true},{"actions":["select","toggle",{"custom":"delete"}],"checked":false,"focused":false,"id":"task-3","label":"Wire up the MCP bridge","role":"list_item","selected":false},{"actions":["select","toggle",{"custom":"delete"}],"checked":false,"focused":false,"id":"task-4","label":"Record the killer demo","role":"list_item","selected":false}],"focused":false,"id":"tasks","label":"Active tasks","role":"list","value":"task-1"},{"actions":["set_value","focus"],"focused":false,"id":"input","label":"New task","role":"text_input","value":""},{"actions":["activate"],"focused":false,"id":"quit","label":"Quit","role":"button"}],"focused":false,"id":"app","label":"taria-demo","role":"app"},"seq":1}"#;
@@ -628,7 +631,8 @@ app app "taria-demo"
     }
 
     /// The typed state costs the outline its marks and nothing else: every
-    /// other part of each line is the 0.3.3 line, and the outline is still
+    /// other part of each line is the line without typed state, and the
+    /// outline is still
     /// about half the JSON.
     #[test]
     fn the_typed_demo_tree_renders_exactly() {

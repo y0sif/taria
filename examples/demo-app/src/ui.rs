@@ -208,9 +208,9 @@ mod tests {
         );
     }
 
-    /// The regression: a `set_value` long enough to saturate the `u16` count
-    /// used to overflow the sum before the clamp, panicking the demo. Any
-    /// length the protocol permits has to render.
+    /// A `set_value` long enough to saturate the `u16` count must not
+    /// overflow the sum before the clamp and panic the demo. Any length the
+    /// protocol permits has to render.
     #[test]
     fn an_enormous_draft_clamps_instead_of_overflowing() {
         let area = input_area(20);

@@ -1,54 +1,73 @@
 //! Socket manager: owns the connection to the app's taria Unix socket (a
 //! named pipe on Windows; see [`transport`]).
 //!
-//! A single background task connects, retrying with capped backoff for as long
-//! as it wants the app. [`spawn`] wants it from the start and for good: it
-//! connects at once and holds the app until the session ends. The `taria-mcp`
-//! binary starts the manager on demand instead (through
-//! [`TariaMcpServerBuilder::on_demand`](crate::TariaMcpServerBuilder::on_demand)):
-//! it opens no connection until the first tool call, and once no tool call has
-//! run for its idle window it lets go of the app, closing its connection and
-//! reconnecting only when the next call comes. Either way the task
-//! reads `AppToBridge` ndjson lines into a [`watch`] channel holding the
-//! latest [`BridgeState`], and writes queued [`AgentInput`]s out as
-//! `BridgeToApp::Input` lines. A snapshot is stored as an [`AppSnapshot`],
-//! which keeps the app's line (minus the message framing) alongside the parse
-//! of it, so the tool layer passes on what the app wrote instead of
-//! re-serializing what this build could decode. On disconnect the watch flips
-//! to
-//! [`BridgeState::Disconnected`] so tool calls fail fast (instead of acting
-//! on a stale tree) with an error that says which app went away.
+//! One background task connects, reads `AppToBridge` ndjson lines into a
+//! [`watch`] channel holding the latest [`BridgeState`], and writes queued
+//! [`AgentInput`]s out as `BridgeToApp::Input` lines. A snapshot is kept as
+//! an [`AppSnapshot`]: the app's own line, minus its framing and its stamp,
+//! beside the parse of it. The agent reads the line, so a role, action or
+//! field this build does not know survives by name; the bridge validates and
+//! diffs against the parse. On disconnect the state flips to
+//! [`BridgeState::Disconnected`], keeping the app's label and the last `seq`,
+//! so tool calls fail fast instead of acting on a stale tree.
 //!
-//! Every outgoing input carries an [`InputId`] and the app answers it with an
-//! `AppToBridge::Ack`. Acks are republished on a [`broadcast`] channel rather
-//! than kept here, because only the tool call that sent an input knows which
-//! id it is waiting for; the manager stays free of per-input bookkeeping.
-//! Whether the app's hello said it stamps its snapshots is kept in one more
-//! [`watch`] ([`BridgeHandle::stamps_rx`]), and ids are claimed and queued
-//! under one lock ([`BridgeHandle::send`]), so a stamp can be compared with
-//! them in the order they went out.
+//! # Channels
 //!
-//! A line the reader cannot parse is skipped, so that a buggy app cannot kill
-//! the bridge, and the reason is kept in a third [`watch`] channel
-//! ([`BridgeHandle::rejected_rx`]) rather than only logged. Skipping is
-//! invisible from the tool surface: an app whose every line is rejected is
-//! indistinguishable from an app that never started, and telling those apart
-//! is the difference between an adopter fixing their tree and an adopter
-//! re-checking a socket path that was right all along.
+//! - Acks are republished on a [`broadcast`] channel, since only the call
+//!   that sent an input knows which id it waits for.
+//! - [`BridgeHandle::stamps_rx`]: whether the app's hello said it stamps.
+//! - [`BridgeHandle::protocol_rx`]: the peer's protocol version, forgotten at
+//!   each connect. A peer that publishes before it greets is held to the
+//!   version its snapshot states.
+//! - [`BridgeHandle::rejected_rx`]: why the last unreadable line was skipped,
+//!   so a buggy app cannot kill the bridge and an adopter still hears why. A
+//!   connect forgets every reason but [`OVERSIZED_LINE`] before the link
+//!   reads as open, so a reason seen on an open link is that connection's.
+//!   The oversized reason ends the connection and outlives reconnects until a
+//!   snapshot parses or a connect finds nothing listening.
+//! - [`BridgeHandle::link_rx`]: the manager's own connect, as a [`LinkState`].
+//!   A connect that keeps failing and a connection nobody answers on both
+//!   leave the state at [`BridgeState::Never`]; only the first is about the
+//!   path.
 //!
-//! A fourth channel ([`BridgeHandle::link_rx`]) reports the manager's own
-//! `connect`, for the same reason one level down: a connect that keeps failing
-//! and a connection nobody ever writes on both leave the state at
-//! [`BridgeState::Never`], and only the first of them is about the socket
-//! path. The adapter serves one bridge at a time, so a second bridge's connect
-//! succeeds into the listen backlog and is not accepted until the first bridge
-//! leaves, which is precisely the second case and the one a new adopter meets
-//! first. (Once it is accepted, the reference adapter throws away whatever it
-//! wrote while it waited, unread and unacked.) A bridge started on demand is
-//! the first bridge leaving: a session that has gone quiet lets go of the app
-//! after its idle window, and the bridge waiting behind it is accepted then.
-//! Before 0.3.2 every bridge held the app for its whole session, so an idle
-//! session locked out the one that wanted it.
+//! Ids come from one process-wide counter, claimed and queued under one lock
+//! ([`BridgeHandle::send`]), so id order is send order. Inputs still queued
+//! at a connect are dropped, as the adapter drops a dead connection's.
+//!
+//! # Connecting
+//!
+//! Backoff starts at [`RETRY_MIN`], doubles, and caps at [`RETRY_MAX`]. A
+//! connection that dies before [`HEALTHY_CONNECTION_MIN`] without a snapshot
+//! keeps it growing, so an app that accepts and drops cannot spin the manager.
+//!
+//! [`spawn`] connects at once and never lets go. [`spawn_on_demand`], which
+//! the binary uses, opens nothing until a tool call wants the app
+//! ([`Demand::begin`]); `initialize`, `tools/list` and `server/discover`
+//! open nothing. The call that wakes it waits in [`Call::settle`] for a tree,
+//! a failed connect, or a connection silent for [`SILENT_LINK_GRACE`], and
+//! never past [`FIRST_CALL_WAIT`] from its start. A new call cuts a pending
+//! backoff short.
+//!
+//! # Letting go
+//!
+//! Once its idle window passes with no tool call, an on-demand manager closes
+//! its connection, or leaves the listen backlog, and stops reconnecting until
+//! the next call. A zero window never lets go. Nor does it while an input it
+//! wrote awaits its ack, for up to [`UNACKED_HOLD`] past the window, because
+//! the adapter discards an ended connection's inputs. A call counts itself
+//! in, and the manager decides to let go, under one lock ([`Activity`]), so
+//! no input is sent to a connection the manager has decided to close.
+//!
+//! The manager records a release, with the pid of the app it let go of, so
+//! the answers can say the disconnect was on purpose. The record is cleared
+//! when a connection serves a tree, when the app closes one, and when a
+//! connect finds nothing listening or another pid listening. A release also
+//! forgets a refused pipe ([`forget_refusal`]).
+//!
+//! [`Activity::peer_pid`] is the process at the other end of the open
+//! connection, which for a connection still in the backlog is the listener.
+//! On Linux the tool layer reads its state to tell a stopped app from one
+//! held by another bridge, since both leave the connection silent.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -199,7 +218,8 @@ impl AppSnapshot {
     /// heard of. Only the two keys go, but the spelling of the rest becomes
     /// the serializer's again: keys sorted, whitespace gone, escapes and
     /// numbers rewritten (`1e3` as `1000.0`), and a key repeated in one object
-    /// kept once, with its last value (`docs/protocol.md` section 16.6).
+    /// kept once, with its last value (`docs/protocol.md` sections 2.2 and
+    /// 16.6).
     pub(crate) fn from_line(line: &str, parsed: Snapshot) -> Self {
         Self {
             tree_json: strip_envelope(line),
@@ -330,10 +350,9 @@ pub(crate) struct BridgeHandle {
     /// away, so a stale version is never read as the current peer's. A peer
     /// that sends a snapshot before any `Hello` is taken at the version that
     /// snapshot carries, and a `Hello` later on the same connection replaces
-    /// it. Every taria adapter has greeted the bridge since its first
-    /// release, so this is for hand-written peers; until 0.3.3 such a peer
-    /// left the version `None`, which reads as "no mismatch known", and
-    /// input went to a peer on another version.
+    /// it. Every taria adapter greets the bridge, so this is for hand-written
+    /// peers: left `None`, which reads as "no mismatch known", input would go
+    /// to a peer on another version.
     ///
     /// The tool layer needs this because a peer on another protocol version
     /// still delivers parseable snapshots while being unable to parse the
@@ -464,8 +483,7 @@ impl BridgeHandle {
 ///
 /// The manager connects at once and holds the app for as long as the returned
 /// handle (or a clone of its `input_tx`) lives, reconnecting whenever the
-/// connection ends. That is every bridge before 0.3.2, and what a library
-/// caller gets from
+/// connection ends. That is what a library caller gets from
 /// [`TariaMcpServerBuilder::connected`](crate::TariaMcpServerBuilder::connected).
 /// The `taria-mcp` binary connects on demand instead, through
 /// [`TariaMcpServerBuilder::on_demand`](crate::TariaMcpServerBuilder::on_demand),
@@ -2080,7 +2098,7 @@ mod tests {
 
     /// A connection that opens retires the last connection's reason for a
     /// rejected line, so the tool layer can quote a reason seen with a
-    /// connection open as that connection's (issue #16), and spares the
+    /// connection open as that connection's, and spares the
     /// oversized one, which the app resends to every connection. Nothing is
     /// sent for a reason that is not there.
     #[test]

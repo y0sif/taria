@@ -15,5 +15,32 @@
 # Python
 __pycache__/
 
-# Benchmark results (bench/run.py)
+# Benchmark output (bench/run.py)
 bench/results/
+
+# Internal files: agent state, specs, plans, notes, results. Never tracked.
+.claude/
+/specs/
+CLAUDE.local.md
+graphify-out/
+/results/
+/memory/
+DESIGN.md
+TASKS.md
+PLAN.md
+NOTES.md
+HANDOFF.md
+MEMORY.md
+BENCHMARKS.md
+next-session*.md
+
+# Docs: only the pages listed here are tracked.
+/docs/*
+!/docs/architecture.md
+!/docs/cli.md
+!/docs/comparison.md
+!/docs/compatibility.md
+!/docs/faq.md
+!/docs/integration-guide.md
+!/docs/protocol.md
+!/docs/tree-guide.md

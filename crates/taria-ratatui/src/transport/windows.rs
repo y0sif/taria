@@ -16,6 +16,11 @@
 //! refused by the system, which is what makes binding over a live endpoint
 //! fail as it does on Unix.
 //!
+//! A pipe's name lives while any handle to it is open, so an app restarted
+//! while a bridge still holds its old end finds its own name taken. The bind
+//! retries for [`BIND_RETRY`] before it reports `AddrInUse`, or the new app
+//! would run with taria off for the whole of its run.
+//!
 //! # Handles and overlapped operations
 //!
 //! The pipe is opened for overlapped I/O, because the session's reader and
@@ -51,6 +56,22 @@
 //! place it happens. At shutdown nothing disconnects: the handle is closed,
 //! which leaves what the writer already wrote, the acks flushed at shutdown
 //! included, readable by the bridge until it has read it all.
+//!
+//! # Why `windows-sys`, not `interprocess`
+//!
+//! `windows-sys` is raw bindings with no code of its own to run, so the pipe
+//! is written here by hand. The obvious crate, `interprocess`, breaks three
+//! promises the layer makes:
+//!
+//! - Its pipe streams have no write timeout, so a bridge that stops reading
+//!   could hold a write, and the app's exit, forever.
+//! - Its listener creates the next instance ahead of each accept, a hidden
+//!   backlog where a second bridge sits silent. With one instance, a held app
+//!   refuses the second bridge as busy, and a silent connection can only be
+//!   the app.
+//! - It hands dropped streams to background threads that wait for the peer
+//!   to read before they close, threads the layer cannot join, holding a
+//!   handle that keeps the name taken.
 
 use std::cell::UnsafeCell;
 use std::ffi::OsStr;

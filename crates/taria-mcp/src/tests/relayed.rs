@@ -40,7 +40,7 @@ fn test_socket_path(name: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-/// One turn of a chat transcript, the way the integration guide builds it:
+/// One turn of a chat transcript, the way docs/tree-guide.md builds it:
 /// the speaker in the turn's own label, which the app wrote, and the words in
 /// a child marked relayed, which it did not.
 fn turn(id: &str, speaker: &str, text: &str) -> Node {

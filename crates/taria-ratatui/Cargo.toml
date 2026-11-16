@@ -1,6 +1,6 @@
 [package]
 name = "taria-ratatui"
-description = "Ratatui adapter for taria. Publishes your app's widget tree, focus, and actions to AI agents alongside normal rendering."
+description = "ARIA for terminals: an agent accessibility layer for TUIs. The ratatui adapter: publish your app's widget tree, focus and actions to AI agents."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
+keywords = ["tui", "ratatui", "accessibility", "ai", "agents"]
 categories.workspace = true
 readme = "../../README.md"
 

@@ -174,9 +174,9 @@ mod tests {
         assert_eq!(IdSpace::try_new("task-"), None);
     }
 
-    /// The pair that used to collide: both spaces build `"task-delete-7"`, and
-    /// both used to answer `Some` for it. An id now belongs to the space named
-    /// before its first separator, so the `"task-delete"` space owns nothing,
+    /// The pair a prefix match would let collide: both spaces build
+    /// `"task-delete-7"`. An id belongs to the space named before its first
+    /// separator, so the `"task-delete"` space owns nothing,
     /// including what its own `id` built. Nothing resolves twice.
     #[test]
     fn a_prefix_holding_the_separator_owns_nothing() {

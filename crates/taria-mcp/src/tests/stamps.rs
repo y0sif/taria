@@ -1,4 +1,4 @@
-//! Stamped snapshots (issue #17): a fake taria app on one side, the bridge and
+//! Stamped snapshots: a fake taria app on one side, the bridge and
 //! the tool methods on the other, playing the orders of acks and trees a slow
 //! app produces.
 //!
@@ -7,8 +7,8 @@
 //! the stamp reaches it. These tests hold the three things that buys: a slow
 //! handler's tree reaches its own input's answer, an input that changes
 //! nothing is answered at once, and a tree that lands late is never credited
-//! to the input after it. A peer that does not say it stamps is answered as
-//! every peer was before, word for word.
+//! to the input after it. A peer that does not say it stamps keeps its own
+//! answers, word for word.
 //!
 //! Then every other way a stamped wait can end: a departure, a restart, a
 //! drop, lost acks, silence, a line the bridge could not read, a burst
@@ -96,7 +96,7 @@ const DROPPED: &str = "the app dropped this input because its input queue was fu
                        was applied. Send fewer inputs, or wait for each call to return before \
                        sending the next; slower input gets through.";
 
-/// The answers an unstamped peer gets, as 0.3.3 gave them.
+/// The answers an unstamped peer gets, pinned word for word.
 const UNCHANGED_UNSTAMPED: &str = "The app received this input, and its tree did not change \
                                    within 500ms. Call read_tree if you expect a delayed effect.";
 const SILENT_UNSTAMPED: &str = "The app neither acknowledged this input nor changed its tree \
@@ -358,7 +358,7 @@ impl Log {
     }
 }
 
-/// The repro of issue #17. A handler slower than 500 ms used to read as
+/// A handler slower than 500 ms reads, from a peer that does not stamp, as
 /// "did not change", with its tree credited to the next input. From a peer
 /// that stamps, the tree comes back in the act's own answer, however late
 /// within the window, and the same app without the stamp still gets the
@@ -435,11 +435,11 @@ async fn an_unchanged_stamped_tree_is_answered_at_once() {
 /// window and then the answer that says so, not "did not change": nothing
 /// stamped says it did not. Then the tree that input caused lands while the
 /// next one is in flight, and becomes that input's baseline instead of its
-/// answer. Credited, it would be issue #17 over again: the next input
-/// changed nothing, and the agent would be told it did.
+/// answer. Credited, it would be misattributed: the next input changed
+/// nothing, and the agent would be told it did.
 ///
-/// The unstamped run plays the same app and gets the misattribution 0.3.3
-/// gave, which is what the stamp exists to remove.
+/// The unstamped run plays the same app and gets the misattribution a peer
+/// that does not stamp still gets, which is what the stamp exists to remove.
 #[tokio::test]
 async fn a_late_tree_rebases_instead_of_being_credited_to_the_next_input() {
     for stamps in [true, false] {
@@ -619,8 +619,8 @@ async fn an_ignored_ack_ends_the_wait_early() {
     );
 }
 
-/// A peer whose hello does not say it stamps is answered byte for byte as
-/// 0.3.3 answered it: the 500 ms window, its two texts, and a tree that
+/// A peer whose hello does not say it stamps is answered by its pinned
+/// rules, byte for byte: the 500 ms window, its two texts, and a tree that
 /// differs anywhere but in a stamp it never said it sends.
 #[tokio::test]
 async fn an_unstamped_peer_gets_the_answers_it_always_did() {
@@ -1198,13 +1198,13 @@ async fn an_honest_unstamped_tree_after_the_first_ack_is_not_a_broken_claim() {
     );
 }
 
-/// A hello that says `stamps` from an app that never stamps. Its changed
-/// tree used to become the baseline, and every input was answered at the
-/// cap with "published no tree after it", trees arriving all the while.
-/// Now the first call that can tell is answered by the rules for a peer
-/// that does not stamp, credited the changed tree, and the log says once
-/// that the claim is false; the rest of the connection is answered as a
-/// peer that does not stamp, 500 ms window and 0.3.3's texts. A new
+/// A hello that says `stamps` from an app that never stamps. Taken at its
+/// word, its changed tree would become the baseline, and every input be
+/// answered at the cap with "published no tree after it", trees arriving all
+/// the while. Instead the first call that can tell is answered by the rules
+/// for a peer that does not stamp, credited the changed tree, and the log
+/// says once that the claim is false; the rest of the connection is answered
+/// as a peer that does not stamp, 500 ms window and its texts. A new
 /// connection starts with a clean record, and is logged again if it lies
 /// again.
 #[tokio::test]

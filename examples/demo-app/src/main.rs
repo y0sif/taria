@@ -11,8 +11,8 @@
 //!
 //! With `TARIA_DEMO_SLOW_MS=<n>` set, the demo holds each agent input for `n`
 //! milliseconds after dequeueing it and before applying it, the way an app
-//! whose handler does real work does. That is the app issue #17 was about:
-//! its input is acknowledged at once and its tree comes later. Unset, empty,
+//! whose handler does real work does: its input is acknowledged at once and
+//! its tree comes later. Unset, empty,
 //! `0` or not a number, inputs are applied at once.
 
 mod app;

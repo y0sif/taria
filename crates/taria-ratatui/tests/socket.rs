@@ -143,7 +143,7 @@ fn publish_single_node(layer: &mut TariaLayer, id: &str) {
 const DROP_BOUND: Duration = Duration::from_millis(50 + 5_000 + 250);
 
 /// Slack for a loaded machine. Far short of a second `WRITE_TIMEOUT`, which a
-/// timeout on each wait for room, rather than on the line, used to add.
+/// timeout on each wait for room, rather than on the line, would add.
 const DROP_MARGIN: Duration = Duration::from_millis(1_000);
 
 /// Drop `layer` on another thread and return how long it took, failing at
@@ -711,7 +711,7 @@ fn input_flood_is_bounded_acked_dropped_and_never_blocks_the_socket_thread() {
         "each dropped input must be counted exactly once"
     );
 
-    // The drops reach the agent, which used to see nothing at all. Not
+    // The drops reach the agent, which would otherwise see nothing. Not
     // necessarily all of them: the connection ends the moment the reader
     // hits EOF, and acks still queued then die with it.
     let dropped: Vec<InputId> = messages
@@ -902,9 +902,9 @@ fn a_second_client_waits_until_the_first_is_gone() {
 
 /// What a client writes while it waits its turn is not its session's input.
 ///
-/// It sits in the kernel's socket buffer until the first client leaves, and
-/// used to be read then as the new session's first lines, so the app applied
-/// keys a client sent before it had seen any tree at all. Nothing written
+/// It sits in the kernel's socket buffer until the first client leaves.
+/// Read then as the new session's first lines, the app would apply keys a
+/// client sent before it had seen any tree at all. Nothing written
 /// before the hello can have been written in reply to it, so all of it is
 /// discarded, counted and never acked, and the session starts with what the
 /// client writes after the hello.
@@ -992,7 +992,7 @@ fn input_a_waiting_client_wrote_before_its_hello_never_reaches_the_app() {
 /// for one. A client that finds the app idle is accepted within a poll of
 /// connecting, and a script that writes the moment it connects, without
 /// reading the hello first (`printf '...' | socat - UNIX:...`), waited behind
-/// nobody: what it wrote is its session's input, and 0.3.0 applied it.
+/// nobody: what it wrote is its session's input, and the app applies it.
 #[test]
 fn a_lone_client_that_writes_before_reading_its_hello_keeps_its_input() {
     let layer = bind_layer("blindlone");
@@ -1048,8 +1048,8 @@ fn a_client_that_finds_the_app_idle_after_a_session_keeps_its_blind_input() {
 /// A common way out of an app answers an input and drops the layer in the
 /// same frame: `q` handled as quit, an input refused on the way out. Nothing
 /// gives the writer a turn in between, so both of that input's acks can still
-/// be queued when the shutdown starts, and they used to be thrown away with
-/// the connection, leaving the agent to time out on an input the app took.
+/// be queued when the shutdown starts. Thrown away with the connection, they
+/// would leave the agent to time out on an input the app took.
 ///
 /// A smoke test, and no proof: the writer may well send both acks before the
 /// drop, and then this passes without any flush at all. The proof is the

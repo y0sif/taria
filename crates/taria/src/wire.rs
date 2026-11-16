@@ -36,8 +36,8 @@
 //! before it has decided anything, and follows with
 //! [`Ignored`](InputStatus::Ignored) once it has looked and done nothing. The
 //! last ack wins, so a bridge must not resolve a waiter on the first ack that
-//! matches an id: a test bridge that did reported `Delivered` for four inputs
-//! its app had refused. The reference bridge keeps listening after a
+//! matches an id, or it reports `Delivered` for an input the app refused. The
+//! reference bridge keeps listening after a
 //! `Delivered` until the tree changes or its window closes, reading acks and
 //! snapshots in wire order, because an app writes an ack ahead of the snapshot
 //! it publishes next. [`InputStatus`] states the rule in full.
@@ -106,8 +106,8 @@
 //! are on that list even though a key travels as a string, because the string
 //! is parsed into them and an adapter takes the result by value. Marking them
 //! is itself a breaking
-//! change, which is why it is done before the first release rather than at the
-//! first addition. Each one costs an outside peer one wildcard arm (or one
+//! change, so a type is marked before its first release, not at its first
+//! addition. Each one costs an outside peer one wildcard arm (or one
 //! `..` in a pattern), and buys back that a new variant, field, role, action
 //! or key is a recompile rather than a repair.
 //!
@@ -118,9 +118,12 @@
 //! attribute as well: [`AppToBridge::Hello`], [`AppToBridge::Ack`],
 //! [`BridgeToApp::Input`], and [`Act`](AgentInput::Act),
 //! [`Key`](AgentInput::Key) and [`Text`](AgentInput::Text) on [`AgentInput`].
-//! For a peer that means two habits: build them with the constructor beside
-//! each one, since a marked variant has no struct literal from outside, and
-//! end a destructuring pattern with `..`.
+//! For a peer that means three habits: build them with the constructor beside
+//! each one, since a marked variant has no struct literal from outside, end a
+//! destructuring pattern with `..`, and carry a wildcard arm on any `match`
+//! over these enums. On [`AgentInput`] that arm is the one that swallows
+//! [`Text`](AgentInput::Text), which is how an app can look complete while
+//! typing goes nowhere; clippy's `wildcard_enum_match_arm` catches it.
 //! [`AppToBridge::Snapshot`] needs neither. It is a
 //! newtype around [`Snapshot`], which is marked already and built by
 //! [`Snapshot::new`](crate::Snapshot::new).
@@ -429,8 +432,8 @@ mod tests {
         assert_eq!(roundtrip_app(&msg), msg);
     }
 
-    /// A hello that does not stamp is the line 0.3.3 wrote, byte for byte,
-    /// and one that does adds the flag at the end.
+    /// A hello that does not stamp is the line an older peer wrote, byte for
+    /// byte, and one that does adds the flag at the end.
     #[test]
     fn the_stamps_flag_is_sent_only_when_true() {
         let line = |msg: &AppToBridge| serde_json::to_string(msg).unwrap();
@@ -585,7 +588,7 @@ mod tests {
     #[test]
     fn unknown_vocabulary_does_not_cost_the_whole_snapshot() {
         // The failure this guards against: one leaf node using a role or an
-        // action added in a later version used to make the entire snapshot
+        // action added in a later version would make the entire snapshot
         // unparseable, so a reader that skips malformed lines went on serving
         // its last tree and the app looked frozen with no error anywhere.
         let line = r#"{"type":"snapshot","protocol_version":1,"seq":4,"root":{"id":"root","role":"app","focused":false,"children":[{"id":"chart","role":"sparkline","label":"cpu","focused":false,"actions":["zoom",{"set_range":{"from":1,"to":9}}]},{"id":"btn","role":"button","label":"Save","focused":true,"actions":["activate"]}]}}"#;
@@ -646,9 +649,9 @@ mod tests {
 
     #[test]
     fn an_input_kind_from_a_later_version_keeps_its_id() {
-        // The whole reason `AgentInput::Unknown` exists. A kind this build has
-        // never heard of used to fail the line it arrived on, so the app
-        // skipped it and the agent waited out a timeout with no ack at all.
+        // The whole reason `AgentInput::Unknown` exists. Without it, a kind
+        // this build has never heard of fails the line it arrived on, so the
+        // app skips it and the agent waits out a timeout with no ack at all.
         // The id lives on the message rather than inside the input, so it
         // survives, and an ack becomes possible.
         let line = r#"{"type":"input","id":41,"input":{"kind":"paste","text":"hi","from":"clip"}}"#;

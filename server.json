@@ -1,0 +1,39 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.y0sif/taria-mcp",
+  "title": "taria",
+  "description": "ARIA for terminals: an agent accessibility layer for TUIs.",
+  "repository": {
+    "url": "https://github.com/y0sif/taria",
+    "source": "github"
+  },
+  "websiteUrl": "https://y0sif.github.io/taria/",
+  "version": "0.4.0",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "registryBaseUrl": "https://crates.io",
+      "identifier": "taria-mcp",
+      "version": "0.4.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--app",
+          "description": "Label of the taria-enabled app to drive, the one it binds its socket (or, on Windows, its pipe) under",
+          "isRequired": true,
+          "placeholder": "taria-demo"
+        },
+        {
+          "type": "named",
+          "name": "--tree-format",
+          "description": "How trees are shown to the agent: the app's JSON snapshot, or one indented line per node",
+          "choices": ["json", "outline"],
+          "default": "json"
+        }
+      ]
+    }
+  ]
+}

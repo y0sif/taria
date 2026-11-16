@@ -1,4 +1,21 @@
 //! The Unix transport: a Unix domain socket at the path the bridge was given.
+//!
+//! A connect to a listening socket completes into the app's listen backlog
+//! before the app accepts it ([`BACKLOG`]). The adapter serves one bridge at
+//! a time, so a second bridge's connection opens and stays silent until the
+//! first lets go: on Unix, silence past the grace is the app held by another
+//! bridge, and nothing ever refuses a connect ([`refusal`]). A connect that
+//! fails as [`nothing_listens`] reads it means the app has gone.
+//!
+//! [`peer_pid`] reads the pid the kernel records for the other end
+//! (`SO_PEERCRED`, `LOCAL_PEERPID` on macOS), which for a connection still in
+//! the backlog is the process listening at the path. The bridge keeps it to
+//! tell one app instance from the next at the same path. On Linux the tool
+//! layer also reads that process's state from `/proc/<pid>/stat`: a stopped
+//! app keeps listening and accepts nothing, the same silence as a held one,
+//! and is named instead with its pid and how to resume it. A job suspended
+//! in its terminal needs the user's `fg`, a tracing stop the debugger, any
+//! other stop `kill -CONT`. Elsewhere a stopped app reads as held.
 
 use std::io;
 use std::path::Path;

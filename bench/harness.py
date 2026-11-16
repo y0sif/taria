@@ -29,7 +29,7 @@ MCP_BIN = os.path.join(REPO, "target", "debug", "taria-mcp")
 TMUX_MCP = os.path.join(BENCH, "tmux_mcp.py")
 # molerat's stdio bridge, built outside this repo: molerat-mcp on PATH, as
 # `cargo install --git https://github.com/orhun/molerat --features mcp molerat`
-# puts it (bench/MOLERAT.md pins the rev). Only its path is known here: the
+# puts it (bench/README.md pins the rev). Only its path is known here: the
 # molerat arm execs it, against a demo that publishes a molerat tree beside the
 # taria one (`plan --demo-bin`). Not on PATH, it stays the bare name, which
 # require_fresh_external refuses.
@@ -202,7 +202,7 @@ def require_fresh_external(binaries):
     for binary in binaries:
         if not os.path.exists(binary):
             if binary == MOLERAT_MCP:
-                raise HarnessError("molerat-mcp is not on PATH; install it as bench/MOLERAT.md says, then rerun")
+                raise HarnessError("molerat-mcp is not on PATH; install it as bench/README.md says, then rerun")
             raise HarnessError(f"{binary} not built; build it in its own repo, then rerun")
         sources = dep_info_sources(binary)
         if sources is None:

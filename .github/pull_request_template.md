@@ -4,9 +4,6 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --check` passes
-- [ ] `cargo clippy --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
-- [ ] `python3 scripts/e2e.py` passes
-- [ ] `python3 scripts/adversarial.py` passes
-- [ ] Wire-format changes bump `PROTOCOL_VERSION` and are documented
+- [ ] The [checks in CONTRIBUTING.md](https://github.com/y0sif/taria/blob/main/CONTRIBUTING.md#before-pushing) pass
+- [ ] CHANGELOG.md has an entry, with an upgrade note if the Rust API changed
+- [ ] A wire-format change is in docs/protocol.md, within the [protocol rules](https://github.com/y0sif/taria/blob/main/AGENTS.md#rules-protocol)

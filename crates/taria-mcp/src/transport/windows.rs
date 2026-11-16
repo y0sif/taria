@@ -26,6 +26,25 @@
 //! them as UTF-16. The ANSI ones convert a name through the code page first,
 //! and a best-fit conversion can turn a character
 //! [`check_pipe_name`](taria::socket::check_pipe_name) passed into a `\`.
+//!
+//! # What the refusals mean to the answers
+//!
+//! - [`Refusal::Busy`], past the retry, is the app held by another bridge,
+//!   with the refusal as the evidence. The answer allows that the app may
+//!   instead be suspended or stuck: an app stopped after a session cannot
+//!   listen again, so its one instance stays busy.
+//! - A connection that opens and stays silent past the grace is the app
+//!   itself, suspended or stuck, never another bridge.
+//! - [`Refusal::Foreign`] and [`Refusal::Denied`] outrank every other answer,
+//!   an oversized tree included, since the pipe is not one those would be
+//!   about. Each stands over the busy refusals after it until a connect
+//!   passes the owner check, finds nothing listening, or the bridge lets go
+//!   of the app (`bridge::forget_refusal`): a released bridge stops trying,
+//!   and meanwhile the impostor can go and the app come back, held by
+//!   another session.
+//!
+//! [`peer_pid`] comes from `GetNamedPipeServerProcessId`. Stopped-app
+//! detection reads `/proc`, so it stays Linux only.
 
 use std::error::Error;
 use std::fmt;
@@ -70,10 +89,10 @@ pub(crate) const ENDPOINT_ADDRESS: &str = "pipe name";
 ///
 /// Between two sessions the app's one instance is busy for a moment: the
 /// bridge that left has closed its end, and the adapter has yet to retire its
-/// session, disconnect it and listen again, which takes a poll of its
-/// accept loop (50 ms) and the session's threads ending. Refused at once, a
-/// bridge arriving in that moment was told the app is held by another bridge,
-/// about an app that was free. A pipe still busy at the end of this is served
+/// session, disconnect it and listen again, which takes a poll of its accept
+/// loop (50 ms) and the session's threads ending. Refused at once, a bridge
+/// arriving in that moment would be told the app is held by another bridge,
+/// about an app that is free. A pipe still busy at the end of this is served
 /// to another bridge.
 pub(crate) const BUSY_RETRY: Duration = Duration::from_millis(250);
 

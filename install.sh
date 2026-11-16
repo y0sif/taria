@@ -47,10 +47,11 @@ case "$OS" in
         esac
         ;;
     MINGW*|MSYS*|CYGWIN*|Windows_NT)
-        # Not a packaging gap: the transport is a Unix domain socket bound
-        # through unix-only APIs, so there is no Windows build to download.
-        echo "Windows is not supported: taria's transport is a Unix domain socket." >&2
-        echo "See https://github.com/$REPO for what is supported." >&2
+        # Windows ships as a zip, which this script does not install.
+        echo "This script installs on Linux and macOS. On Windows, download" >&2
+        echo "taria-mcp-x86_64-pc-windows-msvc.zip from" >&2
+        echo "  https://github.com/$REPO/releases/latest" >&2
+        echo "or run: cargo install taria-mcp --locked" >&2
         exit 1
         ;;
     *)
